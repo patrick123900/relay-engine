@@ -27,6 +27,10 @@ struct MeshAsset {
     std::uint32_t first_index{};
     std::uint32_t index_count{};
     std::int32_t vertex_offset{};
+    // Local-space axis-aligned bounds over the vertices this mesh actually indexes. Computed by the
+    // registry when the mesh is added; used for frustum culling.
+    std::array<float, 3> bounds_min{};
+    std::array<float, 3> bounds_max{};
 };
 
 struct MaterialAsset {
@@ -70,6 +74,8 @@ public:
                            std::vector<MeshAsset> meshes, std::vector<MaterialAsset> materials);
 
 private:
+    void recompute_bounds(std::size_t first_mesh);
+
     std::vector<MeshVertex> vertices_;
     std::vector<std::uint32_t> indices_;
     std::vector<MeshAsset> meshes_;

@@ -82,6 +82,8 @@ Current major layers:
   - GLSL-to-SPIR-V build integration;
   - SPIR-V reflection of vertex inputs, descriptor bindings and push constants;
   - a small compiled render graph with resources, dependencies and transitions;
+  - a device-selected depth attachment with depth testing and writes for opaque geometry;
+  - per-mesh frustum culling and a front-to-back opaque draw order independent of creation order;
   - a bounded 16-slot texture descriptor table;
   - staged procedural texture uploads and GPU-generated mip chains;
   - synchronized swapchain readback to PNG/BMP;
@@ -263,10 +265,15 @@ model cannot reach outside the project. Two caveats remain explicit:
 - Data URIs are decoded by Assimp in memory and are bounded only by the containing file's size
   limit, not by a separate decoded-size budget.
 
-### Rendering is still a first-light renderer
+### Rendering is still an early renderer
 
-- There is no depth buffer or depth testing.
-- There is no opaque/transparent render queue, sorting, culling, batching or instancing.
+- Depth testing and frustum culling exist, but there is still no transparent render queue, no
+  batching and no instancing. Every visible instance is its own draw call.
+- Culling is per-instance against the mesh's local axis-aligned bounds. There is no spatial
+  acceleration structure, so the cull cost is linear in drawable entity count.
+- The depth attachment is a single image shared by every swapchain image. That is correct while one
+  frame at a time records the render pass, but it will need to become per-frame if recording ever
+  overlaps.
 - There are no normals, lighting, shadows, HDR, tonemapping or physically based shading.
 - No ray tracing, DLSS, FSR or temporal upscaling has been implemented; only hardware capability
   discovery exists.
@@ -302,7 +309,7 @@ TODO for a rotating Vulkan staging/readback ring that feeds asynchronous capture
 
 ## What to build next
 
-The current milestone is **Renderable Static glTF v1**. Phase A is complete; Phase B is next.
+The current milestone is **Renderable Static glTF v1**. Phases A and B are complete; Phase C is next.
 
 ### Phase A — durable and safe asset foundation (complete)
 
@@ -317,16 +324,22 @@ in a separate process reports `restored:1, changed:0, failed:0` and resolves the
 same `sha256-v1-…` id with no manual reimport. A model referencing `../` or an absolute path outside
 `assets/` is refused and leaves the registry untouched.
 
-### Phase B — correct basic 3D visibility
+### Phase B — correct basic 3D visibility (complete)
 
-1. Add Vulkan depth images per swapchain image, depth attachment/render-pass integration and cleanup.
-2. Enable depth testing/writes for opaque geometry.
-3. Extend the render graph to represent depth explicitly.
-4. Add frustum culling and a deterministic opaque draw order.
-5. Add overlapping/occluded mesh tests and a real-GPU screenshot proving depth correctness.
+All five steps landed: a device-selected depth attachment with render-pass and framebuffer
+integration and cleanup on swapchain recreation, depth test and write enabled with a `LESS` compare
+op, an explicit `scene_depth` resource and transition in the render graph, per-mesh bounds driving
+frustum culling, and a front-to-back opaque draw order with a total tiebreak so it never depends on
+entity creation order.
 
-Definition of done: two overlapping imported meshes render correctly regardless of creation order,
-and swapchain recreation safely rebuilds depth resources.
+Definition of done, verified: two overlapping meshes captured on the real GPU produced a
+**byte-identical** PNG whether the near or the far entity was created first, with the near mesh
+correctly occluding the far one. The capture is `captures/depth-occlusion.png`. Swapchain recreation
+is exercised by `--vulkan-smoke`, which resizes mid-run and rebuilds the depth resources.
+
+Note: the host has no `VK_LAYER_KHRONOS_validation`, so the Vulkan work here is verified by
+observed output and clean runs, not by validation layers. Installing them is worthwhile before
+Phase C adds more attachments and descriptor traffic.
 
 ### Phase C — static glTF material completeness
 
@@ -366,13 +379,15 @@ base color, normal mapping and metallic/roughness response after a clean restart
 
 Use this as the next instruction after giving the agent this handoff:
 
-> Continue Relay Engine with Phase B of the “Renderable Static glTF v1” milestone from HANDOFF.md.
-> Phase A is complete, so build on the engine-owned `AssetRegistry` rather than reintroducing global
-> asset state. Add per-swapchain depth images with render-pass integration and cleanup, enable depth
-> testing and writes for opaque geometry, represent depth explicitly in the render graph, and add
-> frustum culling with a deterministic opaque draw order. Prove it with overlapping-mesh tests and a
-> real-GPU screenshot, confirm swapchain recreation rebuilds depth resources safely, then run
-> dev/release, ctest and MCP validation and report any remaining boundary.
+> Continue Relay Engine with Phase C of the “Renderable Static glTF v1” milestone from HANDOFF.md.
+> Phases A and B are complete, so build on the engine-owned `AssetRegistry` and the existing depth
+> and culling path rather than reintroducing global asset state or unsorted drawing. Extend
+> `MeshVertex` with normals and tangents and update the Vulkan vertex declarations and shaders,
+> generate missing normals/tangents where appropriate, decode embedded and external glTF images,
+> upload base-colour, metallic/roughness, normal, occlusion and emissive textures, and replace the
+> fixed colour/checker material with a PBR material record. Note that adding vertex attributes
+> changes the registry's mesh bounds input, so keep culling correct. Add golden glTF fixtures and GPU
+> captures, then run dev/release, ctest and MCP validation and report any remaining boundary.
 
 ## Key files to inspect first
 

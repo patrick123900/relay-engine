@@ -10,6 +10,7 @@
 #include "relay/scene/scene_history.hpp"
 #include "relay/scene/scene_io.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -142,6 +143,8 @@ int main() {
     const auto rendered_entity = render_source.create("Rendered child", camera_entity);
     auto rendered_transform = render_source.get(rendered_entity)->transform;
     rendered_transform.position.x = 2.0;
+    // The camera looks down -Z from z = 5, so the child must sit in front of it to survive culling.
+    rendered_transform.position.z = -4.0;
     expect(render_source.set_transform(rendered_entity, rendered_transform),
            "rendered entity receives a local transform");
     expect(render_source.set_mesh_renderer(
@@ -156,18 +159,81 @@ int main() {
            "camera entities are excluded while drawable scene entities become instances");
     if (!render_snapshot.instances.empty()) {
         expect(std::abs(render_snapshot.instances.front().model.values[12] - 3.0F) < 0.0001F &&
-                   std::abs(render_snapshot.instances.front().model.values[14] - 5.0F) < 0.0001F,
+                   std::abs(render_snapshot.instances.front().model.values[14] - 1.0F) < 0.0001F,
                "render snapshot resolves parent and local transforms into a world matrix");
         expect(render_snapshot.instances.front().mesh == "builtin.quad" &&
                    render_snapshot.instances.front().material == "builtin.violet",
                "render snapshot carries mesh and material asset identifiers");
     }
+    expect(render_snapshot.culled == 0U, "a visible entity is not culled");
+
+    // Frustum culling: an entity behind the camera must be rejected before it reaches a draw call.
+    auto behind_transform = render_source.get(rendered_entity)->transform;
+    behind_transform.position.z = 4.0;
+    expect(render_source.set_transform(rendered_entity, behind_transform),
+           "rendered entity can be moved behind the camera");
+    const auto culled_snapshot = relay::build_render_scene(render_source, registry, 16.0F / 9.0F);
+    expect(culled_snapshot.instances.empty() && culled_snapshot.culled == 1U,
+           "an entity behind the camera is culled from the render scene");
+
+    // Far outside the horizontal field of view is culled too.
+    behind_transform.position = {400.0, 0.0, -4.0};
+    expect(render_source.set_transform(rendered_entity, behind_transform),
+           "rendered entity can be moved outside the horizontal field of view");
+    expect(relay::build_render_scene(render_source, registry, 16.0F / 9.0F).culled == 1U,
+           "an entity beyond the side planes is culled from the render scene");
+    expect(render_source.set_transform(rendered_entity, rendered_transform),
+           "rendered entity returns to a visible position");
+
+    // Draw order must be front to back and independent of the order entities were created in.
+    {
+        relay::Scene order_scene;
+        const auto order_camera = order_scene.create("Camera");
+        auto order_camera_transform = order_scene.get(order_camera)->transform;
+        order_camera_transform.position = {0.0, 0.0, 5.0};
+        (void)order_scene.set_transform(order_camera, order_camera_transform);
+        (void)order_scene.set_camera(order_camera, relay::Camera{});
+
+        // Created far first, near second.
+        const auto far_entity = order_scene.create("Far");
+        auto far_transform = order_scene.get(far_entity)->transform;
+        far_transform.position = {0.0, 0.0, -5.0};
+        (void)order_scene.set_transform(far_entity, far_transform);
+        (void)order_scene.set_mesh_renderer(far_entity,
+                                            relay::MeshRenderer{"builtin.quad", "builtin.orange"});
+        const auto near_entity = order_scene.create("Near");
+        auto near_transform = order_scene.get(near_entity)->transform;
+        near_transform.position = {0.0, 0.0, 1.0};
+        (void)order_scene.set_transform(near_entity, near_transform);
+        (void)order_scene.set_mesh_renderer(near_entity,
+                                            relay::MeshRenderer{"builtin.quad", "builtin.azure"});
+
+        const auto ordered = relay::build_render_scene(order_scene, registry, 1.0F);
+        expect(ordered.instances.size() == 2U &&
+                   ordered.instances.front().entity == near_entity &&
+                   ordered.instances.back().entity == far_entity,
+               "opaque instances draw front to back regardless of creation order");
+        expect(ordered.instances.front().view_depth < ordered.instances.back().view_depth,
+               "render instances carry an increasing camera-relative depth");
+    }
 
     const auto render_graph = relay::make_scene_render_graph();
     expect(render_graph.valid && render_graph.ordered_passes.size() == 2U &&
                render_graph.ordered_passes.front().name == "scene_geometry" &&
-               render_graph.transitions.size() == 3U,
-           "render graph compiles geometry and presentation with explicit transitions");
+               render_graph.transitions.size() == 4U,
+           "render graph compiles geometry and presentation with explicit transitions: " +
+               render_graph.error);
+    const auto depth_resource = std::find_if(
+        render_graph.resources.begin(), render_graph.resources.end(),
+        [](const auto& resource) { return resource.name == "scene_depth"; });
+    expect(depth_resource != render_graph.resources.end() && !depth_resource->imported,
+           "render graph declares the depth attachment as a pass-local resource");
+    expect(std::any_of(render_graph.transitions.begin(), render_graph.transitions.end(),
+                       [](const auto& transition) {
+                           return transition.after == "depth_stencil_attachment" &&
+                                  transition.pass == "scene_geometry";
+                       }),
+           "render graph records the depth attachment transition in the geometry pass");
     relay::RenderGraph invalid_graph;
     const auto orphan = invalid_graph.add_resource("orphan", relay::RenderResourceKind::image);
     invalid_graph.add_pass("reader", {{orphan, relay::RenderAccess::sampled}});

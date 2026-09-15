@@ -73,7 +73,39 @@ AssetRegistry::AssetRegistry()
       indices_{relay::indices.begin(), relay::indices.end()},
       meshes_{initial_meshes.begin(), initial_meshes.end()},
       materials_{initial_materials.begin(), initial_materials.end()},
-      textures_{make_textures()} {}
+      textures_{make_textures()} {
+    recompute_bounds(0U);
+}
+
+void AssetRegistry::recompute_bounds(const std::size_t first_mesh) {
+    for (std::size_t mesh_index = first_mesh; mesh_index < meshes_.size(); ++mesh_index) {
+        auto& mesh = meshes_[mesh_index];
+        std::array<float, 3> low{};
+        std::array<float, 3> high{};
+        bool seen = false;
+        for (std::uint32_t offset = 0; offset < mesh.index_count; ++offset) {
+            const std::size_t slot = mesh.first_index + offset;
+            if (slot >= indices_.size()) break;
+            const auto vertex_slot = static_cast<std::size_t>(mesh.vertex_offset) +
+                                     static_cast<std::size_t>(indices_[slot]);
+            if (vertex_slot >= vertices_.size()) continue;
+            const auto& vertex = vertices_[vertex_slot];
+            const std::array<float, 3> position{vertex.x, vertex.y, vertex.z};
+            if (!seen) {
+                low = position;
+                high = position;
+                seen = true;
+                continue;
+            }
+            for (std::size_t axis = 0; axis < 3U; ++axis) {
+                low[axis] = std::min(low[axis], position[axis]);
+                high[axis] = std::max(high[axis], position[axis]);
+            }
+        }
+        mesh.bounds_min = low;
+        mesh.bounds_max = high;
+    }
+}
 
 std::span<const MeshVertex> AssetRegistry::mesh_vertices() const { return vertices_; }
 std::span<const std::uint32_t> AssetRegistry::mesh_indices() const { return indices_; }
@@ -143,6 +175,7 @@ bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
     if (std::all_of(meshes.begin(), meshes.end(), [this](const MeshAsset& mesh) {
             return find_mesh(mesh.name) != nullptr;
         })) return true;
+    const auto first_new_mesh = meshes_.size();
     const auto vertex_base = static_cast<std::int32_t>(vertices_.size());
     const auto index_base = static_cast<std::uint32_t>(indices_.size());
     for (auto& mesh : meshes) {
@@ -158,6 +191,7 @@ bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
     }
     vertices_.insert(vertices_.end(), vertices.begin(), vertices.end());
     indices_.insert(indices_.end(), indices_to_add.begin(), indices_to_add.end());
+    recompute_bounds(first_new_mesh);
     ++revision_;
     return true;
 }

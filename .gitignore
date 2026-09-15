@@ -19,6 +19,7 @@ npm-debug.log*
 /captures/*
 !/captures/bindless-scene.png
 !/captures/imported-gltf.png
+!/captures/depth-occlusion.png
 
 # Editor and operating-system noise
 .DS_Store

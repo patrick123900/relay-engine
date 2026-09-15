@@ -10,8 +10,9 @@ namespace relay {
 using RenderResourceId = std::uint32_t;
 
 enum class RenderResourceKind { image, buffer };
-enum class RenderAccess { sampled, storage_read, storage_write, color_attachment, transfer_source,
-                          transfer_destination, present };
+enum class RenderAccess { sampled, storage_read, storage_write, color_attachment,
+                          depth_stencil_attachment, transfer_source, transfer_destination,
+                          present };
 
 struct RenderResourceDescription {
     std::string name;

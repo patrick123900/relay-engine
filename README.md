@@ -18,6 +18,8 @@ This repository currently contains the first vertical slice:
 - scene-driven Vulkan draws with resolved hierarchy transforms and an explicit perspective camera;
 - a compiled render graph with inspectable resource transitions and dependency validation;
 - staged uploads into device-local mesh buffers plus reflected SPIR-V pipeline interfaces;
+- depth testing with frustum culling and a front-to-back opaque draw order, so overlapping meshes
+  resolve correctly no matter what order they were created in;
 - persistent mesh/material scene components with built-in triangle, quad and color assets;
 - a bounded bindless texture table with staged image uploads and GPU-generated mip chains;
 - content-addressed project model import for glTF/GLB, FBX, OBJ, DAE and Blender files, with
@@ -193,9 +195,9 @@ Both CMake builds and `npm run check` reject stale generated C++, TypeScript or 
 
 Near-term milestones, in the order they should be taken:
 
-1. Add depth buffering, frustum culling and a deterministic opaque draw order. The renderer has no
-   depth attachment yet, so overlapping meshes currently draw in creation order.
-2. Add image texture, PBR channel, skeleton and animation import to the model pipeline.
+1. Add image texture, PBR channel and normal/tangent import to the model pipeline, replacing the
+   fixed colour-and-checker material with a real PBR material record.
+2. Add skeleton and animation import.
 3. Add a Blender-to-glTF adapter matching Godot's `.blend` workflow.
 
 See [`HANDOFF.md`](HANDOFF.md) for the full phase breakdown and the current list of known

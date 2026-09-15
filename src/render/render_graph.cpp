@@ -10,7 +10,10 @@ namespace relay {
 namespace {
 
 bool writes(const RenderAccess access) {
+    // A depth attachment is bound with a clear load and depth writes enabled, so the pass using it
+    // produces it rather than consuming something an earlier pass wrote.
     return access == RenderAccess::storage_write || access == RenderAccess::color_attachment ||
+           access == RenderAccess::depth_stencil_attachment ||
            access == RenderAccess::transfer_destination;
 }
 
@@ -36,6 +39,7 @@ std::string_view to_string(const RenderAccess access) {
     case RenderAccess::storage_read: return "storage_read";
     case RenderAccess::storage_write: return "storage_write";
     case RenderAccess::color_attachment: return "color_attachment";
+    case RenderAccess::depth_stencil_attachment: return "depth_stencil_attachment";
     case RenderAccess::transfer_source: return "transfer_source";
     case RenderAccess::transfer_destination: return "transfer_destination";
     case RenderAccess::present: return "present";
@@ -185,7 +189,11 @@ CompiledRenderGraph make_scene_render_graph() {
     RenderGraph graph;
     const auto swapchain = graph.add_resource("swapchain_color", RenderResourceKind::image, true);
     const auto textures = graph.add_resource("bindless_textures", RenderResourceKind::image, true);
+    // Depth is created and consumed inside the geometry pass, so unlike the swapchain and the
+    // texture table it is not imported from outside the graph.
+    const auto depth = graph.add_resource("scene_depth", RenderResourceKind::image);
     graph.add_pass("scene_geometry", {{textures, RenderAccess::sampled},
+                                      {depth, RenderAccess::depth_stencil_attachment},
                                       {swapchain, RenderAccess::color_attachment}});
     graph.add_pass("present", {{swapchain, RenderAccess::present}});
     return graph.compile();

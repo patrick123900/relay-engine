@@ -1,0 +1,24 @@
+{
+  "name": "@relay-engine/mcp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "python ../../tools/generate_protocol.py",
+    "generate:check": "python ../../tools/generate_protocol.py --check",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "check": "npm run generate:check && tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

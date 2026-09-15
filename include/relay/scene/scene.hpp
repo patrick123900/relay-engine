@@ -1,0 +1,119 @@
+#pragma once
+
+#include <cstdint>
+#include <compare>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace relay {
+
+struct Entity {
+    std::uint32_t index{0};
+    std::uint32_t generation{0};
+
+    [[nodiscard]] constexpr bool valid() const { return generation != 0; }
+    [[nodiscard]] std::uint64_t packed() const;
+    [[nodiscard]] std::string to_string() const;
+    [[nodiscard]] static std::optional<Entity> parse(std::string_view value);
+
+    auto operator<=>(const Entity&) const = default;
+};
+
+struct Vec3 {
+    double x{0.0};
+    double y{0.0};
+    double z{0.0};
+
+    auto operator<=>(const Vec3&) const = default;
+};
+
+struct Transform {
+    Vec3 position{};
+    Vec3 rotation_degrees{};
+    Vec3 scale{1.0, 1.0, 1.0};
+
+    auto operator<=>(const Transform&) const = default;
+};
+
+struct Camera {
+    double field_of_view_y_degrees{60.0};
+    double near_plane{0.1};
+    double far_plane{1000.0};
+    bool active{true};
+
+    auto operator<=>(const Camera&) const = default;
+};
+
+struct MeshRenderer {
+    std::string mesh{"builtin.triangle"};
+    std::string material{"builtin.orange"};
+
+    auto operator<=>(const MeshRenderer&) const = default;
+};
+
+enum class ReflectedFieldType { string, entity, vec3, number, boolean };
+
+struct ReflectedField {
+    std::string_view name;
+    ReflectedFieldType type;
+};
+
+struct ComponentDescriptor {
+    std::string_view name;
+    std::uint32_t stable_id;
+    std::vector<ReflectedField> fields;
+};
+
+struct EntityRecord {
+    std::string name;
+    Transform transform;
+    Entity parent{};
+    std::optional<Camera> camera;
+    std::optional<MeshRenderer> mesh_renderer;
+};
+
+struct SceneSlotState {
+    std::uint32_t generation{1};
+    bool alive{false};
+    EntityRecord record;
+};
+
+struct SceneState {
+    std::vector<SceneSlotState> slots;
+    std::vector<std::uint32_t> free_indices;
+};
+
+class Scene {
+public:
+    [[nodiscard]] Entity create(std::string name = "Entity", Entity parent = {});
+    [[nodiscard]] bool destroy(Entity entity);
+    [[nodiscard]] bool contains(Entity entity) const;
+    [[nodiscard]] EntityRecord* get(Entity entity);
+    [[nodiscard]] const EntityRecord* get(Entity entity) const;
+    [[nodiscard]] std::vector<Entity> entities() const;
+
+    [[nodiscard]] bool set_transform(Entity entity, const Transform& transform);
+    [[nodiscard]] bool set_parent(Entity entity, Entity parent);
+    [[nodiscard]] bool set_camera(Entity entity, std::optional<Camera> camera);
+    [[nodiscard]] bool set_mesh_renderer(Entity entity, std::optional<MeshRenderer> renderer);
+    [[nodiscard]] std::optional<Entity> active_camera() const;
+
+    [[nodiscard]] SceneState capture_state() const;
+    void restore_state(SceneState state);
+
+    [[nodiscard]] std::string entity_json(Entity entity) const;
+    [[nodiscard]] std::string list_json() const;
+    [[nodiscard]] std::string serialize_json() const;
+    [[nodiscard]] static const std::vector<ComponentDescriptor>& component_descriptors();
+
+private:
+    void destroy_recursive(Entity entity);
+    [[nodiscard]] bool would_create_cycle(Entity entity, Entity parent) const;
+
+    std::vector<SceneSlotState> slots_;
+    std::vector<std::uint32_t> free_indices_;
+};
+
+} // namespace relay

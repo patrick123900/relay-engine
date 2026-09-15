@@ -1,0 +1,24 @@
+# CMake build products and local configuration
+/build/
+CMakeUserPresets.json
+
+# Node dependencies and generated package-manager diagnostics
+/tools/mcp-bridge/node_modules/
+npm-debug.log*
+
+# Local runtime output
+/outputs/
+/work/
+/traces/
+
+# Captures are generated artifacts. Keep the two representative images
+# referenced by HANDOFF.md as project documentation.
+/captures/*
+!/captures/bindless-scene.png
+!/captures/imported-gltf.png
+
+# Editor and operating-system noise
+.DS_Store
+*.swp
+*.tmp
+

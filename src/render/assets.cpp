@@ -58,124 +58,107 @@ std::vector<TextureAsset> make_textures() {
     return output;
 }
 
-struct AssetStorage {
-    std::vector<MeshVertex> vertices{initial_vertices.begin(), initial_vertices.end()};
-    std::vector<std::uint32_t> indices{relay::indices.begin(), relay::indices.end()};
-    std::vector<MeshAsset> meshes{initial_meshes.begin(), initial_meshes.end()};
-    std::vector<MaterialAsset> materials{initial_materials.begin(), initial_materials.end()};
-    std::vector<TextureAsset> textures{make_textures()};
-    std::uint64_t revision{1U};
-};
-
-AssetStorage& storage() {
-    static AssetStorage value;
-    return value;
+template <typename Assets>
+const typename Assets::value_type* find_named(const Assets& assets, const std::string_view name) {
+    const auto found = std::find_if(assets.begin(), assets.end(), [name](const auto& asset) {
+        return asset.name == name;
+    });
+    return found == assets.end() ? nullptr : &*found;
 }
 
 } // namespace
 
-std::span<const MeshVertex> built_in_mesh_vertices() { return storage().vertices; }
-std::span<const std::uint32_t> built_in_mesh_indices() { return storage().indices; }
-std::span<const MeshAsset> built_in_meshes() { return storage().meshes; }
-std::span<const MaterialAsset> built_in_materials() { return storage().materials; }
-std::span<const TextureAsset> built_in_textures() { return storage().textures; }
+AssetRegistry::AssetRegistry()
+    : vertices_{initial_vertices.begin(), initial_vertices.end()},
+      indices_{relay::indices.begin(), relay::indices.end()},
+      meshes_{initial_meshes.begin(), initial_meshes.end()},
+      materials_{initial_materials.begin(), initial_materials.end()},
+      textures_{make_textures()} {}
 
-const MeshAsset* find_mesh_asset(const std::string_view name) {
-    const auto& meshes = storage().meshes;
-    const auto found = std::find_if(meshes.begin(), meshes.end(), [name](const auto& asset) {
-        return asset.name == name;
-    });
-    return found == meshes.end() ? nullptr : &*found;
+std::span<const MeshVertex> AssetRegistry::mesh_vertices() const { return vertices_; }
+std::span<const std::uint32_t> AssetRegistry::mesh_indices() const { return indices_; }
+std::span<const MeshAsset> AssetRegistry::meshes() const { return meshes_; }
+std::span<const MaterialAsset> AssetRegistry::materials() const { return materials_; }
+std::span<const TextureAsset> AssetRegistry::textures() const { return textures_; }
+
+const MeshAsset* AssetRegistry::find_mesh(const std::string_view name) const {
+    return find_named(meshes_, name);
 }
 
-const MaterialAsset* find_material_asset(const std::string_view name) {
-    const auto& materials = storage().materials;
-    const auto found = std::find_if(materials.begin(), materials.end(), [name](const auto& asset) {
-        return asset.name == name;
-    });
-    return found == materials.end() ? nullptr : &*found;
+const MaterialAsset* AssetRegistry::find_material(const std::string_view name) const {
+    return find_named(materials_, name);
 }
 
-const TextureAsset* find_texture_asset(const std::string_view name) {
-    const auto& textures = storage().textures;
-    const auto found = std::find_if(textures.begin(), textures.end(), [name](const auto& asset) {
-        return asset.name == name;
-    });
-    return found == textures.end() ? nullptr : &*found;
+const TextureAsset* AssetRegistry::find_texture(const std::string_view name) const {
+    return find_named(textures_, name);
 }
 
-std::uint32_t texture_asset_index(const std::string_view name) {
-    const auto& textures = storage().textures;
-    const auto found = std::find_if(textures.begin(), textures.end(), [name](const auto& asset) {
+std::uint32_t AssetRegistry::texture_index(const std::string_view name) const {
+    const auto found = std::find_if(textures_.begin(), textures_.end(), [name](const auto& asset) {
         return asset.name == name;
     });
-    return found == textures.end() ? 0U : static_cast<std::uint32_t>(found - textures.begin());
+    return found == textures_.end() ? 0U : static_cast<std::uint32_t>(found - textures_.begin());
 }
 
-std::string render_assets_json() {
-    const auto& store = storage();
-    const auto& meshes = store.meshes;
-    const auto& materials = store.materials;
-    const auto& textures = store.textures;
+std::string AssetRegistry::to_json() const {
     std::ostringstream output;
     output << "{\"texture_table_capacity\":" << bindless_texture_capacity
            << ",\"meshes\":[";
-    for (std::size_t index = 0; index < meshes.size(); ++index) {
+    for (std::size_t index = 0; index < meshes_.size(); ++index) {
         if (index != 0U) output << ',';
-        const auto next_vertex = index + 1U < meshes.size()
-                                     ? static_cast<std::uint32_t>(meshes[index + 1U].vertex_offset)
-                                     : static_cast<std::uint32_t>(store.vertices.size());
-        output << "{\"name\":\"" << meshes[index].name << "\",\"vertices\":"
-               << next_vertex - static_cast<std::uint32_t>(meshes[index].vertex_offset)
-               << ",\"indices\":" << meshes[index].index_count << '}';
+        const auto next_vertex = index + 1U < meshes_.size()
+                                     ? static_cast<std::uint32_t>(meshes_[index + 1U].vertex_offset)
+                                     : static_cast<std::uint32_t>(vertices_.size());
+        output << "{\"name\":\"" << meshes_[index].name << "\",\"vertices\":"
+               << next_vertex - static_cast<std::uint32_t>(meshes_[index].vertex_offset)
+               << ",\"indices\":" << meshes_[index].index_count << '}';
     }
     output << "],\"materials\":[";
-    for (std::size_t index = 0; index < materials.size(); ++index) {
+    for (std::size_t index = 0; index < materials_.size(); ++index) {
         if (index != 0U) output << ',';
-        const auto& material = materials[index];
+        const auto& material = materials_[index];
         output << "{\"name\":\"" << material.name << "\",\"color\":["
                << material.color[0] << ',' << material.color[1] << ',' << material.color[2]
                << ',' << material.color[3] << "],\"texture\":\"" << material.texture << "\"}";
     }
     output << "],\"textures\":[";
-    for (std::size_t index = 0; index < textures.size(); ++index) {
+    for (std::size_t index = 0; index < textures_.size(); ++index) {
         if (index != 0U) output << ',';
-        output << "{\"slot\":" << index << ",\"name\":\"" << textures[index].name
-               << "\",\"width\":" << textures[index].width << ",\"height\":"
-               << textures[index].height << ",\"mip_levels\":"
-               << std::bit_width(std::max(textures[index].width, textures[index].height)) << "}";
+        output << "{\"slot\":" << index << ",\"name\":\"" << textures_[index].name
+               << "\",\"width\":" << textures_[index].width << ",\"height\":"
+               << textures_[index].height << ",\"mip_levels\":"
+               << std::bit_width(std::max(textures_[index].width, textures_[index].height)) << "}";
     }
     output << "]}";
     return output.str();
 }
 
-std::uint64_t render_asset_revision() { return storage().revision; }
+std::uint64_t AssetRegistry::revision() const { return revision_; }
 
-bool register_imported_render_assets(std::vector<MeshVertex> vertices,
-                                     std::vector<std::uint32_t> indices_to_add,
-                                     std::vector<MeshAsset> meshes,
-                                     std::vector<MaterialAsset> materials) {
-    auto& store = storage();
+bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
+                                      std::vector<std::uint32_t> indices_to_add,
+                                      std::vector<MeshAsset> meshes,
+                                      std::vector<MaterialAsset> materials) {
     if (vertices.empty() || indices_to_add.empty() || meshes.empty()) return false;
-    if (std::all_of(meshes.begin(), meshes.end(), [](const MeshAsset& mesh) {
-            return find_mesh_asset(mesh.name) != nullptr;
+    if (std::all_of(meshes.begin(), meshes.end(), [this](const MeshAsset& mesh) {
+            return find_mesh(mesh.name) != nullptr;
         })) return true;
-    const auto vertex_base = static_cast<std::int32_t>(store.vertices.size());
-    const auto index_base = static_cast<std::uint32_t>(store.indices.size());
+    const auto vertex_base = static_cast<std::int32_t>(vertices_.size());
+    const auto index_base = static_cast<std::uint32_t>(indices_.size());
     for (auto& mesh : meshes) {
         // Importer offsets are relative to the batch being registered.
         mesh.vertex_offset += vertex_base;
         mesh.first_index += index_base;
-        store.meshes.push_back(std::move(mesh));
+        meshes_.push_back(std::move(mesh));
     }
     for (auto& material : materials) {
-        if (find_material_asset(material.name) == nullptr) {
-            store.materials.push_back(std::move(material));
+        if (find_material(material.name) == nullptr) {
+            materials_.push_back(std::move(material));
         }
     }
-    store.vertices.insert(store.vertices.end(), vertices.begin(), vertices.end());
-    store.indices.insert(store.indices.end(), indices_to_add.begin(), indices_to_add.end());
-    ++store.revision;
+    vertices_.insert(vertices_.end(), vertices.begin(), vertices.end());
+    indices_.insert(indices_.end(), indices_to_add.begin(), indices_to_add.end());
+    ++revision_;
     return true;
 }
 

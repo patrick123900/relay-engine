@@ -3,6 +3,7 @@
 
 #include "relay/core/engine.hpp"
 #include "relay/render/vulkan_device.hpp"
+#include "relay/render/asset_manifest.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/render/render_graph.hpp"
 #include "relay/scene/scene_io.hpp"
@@ -175,7 +176,25 @@ std::optional<std::filesystem::path> safe_video_path(const std::string_view file
     return std::filesystem::path{"captures"} / filename;
 }
 
-std::optional<std::filesystem::path> safe_model_path(const std::string_view filename) {
+// Captures always land in the project captures directory. The wire form tolerates an explicit
+// "captures/" prefix because the MCP bridge sends one, but the directory is decided here rather
+// than by the caller, so a native agent cannot write into the process working directory.
+std::optional<std::filesystem::path> safe_capture_path(std::string_view filename) {
+    constexpr std::string_view directory = "captures";
+    if (filename.starts_with("captures/")) filename.remove_prefix(directory.size() + 1U);
+    if (filename.empty() || filename.size() > 128U || filename.front() == '.') return std::nullopt;
+    if (!filename.ends_with(".png") && !filename.ends_with(".bmp")) return std::nullopt;
+    for (const char character : filename) {
+        if (!((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+              (character >= '0' && character <= '9') || character == '-' || character == '_' ||
+              character == '.')) return std::nullopt;
+    }
+    return std::filesystem::path{directory} / filename;
+}
+
+// Returns the validated top-level name only. The importer joins it against the assets root itself
+// and sandboxes every dependency the model goes on to reference.
+std::optional<std::string> safe_model_filename(const std::string_view filename) {
     if (filename.empty() || filename.size() > 128U || filename.front() == '.') return std::nullopt;
     for (const char character : filename) {
         if (!((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
@@ -187,7 +206,7 @@ std::optional<std::filesystem::path> safe_model_path(const std::string_view file
     if (std::find(extensions.begin(), extensions.end(), extension) == extensions.end()) {
         return std::nullopt;
     }
-    return std::filesystem::path{"assets"} / filename;
+    return std::string{filename};
 }
 
 std::string capture_state_name(const CaptureJobState state) {
@@ -252,17 +271,17 @@ std::string ControlProtocol::handle(const std::string_view request) {
     }
     if (method == "render.capture") {
         const auto path_value = string_field(request, "path");
-        const auto path = path_value.empty() ? std::filesystem::path{"captures/frame.bmp"}
-                                             : std::filesystem::path{path_value};
+        const auto path = safe_capture_path(path_value.empty() ? "frame.bmp" : path_value);
+        if (!path) return error_response(id, "path must be a safe .png or .bmp name without directories");
         std::string error;
         const auto source = string_field(request, "source");
         const bool captured = capture_handler_ && source != "deterministic"
-                                  ? capture_handler_(path, error)
-                                  : engine_.capture(path, error);
+                                  ? capture_handler_(*path, error)
+                                  : engine_.capture(*path, error);
         if (!captured) {
             return error_response(id, error);
         }
-        return response_prefix(id) + "{\"path\":\"" + escape_json(path.string()) +
+        return response_prefix(id) + "{\"path\":\"" + escape_json(path->generic_string()) +
                "\",\"source\":\"" + (capture_handler_ && source != "deterministic" ? "vulkan" : "deterministic") +
                "\"}}";
     }
@@ -303,40 +322,54 @@ std::string ControlProtocol::handle(const std::string_view request) {
                "{\"available\":false,\"reason\":\"no live Vulkan renderer is attached\"}}";
     }
     if (method == "render.assets") {
-        return response_prefix(id) + render_assets_json() + '}';
+        return response_prefix(id) + engine_.assets().to_json() + '}';
     }
     if (method == "assets.formats") {
         return response_prefix(id) + model_import_capabilities_json() + '}';
     }
     if (method == "assets.import_model") {
         const auto filename = string_field(request, "filename");
-        const auto path = safe_model_path(filename);
-        if (!path) return error_response(id, "filename must be a supported model name without directories");
+        const auto safe_name = safe_model_filename(filename);
+        if (!safe_name) return error_response(id, "filename must be a supported model name without directories");
         const bool instantiate = boolean_field(request, "instantiate", true);
+        const std::filesystem::path assets_root{"assets"};
         std::string error;
         ModelImportResult imported;
         if (instantiate) {
             const bool changed = engine_.scene_history().execute("Import " + filename, [&](Scene& scene) {
-                imported = import_model_asset(*path, &scene, error);
+                imported = import_model_asset(assets_root, *safe_name, engine_.assets(), &scene, error);
                 return imported.imported;
             });
             if (!changed) return error_response(id, error.empty() ? "model import failed" : error);
         } else {
-            imported = import_model_asset(*path, nullptr, error);
+            imported = import_model_asset(assets_root, *safe_name, engine_.assets(), nullptr, error);
             if (!imported.imported) return error_response(id, error);
+        }
+        ImportManifest manifest;
+        std::string manifest_error;
+        if (manifest.load(assets_root, manifest_error)) {
+            manifest.record({*safe_name, model_importer_version, imported.content_id,
+                             imported.dependencies, imported.meshes, imported.materials});
+            if (!manifest.save(assets_root, manifest_error)) {
+                engine_.logs().write(LogLevel::warning,
+                                     "Import manifest not updated: " + manifest_error);
+            }
+        } else {
+            engine_.logs().write(LogLevel::warning,
+                                 "Import manifest not updated: " + manifest_error);
         }
         engine_.logs().write(LogLevel::info, "Imported model " + filename + " as " + imported.content_id);
         return response_prefix(id) + imported.json() + '}';
     }
     if (method == "render.capture_async") {
         const auto path_value = string_field(request, "path");
-        const auto path = path_value.empty() ? std::filesystem::path{"captures/frame.png"}
-                                             : std::filesystem::path{path_value};
+        const auto path = safe_capture_path(path_value.empty() ? "frame.png" : path_value);
+        if (!path) return error_response(id, "path must be a safe .png or .bmp name without directories");
         std::string error;
-        const auto job = engine_.capture_async(path, error);
+        const auto job = engine_.capture_async(*path, error);
         if (job == 0U) return error_response(id, error);
         return response_prefix(id) + "{\"job\":" + std::to_string(job) +
-               ",\"path\":\"" + escape_json(path.string()) + "\",\"state\":\"queued\"}}";
+               ",\"path\":\"" + escape_json(path->generic_string()) + "\",\"state\":\"queued\"}}";
     }
     if (method == "render.capture_status") {
         const auto job = unsigned_field(request, "job", 0);
@@ -522,7 +555,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
             auto material = string_field(request, "material");
             if (mesh.empty()) mesh = "builtin.triangle";
             if (material.empty()) material = "builtin.orange";
-            if (find_mesh_asset(mesh) == nullptr || find_material_asset(material) == nullptr) {
+            if (engine_.assets().find_mesh(mesh) == nullptr ||
+                engine_.assets().find_material(material) == nullptr) {
                 return error_response(id, "mesh or material asset is not registered");
             }
             renderer = MeshRenderer{std::move(mesh), std::move(material)};
@@ -581,6 +615,12 @@ std::string ControlProtocol::handle(const std::string_view request) {
         auto loaded = load_scene_file(*path);
         if (!loaded) return error_response(id, loaded.error);
         const auto state = std::move(*loaded.state);
+        // Imported assets live outside the scene file, so restore them before the scene that
+        // references them by id.
+        const auto reload = reload_imported_assets(std::filesystem::path{"assets"}, engine_.assets());
+        for (const auto& message : reload.messages) {
+            engine_.logs().write(LogLevel::warning, "Imported asset reload: " + message);
+        }
         if (!engine_.scene_history().execute("Load " + filename, [&](Scene& scene) {
                 scene.restore_state(state);
                 return true;
@@ -593,6 +633,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
                ",\"version\":" + std::to_string(scene_file_version) +
                ",\"migrated\":" + (loaded.migrated ? "true" : "false") +
                ",\"entities\":" + std::to_string(loaded.entity_count) +
+               ",\"imported_assets\":" + reload.json() +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }
     if (method == "trace.start") {

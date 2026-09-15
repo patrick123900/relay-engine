@@ -2,6 +2,7 @@
 #include "relay/control/generated_protocol.hpp"
 #include "relay/core/engine.hpp"
 #include "relay/render/scene_render.hpp"
+#include "relay/render/asset_manifest.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/render/render_graph.hpp"
 #include "relay/render/shader_reflection.hpp"
@@ -38,6 +39,52 @@ std::vector<std::uint32_t> read_spirv(const std::filesystem::path& path) {
     input.seekg(0);
     input.read(reinterpret_cast<char*>(words.data()), bytes);
     return input ? words : std::vector<std::uint32_t>{};
+}
+
+bool importer_available() {
+    return relay::model_import_capabilities_json().find(R"("available":true)") != std::string::npos;
+}
+
+void write_file(const std::filesystem::path& path, const std::string& text) {
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+}
+
+// A minimal but valid glTF triangle whose vertex data lives in a separate file, so the importer
+// has to follow a dependency to succeed.
+std::string external_buffer_gltf(const std::string& buffer_uri) {
+    return R"({
+  "asset": {"version": "2.0", "generator": "Relay sandbox test"},
+  "buffers": [{"byteLength": 66, "uri": ")" + buffer_uri + R"("}],
+  "bufferViews": [
+    {"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962},
+    {"buffer": 0, "byteOffset": 36, "byteLength": 24, "target": 34962},
+    {"buffer": 0, "byteOffset": 60, "byteLength": 6, "target": 34963}
+  ],
+  "accessors": [
+    {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [-0.5, -0.5, 0], "max": [0.5, 0.5, 0]},
+    {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2"},
+    {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"}
+  ],
+  "materials": [{"name": "Relay White", "pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1]}}],
+  "meshes": [{"name": "RelayTriangle", "primitives": [{
+    "attributes": {"POSITION": 0, "TEXCOORD_0": 1}, "indices": 2, "material": 0
+  }]}],
+  "nodes": [{"name": "RelayTriangle", "mesh": 0}],
+  "scenes": [{"nodes": [0]}],
+  "scene": 0
+})";
+}
+
+std::string triangle_buffer_bytes(const float first_x) {
+    const std::array<float, 9> positions{first_x, -0.5F, 0.0F, 0.5F, -0.5F, 0.0F, 0.0F, 0.5F, 0.0F};
+    const std::array<float, 6> uvs{0.0F, 1.0F, 1.0F, 1.0F, 0.5F, 0.0F};
+    const std::array<std::uint16_t, 3> indices{0U, 1U, 2U};
+    std::string bytes;
+    bytes.append(reinterpret_cast<const char*>(positions.data()), sizeof(positions));
+    bytes.append(reinterpret_cast<const char*>(uvs.data()), sizeof(uvs));
+    bytes.append(reinterpret_cast<const char*>(indices.data()), sizeof(indices));
+    return bytes;
 }
 
 } // namespace
@@ -100,7 +147,8 @@ int main() {
     expect(render_source.set_mesh_renderer(
                rendered_entity, relay::MeshRenderer{"builtin.quad", "builtin.violet"}),
            "scene accepts a registered mesh and material reference");
-    const auto render_snapshot = relay::build_render_scene(render_source, 16.0F / 9.0F);
+    relay::AssetRegistry registry;
+    const auto render_snapshot = relay::build_render_scene(render_source, registry, 16.0F / 9.0F);
     expect(!render_snapshot.camera.using_default && render_snapshot.camera.entity == camera_entity,
            "render snapshot selects the scene's active camera");
     expect(render_snapshot.instances.size() == 1U &&
@@ -125,35 +173,133 @@ int main() {
     invalid_graph.add_pass("reader", {{orphan, relay::RenderAccess::sampled}});
     expect(!invalid_graph.compile().valid,
            "render graph rejects reads of non-imported resources without a producer");
-    expect(relay::find_mesh_asset("builtin.quad") != nullptr &&
-               relay::find_material_asset("builtin.azure") != nullptr,
+    expect(registry.find_mesh("builtin.quad") != nullptr &&
+               registry.find_material("builtin.azure") != nullptr,
            "built-in render assets are registered for deterministic lookup");
-    expect(relay::built_in_textures().size() == 2U &&
-               relay::built_in_textures().front().rgba.size() == 64U * 64U * 4U &&
-               relay::texture_asset_index("builtin.gradient") == 1U,
+    expect(registry.textures().size() == 2U &&
+               registry.textures().front().rgba.size() == 64U * 64U * 4U &&
+               registry.texture_index("builtin.gradient") == 1U,
            "texture assets expose stable bindless slots and complete RGBA payloads");
+    {
+        relay::AssetRegistry isolated;
+        expect(isolated.revision() == registry.revision() &&
+                   isolated.meshes().size() == registry.meshes().size(),
+               "independent registries start from identical built-in state");
+    }
     expect(relay::model_import_capabilities_json().find(R"(".gltf")") != std::string::npos,
            "model importer advertises Godot's recommended glTF interchange format");
 #ifdef RELAY_TEST_SOURCE_DIR
     relay::Scene imported_scene;
     std::string import_error;
-    const auto asset_revision = relay::render_asset_revision();
-    const auto imported = relay::import_model_asset(
-        std::filesystem::path{RELAY_TEST_SOURCE_DIR} / "assets/relay-test-triangle.gltf",
-        &imported_scene, import_error);
+    const std::filesystem::path assets_root = std::filesystem::path{RELAY_TEST_SOURCE_DIR} / "assets";
+    const auto asset_revision = registry.revision();
+    const auto imported = relay::import_model_asset(assets_root, "relay-test-triangle.gltf",
+                                                    registry, &imported_scene, import_error);
     expect(imported.imported && imported.meshes.size() == 1U && !imported.roots.empty() &&
-               relay::find_mesh_asset(imported.meshes.front()) != nullptr &&
-               relay::render_asset_revision() == asset_revision + 1U,
+               registry.find_mesh(imported.meshes.front()) != nullptr &&
+               registry.revision() == asset_revision + 1U,
            "model import registers content-addressed geometry and instantiates its hierarchy: " +
                import_error);
-    expect(relay::build_render_scene(imported_scene, 1.0F).instances.size() == 1U,
+    expect(relay::build_render_scene(imported_scene, registry, 1.0F).instances.size() == 1U,
            "imported hierarchy nodes remain organizational and only mesh nodes are drawable");
-    const auto imported_again = relay::import_model_asset(
-        std::filesystem::path{RELAY_TEST_SOURCE_DIR} / "assets/relay-test-triangle.gltf",
-        nullptr, import_error);
+    const auto imported_again = relay::import_model_asset(assets_root, "relay-test-triangle.gltf",
+                                                          registry, nullptr, import_error);
     expect(imported_again.imported && imported_again.content_id == imported.content_id &&
-               relay::render_asset_revision() == asset_revision + 1U,
+               registry.revision() == asset_revision + 1U,
            "reimporting identical model content reuses stable asset identities");
+
+    if (importer_available()) {
+        const auto sandbox_root = std::filesystem::temp_directory_path() / "relay-phase-a-assets";
+        const auto outside_root = std::filesystem::temp_directory_path() / "relay-phase-a-outside";
+        std::filesystem::remove_all(sandbox_root);
+        std::filesystem::remove_all(outside_root);
+        std::filesystem::create_directories(sandbox_root);
+        std::filesystem::create_directories(outside_root);
+
+        // A model whose vertex data lives in a sibling .bin must import through the sandbox.
+        write_file(sandbox_root / "external.gltf", external_buffer_gltf("external.bin"));
+        write_file(sandbox_root / "external.bin", triangle_buffer_bytes(-0.5F));
+        relay::AssetRegistry external_registry;
+        std::string external_error;
+        const auto external = relay::import_model_asset(sandbox_root, "external.gltf",
+                                                        external_registry, nullptr, external_error);
+        expect(external.imported && external.meshes.size() == 1U,
+               "importer resolves an external glTF buffer inside the assets root: " + external_error);
+        expect(std::find(external.dependencies.begin(), external.dependencies.end(),
+                         std::string{"external.bin"}) != external.dependencies.end(),
+               "import records the external buffer as a tracked dependency");
+
+        // The same model pointed at a file outside the root must be refused.
+        write_file(outside_root / "secret.bin", triangle_buffer_bytes(-0.5F));
+        write_file(sandbox_root / "escape.gltf",
+                   external_buffer_gltf("../relay-phase-a-outside/secret.bin"));
+        relay::AssetRegistry escape_registry;
+        std::string escape_error;
+        const auto escaped = relay::import_model_asset(sandbox_root, "escape.gltf",
+                                                       escape_registry, nullptr, escape_error);
+        expect(!escaped.imported &&
+                   escape_error.find("outside the project assets directory") != std::string::npos,
+               "importer refuses a model dependency that escapes the assets root: " + escape_error);
+        expect(escape_registry.revision() == relay::AssetRegistry{}.revision(),
+               "a blocked import leaves the asset registry untouched");
+
+        // An absolute path is refused for the same reason.
+        write_file(sandbox_root / "absolute.gltf",
+                   external_buffer_gltf((outside_root / "secret.bin").generic_string()));
+        relay::AssetRegistry absolute_registry;
+        std::string absolute_error;
+        const auto absolute = relay::import_model_asset(sandbox_root, "absolute.gltf",
+                                                        absolute_registry, nullptr, absolute_error);
+        expect(!absolute.imported, "importer refuses an absolute dependency path: " + absolute_error);
+
+        // A dependency that is simply gone must fail cleanly rather than import partial geometry.
+        write_file(sandbox_root / "missing.gltf", external_buffer_gltf("absent.bin"));
+        relay::AssetRegistry missing_registry;
+        std::string missing_error;
+        const auto missing = relay::import_model_asset(sandbox_root, "missing.gltf",
+                                                       missing_registry, nullptr, missing_error);
+        expect(!missing.imported && !missing_error.empty(),
+               "importer reports a missing dependency instead of importing partial geometry");
+
+        // Changing the referenced buffer must change the content identity.
+        write_file(sandbox_root / "external.bin", triangle_buffer_bytes(-0.25F));
+        relay::AssetRegistry changed_registry;
+        std::string changed_error;
+        const auto changed = relay::import_model_asset(sandbox_root, "external.gltf",
+                                                       changed_registry, nullptr, changed_error);
+        expect(changed.imported && changed.content_id != external.content_id,
+               "changed dependency content produces a different asset identity");
+        expect(external.content_id.rfind("sha256-v1-", 0U) == 0U,
+               "asset identities carry a versioned SHA-256 scheme");
+
+        // A manifest must let a fresh registry rebuild the same asset ids after a restart.
+        write_file(sandbox_root / "external.bin", triangle_buffer_bytes(-0.5F));
+        relay::ImportManifest manifest;
+        std::string manifest_error;
+        expect(manifest.load(sandbox_root, manifest_error),
+               "a project with no manifest loads as empty: " + manifest_error);
+        manifest.record({"external.gltf", relay::model_importer_version, external.content_id,
+                         external.dependencies, external.meshes, external.materials});
+        expect(manifest.save(sandbox_root, manifest_error),
+               "import manifest is written to the project: " + manifest_error);
+
+        relay::AssetRegistry restored_registry;
+        const auto report = reload_imported_assets(sandbox_root, restored_registry);
+        expect(report.restored == 1U && report.changed == 0U && report.failed == 0U,
+               "a fresh registry restores imported assets from the manifest");
+        expect(restored_registry.find_mesh(external.meshes.front()) != nullptr,
+               "asset ids saved in a scene resolve again after a simulated restart");
+
+        // A source file that changed since the manifest was written must be reported, not hidden.
+        write_file(sandbox_root / "external.bin", triangle_buffer_bytes(-0.25F));
+        relay::AssetRegistry stale_registry;
+        const auto stale_report = reload_imported_assets(sandbox_root, stale_registry);
+        expect(stale_report.changed == 1U && stale_report.restored == 0U,
+               "a changed dependency is reported rather than silently re-pointed");
+
+        std::filesystem::remove_all(sandbox_root);
+        std::filesystem::remove_all(outside_root);
+    }
 #endif
 
 #ifdef RELAY_TEST_VERTEX_SHADER_PATH
@@ -353,7 +499,33 @@ int main() {
         R"({"id":14,"method":"render.capture","path":"capture.bmp","source":"deterministic"})");
     expect(!live_capture_called && deterministic_capture.find(R"("source":"deterministic")") != std::string::npos,
            "protocol retains deterministic capture while a live renderer is attached");
+    expect(deterministic_capture.find(R"("path":"captures/capture.bmp")") != std::string::npos &&
+               std::filesystem::exists("captures/capture.bmp") &&
+               !std::filesystem::exists("capture.bmp"),
+           "a bare capture filename is contained in the captures directory, not the working directory");
+
+    // The MCP bridge sends an explicit prefix; it must resolve to the same place, not captures/captures.
+    const auto prefixed_capture = live_protocol.handle(
+        R"({"id":15,"method":"render.capture","path":"captures/prefixed.png","source":"deterministic"})");
+    expect(prefixed_capture.find(R"("path":"captures/prefixed.png")") != std::string::npos &&
+               std::filesystem::exists("captures/prefixed.png"),
+           "an explicit captures/ prefix is accepted without being applied twice");
+
+    const auto escaping_capture = live_protocol.handle(
+        R"({"id":16,"method":"render.capture","path":"../escaped.png","source":"deterministic"})");
+    expect(escaping_capture.find(R"("ok":false)") != std::string::npos &&
+               !std::filesystem::exists("../escaped.png"),
+           "a capture path with directory components is refused");
+
+    const auto async_capture = live_protocol.handle(
+        R"({"id":17,"method":"render.capture_async","path":"async.png"})");
+    expect(async_capture.find(R"("path":"captures/async.png")") != std::string::npos,
+           "asynchronous captures are contained in the captures directory too");
+
     std::filesystem::remove("capture.bmp");
+    std::filesystem::remove("captures/capture.bmp");
+    std::filesystem::remove("captures/prefixed.png");
+    std::filesystem::remove("captures/async.png");
 
     const auto capture_path = std::filesystem::temp_directory_path() / "relay-engine-test.bmp";
     std::string capture_error;

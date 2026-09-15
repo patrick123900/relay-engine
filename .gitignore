@@ -6,6 +6,9 @@ CMakeUserPresets.json
 /tools/mcp-bridge/node_modules/
 npm-debug.log*
 
+# Generated import cache. It is rebuilt from the models in assets/ on demand.
+/assets/.relay-imports.json
+
 # Local runtime output
 /outputs/
 /work/

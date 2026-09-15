@@ -20,11 +20,13 @@ add_library(relay_engine
     src/control/local_server.cpp
     src/control/protocol_validation.cpp
     src/core/engine.cpp
+    src/core/hash.cpp
     src/core/log.cpp
     src/observe/capture.cpp
     src/observe/performance.cpp
     src/observe/trace.cpp
     src/render/software_renderer.cpp
+    src/render/asset_manifest.cpp
     src/render/assets.cpp
     src/render/model_import.cpp
     src/render/scene_render.cpp

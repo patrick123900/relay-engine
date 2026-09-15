@@ -22,6 +22,8 @@ This repository currently contains the first vertical slice:
 - a bounded bindless texture table with staged image uploads and GPU-generated mip chains;
 - content-addressed project model import for glTF/GLB, FBX, OBJ, DAE and Blender files, with
   hierarchy instantiation and live Vulkan mesh-buffer refresh;
+- an engine-owned asset registry with versioned SHA-256 asset identities, a project import manifest
+  that rebuilds imported assets on scene load, and importer dependency reads sandboxed to `assets/`;
 - synchronized Vulkan swapchain readback for agent-visible screenshots of the real GPU output;
 - dependency-free PNG/BMP encoding plus a bounded asynchronous capture worker;
 - short WebM recordings sampled without blocking frame encoding, with explicit dropped-frame counts;
@@ -71,6 +73,9 @@ captures cannot race GPU presentation:
 ./build/dev/relay_demo --editor-stdio
 ```
 
+Each request is a single line holding an `id`, a `method` and that method's parameters as
+**top-level fields**. Parameters are not nested inside a `params` object, so this is not JSON-RPC.
+
 Example requests:
 
 ```json
@@ -98,6 +103,19 @@ DAE and Blender files through Assimp. Imported geometry, UVs, base material colo
 hierarchies are available now; image textures, PBR channels, skeletons and animation playback are
 reported as deferred rather than silently presented as complete. Blender-to-glTF conversion matching
 Godot's exact `.blend` workflow is also planned.
+
+Imports are sandboxed. A model may only be named by a top-level filename inside `assets/`, and every
+dependency it goes on to reference — external `.bin` buffers, images — is canonicalized and must
+resolve inside that same directory. Relative escapes, absolute paths and symlinks that leave the
+asset root are refused, reads are capped at 64 dependency files and 64 MiB each, and the importer is
+given no write path.
+
+Each import is content-addressed with a versioned SHA-256 digest (`sha256-v1-<hex>`), and recorded in
+a project manifest at `assets/.relay-imports.json` alongside its source name, importer version,
+dependency list and generated asset ids. Loading a scene rebuilds those assets first, so a scene
+saved with imported meshes opens correctly in a fresh process without a manual reimport. If a source
+file changed since the manifest was written, `scene.load` reports it rather than silently binding the
+scene to different assets.
 
 For a long-lived local connection, run Relay on an IPv4 loopback port:
 
@@ -173,11 +191,15 @@ python3 tools/generate_protocol.py
 
 Both CMake builds and `npm run check` reject stale generated C++, TypeScript or documentation.
 
-Near-term milestones:
+Near-term milestones, in the order they should be taken:
 
-1. Add image texture, PBR channel, skeleton and animation import to the model pipeline.
-2. Add a Blender-to-glTF adapter matching Godot's `.blend` workflow.
-3. Add depth buffering, opaque sorting and physically based material inputs.
+1. Add depth buffering, frustum culling and a deterministic opaque draw order. The renderer has no
+   depth attachment yet, so overlapping meshes currently draw in creation order.
+2. Add image texture, PBR channel, skeleton and animation import to the model pipeline.
+3. Add a Blender-to-glTF adapter matching Godot's `.blend` workflow.
+
+See [`HANDOFF.md`](HANDOFF.md) for the full phase breakdown and the current list of known
+boundaries.
 
 ## Rendering TODOs
 

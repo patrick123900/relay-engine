@@ -4,6 +4,7 @@
 #include "relay/observe/capture.hpp"
 #include "relay/observe/performance.hpp"
 #include "relay/observe/trace.hpp"
+#include "relay/render/assets.hpp"
 #include "relay/render/renderer.hpp"
 #include "relay/scene/scene.hpp"
 #include "relay/scene/scene_history.hpp"
@@ -67,6 +68,8 @@ public:
     [[nodiscard]] Scene& scene();
     [[nodiscard]] const Scene& scene() const;
     [[nodiscard]] SceneHistory& scene_history();
+    [[nodiscard]] AssetRegistry& assets();
+    [[nodiscard]] const AssetRegistry& assets() const;
 
 private:
     void advance_one_frame();
@@ -76,6 +79,7 @@ private:
     LogBuffer logs_;
     Scene scene_;
     SceneHistory scene_history_;
+    AssetRegistry assets_;
     CaptureQueue capture_queue_;
     VideoRecorder video_{capture_queue_};
     PerformanceTracker performance_;

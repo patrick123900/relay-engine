@@ -135,6 +135,8 @@ const LogBuffer& Engine::logs() const {
 Scene& Engine::scene() { return scene_; }
 const Scene& Engine::scene() const { return scene_; }
 SceneHistory& Engine::scene_history() { return scene_history_; }
+AssetRegistry& Engine::assets() { return assets_; }
+const AssetRegistry& Engine::assets() const { return assets_; }
 
 void Engine::advance_one_frame() {
     const auto start = std::chrono::steady_clock::now();

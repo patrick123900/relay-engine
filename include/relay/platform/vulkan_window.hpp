@@ -8,11 +8,15 @@
 
 namespace relay {
 
+class AssetRegistry;
 class Scene;
 
 class VulkanWindow {
 public:
-    VulkanWindow(std::string title, std::uint32_t width, std::uint32_t height);
+    // The registry supplies every mesh, material and texture this window uploads, and must outlive
+    // the window. Imported content is picked up by comparing the registry revision each frame.
+    VulkanWindow(std::string title, std::uint32_t width, std::uint32_t height,
+                 const AssetRegistry& assets);
     ~VulkanWindow();
 
     VulkanWindow(const VulkanWindow&) = delete;

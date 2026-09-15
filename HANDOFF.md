@@ -100,7 +100,8 @@ Current major layers:
 - Imported static geometry currently includes positions, UV0 and triangle indices.
 - Base material colors and node transforms/hierarchy are imported.
 - Import can register assets only or instantiate the node hierarchy into the active scene.
-- Imported mesh/material IDs are based on an FNV-1a hash of normalized imported content.
+- Imported mesh/material IDs are a versioned SHA-256 digest of normalized imported content, so the
+  identity covers an external `.bin` payload and not just the container file.
 - Reimporting identical content reuses stable IDs rather than adding duplicate assets.
 - The Vulkan backend notices asset-registry revisions, waits for the device to become idle and
   rebuilds the combined mesh buffers so models imported into a live editor can render immediately.
@@ -109,6 +110,23 @@ Current major layers:
 - The importer reports deferred animations, skeletons/skin weights and image/PBR textures as
   warnings rather than pretending the import is complete.
 - Tiny OBJ and embedded-buffer glTF fixtures exist in `assets/` and are covered by tests.
+
+### Durable and safe asset foundation
+
+- `AssetRegistry` owns every mesh, material and texture; the process-global singleton is gone.
+- `Engine` owns one registry and hands a const view to render-scene construction and Vulkan drawing.
+  Independent registries can coexist, so tests no longer share mutable state.
+- Imported asset identity is a versioned SHA-256 digest (`sha256-v1-<hex>`), verified against the
+  NIST test vectors. The scheme version is part of every generated asset name.
+- A sandboxed Assimp `IOSystem` resolves every dependency read inside the project assets root.
+  Relative escapes, absolute paths and symlinked escapes are refused; reads are capped at 64
+  dependency files and 64 MiB each, and the importer is given no write path.
+- Imports are recorded in a project manifest (`assets/.relay-imports.json`) holding the source name,
+  importer version, content id, dependency list and generated asset ids.
+- `scene.load` rebuilds imported assets from that manifest before applying the scene, and reports
+  restored/changed/failed counts in its response. A source file that changed since the manifest was
+  written is reported rather than silently re-pointed.
+- Scene files, the import manifest and any future on-disk format share one strict JSON reader.
 
 ### Agent observability and debugging
 
@@ -137,22 +155,38 @@ Current major layers:
 - MCP bridge launches and owns the runtime, keeping engine messages off MCP standard output.
 - Important tool groups include runtime control, scene CRUD, cameras/renderers, undo/redo,
   save/load, render capture and inspection, logs, telemetry, video, traces and model import.
-- `assets.formats` reports import coverage.
-- `assets.import_model` safely accepts a top-level filename from the project `assets/` directory.
+- `assets.formats` reports import coverage, the active identity scheme and the import sandbox limits.
+- `assets.import_model` safely accepts a top-level filename from the project `assets/` directory, and
+  every dependency that model references is resolved inside the same directory.
+- Every file-writing method decides its own directory natively: scenes resolve under `scenes/`,
+  traces under `traces/`, video and captures under `captures/`. None of this depends on the bridge.
+- `scene.load` reports an `imported_assets` summary of assets rebuilt from the import manifest.
 
 ## What was verified
 
-At the end of the previous session:
+At the end of the Phase A session:
 
-- development configuration and build passed;
-- the complete native test suite passed;
-- release configuration and build passed;
-- generated protocol files were current;
-- MCP TypeScript type-check and production build passed;
-- Vulkan ran on the host’s **AMD Radeon RX 9070 XT (RADV GFX1201)**;
-- live OBJ import caused a successful Vulkan mesh-buffer refresh and capture;
-- live glTF import caused a successful Vulkan mesh-buffer refresh and capture;
-- the final glTF capture is `captures/imported-gltf.png`;
+- clean development and release builds passed with **zero compiler warnings** under
+  `-Wall -Wextra -Wpedantic -Wconversion -Wshadow`;
+- the native test suite passed, now 107 assertions;
+- generated protocol files regenerated with no drift, and the MCP TypeScript check passed;
+- the SHA-256 implementation matched all four official NIST test vectors, including the
+  one-million-character case, and produced identical digests across chunked updates;
+- the import sandbox refused a `../` dependency, an absolute dependency path and a missing
+  dependency, and left the asset registry untouched in each case;
+- **Phase A definition of done:** importing `relay-test-triangle.gltf` and saving the scene in one
+  process, then loading it in a *separate* process, reported
+  `imported_assets: {restored: 1, changed: 0, failed: 0}` and resolved the entity's mesh renderer to
+  the same `sha256-v1-…` id with no manual reimport;
+- a capture requested as a bare filename over `--agent-stdio` landed in `captures/` rather than the
+  process working directory;
+- Vulkan still ran on the host’s **AMD Radeon RX 9070 XT (RADV GFX1201)**: `--vulkan-smoke` passed
+  and `--vulkan-capture` produced a correct textured frame through the new registry-backed path.
+
+From earlier sessions, still current:
+
+- live OBJ and glTF import each caused a successful Vulkan mesh-buffer refresh and capture;
+- the reference glTF capture is `captures/imported-gltf.png`;
 - an earlier bindless-texture scene capture is `captures/bindless-scene.png`.
 
 Useful commands:
@@ -204,32 +238,30 @@ Godot FBX behavior.
 - Skeletons, skinning, morph targets and animation playback are absent.
 - Cameras and lights embedded in imported scenes are not instantiated.
 
-### Asset lifecycle needs a foundational cleanup
+### Remaining asset lifecycle gaps
 
-- The asset registry is currently a process-global mutable singleton in `src/render/assets.cpp`, not
-  owned by an `Engine` or project instance.
-- It is safe in the current live editor because protocol mutations run on the render thread, but it
-  is not a final multi-engine or multi-threaded design.
-- Imported asset IDs use FNV-1a 64-bit with the algorithm included in the ID. This is deterministic
-  and adequate for the prototype, but it is not cryptographically collision-resistant. SHA-256 or
-  BLAKE3 should replace it before asset IDs become durable public data.
-- A scene saves imported asset IDs, but the imported registry is not persisted or reconstructed
-  automatically on the next process launch. Saved scenes referencing imported meshes therefore
-  require manual reimport in the current prototype.
+Phase A replaced the global registry, the FNV-1a identity and the unsandboxed importer. These parts
+are still outstanding:
+
 - Undoing a model import removes instantiated scene entities but does not unregister the imported
-  assets. This is currently a cache-like behavior, not transactional asset lifecycle management.
+  assets. This is still cache-like behavior, not transactional asset lifecycle management.
 - Hot import waits for the entire Vulkan device to become idle and rebuilds all combined mesh
   buffers. It is correct but stalls and will not scale. Use versioned/asynchronous uploads later.
 - Imported texture resources do not yet participate in hot reload.
+- The manifest records a content id per source file but does not store per-dependency hashes, so a
+  changed dependency is detected by re-importing rather than by comparing recorded digests.
+- Nothing prunes manifest entries whose source file has been deleted; they surface as failures on
+  the next load instead of being retired.
 
-### Import security boundary is incomplete
+### Import sandbox boundary
 
-The MCP/native command accepts only a safe top-level filename under `assets/`, preventing direct
-`../` paths in the command. However, a glTF/DAE/etc. file can itself reference external files.
-Assimp currently uses its normal filesystem access, so an untrusted model could reference a path
-outside the project. Before accepting arbitrary agent/user-supplied model files, add a custom Assimp
-`IOSystem` or equivalent canonicalized virtual filesystem that restricts every dependency read to
-the project asset root, with explicit policy for data URIs and file-size/count limits.
+Every dependency read now resolves through a canonicalizing `IOSystem` rooted at `assets/`, so a
+model cannot reach outside the project. Two caveats remain explicit:
+
+- `.blend` is still handed to Assimp directly, so the sandbox does not cover a future Blender
+  subprocess adapter. That adapter will need its own containment.
+- Data URIs are decoded by Assimp in memory and are bounded only by the containing file's size
+  limit, not by a separate decoded-size budget.
 
 ### Rendering is still a first-light renderer
 
@@ -245,6 +277,13 @@ the project asset root, with explicit policy for data URIs and file-size/count l
 - The code has been exercised on Linux/RADV. Windows and macOS builds have not been verified here.
 
 ### Capture boundary to revisit
+
+Capture paths are now contained at the native protocol boundary: `render.capture` and
+`render.capture_async` route through `safe_capture_path`, which always resolves under `captures/`.
+It accepts the explicit `captures/` prefix the MCP bridge sends without applying it twice, so a
+native agent on `--agent-stdio` can no longer write into the process working directory. Every
+file-writing protocol method now enforces its own directory natively rather than relying on the
+TypeScript bridge.
 
 Real GPU screenshots use a synchronous swapchain readback and work. Background screenshot encoding
 and WebM recording still consume the deterministic CPU-renderer stream. They therefore cannot yet
@@ -263,26 +302,20 @@ TODO for a rotating Vulkan staging/readback ring that feeds asynchronous capture
 
 ## What to build next
 
-The recommended next milestone is **Renderable Static glTF v1**, but begin with the asset-foundation
-work below so the new material/texture system does not deepen prototype shortcuts.
+The current milestone is **Renderable Static glTF v1**. Phase A is complete; Phase B is next.
 
-### Phase A — durable and safe asset foundation
+### Phase A — durable and safe asset foundation (complete)
 
-1. Replace the global registry with an `AssetRegistry` owned by `Engine` or a `Project` object.
-2. Pass a const registry/view explicitly into render-scene construction and Vulkan drawing.
-3. Add a project asset manifest/import cache that records source filename, importer version,
-   dependency list, content hash and generated asset IDs.
-4. On scene/project load, rebuild or reload imported assets automatically so saved imported IDs are
-   immediately valid.
-5. Replace FNV-1a identities with SHA-256 or BLAKE3 and version the identity scheme.
-6. Add a sandboxed Assimp `IOSystem`/virtual filesystem enforcing canonical paths under `assets/`,
-   bounded dependency count, bounded file sizes and controlled data URIs.
-7. Add tests for external `.gltf` buffers, path traversal inside a model, duplicate import, changed
-   dependency content, missing dependencies and scene reload across a fresh engine instance.
+All seven steps landed: an `Engine`-owned `AssetRegistry`, a const registry threaded explicitly into
+render-scene construction and Vulkan drawing, a project import manifest, automatic rebuild on scene
+load, a versioned SHA-256 identity, a sandboxed Assimp `IOSystem`, and tests covering external
+`.gltf` buffers, traversal and absolute-path escapes, duplicate import, changed dependency content,
+missing dependencies and reload into a fresh registry.
 
-Definition of done: importing a project-local `.gltf` or `.glb`, saving the scene, restarting Relay
-and loading the scene produces the same valid registered asset IDs without manual reimport; referenced
-files cannot escape the asset root.
+Definition of done, verified: importing `relay-test-triangle.gltf`, saving the scene and loading it
+in a separate process reports `restored:1, changed:0, failed:0` and resolves the entity's mesh to the
+same `sha256-v1-…` id with no manual reimport. A model referencing `../` or an absolute path outside
+`assets/` is refused and leaves the registry untouched.
 
 ### Phase B — correct basic 3D visibility
 
@@ -333,12 +366,13 @@ base color, normal mapping and metallic/roughness response after a clean restart
 
 Use this as the next instruction after giving the agent this handoff:
 
-> Continue Relay Engine with Phase A of the “Renderable Static glTF v1” milestone from HANDOFF.md.
-> First inspect the existing asset/import/render interfaces and preserve all working behavior. Replace
-> the process-global asset storage with an engine/project-owned registry, add durable import metadata
-> sufficient for scene reload, and sandbox all importer dependency reads to the project assets root.
-> Use a versioned SHA-256 or BLAKE3 identity. Add focused tests, regenerate the protocol artifacts if
-> its surface changes, run dev/release and MCP validation, and clearly report any remaining boundary.
+> Continue Relay Engine with Phase B of the “Renderable Static glTF v1” milestone from HANDOFF.md.
+> Phase A is complete, so build on the engine-owned `AssetRegistry` rather than reintroducing global
+> asset state. Add per-swapchain depth images with render-pass integration and cleanup, enable depth
+> testing and writes for opaque geometry, represent depth explicitly in the render graph, and add
+> frustum culling with a deterministic opaque draw order. Prove it with overlapping-mesh tests and a
+> real-GPU screenshot, confirm swapchain recreation rebuilds depth resources safely, then run
+> dev/release, ctest and MCP validation and report any remaining boundary.
 
 ## Key files to inspect first
 
@@ -346,8 +380,12 @@ Use this as the next instruction after giving the agent this handoff:
 - `HANDOFF.md`
 - `CMakeLists.txt`
 - `include/relay/core/engine.hpp`
+- `include/relay/core/hash.hpp`
+- `include/relay/core/json.hpp`
 - `include/relay/render/assets.hpp`
+- `include/relay/render/asset_manifest.hpp`
 - `src/render/assets.cpp`
+- `src/render/asset_manifest.cpp`
 - `src/render/model_import.cpp`
 - `include/relay/render/scene_render.hpp`
 - `src/render/scene_render.cpp`

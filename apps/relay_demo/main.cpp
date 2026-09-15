@@ -86,7 +86,7 @@ int run_socket_mode(const std::string_view port_text) {
 #ifdef RELAY_HAS_VULKAN_WINDOW
 int run_windowed() {
     relay::Engine engine;
-    relay::VulkanWindow window("Relay Engine — Vulkan First Light", 1280, 720);
+    relay::VulkanWindow window("Relay Engine — Vulkan First Light", 1280, 720, engine.assets());
     if (!window.valid()) {
         std::cerr << "Could not create the Vulkan window: " << window.error() << '\n';
         return 1;
@@ -110,7 +110,8 @@ int run_windowed() {
 }
 
 int run_vulkan_smoke() {
-    relay::VulkanWindow window("Relay Vulkan Smoke Test", 640, 360);
+    const relay::AssetRegistry assets;
+    relay::VulkanWindow window("Relay Vulkan Smoke Test", 640, 360, assets);
     if (!window.valid()) {
         std::cerr << "Vulkan smoke test initialization failed: " << window.error() << '\n';
         return 1;
@@ -136,7 +137,8 @@ int run_vulkan_smoke() {
 int run_vulkan_capture(const std::string_view path_text) {
     const std::string capture_path = path_text.empty() ? "captures/vulkan-frame.bmp"
                                                         : std::string(path_text);
-    relay::VulkanWindow window("Relay Vulkan Capture", 1280, 720);
+    const relay::AssetRegistry assets;
+    relay::VulkanWindow window("Relay Vulkan Capture", 1280, 720, assets);
     if (!window.valid()) {
         std::cerr << "Vulkan capture initialization failed: " << window.error() << '\n';
         return 1;
@@ -158,7 +160,7 @@ struct LiveInputState {
 
 int run_live_editor_stdio() {
     relay::Engine engine;
-    relay::VulkanWindow window("Relay Live Editor", 1280, 720);
+    relay::VulkanWindow window("Relay Live Editor", 1280, 720, engine.assets());
     if (!window.valid()) {
         std::cerr << "Live editor initialization failed: " << window.error() << '\n';
         return 1;

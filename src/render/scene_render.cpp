@@ -163,7 +163,8 @@ std::array<float, 4> entity_color(const Entity entity) {
 
 } // namespace
 
-RenderScene build_render_scene(const Scene& scene, const float aspect_ratio) {
+RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
+                               const float aspect_ratio) {
     RenderScene output;
     const auto entities = scene.entities();
     std::unordered_map<std::uint64_t, RenderMatrix> world_matrices;
@@ -202,13 +203,13 @@ RenderScene build_render_scene(const Scene& scene, const float aspect_ratio) {
         const auto model = resolve_world(resolve_world, entity);
         const auto& mesh = record->mesh_renderer->mesh;
         const auto& material = record->mesh_renderer->material;
-        const auto* material_asset = find_material_asset(material);
+        const auto* material_asset = assets.find_material(material);
         output.instances.push_back({entity, model,
                                     multiply(output.camera.view_projection, model),
                                     material_asset != nullptr ? material_asset->color : entity_color(entity),
                                     mesh, material,
                                     material_asset != nullptr
-                                        ? texture_asset_index(material_asset->texture) : 0U});
+                                        ? assets.texture_index(material_asset->texture) : 0U});
     }
     return output;
 }

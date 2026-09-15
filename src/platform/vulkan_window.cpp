@@ -63,6 +63,7 @@ std::vector<std::uint32_t> read_shader(const std::filesystem::path& path, std::s
 } // namespace
 
 struct VulkanWindow::Impl {
+    const AssetRegistry* assets{};
     SDL_Window* window{};
     bool sdl_initialized{false};
     VkInstance instance{};
@@ -472,20 +473,20 @@ struct VulkanWindow::Impl {
     }
 
     bool create_mesh_buffers() {
-        const auto vertices = built_in_mesh_vertices();
-        const auto indices = built_in_mesh_indices();
+        const auto vertices = assets->mesh_vertices();
+        const auto indices = assets->mesh_indices();
         const bool uploaded = upload_buffer(vertices.data(), vertices.size_bytes(),
                                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                                             mesh_vertex_buffer, mesh_vertex_memory) &&
                               upload_buffer(indices.data(), indices.size_bytes(),
                                             VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                                             mesh_index_buffer, mesh_index_memory);
-        if (uploaded) uploaded_asset_revision = render_asset_revision();
+        if (uploaded) uploaded_asset_revision = assets->revision();
         return uploaded;
     }
 
     bool refresh_mesh_assets() {
-        if (uploaded_asset_revision == render_asset_revision()) return true;
+        if (uploaded_asset_revision == assets->revision()) return true;
         auto result = vkDeviceWaitIdle(device);
         if (result != VK_SUCCESS) {
             last_error = vk_error("waiting to refresh imported meshes", result);
@@ -694,14 +695,14 @@ struct VulkanWindow::Impl {
             last_error = "RGBA8 textures do not support linear blit mip generation";
             return false;
         }
-        const auto assets = built_in_textures();
-        if (assets.empty() || assets.size() > bindless_texture_capacity) {
+        const auto texture_assets = assets->textures();
+        if (texture_assets.empty() || texture_assets.size() > bindless_texture_capacity) {
             last_error = "built-in textures exceed the bindless table capacity";
             return false;
         }
-        textures.resize(assets.size());
-        for (std::size_t index = 0; index < assets.size(); ++index) {
-            if (!create_texture_image(assets[index], textures[index])) return false;
+        textures.resize(texture_assets.size());
+        for (std::size_t index = 0; index < texture_assets.size(); ++index) {
+            if (!create_texture_image(texture_assets[index], textures[index])) return false;
         }
         VkSamplerCreateInfo sampler_info{};
         sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -1178,9 +1179,9 @@ struct VulkanWindow::Impl {
         if (scene != nullptr && !scene->entities().empty()) {
             const float aspect = static_cast<float>(swapchain_extent.width) /
                                  static_cast<float>(std::max(swapchain_extent.height, 1U));
-            const auto render_scene = build_render_scene(*scene, aspect);
+            const auto render_scene = build_render_scene(*scene, *assets, aspect);
             for (const auto& instance : render_scene.instances) {
-                const auto* mesh = find_mesh_asset(instance.mesh);
+                const auto* mesh = assets->find_mesh(instance.mesh);
                 if (mesh == nullptr) continue;
                 const DrawPushConstants constants{instance.model_view_projection.values,
                                                   instance.color, instance.texture_index};
@@ -1205,7 +1206,7 @@ struct VulkanWindow::Impl {
             vkCmdPushConstants(commands, pipeline_layout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(constants), &constants);
-            if (const auto* mesh = find_mesh_asset("builtin.triangle")) {
+            if (const auto* mesh = assets->find_mesh("builtin.triangle")) {
                 vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
                                  mesh->vertex_offset, 0U);
             }
@@ -1438,8 +1439,9 @@ struct VulkanWindow::Impl {
 };
 
 VulkanWindow::VulkanWindow(std::string title, const std::uint32_t width,
-                           const std::uint32_t height)
+                           const std::uint32_t height, const AssetRegistry& assets)
     : impl_(std::make_unique<Impl>()) {
+    impl_->assets = &assets;
     impl_->initialize(title, width, height);
 }
 

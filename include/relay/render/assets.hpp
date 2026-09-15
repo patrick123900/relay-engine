@@ -42,17 +42,41 @@ struct TextureAsset {
     std::vector<std::uint8_t> rgba;
 };
 
-[[nodiscard]] std::span<const MeshVertex> built_in_mesh_vertices();
-[[nodiscard]] std::span<const std::uint32_t> built_in_mesh_indices();
-[[nodiscard]] std::span<const MeshAsset> built_in_meshes();
-[[nodiscard]] std::span<const MaterialAsset> built_in_materials();
-[[nodiscard]] std::span<const TextureAsset> built_in_textures();
-[[nodiscard]] const MeshAsset* find_mesh_asset(std::string_view name);
-[[nodiscard]] const MaterialAsset* find_material_asset(std::string_view name);
-[[nodiscard]] const TextureAsset* find_texture_asset(std::string_view name);
-[[nodiscard]] std::uint32_t texture_asset_index(std::string_view name);
-[[nodiscard]] std::string render_assets_json();
-[[nodiscard]] std::uint64_t render_asset_revision();
+// Owns every mesh, material and texture a renderer may draw. An instance starts populated with
+// Relay's built-in assets; imported content is appended. Registries are independent, so tests and
+// future multi-project hosts can hold several without sharing mutable state.
+class AssetRegistry {
+public:
+    AssetRegistry();
+
+    [[nodiscard]] std::span<const MeshVertex> mesh_vertices() const;
+    [[nodiscard]] std::span<const std::uint32_t> mesh_indices() const;
+    [[nodiscard]] std::span<const MeshAsset> meshes() const;
+    [[nodiscard]] std::span<const MaterialAsset> materials() const;
+    [[nodiscard]] std::span<const TextureAsset> textures() const;
+
+    [[nodiscard]] const MeshAsset* find_mesh(std::string_view name) const;
+    [[nodiscard]] const MaterialAsset* find_material(std::string_view name) const;
+    [[nodiscard]] const TextureAsset* find_texture(std::string_view name) const;
+    [[nodiscard]] std::uint32_t texture_index(std::string_view name) const;
+
+    [[nodiscard]] std::string to_json() const;
+
+    // Increments whenever imported content is appended. Render backends compare this against the
+    // revision they last uploaded to decide when to rebuild device-local buffers.
+    [[nodiscard]] std::uint64_t revision() const;
+
+    bool register_imported(std::vector<MeshVertex> vertices, std::vector<std::uint32_t> indices,
+                           std::vector<MeshAsset> meshes, std::vector<MaterialAsset> materials);
+
+private:
+    std::vector<MeshVertex> vertices_;
+    std::vector<std::uint32_t> indices_;
+    std::vector<MeshAsset> meshes_;
+    std::vector<MaterialAsset> materials_;
+    std::vector<TextureAsset> textures_;
+    std::uint64_t revision_{1U};
+};
 
 struct ModelImportResult {
     bool imported{};
@@ -62,12 +86,20 @@ struct ModelImportResult {
     std::vector<std::string> materials;
     std::vector<std::string> warnings;
     std::vector<Entity> roots;
+    // Every file read during the import, relative to the assets root, in the order first opened.
+    std::vector<std::string> dependencies;
 
     [[nodiscard]] std::string json() const;
 };
 
 [[nodiscard]] std::string model_import_capabilities_json();
-[[nodiscard]] ModelImportResult import_model_asset(const std::filesystem::path& path,
-                                                    Scene* scene, std::string& error);
+
+// Imports `filename` from `assets_root`. Every dependency the model references is resolved inside
+// that root; nothing outside it is readable. Pass a null scene to register assets without
+// instantiating a node hierarchy.
+[[nodiscard]] ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
+                                                   std::string_view filename,
+                                                   AssetRegistry& registry, Scene* scene,
+                                                   std::string& error);
 
 } // namespace relay

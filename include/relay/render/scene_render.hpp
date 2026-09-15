@@ -1,5 +1,6 @@
 #pragma once
 
+#include "relay/render/assets.hpp"
 #include "relay/scene/scene.hpp"
 
 #include <array>
@@ -33,6 +34,7 @@ struct RenderScene {
     std::vector<RenderInstance> instances;
 };
 
-[[nodiscard]] RenderScene build_render_scene(const Scene& scene, float aspect_ratio);
+[[nodiscard]] RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
+                                             float aspect_ratio);
 
 } // namespace relay

@@ -349,7 +349,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
         std::string manifest_error;
         if (manifest.load(assets_root, manifest_error)) {
             manifest.record({*safe_name, model_importer_version, imported.content_id,
-                             imported.dependencies, imported.meshes, imported.materials});
+                             imported.dependencies, imported.meshes, imported.materials,
+                             imported.textures});
             if (!manifest.save(assets_root, manifest_error)) {
                 engine_.logs().write(LogLevel::warning,
                                      "Import manifest not updated: " + manifest_error);

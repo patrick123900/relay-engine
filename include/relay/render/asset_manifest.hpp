@@ -13,7 +13,7 @@ inline constexpr std::uint32_t import_manifest_version = 1;
 
 // Bump when a change to the importer would produce different geometry or identities from the same
 // source file. Recorded per entry so a stale cache is detectable rather than silently trusted.
-inline constexpr std::uint32_t model_importer_version = 1;
+inline constexpr std::uint32_t model_importer_version = 2;
 
 struct ImportManifestEntry {
     std::string source;
@@ -22,6 +22,7 @@ struct ImportManifestEntry {
     std::vector<std::string> dependencies;
     std::vector<std::string> meshes;
     std::vector<std::string> materials;
+    std::vector<std::string> textures;
 };
 
 struct ImportReloadReport {

@@ -82,7 +82,7 @@ Current major layers:
   - GLSL-to-SPIR-V build integration;
   - SPIR-V reflection of vertex inputs, descriptor bindings and push constants;
   - a small compiled render graph with resources, dependencies and transitions;
-  - a device-selected depth attachment with depth testing and writes for opaque geometry;
+  - per-swapchain-image depth attachments with depth testing and writes for opaque geometry;
   - per-mesh frustum culling and a front-to-back opaque draw order independent of creation order;
   - a bounded 16-slot texture descriptor table;
   - staged procedural texture uploads and GPU-generated mip chains;
@@ -99,19 +99,21 @@ Current major layers:
 - Assimp-backed model importer is optional at build time.
 - Accepted project-file extensions are `.gltf`, `.glb`, `.fbx`, `.obj`, `.dae` and `.blend`.
 - glTF 2.0/GLB is the recommended native interchange path, matching Godot’s recommendation.
-- Imported static geometry currently includes positions, UV0 and triangle indices.
-- Base material colors and node transforms/hierarchy are imported.
+- Imported static geometry includes positions, UV0, generated normals/tangents and triangle indices.
+- Node transforms/hierarchy and PBR material factors are imported. Embedded and external PNG/JPEG
+  images support base-color, metallic/roughness, normal, occlusion and emissive channels.
 - Import can register assets only or instantiate the node hierarchy into the active scene.
 - Imported mesh/material IDs are a versioned SHA-256 digest of normalized imported content, so the
   identity covers an external `.bin` payload and not just the container file.
 - Reimporting identical content reuses stable IDs rather than adding duplicate assets.
 - The Vulkan backend notices asset-registry revisions, waits for the device to become idle and
-  rebuilds the combined mesh buffers so models imported into a live editor can render immediately.
+  safely rebuilds mesh, material, texture and descriptor resources so live imports render
+  immediately.
 - Hierarchy-only nodes do not render placeholder geometry; only entities with a mesh-renderer
   component are drawable.
-- The importer reports deferred animations, skeletons/skin weights and image/PBR textures as
-  warnings rather than pretending the import is complete.
-- Tiny OBJ and embedded-buffer glTF fixtures exist in `assets/` and are covered by tests.
+- The importer reports deferred animations and skeletons/skin weights as warnings rather than
+  pretending the import is complete.
+- Tiny OBJ and embedded-buffer glTF fixtures plus a golden PBR glTF/GLB pair are covered by tests.
 
 ### Durable and safe asset foundation
 
@@ -231,12 +233,14 @@ Reference: [Godot — Available 3D formats](https://docs.godotengine.org/en/late
 FBX, OBJ and DAE are currently routed through Assimp. There is no ufbx-specific path matching newer
 Godot FBX behavior.
 
-### Static model data is incomplete
+### Static model data boundaries
 
-- Vertex data contains position and UV only—no normals, tangents, vertex colors, joints or weights.
-- Imported image textures are not decoded or uploaded.
-- Materials only preserve base color and use a built-in checker texture.
-- Metallic/roughness, normal, occlusion, emissive, alpha modes and double-sided flags are absent.
+- Vertex data contains positions, UV0, normals and tangents, but not vertex colors, joints or
+  weights.
+- Imported image decoding currently supports PNG and JPEG; other glTF image formats are rejected.
+- Materials preserve PBR factors and base-color, metallic/roughness, normal, occlusion and emissive
+  textures. Alpha modes and double-sided state are retained, but blended materials do not yet have
+  a transparent draw queue and single-sided materials currently share the no-cull pipeline.
 - Skeletons, skinning, morph targets and animation playback are absent.
 - Cameras and lights embedded in imported scenes are not instantiated.
 
@@ -249,7 +253,8 @@ are still outstanding:
   assets. This is still cache-like behavior, not transactional asset lifecycle management.
 - Hot import waits for the entire Vulkan device to become idle and rebuilds all combined mesh
   buffers. It is correct but stalls and will not scale. Use versioned/asynchronous uploads later.
-- Imported texture resources do not yet participate in hot reload.
+- Texture resources participate in safe live refresh, but the current implementation waits for the
+  device and rebuilds the full registry rather than updating only changed resources.
 - The manifest records a content id per source file but does not store per-dependency hashes, so a
   changed dependency is detected by re-importing rather than by comparing recorded digests.
 - Nothing prunes manifest entries whose source file has been deleted; they surface as failures on
@@ -271,10 +276,10 @@ model cannot reach outside the project. Two caveats remain explicit:
   batching and no instancing. Every visible instance is its own draw call.
 - Culling is per-instance against the mesh's local axis-aligned bounds. There is no spatial
   acceleration structure, so the cull cost is linear in drawable entity count.
-- The depth attachment is a single image shared by every swapchain image. That is correct while one
-  frame at a time records the render pass, but it will need to become per-frame if recording ever
-  overlaps.
-- There are no normals, lighting, shadows, HDR, tonemapping or physically based shading.
+- Depth attachments are isolated per swapchain image so frames in flight cannot write the same
+  depth image concurrently.
+- Normals, normal maps, a direct-light metallic/roughness shader and tone mapping exist. There is no
+  image-based lighting, shadowing, HDR render target or post-processing pipeline yet.
 - No ray tracing, DLSS, FSR or temporal upscaling has been implemented; only hardware capability
   discovery exists.
 - Texture table capacity is fixed at 16.
@@ -309,7 +314,7 @@ TODO for a rotating Vulkan staging/readback ring that feeds asynchronous capture
 
 ## What to build next
 
-The current milestone is **Renderable Static glTF v1**. Phases A and B are complete; Phase C is next.
+The **Renderable Static glTF v1** milestone is complete through Phase C. Phase D is next.
 
 ### Phase A — durable and safe asset foundation (complete)
 
@@ -338,10 +343,9 @@ correctly occluding the far one. The capture is `captures/depth-occlusion.png`. 
 is exercised by `--vulkan-smoke`, which resizes mid-run and rebuilds the depth resources.
 
 Note: the host has no `VK_LAYER_KHRONOS_validation`, so the Vulkan work here is verified by
-observed output and clean runs, not by validation layers. Installing them is worthwhile before
-Phase C adds more attachments and descriptor traffic.
+observed output and clean runs, not by validation layers. Installing them remains worthwhile.
 
-### Phase C — static glTF material completeness
+### Phase C — static glTF material completeness (complete)
 
 1. Extend `MeshVertex` with normal and tangent data; update Vulkan vertex declarations and shaders.
 2. Generate missing normals/tangents when appropriate.
@@ -350,11 +354,24 @@ Phase C adds more attachments and descriptor traffic.
 5. Replace the fixed color/checker material with a PBR material record including alpha mode,
    alpha cutoff and double-sided state.
 6. Add sRGB versus linear texture formats and sampler settings.
-7. Make texture/descriptor updates hot-reload safely rather than rebuilding globally.
+7. Make texture/descriptor updates hot-reload safely; replace the initial whole-registry refresh
+   with incremental/versioned uploads when scaling work begins.
 8. Add golden glTF fixtures and GPU captures for textured and metallic/roughness materials.
 
-Definition of done: a representative static Godot-exported GLB renders with correct geometry, UVs,
-base color, normal mapping and metallic/roughness response after a clean restart.
+The Phase C import and rendering path has landed. The importer generates normals/tangents, decodes
+embedded and external PNG/JPEG images, retains the full static glTF PBR material record, selects
+sRGB or linear Vulkan formats, applies glTF sampler settings and safely refreshes live GPU
+resources. The shader renders
+base-color, metallic/roughness, normal, occlusion and emissive inputs. The golden fixture is present
+as both `assets/relay-pbr-golden.gltf` and `assets/relay-pbr-golden.glb`.
+
+Definition of done, verified: the representative GLB renders its textured metallic and rough
+dielectric materials on the real GPU, and a saved scene reloads the same asset in a clean editor
+process with a byte-identical capture. The reference image is `captures/pbr-golden.png`. Normal-map
+decoding, generated tangent space and every PBR channel are additionally covered by native tests.
+
+The implementation is deliberately still small: textures are capped at 16, live refresh rebuilds
+the full registry after waiting for the device, and alpha blending needs a transparent queue.
 
 ### Phase D — finish Godot-oriented importing
 
@@ -379,15 +396,13 @@ base color, normal mapping and metallic/roughness response after a clean restart
 
 Use this as the next instruction after giving the agent this handoff:
 
-> Continue Relay Engine with Phase C of the “Renderable Static glTF v1” milestone from HANDOFF.md.
-> Phases A and B are complete, so build on the engine-owned `AssetRegistry` and the existing depth
-> and culling path rather than reintroducing global asset state or unsorted drawing. Extend
-> `MeshVertex` with normals and tangents and update the Vulkan vertex declarations and shaders,
-> generate missing normals/tangents where appropriate, decode embedded and external glTF images,
-> upload base-colour, metallic/roughness, normal, occlusion and emissive textures, and replace the
-> fixed colour/checker material with a PBR material record. Note that adding vertex attributes
-> changes the registry's mesh bounds input, so keep culling correct. Add golden glTF fixtures and GPU
-> captures, then run dev/release, ctest and MCP validation and report any remaining boundary.
+> Continue Relay Engine with Phase D from HANDOFF.md. Phases A-C are complete. Start with the
+> Blender-to-glTF adapter used conceptually by Godot: detect a configured Blender executable,
+> convert `.blend` files into a contained cache, capture actionable diagnostics, include conversion
+> inputs in durable identity and keep every subprocess and dependency inside an explicit sandbox.
+> Add import settings and reimport-on-change without weakening the existing path and symlink checks.
+> Keep direct Assimp import for glTF/GLB and the current FBX/OBJ/DAE fallback. Add focused tests, then
+> run dev/release, ctest, MCP validation and a real GPU smoke test.
 
 ## Key files to inspect first
 

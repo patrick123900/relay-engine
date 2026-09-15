@@ -20,9 +20,9 @@ npm-debug.log*
 !/captures/bindless-scene.png
 !/captures/imported-gltf.png
 !/captures/depth-occlusion.png
+!/captures/pbr-golden.png
 
 # Editor and operating-system noise
 .DS_Store
 *.swp
 *.tmp
-

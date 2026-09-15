@@ -27,9 +27,15 @@ struct RenderInstance {
     std::string mesh;
     std::string material;
     std::uint32_t texture_index{};
+    std::uint32_t material_index{};
     // Distance from the camera plane to the instance's bounds centre. Opaque instances are drawn
     // in increasing order of this value.
     float view_depth{};
+    std::array<float, 4> emissive_metallic{};
+    std::array<float, 4> surface_parameters{1.0F, 1.0F, 1.0F, 0.5F};
+    // Base color, metallic-roughness and normal occupy xyz. The packed w contains occlusion and
+    // emissive indices plus alpha-mode/double-sided flags.
+    std::array<std::uint32_t, 4> pbr_textures{};
 };
 
 struct RenderScene {

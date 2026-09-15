@@ -134,6 +134,7 @@ bool ImportManifest::load(const std::filesystem::path& assets_root, std::string&
         entry.dependencies = read_string_array(field(*record, "dependencies"));
         entry.meshes = read_string_array(field(*record, "meshes"));
         entry.materials = read_string_array(field(*record, "materials"));
+        entry.textures = read_string_array(field(*record, "textures"));
         entries_.push_back(std::move(entry));
     }
     return true;
@@ -154,6 +155,8 @@ bool ImportManifest::save(const std::filesystem::path& assets_root, std::string&
         write_string_array(output, entry.meshes);
         output << ",\"materials\":";
         write_string_array(output, entry.materials);
+        output << ",\"textures\":";
+        write_string_array(output, entry.textures);
         output << '}';
     }
     output << "]}\n";

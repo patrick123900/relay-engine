@@ -79,14 +79,16 @@ struct VulkanWindow::Impl {
     VkDeviceMemory mesh_vertex_memory{};
     VkBuffer mesh_index_buffer{};
     VkDeviceMemory mesh_index_memory{};
+    VkBuffer material_buffer{};
+    VkDeviceMemory material_memory{};
     struct GpuTexture {
         VkImage image{};
         VkDeviceMemory memory{};
         VkImageView view{};
+        VkSampler sampler{};
         std::uint32_t mip_levels{};
     };
     std::vector<GpuTexture> textures;
-    VkSampler texture_sampler{};
     VkDescriptorSetLayout texture_layout{};
     VkDescriptorPool texture_pool{};
     VkDescriptorSet texture_set{};
@@ -142,9 +144,11 @@ struct VulkanWindow::Impl {
             vkFreeMemory(device, mesh_index_memory, nullptr);
             vkDestroyBuffer(device, mesh_vertex_buffer, nullptr);
             vkFreeMemory(device, mesh_vertex_memory, nullptr);
+            vkDestroyBuffer(device, material_buffer, nullptr);
+            vkFreeMemory(device, material_memory, nullptr);
             vkDestroyDescriptorPool(device, texture_pool, nullptr);
-            vkDestroySampler(device, texture_sampler, nullptr);
             for (const auto& texture : textures) {
+                vkDestroySampler(device, texture.sampler, nullptr);
                 vkDestroyImageView(device, texture.view, nullptr);
                 vkDestroyImage(device, texture.image, nullptr);
                 vkFreeMemory(device, texture.memory, nullptr);
@@ -485,14 +489,12 @@ struct VulkanWindow::Impl {
     bool create_mesh_buffers() {
         const auto vertices = assets->mesh_vertices();
         const auto indices = assets->mesh_indices();
-        const bool uploaded = upload_buffer(vertices.data(), vertices.size_bytes(),
-                                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                                            mesh_vertex_buffer, mesh_vertex_memory) &&
-                              upload_buffer(indices.data(), indices.size_bytes(),
-                                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                                            mesh_index_buffer, mesh_index_memory);
-        if (uploaded) uploaded_asset_revision = assets->revision();
-        return uploaded;
+        return upload_buffer(vertices.data(), vertices.size_bytes(),
+                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                             mesh_vertex_buffer, mesh_vertex_memory) &&
+               upload_buffer(indices.data(), indices.size_bytes(),
+                             VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                             mesh_index_buffer, mesh_index_memory);
     }
 
     bool refresh_mesh_assets() {
@@ -510,7 +512,21 @@ struct VulkanWindow::Impl {
         mesh_index_memory = VK_NULL_HANDLE;
         mesh_vertex_buffer = VK_NULL_HANDLE;
         mesh_vertex_memory = VK_NULL_HANDLE;
-        return create_mesh_buffers();
+        vkDestroyBuffer(device, material_buffer, nullptr);
+        vkFreeMemory(device, material_memory, nullptr);
+        material_buffer = VK_NULL_HANDLE;
+        material_memory = VK_NULL_HANDLE;
+        vkDestroyDescriptorPool(device, texture_pool, nullptr);
+        texture_pool = VK_NULL_HANDLE;
+        texture_set = VK_NULL_HANDLE;
+        for (const auto& texture : textures) {
+            vkDestroySampler(device, texture.sampler, nullptr);
+            vkDestroyImageView(device, texture.view, nullptr);
+            vkDestroyImage(device, texture.image, nullptr);
+            vkFreeMemory(device, texture.memory, nullptr);
+        }
+        textures.clear();
+        return create_mesh_buffers() && create_texture_resources();
     }
 
     bool create_texture_image(const TextureAsset& asset, GpuTexture& texture) {
@@ -520,7 +536,19 @@ struct VulkanWindow::Impl {
         VkImageCreateInfo image_info{};
         image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         image_info.imageType = VK_IMAGE_TYPE_2D;
-        image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        const auto image_format = asset.color_space == TextureColorSpace::srgb
+                                      ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+        VkFormatProperties format_properties{};
+        vkGetPhysicalDeviceFormatProperties(physical_device, image_format, &format_properties);
+        constexpr VkFormatFeatureFlags required_format_features =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        if ((format_properties.optimalTilingFeatures & required_format_features) !=
+            required_format_features) {
+            last_error = "RGBA8 texture format does not support linear blit mip generation";
+            return false;
+        }
+        image_info.format = image_format;
         image_info.extent = {asset.width, asset.height, 1U};
         image_info.mipLevels = texture.mip_levels;
         image_info.arrayLayers = 1U;
@@ -681,7 +709,7 @@ struct VulkanWindow::Impl {
         view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         view_info.image = texture.image;
         view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        view_info.format = image_format;
         view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         view_info.subresourceRange.levelCount = texture.mip_levels;
         view_info.subresourceRange.layerCount = 1U;
@@ -690,21 +718,37 @@ struct VulkanWindow::Impl {
             last_error = vk_error("texture image view creation", result);
             return false;
         }
+        const auto filter = [](const TextureFilter value) {
+            return value == TextureFilter::nearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+        };
+        const auto wrap = [](const TextureWrap value) {
+            switch (value) {
+            case TextureWrap::clamp_to_edge: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            case TextureWrap::mirrored_repeat: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+            case TextureWrap::repeat: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            }
+            return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        };
+        VkSamplerCreateInfo sampler_info{};
+        sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sampler_info.magFilter = filter(asset.mag_filter);
+        sampler_info.minFilter = filter(asset.min_filter);
+        sampler_info.mipmapMode = asset.mip_filter == TextureFilter::nearest
+                                      ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                                      : VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sampler_info.addressModeU = wrap(asset.wrap_u);
+        sampler_info.addressModeV = wrap(asset.wrap_v);
+        sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sampler_info.maxLod = static_cast<float>(texture.mip_levels - 1U);
+        result = vkCreateSampler(device, &sampler_info, nullptr, &texture.sampler);
+        if (result != VK_SUCCESS) {
+            last_error = vk_error("texture sampler creation", result);
+            return false;
+        }
         return true;
     }
 
     bool create_texture_resources() {
-        VkFormatProperties format_properties{};
-        vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_R8G8B8A8_UNORM,
-                                            &format_properties);
-        constexpr VkFormatFeatureFlags required_format_features =
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-            VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-        if ((format_properties.optimalTilingFeatures & required_format_features) !=
-            required_format_features) {
-            last_error = "RGBA8 textures do not support linear blit mip generation";
-            return false;
-        }
         const auto texture_assets = assets->textures();
         if (texture_assets.empty() || texture_assets.size() > bindless_texture_capacity) {
             last_error = "built-in textures exceed the bindless table capacity";
@@ -714,37 +758,67 @@ struct VulkanWindow::Impl {
         for (std::size_t index = 0; index < texture_assets.size(); ++index) {
             if (!create_texture_image(texture_assets[index], textures[index])) return false;
         }
-        VkSamplerCreateInfo sampler_info{};
-        sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        sampler_info.magFilter = VK_FILTER_LINEAR;
-        sampler_info.minFilter = VK_FILTER_LINEAR;
-        sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-        sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler_info.maxLod = static_cast<float>(textures.front().mip_levels);
-        auto result = vkCreateSampler(device, &sampler_info, nullptr, &texture_sampler);
-        if (result != VK_SUCCESS) {
-            last_error = vk_error("texture sampler creation", result);
+        struct alignas(16) GpuMaterial {
+            std::array<float, 4> base_color_factor;
+            std::array<float, 4> emissive_metallic;
+            std::array<float, 4> surface_parameters;
+            std::array<std::uint32_t, 4> texture_indices;
+        };
+        static_assert(sizeof(GpuMaterial) == 64U);
+        const auto missing_texture = std::numeric_limits<std::uint32_t>::max();
+        const auto texture_slot = [&](const std::string& name) {
+            return !name.empty() && assets->find_texture(name) != nullptr
+                       ? assets->texture_index(name) : missing_texture;
+        };
+        std::vector<GpuMaterial> gpu_materials;
+        gpu_materials.reserve(assets->materials().size());
+        for (const auto& material : assets->materials()) {
+            const auto occlusion = texture_slot(material.occlusion_texture);
+            const auto emissive = texture_slot(material.emissive_texture);
+            const auto packed = (occlusion == missing_texture ? 0xFFU : occlusion) |
+                                ((emissive == missing_texture ? 0xFFU : emissive) << 8U) |
+                                (static_cast<std::uint32_t>(material.alpha_mode) << 16U) |
+                                (static_cast<std::uint32_t>(material.double_sided) << 18U);
+            gpu_materials.push_back({
+                material.color,
+                {material.emissive_factor[0], material.emissive_factor[1],
+                 material.emissive_factor[2], material.metallic_factor},
+                {material.roughness_factor, material.normal_scale,
+                 material.occlusion_strength, material.alpha_cutoff},
+                {texture_slot(material.texture), texture_slot(material.metallic_roughness_texture),
+                 texture_slot(material.normal_texture), packed}});
+        }
+        if (gpu_materials.empty() ||
+            !upload_buffer(gpu_materials.data(), gpu_materials.size() * sizeof(GpuMaterial),
+                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, material_buffer, material_memory)) {
             return false;
         }
-        VkDescriptorSetLayoutBinding binding{};
-        binding.binding = 0U;
-        binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        binding.descriptorCount = bindless_texture_capacity;
-        binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        VkDescriptorSetLayoutCreateInfo layout_info{};
-        layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layout_info.bindingCount = 1U;
-        layout_info.pBindings = &binding;
-        result = vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &texture_layout);
-        VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                       bindless_texture_capacity};
+        auto result = VK_SUCCESS;
+        if (texture_layout == VK_NULL_HANDLE) {
+            std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+            bindings[0].binding = 0U;
+            bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bindings[0].descriptorCount = bindless_texture_capacity;
+            bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bindings[1].binding = 1U;
+            bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[1].descriptorCount = 1U;
+            bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo layout_info{};
+            layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            layout_info.bindingCount = static_cast<std::uint32_t>(bindings.size());
+            layout_info.pBindings = bindings.data();
+            result = vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &texture_layout);
+        }
+        const std::array pool_sizes{
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                 bindless_texture_capacity},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1U}};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = 1U;
-        pool_info.poolSizeCount = 1U;
-        pool_info.pPoolSizes = &pool_size;
+        pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
+        pool_info.pPoolSizes = pool_sizes.data();
         if (result == VK_SUCCESS) result = vkCreateDescriptorPool(device, &pool_info, nullptr, &texture_pool);
         VkDescriptorSetAllocateInfo set_info{};
         set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -759,18 +833,29 @@ struct VulkanWindow::Impl {
         std::array<VkDescriptorImageInfo, bindless_texture_capacity> image_infos{};
         for (std::size_t index = 0; index < image_infos.size(); ++index) {
             const auto& texture = textures[index < textures.size() ? index : 0U];
-            image_infos[index].sampler = texture_sampler;
+            image_infos[index].sampler = texture.sampler;
             image_infos[index].imageView = texture.view;
             image_infos[index].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
-        VkWriteDescriptorSet write{};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = texture_set;
-        write.dstBinding = 0U;
-        write.descriptorCount = bindless_texture_capacity;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        write.pImageInfo = image_infos.data();
-        vkUpdateDescriptorSets(device, 1U, &write, 0U, nullptr);
+        VkDescriptorBufferInfo material_info{};
+        material_info.buffer = material_buffer;
+        material_info.range = gpu_materials.size() * sizeof(GpuMaterial);
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = texture_set;
+        writes[0].dstBinding = 0U;
+        writes[0].descriptorCount = bindless_texture_capacity;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].pImageInfo = image_infos.data();
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = texture_set;
+        writes[1].dstBinding = 1U;
+        writes[1].descriptorCount = 1U;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &material_info;
+        vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(),
+                               0U, nullptr);
+        uploaded_asset_revision = assets->revision();
         return true;
     }
 
@@ -1088,7 +1173,7 @@ struct VulkanWindow::Impl {
         vertex_binding.binding = 0U;
         vertex_binding.stride = sizeof(MeshVertex);
         vertex_binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        std::array<VkVertexInputAttributeDescription, 2> attributes{};
+        std::array<VkVertexInputAttributeDescription, 4> attributes{};
         attributes[0].location = 0U;
         attributes[0].binding = 0U;
         attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
@@ -1097,6 +1182,14 @@ struct VulkanWindow::Impl {
         attributes[1].binding = 0U;
         attributes[1].format = VK_FORMAT_R32G32_SFLOAT;
         attributes[1].offset = static_cast<std::uint32_t>(offsetof(MeshVertex, u));
+        attributes[2].location = 2U;
+        attributes[2].binding = 0U;
+        attributes[2].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributes[2].offset = static_cast<std::uint32_t>(offsetof(MeshVertex, nx));
+        attributes[3].location = 3U;
+        attributes[3].binding = 0U;
+        attributes[3].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attributes[3].offset = static_cast<std::uint32_t>(offsetof(MeshVertex, tx));
         vertex_input.vertexBindingDescriptionCount = 1U;
         vertex_input.pVertexBindingDescriptions = &vertex_binding;
         vertex_input.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());
@@ -1253,9 +1346,9 @@ struct VulkanWindow::Impl {
 
     struct DrawPushConstants {
         std::array<float, 16> model_view_projection;
-        std::array<float, 4> color;
-        std::uint32_t texture_index{};
+        std::array<float, 16> model;
     };
+    static_assert(sizeof(DrawPushConstants) == 128U);
 
     bool record_commands(const VkCommandBuffer commands, const std::uint32_t image_index,
                          const float elapsed_seconds, const Scene* scene,
@@ -1307,12 +1400,12 @@ struct VulkanWindow::Impl {
                 const auto* mesh = assets->find_mesh(instance.mesh);
                 if (mesh == nullptr) continue;
                 const DrawPushConstants constants{instance.model_view_projection.values,
-                                                  instance.color, instance.texture_index};
+                                                  instance.model.values};
                 vkCmdPushConstants(commands, pipeline_layout,
                                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                    sizeof(constants), &constants);
                 vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
-                                 mesh->vertex_offset, 0U);
+                                 mesh->vertex_offset, instance.material_index);
                 ++latest_draw_calls;
             }
         } else {
@@ -1324,14 +1417,16 @@ struct VulkanWindow::Impl {
                                                 -sine, cosine, 0.0F, 0.0F,
                                                 0.0F, 0.0F, 1.0F, 0.0F,
                                                 0.0F, 0.0F, 0.0F, 1.0F};
-            constants.color = {0.98F, 0.45F, 0.16F, 1.0F};
-            constants.texture_index = 0U;
+            constants.model = {1.0F, 0.0F, 0.0F, 0.0F,
+                               0.0F, 1.0F, 0.0F, 0.0F,
+                               0.0F, 0.0F, 1.0F, 0.0F,
+                               0.0F, 0.0F, 0.0F, 1.0F};
             vkCmdPushConstants(commands, pipeline_layout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(constants), &constants);
             if (const auto* mesh = assets->find_mesh("builtin.triangle")) {
                 vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
-                                 mesh->vertex_offset, 0U);
+                                 mesh->vertex_offset, assets->material_index("builtin.orange"));
             }
             latest_draw_calls = 1U;
         }
@@ -1658,8 +1753,8 @@ std::uint32_t VulkanWindow::render_resource_count() const {
     // Every swapchain depth attachment contributes an image, its memory and its view.
     const std::size_t depth_resources = impl_->depth_attachments.size() * 3U;
     return static_cast<std::uint32_t>(impl_->swapchain_images.size() + impl_->image_views.size() +
-                                      impl_->framebuffers.size() + impl_->textures.size() * 2U +
-                                      depth_resources + 8U);
+                                      impl_->framebuffers.size() + impl_->textures.size() * 4U +
+                                      depth_resources + 10U);
 }
 
 std::string VulkanWindow::render_graph_json() const {

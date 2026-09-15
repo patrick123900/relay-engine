@@ -26,9 +26,15 @@ const std::array initial_meshes{
 };
 
 const std::array initial_materials{
-    MaterialAsset{"builtin.orange", {0.98F, 0.45F, 0.16F, 1.0F}, "builtin.checker"},
-    MaterialAsset{"builtin.azure", {0.18F, 0.76F, 0.96F, 1.0F}, "builtin.gradient"},
-    MaterialAsset{"builtin.violet", {0.62F, 0.32F, 0.98F, 1.0F}, "builtin.checker"},
+    MaterialAsset{"builtin.orange", {0.98F, 0.45F, 0.16F, 1.0F}, "builtin.checker",
+                  0.0F, 1.0F, {}, {}, 1.0F, {}, 1.0F, {}, {},
+                  MaterialAsset::AlphaMode::opaque, 0.5F, false},
+    MaterialAsset{"builtin.azure", {0.18F, 0.76F, 0.96F, 1.0F}, "builtin.gradient",
+                  0.0F, 1.0F, {}, {}, 1.0F, {}, 1.0F, {}, {},
+                  MaterialAsset::AlphaMode::opaque, 0.5F, false},
+    MaterialAsset{"builtin.violet", {0.62F, 0.32F, 0.98F, 1.0F}, "builtin.checker",
+                  0.0F, 1.0F, {}, {}, 1.0F, {}, 1.0F, {}, {},
+                  MaterialAsset::AlphaMode::opaque, 0.5F, false},
 };
 
 std::vector<TextureAsset> make_textures() {
@@ -132,6 +138,13 @@ std::uint32_t AssetRegistry::texture_index(const std::string_view name) const {
     return found == textures_.end() ? 0U : static_cast<std::uint32_t>(found - textures_.begin());
 }
 
+std::uint32_t AssetRegistry::material_index(const std::string_view name) const {
+    const auto found = std::find_if(materials_.begin(), materials_.end(), [name](const auto& asset) {
+        return asset.name == name;
+    });
+    return found == materials_.end() ? 0U : static_cast<std::uint32_t>(found - materials_.begin());
+}
+
 std::string AssetRegistry::to_json() const {
     std::ostringstream output;
     output << "{\"texture_table_capacity\":" << bindless_texture_capacity
@@ -151,7 +164,12 @@ std::string AssetRegistry::to_json() const {
         const auto& material = materials_[index];
         output << "{\"name\":\"" << material.name << "\",\"color\":["
                << material.color[0] << ',' << material.color[1] << ',' << material.color[2]
-               << ',' << material.color[3] << "],\"texture\":\"" << material.texture << "\"}";
+               << ',' << material.color[3] << "],\"texture\":\"" << material.texture
+               << "\",\"metallic_factor\":" << material.metallic_factor
+               << ",\"roughness_factor\":" << material.roughness_factor
+               << ",\"normal_texture\":\"" << material.normal_texture
+               << "\",\"occlusion_texture\":\"" << material.occlusion_texture
+               << "\",\"emissive_texture\":\"" << material.emissive_texture << "\"}";
     }
     output << "],\"textures\":[";
     for (std::size_t index = 0; index < textures_.size(); ++index) {
@@ -159,7 +177,24 @@ std::string AssetRegistry::to_json() const {
         output << "{\"slot\":" << index << ",\"name\":\"" << textures_[index].name
                << "\",\"width\":" << textures_[index].width << ",\"height\":"
                << textures_[index].height << ",\"mip_levels\":"
-               << std::bit_width(std::max(textures_[index].width, textures_[index].height)) << "}";
+               << std::bit_width(std::max(textures_[index].width, textures_[index].height))
+               << ",\"color_space\":\""
+               << (textures_[index].color_space == TextureColorSpace::srgb ? "srgb" : "linear")
+               << "\",\"mag_filter\":\""
+               << (textures_[index].mag_filter == TextureFilter::linear ? "linear" : "nearest")
+               << "\",\"min_filter\":\""
+               << (textures_[index].min_filter == TextureFilter::linear ? "linear" : "nearest")
+               << "\",\"mip_filter\":\""
+               << (textures_[index].mip_filter == TextureFilter::linear ? "linear" : "nearest")
+               << "\",\"wrap_u\":\""
+               << (textures_[index].wrap_u == TextureWrap::repeat ? "repeat" :
+                   textures_[index].wrap_u == TextureWrap::mirrored_repeat ? "mirrored_repeat" :
+                                                                            "clamp_to_edge")
+               << "\",\"wrap_v\":\""
+               << (textures_[index].wrap_v == TextureWrap::repeat ? "repeat" :
+                   textures_[index].wrap_v == TextureWrap::mirrored_repeat ? "mirrored_repeat" :
+                                                                            "clamp_to_edge")
+               << "\"}";
     }
     output << "]}";
     return output.str();
@@ -170,7 +205,8 @@ std::uint64_t AssetRegistry::revision() const { return revision_; }
 bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
                                       std::vector<std::uint32_t> indices_to_add,
                                       std::vector<MeshAsset> meshes,
-                                      std::vector<MaterialAsset> materials) {
+                                      std::vector<MaterialAsset> materials,
+                                      std::vector<TextureAsset> textures) {
     if (vertices.empty() || indices_to_add.empty() || meshes.empty()) return false;
     if (std::all_of(meshes.begin(), meshes.end(), [this](const MeshAsset& mesh) {
             return find_mesh(mesh.name) != nullptr;
@@ -188,6 +224,9 @@ bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
         if (find_material(material.name) == nullptr) {
             materials_.push_back(std::move(material));
         }
+    }
+    for (auto& texture : textures) {
+        if (find_texture(texture.name) == nullptr) textures_.push_back(std::move(texture));
     }
     vertices_.insert(vertices_.end(), vertices.begin(), vertices.end());
     indices_.insert(indices_.end(), indices_to_add.begin(), indices_to_add.end());

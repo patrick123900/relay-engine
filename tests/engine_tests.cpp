@@ -88,6 +88,36 @@ std::string triangle_buffer_bytes(const float first_x) {
     return bytes;
 }
 
+std::string one_pixel_png() {
+    static constexpr std::array<unsigned char, 70> bytes{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+        0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50,
+        0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82};
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
+std::string textured_external_gltf(const std::string& buffer_uri) {
+    auto document = external_buffer_gltf(buffer_uri);
+    const std::string original =
+        R"("materials": [{"name": "Relay White", "pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1]}}])";
+    const std::string replacement = R"("images": [{"uri": "pixel.png"}],
+  "textures": [{"source": 0}],
+  "materials": [{
+    "name": "Relay PBR", "doubleSided": true, "alphaMode": "MASK", "alphaCutoff": 0.25,
+    "emissiveFactor": [0.1, 0.2, 0.3],
+    "pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.7, 0.6, 1], "baseColorTexture": {"index": 0}, "metallicFactor": 0.7, "roughnessFactor": 0.3, "metallicRoughnessTexture": {"index": 0}},
+    "normalTexture": {"index": 0, "scale": 0.75},
+    "occlusionTexture": {"index": 0, "strength": 0.6},
+    "emissiveTexture": {"index": 0}
+  }])";
+    const auto position = document.find(original);
+    if (position != std::string::npos) document.replace(position, original.size(), replacement);
+    return document;
+}
+
 } // namespace
 
 int main() {
@@ -274,6 +304,31 @@ int main() {
                registry.revision() == asset_revision + 1U,
            "reimporting identical model content reuses stable asset identities");
 
+    relay::AssetRegistry golden_gltf_registry;
+    relay::AssetRegistry golden_glb_registry;
+    std::string golden_error;
+    const auto golden_gltf = relay::import_model_asset(assets_root, "relay-pbr-golden.gltf",
+                                                       golden_gltf_registry, nullptr, golden_error);
+    const auto golden_glb = relay::import_model_asset(assets_root, "relay-pbr-golden.glb",
+                                                      golden_glb_registry, nullptr, golden_error);
+    const auto* golden_material = golden_glb.materials.empty()
+                                      ? nullptr
+                                      : golden_glb_registry.find_material(golden_glb.materials.front());
+    expect(golden_gltf.imported && golden_glb.imported &&
+               golden_gltf.content_id == golden_glb.content_id &&
+               golden_glb.meshes.size() == 2U && golden_glb.textures.size() == 2U &&
+               golden_material != nullptr && !golden_material->normal_texture.empty(),
+           "golden glTF and binary GLB import to the same complete PBR asset identity: " +
+               golden_error);
+    const auto& golden_textures = golden_glb_registry.textures();
+    expect(golden_textures.size() == 4U &&
+               golden_textures[2].mag_filter == relay::TextureFilter::linear &&
+               golden_textures[2].min_filter == relay::TextureFilter::linear &&
+               golden_textures[2].mip_filter == relay::TextureFilter::linear &&
+               golden_textures[2].wrap_u == relay::TextureWrap::repeat &&
+               golden_textures[2].wrap_v == relay::TextureWrap::repeat,
+           "glTF sampler filters and wrap modes survive normalized import");
+
     if (importer_available()) {
         const auto sandbox_root = std::filesystem::temp_directory_path() / "relay-phase-a-assets";
         const auto outside_root = std::filesystem::temp_directory_path() / "relay-phase-a-outside";
@@ -294,6 +349,40 @@ int main() {
         expect(std::find(external.dependencies.begin(), external.dependencies.end(),
                          std::string{"external.bin"}) != external.dependencies.end(),
                "import records the external buffer as a tracked dependency");
+
+        write_file(sandbox_root / "textured.gltf", textured_external_gltf("external.bin"));
+        write_file(sandbox_root / "pixel.png", one_pixel_png());
+        relay::AssetRegistry textured_registry;
+        std::string textured_error;
+        const auto textured = relay::import_model_asset(sandbox_root, "textured.gltf",
+                                                        textured_registry, nullptr, textured_error);
+        const auto* pbr_material = textured.materials.empty()
+                                       ? nullptr : textured_registry.find_material(textured.materials.front());
+        const auto* pbr_mesh = textured.meshes.empty()
+                                   ? nullptr : textured_registry.find_mesh(textured.meshes.front());
+        expect(textured.imported && pbr_material != nullptr && pbr_mesh != nullptr &&
+                   !pbr_material->texture.empty() &&
+                   !pbr_material->metallic_roughness_texture.empty() &&
+                   !pbr_material->normal_texture.empty() &&
+                   !pbr_material->occlusion_texture.empty() &&
+                   !pbr_material->emissive_texture.empty() &&
+                   std::abs(pbr_material->metallic_factor - 0.7F) < 0.001F &&
+                   std::abs(pbr_material->roughness_factor - 0.3F) < 0.001F &&
+                   pbr_material->alpha_mode == relay::MaterialAsset::AlphaMode::mask &&
+                   pbr_material->double_sided,
+               "glTF import preserves PBR factors, flags and all five texture channels: " +
+                   textured_error);
+        expect(textured_registry.textures().size() == 4U &&
+                   textured_registry.textures()[2].color_space == relay::TextureColorSpace::srgb &&
+                   textured_registry.textures()[3].color_space == relay::TextureColorSpace::linear,
+               "image textures decode to RGBA8 and retain sRGB versus linear semantics");
+        if (pbr_mesh != nullptr) {
+            const auto vertex = textured_registry.mesh_vertices()[
+                static_cast<std::size_t>(pbr_mesh->vertex_offset)];
+            expect(std::abs(vertex.nz) > 0.9F &&
+                       std::abs(vertex.tx) + std::abs(vertex.ty) + std::abs(vertex.tz) > 0.9F,
+                   "import generates missing normals and tangents for textured geometry");
+        }
 
         // The same model pointed at a file outside the root must be refused.
         write_file(outside_root / "secret.bin", triangle_buffer_bytes(-0.5F));
@@ -345,7 +434,8 @@ int main() {
         expect(manifest.load(sandbox_root, manifest_error),
                "a project with no manifest loads as empty: " + manifest_error);
         manifest.record({"external.gltf", relay::model_importer_version, external.content_id,
-                         external.dependencies, external.meshes, external.materials});
+                         external.dependencies, external.meshes, external.materials,
+                         external.textures});
         expect(manifest.save(sandbox_root, manifest_error),
                "import manifest is written to the project: " + manifest_error);
 
@@ -374,11 +464,11 @@ int main() {
     const auto vertex_interface = relay::reflect_spirv(vertex_words);
     const auto fragment_interface = relay::reflect_spirv(fragment_words);
     expect(vertex_interface.valid && vertex_interface.stage == "vertex" &&
-               vertex_interface.push_constant_bytes == 84U &&
+               vertex_interface.push_constant_bytes == 128U &&
                !vertex_interface.inputs.empty() && vertex_interface.inputs.front().location == 0U,
            "SPIR-V reflection discovers the vertex input and native push-constant layout");
     expect(fragment_interface.valid && fragment_interface.stage == "fragment" &&
-               fragment_interface.push_constant_bytes == 84U &&
+               fragment_interface.push_constant_bytes == 128U &&
                !fragment_interface.outputs.empty() && fragment_interface.outputs.front().location == 0U &&
                !fragment_interface.bindings.empty() && fragment_interface.bindings.front().set == 0U &&
                fragment_interface.bindings.front().binding == 0U,

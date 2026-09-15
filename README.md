@@ -23,7 +23,9 @@ This repository currently contains the first vertical slice:
 - persistent mesh/material scene components with built-in triangle, quad and color assets;
 - a bounded bindless texture table with staged image uploads and GPU-generated mip chains;
 - content-addressed project model import for glTF/GLB, FBX, OBJ, DAE and Blender files, with
-  hierarchy instantiation and live Vulkan mesh-buffer refresh;
+  hierarchy instantiation and live Vulkan mesh, material and texture refresh;
+- static glTF PBR import with generated normals/tangents, PNG/JPEG image decoding, color-space and
+  sampler metadata, and base-color, metallic/roughness, normal, occlusion and emissive channels;
 - an engine-owned asset registry with versioned SHA-256 asset identities, a project import manifest
   that rebuilds imported assets on scene load, and importer dependency reads sandboxed to `assets/`;
 - synchronized Vulkan swapchain readback for agent-visible screenshots of the real GPU output;
@@ -101,10 +103,10 @@ cycles are rejected before the live scene is changed.
 
 Model files live in `assets/`. Relay treats glTF 2.0 (`.gltf`/`.glb`) as its native, recommended
 interchange format, matching Godot's preferred pipeline. The first importer also accepts FBX, OBJ,
-DAE and Blender files through Assimp. Imported geometry, UVs, base material colors and node
-hierarchies are available now; image textures, PBR channels, skeletons and animation playback are
-reported as deferred rather than silently presented as complete. Blender-to-glTF conversion matching
-Godot's exact `.blend` workflow is also planned.
+DAE and Blender files through Assimp. Imported static geometry includes UVs, generated
+normals/tangents, node hierarchies, PBR factors and PNG/JPEG image textures. Skeletons, skinning,
+morph targets and animation playback are reported as deferred rather than silently presented as
+complete. Blender-to-glTF conversion matching Godot's exact `.blend` workflow is also planned.
 
 Imports are sandboxed. A model may only be named by a top-level filename inside `assets/`, and every
 dependency it goes on to reference — external `.bin` buffers, images — is canonicalized and must
@@ -195,10 +197,9 @@ Both CMake builds and `npm run check` reject stale generated C++, TypeScript or 
 
 Near-term milestones, in the order they should be taken:
 
-1. Add image texture, PBR channel and normal/tangent import to the model pipeline, replacing the
-   fixed colour-and-checker material with a real PBR material record.
-2. Add skeleton and animation import.
-3. Add a Blender-to-glTF adapter matching Godot's `.blend` workflow.
+1. Add the Blender-to-glTF adapter used by Godot's `.blend` workflow and improve reimport settings.
+2. Add skeleton, skin-weight, animation, morph-target, imported-camera and imported-light support.
+3. Replace whole-registry hot refresh with versioned asynchronous resource uploads.
 
 See [`HANDOFF.md`](HANDOFF.md) for the full phase breakdown and the current list of known
 boundaries.

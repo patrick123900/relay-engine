@@ -28,6 +28,7 @@ add_library(relay_engine
     src/render/software_renderer.cpp
     src/render/asset_manifest.cpp
     src/render/assets.cpp
+    src/render/image_decode.cpp
     src/render/model_import.cpp
     src/render/scene_render.cpp
     src/render/render_graph.cpp
@@ -58,6 +59,18 @@ if(TARGET assimp::assimp)
     target_compile_definitions(relay_engine PRIVATE RELAY_HAS_ASSIMP=1)
 else()
     message(STATUS "Assimp was not found; project model import will report unavailable")
+endif()
+
+find_package(PNG QUIET)
+if(TARGET PNG::PNG)
+    target_link_libraries(relay_engine PRIVATE PNG::PNG)
+    target_compile_definitions(relay_engine PRIVATE RELAY_HAS_PNG=1)
+endif()
+
+find_package(JPEG QUIET)
+if(TARGET JPEG::JPEG)
+    target_link_libraries(relay_engine PRIVATE JPEG::JPEG)
+    target_compile_definitions(relay_engine PRIVATE RELAY_HAS_JPEG=1)
 endif()
 
 if(MSVC)

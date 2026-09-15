@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <unordered_map>
 
 namespace relay {
@@ -255,12 +256,45 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
             view_depth = m[3] * centre[0] + m[7] * centre[1] + m[11] * centre[2] + m[15];
         }
         const auto* material_asset = assets.find_material(material);
-        output.instances.push_back({entity, model, model_view_projection,
-                                    material_asset != nullptr ? material_asset->color : entity_color(entity),
-                                    mesh, material,
-                                    material_asset != nullptr
-                                        ? assets.texture_index(material_asset->texture) : 0U,
-                                    view_depth});
+        const auto missing_texture = std::numeric_limits<std::uint32_t>::max();
+        const auto texture_slot = [&](const std::string& name) {
+            return !name.empty() && assets.find_texture(name) != nullptr
+                       ? assets.texture_index(name) : missing_texture;
+        };
+        RenderInstance instance;
+        instance.entity = entity;
+        instance.model = model;
+        instance.model_view_projection = model_view_projection;
+        instance.color = material_asset != nullptr ? material_asset->color : entity_color(entity);
+        instance.mesh = mesh;
+        instance.material = material;
+        instance.texture_index = material_asset != nullptr
+                                     ? texture_slot(material_asset->texture) : missing_texture;
+        instance.material_index = material_asset != nullptr ? assets.material_index(material) : 0U;
+        instance.view_depth = view_depth;
+        if (material_asset != nullptr) {
+            instance.emissive_metallic = {material_asset->emissive_factor[0],
+                                          material_asset->emissive_factor[1],
+                                          material_asset->emissive_factor[2],
+                                          material_asset->metallic_factor};
+            instance.surface_parameters = {material_asset->roughness_factor,
+                                           material_asset->normal_scale,
+                                           material_asset->occlusion_strength,
+                                           material_asset->alpha_cutoff};
+            const auto occlusion = texture_slot(material_asset->occlusion_texture);
+            const auto emissive = texture_slot(material_asset->emissive_texture);
+            const auto packed = (occlusion == missing_texture ? 0xFFU : occlusion) |
+                                ((emissive == missing_texture ? 0xFFU : emissive) << 8U) |
+                                (static_cast<std::uint32_t>(material_asset->alpha_mode) << 16U) |
+                                (static_cast<std::uint32_t>(material_asset->double_sided) << 18U);
+            instance.pbr_textures = {instance.texture_index,
+                                     texture_slot(material_asset->metallic_roughness_texture),
+                                     texture_slot(material_asset->normal_texture), packed};
+        } else {
+            instance.pbr_textures = {missing_texture, missing_texture, missing_texture,
+                                     0x0000FFFFU};
+        }
+        output.instances.push_back(std::move(instance));
     }
     // Opaque geometry draws front to back so the depth test rejects hidden fragments early. The
     // remaining keys make the order total, so it never depends on entity creation order.

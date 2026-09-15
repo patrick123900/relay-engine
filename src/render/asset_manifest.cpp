@@ -3,10 +3,17 @@
 #include "relay/core/json.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <system_error>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 namespace relay {
 namespace {
@@ -30,6 +37,32 @@ void write_string_array(std::ostringstream& output, const std::vector<std::strin
         output << '"' << json_escape(values[index]) << '"';
     }
     output << ']';
+}
+
+std::filesystem::path temporary_path_for(const std::filesystem::path& destination) {
+    static std::atomic<std::uint64_t> serial{0U};
+    const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    return destination.parent_path() /
+           (destination.filename().string() + ".tmp." + std::to_string(ticks) + '.' +
+            std::to_string(serial.fetch_add(1U, std::memory_order_relaxed)));
+}
+
+bool replace_atomically(const std::filesystem::path& temporary,
+                        const std::filesystem::path& destination, std::string& error) {
+#ifdef _WIN32
+    if (MoveFileExW(temporary.c_str(), destination.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+        error = "import manifest replacement failed with Windows error " +
+                std::to_string(GetLastError());
+        return false;
+    }
+#else
+    if (std::rename(temporary.c_str(), destination.c_str()) != 0) {
+        error = "import manifest could not be replaced";
+        return false;
+    }
+#endif
+    return true;
 }
 
 } // namespace
@@ -126,8 +159,7 @@ bool ImportManifest::save(const std::filesystem::path& assets_root, std::string&
     output << "]}\n";
 
     // Write beside the target and rename, so an interrupted save cannot truncate a good manifest.
-    auto temporary = path;
-    temporary += ".tmp";
+    const auto temporary = temporary_path_for(path);
     {
         std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
         if (!stream) {
@@ -142,10 +174,8 @@ bool ImportManifest::save(const std::filesystem::path& assets_root, std::string&
         }
     }
     std::error_code code;
-    std::filesystem::rename(temporary, path, code);
-    if (code) {
+    if (!replace_atomically(temporary, path, error)) {
         std::filesystem::remove(temporary, code);
-        error = "import manifest could not be replaced";
         return false;
     }
     return true;

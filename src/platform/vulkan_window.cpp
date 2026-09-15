@@ -99,12 +99,16 @@ struct VulkanWindow::Impl {
     VkRenderPass render_pass{};
     VkPipelineLayout pipeline_layout{};
     VkPipeline pipeline{};
-    // One depth attachment shared by every swapchain image. Only one frame records into the render
-    // pass at a time, so the depth buffer does not need to be per-image the way colour does.
+    // Each swapchain image owns its depth attachment. Multiple frames may be executing on the GPU
+    // concurrently, so sharing one depth image across their framebuffers would introduce a write
+    // hazard that the per-frame fences do not prevent.
+    struct DepthAttachment {
+        VkImage image{};
+        VkDeviceMemory memory{};
+        VkImageView view{};
+    };
     VkFormat depth_format{VK_FORMAT_UNDEFINED};
-    VkImage depth_image{};
-    VkDeviceMemory depth_memory{};
-    VkImageView depth_view{};
+    std::vector<DepthAttachment> depth_attachments;
     std::vector<VkFramebuffer> framebuffers;
     std::array<VkCommandBuffer, frames_in_flight> command_buffers{};
     std::array<VkSemaphore, frames_in_flight> image_available{};
@@ -912,53 +916,58 @@ struct VulkanWindow::Impl {
             last_error = "no supported depth attachment format is available";
             return false;
         }
-        VkImageCreateInfo image_info{};
-        image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        image_info.imageType = VK_IMAGE_TYPE_2D;
-        image_info.format = depth_format;
-        image_info.extent = {swapchain_extent.width, swapchain_extent.height, 1U};
-        image_info.mipLevels = 1U;
-        image_info.arrayLayers = 1U;
-        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
-        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        auto result = vkCreateImage(device, &image_info, nullptr, &depth_image);
-        if (result != VK_SUCCESS) {
-            last_error = vk_error("depth image creation", result);
-            return false;
-        }
-        VkMemoryRequirements requirements{};
-        vkGetImageMemoryRequirements(device, depth_image, &requirements);
-        const auto memory_type = find_memory_type(requirements.memoryTypeBits,
-                                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (!memory_type.has_value()) {
-            last_error = "no device-local memory type is available for the depth attachment";
-            return false;
-        }
-        VkMemoryAllocateInfo allocation{};
-        allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = *memory_type;
-        result = vkAllocateMemory(device, &allocation, nullptr, &depth_memory);
-        if (result == VK_SUCCESS) result = vkBindImageMemory(device, depth_image, depth_memory, 0U);
-        if (result != VK_SUCCESS) {
-            last_error = vk_error("depth image allocation", result);
-            return false;
-        }
-        VkImageViewCreateInfo view_info{};
-        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        view_info.image = depth_image;
-        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view_info.format = depth_format;
-        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        view_info.subresourceRange.levelCount = 1U;
-        view_info.subresourceRange.layerCount = 1U;
-        result = vkCreateImageView(device, &view_info, nullptr, &depth_view);
-        if (result != VK_SUCCESS) {
-            last_error = vk_error("depth image view creation", result);
-            return false;
+        depth_attachments.resize(swapchain_images.size());
+        for (auto& depth : depth_attachments) {
+            VkImageCreateInfo image_info{};
+            image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            image_info.imageType = VK_IMAGE_TYPE_2D;
+            image_info.format = depth_format;
+            image_info.extent = {swapchain_extent.width, swapchain_extent.height, 1U};
+            image_info.mipLevels = 1U;
+            image_info.arrayLayers = 1U;
+            image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+            image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            auto result = vkCreateImage(device, &image_info, nullptr, &depth.image);
+            if (result != VK_SUCCESS) {
+                last_error = vk_error("depth image creation", result);
+                return false;
+            }
+            VkMemoryRequirements requirements{};
+            vkGetImageMemoryRequirements(device, depth.image, &requirements);
+            const auto memory_type = find_memory_type(requirements.memoryTypeBits,
+                                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (!memory_type.has_value()) {
+                last_error = "no device-local memory type is available for the depth attachment";
+                return false;
+            }
+            VkMemoryAllocateInfo allocation{};
+            allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = *memory_type;
+            result = vkAllocateMemory(device, &allocation, nullptr, &depth.memory);
+            if (result == VK_SUCCESS) {
+                result = vkBindImageMemory(device, depth.image, depth.memory, 0U);
+            }
+            if (result != VK_SUCCESS) {
+                last_error = vk_error("depth image allocation", result);
+                return false;
+            }
+            VkImageViewCreateInfo view_info{};
+            view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            view_info.image = depth.image;
+            view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            view_info.format = depth_format;
+            view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            view_info.subresourceRange.levelCount = 1U;
+            view_info.subresourceRange.layerCount = 1U;
+            result = vkCreateImageView(device, &view_info, nullptr, &depth.view);
+            if (result != VK_SUCCESS) {
+                last_error = vk_error("depth image view creation", result);
+                return false;
+            }
         }
         return true;
     }
@@ -1167,7 +1176,7 @@ struct VulkanWindow::Impl {
     bool create_framebuffers() {
         framebuffers.resize(image_views.size());
         for (std::size_t index = 0; index < image_views.size(); ++index) {
-            const std::array attachments{image_views[index], depth_view};
+            const std::array attachments{image_views[index], depth_attachments[index].view};
             VkFramebufferCreateInfo create_info{};
             create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             create_info.renderPass = render_pass;
@@ -1218,12 +1227,12 @@ struct VulkanWindow::Impl {
         pipeline_layout = VK_NULL_HANDLE;
         vkDestroyRenderPass(device, render_pass, nullptr);
         render_pass = VK_NULL_HANDLE;
-        vkDestroyImageView(device, depth_view, nullptr);
-        depth_view = VK_NULL_HANDLE;
-        vkDestroyImage(device, depth_image, nullptr);
-        depth_image = VK_NULL_HANDLE;
-        vkFreeMemory(device, depth_memory, nullptr);
-        depth_memory = VK_NULL_HANDLE;
+        for (auto& depth : depth_attachments) {
+            vkDestroyImageView(device, depth.view, nullptr);
+            vkDestroyImage(device, depth.image, nullptr);
+            vkFreeMemory(device, depth.memory, nullptr);
+        }
+        depth_attachments.clear();
         for (const auto view : image_views) vkDestroyImageView(device, view, nullptr);
         image_views.clear();
         vkDestroySwapchainKHR(device, swapchain, nullptr);
@@ -1646,8 +1655,8 @@ std::uint32_t VulkanWindow::draw_call_count() const {
 
 std::uint32_t VulkanWindow::render_resource_count() const {
     if (!impl_) return 0U;
-    // Depth contributes an image, its memory and its view.
-    const std::size_t depth_resources = impl_->depth_image == VK_NULL_HANDLE ? 0U : 3U;
+    // Every swapchain depth attachment contributes an image, its memory and its view.
+    const std::size_t depth_resources = impl_->depth_attachments.size() * 3U;
     return static_cast<std::uint32_t>(impl_->swapchain_images.size() + impl_->image_views.size() +
                                       impl_->framebuffers.size() + impl_->textures.size() * 2U +
                                       depth_resources + 8U);

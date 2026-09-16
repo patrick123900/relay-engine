@@ -235,3 +235,9 @@ boundaries.
   WebM recording. Until this lands, synchronous screenshots can capture the real Vulkan swapchain,
   but background captures and video use the deterministic CPU stream. Revisit this before relying
   on recordings to diagnose shaders, ray tracing, DLSS/FSR, lighting or driver-specific artifacts.
+
+## Importing TODOs
+
+- [ ] Add and verify OS-level Blender conversion sandboxes on Windows and macOS equivalent to
+  Linux Bubblewrap. Until then, keep untrusted `.blend` conversion disabled on those platforms;
+  `RELAY_BLENDER_TRUSTED=1` must remain an explicit administrator opt-in for trusted files only.

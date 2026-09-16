@@ -95,6 +95,12 @@ std::size_t ImportReloadReport::rebind_scene(Scene& scene) {
     };
     for (const auto entity : scene.entities()) {
         const auto* record = scene.get(entity);
+        if (record && record->animator) {
+            auto animator = *record->animator;
+            animator.model = resolve(animator.model);
+            if (animator != *record->animator && scene.set_animator(entity, animator))
+                ++count;
+        }
         if (record == nullptr || !record->mesh_renderer.has_value()) continue;
         auto renderer = *record->mesh_renderer;
         renderer.mesh = resolve(renderer.mesh);
@@ -136,7 +142,7 @@ bool ImportManifest::load(const std::filesystem::path& assets_root, std::string&
     const auto& root = *document->object();
     const auto* version = field(root, "version");
     if (version == nullptr || version->number() == nullptr ||
-        (*version->number() != 1.0 &&
+        (*version->number() != 1.0 && *version->number() != 2.0 &&
          *version->number() != static_cast<double>(import_manifest_version))) {
         error = "import manifest version is missing or unsupported";
         return false;
@@ -159,10 +165,18 @@ bool ImportManifest::load(const std::filesystem::path& assets_root, std::string&
         entry.source = *source->string();
         entry.content_id = *content_id->string();
         const auto* importer = field(*record, "importer_version");
+        if (importer && (!importer->number() || *importer->number() < 0.0 ||
+                         *importer->number() > 4294967295.0 ||
+                         std::floor(*importer->number()) != *importer->number())) {
+            error = "invalid importer version";
+            return false;
+        }
         entry.importer_version = importer != nullptr && importer->number() != nullptr
                                      ? static_cast<std::uint32_t>(*importer->number())
                                      : 0U;
         entry.dependencies = read_string_array(field(*record, "dependencies"));
+        entry.nodes = read_string_array(field(*record, "nodes"));
+        entry.clips = read_string_array(field(*record, "clips"));
         entry.meshes = read_string_array(field(*record, "meshes"));
         entry.materials = read_string_array(field(*record, "materials"));
         entry.textures = read_string_array(field(*record, "textures"));
@@ -190,6 +204,10 @@ bool ImportManifest::save(const std::filesystem::path& assets_root, std::string&
         write_string_array(output, entry.materials);
         output << ",\"textures\":";
         write_string_array(output, entry.textures);
+        output << ",\"nodes\":";
+        write_string_array(output, entry.nodes);
+        output << ",\"clips\":";
+        write_string_array(output, entry.clips);
         output << ",\"preset\":\"" << json_escape(entry.preset) << '"';
         output << '}';
     }
@@ -282,6 +300,19 @@ ImportReloadReport reload_imported_assets(const std::filesystem::path& assets_ro
         };
         add_remaps(entry.meshes, imported.meshes);
         add_remaps(entry.materials, imported.materials);
+        if (const auto *model = registry.find_model(imported.model)) {
+            std::vector<std::string> clips;
+            for (const auto &clip : model->clips)
+                clips.push_back(clip.name);
+            if (!entry.nodes.empty() && entry.nodes == model->binding_layout &&
+                entry.clips == clips)
+                report.asset_remaps.emplace_back("asset." + entry.content_id + ".model",
+                                                 imported.model);
+            else
+                report.messages.push_back("'" + entry.source +
+                                          "' lacks compatible node/clip ordering; saved animation "
+                                          "bindings were not rebound");
+        }
     }
     return report;
 }

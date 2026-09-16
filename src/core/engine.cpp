@@ -1,4 +1,6 @@
 #include "relay/core/engine.hpp"
+#include <algorithm>
+#include <cmath>
 
 #include <chrono>
 #include <sstream>
@@ -142,6 +144,29 @@ void Engine::advance_one_frame() {
     const auto start = std::chrono::steady_clock::now();
     ++frame_index_;
     elapsed_seconds_ += config_.fixed_delta_seconds;
+    for (const auto entity : scene_.entities()) {
+        auto *record = scene_.get(entity);
+        if (!record->animator || !record->animator->playing)
+            continue;
+        auto &animator = *record->animator;
+        const auto *model = assets_.find_model(animator.model);
+        if (!model || animator.clip >= model->clips.size())
+            continue;
+        const auto duration = model->clips[animator.clip].duration_seconds;
+        animator.time_seconds += config_.fixed_delta_seconds * animator.speed;
+        if (duration <= 0.0) {
+            animator.time_seconds = 0.0;
+            animator.playing = false;
+        } else if (animator.loop) {
+            animator.time_seconds = std::fmod(animator.time_seconds, duration);
+            if (animator.time_seconds < 0.0)
+                animator.time_seconds += duration;
+        } else {
+            if (animator.time_seconds <= 0.0 || animator.time_seconds >= duration)
+                animator.playing = false;
+            animator.time_seconds = std::clamp(animator.time_seconds, 0.0, duration);
+        }
+    }
     renderer_.render(frame_index_, elapsed_seconds_);
     video_.record(renderer_.frame());
     const auto end = std::chrono::steady_clock::now();

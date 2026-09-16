@@ -446,21 +446,22 @@ export function registerGeneratedTools(
     "scene_set_camera",
     {
       title: "Configure entity camera",
-      description: "Add, update or remove a perspective camera component; activating one camera deactivates the previous camera.",
+      description: "Add, update or remove a perspective or orthographic camera; activating one deactivates the previous camera.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
         "enabled": z.boolean().default(true),
         "active": z.boolean().default(true),
         "fieldOfViewY": z.number().finite().min(1.01).max(178.99).default(60),
         "nearPlane": z.number().finite().min(0.0001).max(1000).default(0.1),
-        "farPlane": z.number().finite().min(0.001).max(1000000).default(1000)
+        "farPlane": z.number().finite().min(0.001).max(1000000).default(1000),
+        "orthographicHeight": z.number().finite().min(0).max(1000000).optional().describe("Full viewport height; zero selects perspective")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
     },
     async (input) => {
         const override = overrides["scene_set_camera"];
         if (override) return override(input as JsonObject);
-        return invoke("scene.set_camera", {"entity": input["entity"], "enabled": input["enabled"], "active": input["active"], "field_of_view_y_degrees": input["fieldOfViewY"], "near_plane": input["nearPlane"], "far_plane": input["farPlane"]});
+        return invoke("scene.set_camera", {"entity": input["entity"], "enabled": input["enabled"], "active": input["active"], "field_of_view_y_degrees": input["fieldOfViewY"], "near_plane": input["nearPlane"], "far_plane": input["farPlane"], "orthographic_height": input["orthographicHeight"]});
       },
   );
 
@@ -529,6 +530,77 @@ export function registerGeneratedTools(
         const override = overrides["scene_redo"];
         if (override) return override({});
         return invoke("scene.redo", {});
+      },
+  );
+
+  server.registerTool(
+    "scene_set_animation",
+    {
+      title: "Control imported animation",
+      description: "Configure clip, playback, looping, speed and seek time on an imported model root.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "clip": z.number().int().min(0).max(255).optional(),
+        "playing": z.boolean().optional(),
+        "loop": z.boolean().optional(),
+        "speed": z.number().finite().min(-100).max(100).optional(),
+        "timeSeconds": z.number().finite().min(0).max(1000000).optional()
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_set_animation"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.set_animation", {"entity": input["entity"], "clip": input["clip"], "playing": input["playing"], "loop": input["loop"], "speed": input["speed"], "time_seconds": input["timeSeconds"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_set_morph",
+    {
+      title: "Set imported morph weight",
+      description: "Override a mesh morph weight, or reset all overrides to imported defaults and animation.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "target": z.number().int().min(0).max(63).default(0),
+        "weight": z.number().finite().min(-100).max(100).default(0),
+        "reset": z.boolean().default(false)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_set_morph"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.set_morph", {"entity": input["entity"], "target": input["target"], "weight": input["weight"], "reset": input["reset"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_set_light",
+    {
+      title: "Configure scene light",
+      description: "Add, update or remove a directional, point or spot light.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "enabled": z.boolean().default(true),
+        "type": z.enum(["directional", "point", "spot"]).optional(),
+        "red": z.number().finite().min(0).max(100000).optional(),
+        "green": z.number().finite().min(0).max(100000).optional(),
+        "blue": z.number().finite().min(0).max(100000).optional(),
+        "intensity": z.number().finite().min(0).max(100000).optional(),
+        "constant": z.number().finite().min(0).max(100000).optional(),
+        "linear": z.number().finite().min(0).max(100000).optional(),
+        "quadratic": z.number().finite().min(0).max(100000).optional(),
+        "innerCone": z.number().finite().min(0).max(1.5707963267948966).optional(),
+        "outerCone": z.number().finite().min(0.0001).max(1.5707963267948966).optional(),
+        "range": z.number().finite().min(0).max(1000000).optional().describe("Light range; zero means infinite")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_set_light"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.set_light", {"entity": input["entity"], "enabled": input["enabled"], "type": input["type"], "red": input["red"], "green": input["green"], "blue": input["blue"], "intensity": input["intensity"], "constant": input["constant"], "linear": input["linear"], "quadratic": input["quadratic"], "inner_cone": input["innerCone"], "outer_cone": input["outerCone"], "range": input["range"]});
       },
   );
 

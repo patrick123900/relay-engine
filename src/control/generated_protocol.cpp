@@ -73,13 +73,14 @@ constexpr std::array<ProtocolFieldSpec, 10> fields_scene_set_transform{{
     {"sz", ProtocolValueType::number, false, false, false, false, 0, 0, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 6> fields_scene_set_camera{{
+constexpr std::array<ProtocolFieldSpec, 7> fields_scene_set_camera{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"active", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"field_of_view_y_degrees", ProtocolValueType::number, false, false, true, true, 1.01, 178.99, 0U, 0U, "", ""},
     {"near_plane", ProtocolValueType::number, false, false, true, true, 0.0001, 1000, 0U, 0U, "", ""},
     {"far_plane", ProtocolValueType::number, false, false, true, true, 0.001, 1000000, 0U, 0U, "", ""},
+    {"orthographic_height", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_renderer{{
@@ -92,6 +93,38 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_renderer{{
 constexpr std::array<ProtocolFieldSpec, 2> fields_scene_set_parent{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"parent", ProtocolValueType::string, true, true, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 6> fields_scene_set_animation{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"clip", ProtocolValueType::integer, false, false, true, true, 0, 255, 0U, 0U, "", ""},
+    {"playing", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"loop", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"speed", ProtocolValueType::number, false, false, true, true, -100, 100, 0U, 0U, "", ""},
+    {"time_seconds", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_morph{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"target", ProtocolValueType::integer, false, false, true, true, 0, 63, 0U, 0U, "", ""},
+    {"weight", ProtocolValueType::number, false, false, true, true, -100, 100, 0U, 0U, "", ""},
+    {"reset", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 13> fields_scene_set_light{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "directional|point|spot"},
+    {"red", ProtocolValueType::number, false, false, true, true, 0, 100000, 0U, 0U, "", ""},
+    {"green", ProtocolValueType::number, false, false, true, true, 0, 100000, 0U, 0U, "", ""},
+    {"blue", ProtocolValueType::number, false, false, true, true, 0, 100000, 0U, 0U, "", ""},
+    {"intensity", ProtocolValueType::number, false, false, true, true, 0, 100000, 0U, 0U, "", ""},
+    {"constant", ProtocolValueType::number, false, false, true, true, 0, 100000, 0U, 0U, "", ""},
+    {"linear", ProtocolValueType::number, false, false, true, true, 0, 100000, 0U, 0U, "", ""},
+    {"quadratic", ProtocolValueType::number, false, false, true, true, 0, 100000, 0U, 0U, "", ""},
+    {"inner_cone", ProtocolValueType::number, false, false, true, true, 0, 1.5707963267948966, 0U, 0U, "", ""},
+    {"outer_cone", ProtocolValueType::number, false, false, true, true, 0.0001, 1.5707963267948966, 0U, 0U, "", ""},
+    {"range", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_scene_save{{
@@ -110,7 +143,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_trace_replay{{
     {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.relay-trace\\.jsonl$", ""},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 38> methods{{
+constexpr std::array<ProtocolMethodSpec, 41> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current run, pause, frame, simulation time and resolution state.", true, false, false, no_fields},
     {"runtime.pause", "runtime_pause", "Pause Relay runtime", "Pause automatic simulation so the scene can be inspected deterministically.", false, false, true, no_fields},
     {"runtime.resume", "runtime_resume", "Resume Relay runtime", "Resume automatic simulation after an inspection or controlled frame step.", false, false, true, no_fields},
@@ -137,11 +170,14 @@ constexpr std::array<ProtocolMethodSpec, 38> methods{{
     {"scene.create", "scene_create", "Create scene entity", "Create a named entity, optionally parented to another live entity.", false, false, false, fields_scene_create},
     {"scene.destroy", "scene_destroy", "Destroy scene entity", "Destroy an entity and its descendants as one undoable transaction.", false, true, false, fields_scene_destroy},
     {"scene.set_transform", "scene_set_transform", "Set entity transform", "Update selected local position, Euler rotation or scale fields in one transaction.", false, false, false, fields_scene_set_transform},
-    {"scene.set_camera", "scene_set_camera", "Configure entity camera", "Add, update or remove a perspective camera component; activating one camera deactivates the previous camera.", false, false, false, fields_scene_set_camera},
+    {"scene.set_camera", "scene_set_camera", "Configure entity camera", "Add, update or remove a perspective or orthographic camera; activating one deactivates the previous camera.", false, false, false, fields_scene_set_camera},
     {"scene.set_renderer", "scene_set_renderer", "Configure entity renderer", "Attach a registered built-in or imported mesh and material to an entity, or remove its renderer component.", false, false, false, fields_scene_set_renderer},
     {"scene.set_parent", "scene_set_parent", "Set entity parent", "Reparent an entity safely; use null to move it to the scene root.", false, false, false, fields_scene_set_parent},
     {"scene.undo", "scene_undo", "Undo scene change", "Undo the most recent scene transaction and restore exact entity generations.", false, false, false, no_fields},
     {"scene.redo", "scene_redo", "Redo scene change", "Reapply the most recently undone scene transaction.", false, false, false, no_fields},
+    {"scene.set_animation", "scene_set_animation", "Control imported animation", "Configure clip, playback, looping, speed and seek time on an imported model root.", false, false, false, fields_scene_set_animation},
+    {"scene.set_morph", "scene_set_morph", "Set imported morph weight", "Override a mesh morph weight, or reset all overrides to imported defaults and animation.", false, false, false, fields_scene_set_morph},
+    {"scene.set_light", "scene_set_light", "Configure scene light", "Add, update or remove a directional, point or spot light.", false, false, false, fields_scene_set_light},
     {"scene.snapshot", "scene_snapshot", "Snapshot Relay scene", "Return deterministic scene JSON plus reflected component field metadata.", true, false, false, no_fields},
     {"scene.save", "scene_save", "Save Relay scene", "Atomically save the current scene in Relay's project-local scenes directory.", false, true, true, fields_scene_save},
     {"scene.load", "scene_load", "Load Relay scene", "Validate, migrate and load a project scene as one undoable transaction.", false, false, false, fields_scene_load},

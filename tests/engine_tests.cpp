@@ -9,6 +9,7 @@
 #include "relay/scene/scene.hpp"
 #include "relay/scene/scene_history.hpp"
 #include "relay/scene/scene_io.hpp"
+#include "../src/render/gltf_animation.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -314,12 +315,13 @@ int main() {
     for (const auto entity : camera_scene.entities()) {
         const auto* record = camera_scene.get(entity);
         if (record->camera && entity != existing_camera) {
-            imported_camera_entity = entity;
+            if (record->camera->orthographic_height == 0.0)
+                imported_camera_entity = entity;
             ++camera_count;
         }
     }
     const auto* camera_record = camera_scene.get(imported_camera_entity);
-    expect(camera_import.imported && camera_count == 1U && camera_record &&
+    expect(camera_import.imported && camera_count == 2U && camera_record &&
                !camera_record->camera->active &&
                std::abs(camera_record->camera->field_of_view_y_degrees - 60.0) < 0.001 &&
                std::abs(camera_record->camera->near_plane - 0.25) < 0.001 &&
@@ -327,8 +329,8 @@ int main() {
                camera_scene.active_camera() == existing_camera,
            "perspective cameras preserve projection without stealing the active camera: " +
                import_error + camera_scene.serialize_json());
-    expect(camera_import.json().find("orthographic camera") != std::string::npos,
-           "unsupported orthographic cameras produce an explicit diagnostic");
+    expect(camera_import.warnings.empty(),
+           "perspective and orthographic cameras import without warnings");
     if (camera_record) {
         const auto* node = camera_scene.get(camera_record->parent);
         expect(node && node->name == "Perspective" && node->transform.position.z == 5.0 &&
@@ -370,6 +372,259 @@ int main() {
                        imported_camera_entity,
                "imported cameras can be activated through the existing scene interface");
     }
+
+    relay::Engine dynamic_engine;
+    std::string dynamic_error;
+    const auto dynamic =
+        relay::import_model_asset(assets_root, "relay-dynamic-golden.gltf", dynamic_engine.assets(),
+                                  &dynamic_engine.scene(), dynamic_error);
+    const auto *dynamic_model = dynamic_engine.assets().find_model(dynamic.model);
+    const auto *dynamic_mesh = dynamic.meshes.empty()
+                                   ? nullptr
+                                   : dynamic_engine.assets().find_mesh(dynamic.meshes.front());
+    expect(dynamic.imported && dynamic_model && dynamic_model->clips.size() == 2U && dynamic_mesh &&
+               dynamic_mesh->joints.size() == 2U && dynamic_mesh->skin.size() == 3U &&
+               dynamic_mesh->morph_targets.size() == 1U,
+           "dynamic golden imports skeleton, skin, clips and morph targets: " + dynamic_error);
+    if (dynamic.imported && dynamic_model && dynamic_mesh) {
+        const auto root = dynamic.roots.front();
+        relay::ControlProtocol dynamic_protocol(dynamic_engine);
+        const auto command = [&](std::string_view method, relay::Entity entity,
+                                 std::string_view fields) {
+            return dynamic_protocol.handle("{\"id\":900,\"method\":\"" + std::string(method) +
+                                           "\",\"entity\":\"" + entity.to_string() + "\"" +
+                                           std::string(fields) + "}");
+        };
+        const auto pose0 =
+            relay::build_render_scene(dynamic_engine.scene(), dynamic_engine.assets(), 1.0F);
+        expect(pose0.deformed_vertices.size() == 3U && pose0.lights.size() == 3U,
+               "dynamic geometry and all punctual light types reach the render scene");
+        expect(command("scene.set_animation", root, ",\"clip\":0,\"time_seconds\":0.5")
+                       .find("\"ok\":true") != std::string::npos,
+               "animation control supports deterministic seeking");
+        const auto half_pose =
+            relay::build_render_scene(dynamic_engine.scene(), dynamic_engine.assets(), 1.0F);
+        expect(half_pose.deformed_vertices.size() == 3U &&
+                   std::abs(half_pose.deformed_vertices[0].z - 0.5F) < 0.001F &&
+                   std::abs(half_pose.deformed_vertices[1].y) < 0.001F &&
+                   std::abs(half_pose.deformed_vertices[2].y - 0.75F) < 0.001F,
+               "morph interpolation is applied before weighted skinning at the expected half-time "
+               "pose");
+        const auto mesh_entity = half_pose.instances.front().entity;
+        expect(command("scene.set_morph", mesh_entity, ",\"target\":0,\"weight\":0.25")
+                       .find("\"ok\":true") != std::string::npos,
+               "morph weights can be overridden through the protocol");
+        const auto overridden =
+            relay::build_render_scene(dynamic_engine.scene(), dynamic_engine.assets(), 1.0F);
+        expect(std::abs(overridden.deformed_vertices[0].z - 0.25F) < 0.001F,
+               "manual morph weights override animated weights");
+        expect(command("scene.set_morph", mesh_entity, ",\"reset\":true").find("\"ok\":true") !=
+                   std::string::npos,
+               "reset restores animated morph weights");
+        expect(command("scene.set_animation", root, ",\"clip\":1,\"time_seconds\":0.5")
+                       .find("\"ok\":true") != std::string::npos,
+               "animation clips can be switched");
+        const auto rotated =
+            relay::build_render_scene(dynamic_engine.scene(), dynamic_engine.assets(), 1.0F);
+        expect(std::abs(rotated.deformed_vertices[0].x) < 0.001F &&
+                   std::abs(rotated.deformed_vertices[0].y + 0.70710678F) < 0.001F,
+               "quaternion rotation uses shortest-path spherical interpolation");
+        (void)command("scene.set_animation", root,
+                      ",\"clip\":0,\"time_seconds\":0,\"playing\":true,\"loop\":false");
+        dynamic_engine.pause();
+        dynamic_engine.tick();
+        expect(dynamic_engine.scene().get(root)->animator->time_seconds == 0.0,
+               "pause freezes animation time");
+        dynamic_engine.step(30);
+        expect(std::abs(dynamic_engine.scene().get(root)->animator->time_seconds - 0.5) < 1e-9,
+               "fixed steps advance animation deterministically while paused");
+        dynamic_engine.step(31);
+        expect(dynamic_engine.scene().get(root)->animator->time_seconds == 1.0 &&
+                   !dynamic_engine.scene().get(root)->animator->playing,
+               "nonlooping playback stops at the last pose");
+        const auto dynamic_scene_path =
+            std::filesystem::temp_directory_path() / "relay-dynamic-scene.relay.json";
+        expect(relay::save_scene_file_atomic(dynamic_engine.scene(), dynamic_scene_path,
+                                             dynamic_error),
+               "dynamic scene saves: " + dynamic_error);
+        const auto loaded = relay::load_scene_file(dynamic_scene_path);
+        expect(static_cast<bool>(loaded), "dynamic scene validates: " + loaded.error);
+        if (loaded) {
+            relay::Scene restored;
+            restored.restore_state(*loaded.state);
+            expect(restored.serialize_json() == dynamic_engine.scene().serialize_json(),
+                   "animation state, node bindings, light and morph components survive restart");
+        }
+        std::filesystem::remove(dynamic_scene_path);
+        const auto reload_root =
+            std::filesystem::temp_directory_path() / "relay-phase-d-reload-tests";
+        std::filesystem::create_directories(reload_root);
+        std::filesystem::copy_file(assets_root / "relay-dynamic-golden.gltf",
+                                   reload_root / "dynamic.gltf",
+                                   std::filesystem::copy_options::overwrite_existing);
+        relay::ImportManifest dynamic_manifest;
+        relay::ImportManifestEntry entry{"dynamic.gltf",
+                                         relay::model_importer_version,
+                                         dynamic.content_id,
+                                         {"dynamic.gltf"},
+                                         dynamic.meshes,
+                                         dynamic.materials,
+                                         dynamic.textures,
+                                         "scene",
+                                         dynamic_model->binding_layout,
+                                         {}};
+        for (const auto &clip : dynamic_model->clips)
+            entry.clips.push_back(clip.name);
+        dynamic_manifest.record(entry);
+        expect(dynamic_manifest.save(reload_root, dynamic_error), "dynamic manifest saves");
+        relay::AssetRegistry restarted_assets;
+        const auto restarted = relay::reload_imported_assets(reload_root, restarted_assets);
+        expect(restarted.restored == 1U && restarted_assets.find_model(dynamic.model),
+               "manifest reload restores immutable skeleton/morph/clip data in a fresh process");
+        std::ifstream original_file(reload_root / "dynamic.gltf");
+        std::string original{std::istreambuf_iterator<char>{original_file}, {}};
+        const auto factor = original.find("\"roughnessFactor\": 0.8");
+        expect(factor != std::string::npos, "dynamic fixture contains expected material factor");
+        if (factor != std::string::npos)
+            original.replace(factor, 22U, "\"roughnessFactor\": 0.4");
+        write_file(reload_root / "dynamic.gltf", original);
+        relay::AssetRegistry changed_assets;
+        auto changed_report = relay::reload_imported_assets(reload_root, changed_assets);
+        relay::Scene rebound_scene;
+        rebound_scene.restore_state(dynamic_engine.scene().capture_state());
+        expect(changed_report.changed == 1U && changed_report.rebind_scene(rebound_scene) == 2U &&
+                   changed_assets.find_model(rebound_scene.get(root)->animator->model),
+               "compatible changed-source reload rebinds both renderers and animation models");
+        const auto replayed = relay::build_render_scene(rebound_scene, changed_assets, 1.0F);
+        expect(replayed.deformed_vertices.size() == 3U &&
+                   std::abs(replayed.deformed_vertices[0].z - 1.0F) < 0.001F,
+               "saved terminal animation pose renders correctly after changed-source reload");
+        const auto bone_name = original.find("TipBone");
+        if (bone_name != std::string::npos)
+            original.replace(bone_name, 7U, "RenamedBone");
+        write_file(reload_root / "dynamic.gltf", original);
+        relay::AssetRegistry structural_assets;
+        auto structural_report = relay::reload_imported_assets(reload_root, structural_assets);
+        relay::Scene structural_scene;
+        structural_scene.restore_state(dynamic_engine.scene().capture_state());
+        (void)structural_report.rebind_scene(structural_scene);
+        expect(structural_scene.get(root)->animator->model == dynamic.model &&
+                   !structural_report.messages.empty(),
+               "incompatible node ordering/names never silently rebind saved animation state");
+        std::filesystem::remove_all(reload_root);
+        const auto second = relay::import_model_asset(assets_root, "relay-dynamic-golden.gltf",
+                                                      dynamic_engine.assets(),
+                                                      &dynamic_engine.scene(), dynamic_error);
+        expect(second.imported && second.content_id == dynamic.content_id &&
+                   second.roots.front() != root,
+               "reimport reuses immutable assets while giving each instance independent playback");
+        const auto two_instances =
+            relay::build_render_scene(dynamic_engine.scene(), dynamic_engine.assets(), 1.0F);
+        expect(two_instances.deformed_vertices.size() == 6U,
+               "independent instances receive separate deformation slices");
+    }
+
+    for (const auto *filename : {"relay-dynamic-golden.glb", "relay-dynamic-golden.fbx"}) {
+        relay::AssetRegistry round_trip_assets;
+        relay::Scene round_trip_scene;
+        const auto imported = relay::import_model_asset(assets_root, filename, round_trip_assets,
+                                                        &round_trip_scene, dynamic_error);
+        const auto *model = round_trip_assets.find_model(imported.model);
+        bool has_skin = false, has_morph = false;
+        for (const auto &mesh : round_trip_assets.meshes()) {
+            has_skin = has_skin || !mesh.joints.empty();
+            has_morph = has_morph || !mesh.morph_targets.empty();
+        }
+        expect(imported.imported && model && !model->clips.empty() && has_skin && has_morph,
+               std::string{"Blender round trip preserves clips, skin and morphs through "} +
+                   filename + ": " + dynamic_error);
+    }
+    relay::AssetRegistry camera_only_assets;
+    relay::Scene camera_only_scene;
+    const auto camera_only =
+        relay::import_model_asset(assets_root, "relay-camera-only.gltf", camera_only_assets,
+                                  &camera_only_scene, dynamic_error);
+    expect(camera_only.imported && camera_only.meshes.empty() && !camera_only.roots.empty(),
+           "camera-only models do not require a dummy mesh: " + dynamic_error);
+    if (camera_only.imported) {
+        for (const auto entity : camera_only_scene.entities())
+            if (const auto &camera = camera_only_scene.get(entity)->camera) {
+                expect(std::abs(camera->orthographic_height - 2.0) < 0.001,
+                       "orthographic import preserves full viewport height");
+                auto active = *camera;
+                active.active = true;
+                expect(camera_only_scene.set_camera(entity, active),
+                       "activate orthographic camera");
+                const auto render =
+                    relay::build_render_scene(camera_only_scene, camera_only_assets, 2.0F);
+                expect(std::abs(render.camera.view_projection.values[0] - 0.5F) < 0.001F &&
+                           std::abs(render.camera.view_projection.values[5] + 1.0F) < 0.001F,
+                       "orthographic projection reaches rendering with Vulkan depth/Y conventions");
+            }
+    }
+
+    relay::AssetRegistry curve_assets;
+    relay::AssetRegistry unnamed_assets;
+    relay::Scene unnamed_scene;
+    const auto unnamed = relay::import_model_asset(assets_root, "relay-unnamed-skin.gltf",
+        unnamed_assets, &unnamed_scene, dynamic_error);
+    expect(unnamed.imported, "unnamed joints and omitted inverse-bind matrices import: " + dynamic_error);
+    if (unnamed.imported) {
+        const auto* mesh = unnamed_assets.find_mesh(unnamed.meshes.front());
+        expect(mesh && mesh->joints.size() == 2U && mesh->joints[0].node != mesh->joints[1].node &&
+                   mesh->joints[1].inverse_bind[13] == 0.0F && mesh->joints[1].inverse_bind[0] == 1.0F,
+               "native glTF joint indices avoid Assimp default-name mismatches and synthesize identity binds");
+    }
+    relay::Scene curve_scene;
+    const auto curves = relay::import_model_asset(assets_root, "relay-curves-golden.gltf",
+                                                  curve_assets, &curve_scene, dynamic_error);
+    expect(curves.imported, "STEP/cubic fixture imports: " + dynamic_error);
+    if (curves.imported) {
+        const auto root = curves.roots.front();
+        auto animator = *curve_scene.get(root)->animator;
+        animator.time_seconds = 0.5;
+        expect(curve_scene.set_animator(root, animator), "set STEP animation time");
+        const auto step_pose = relay::build_render_scene(curve_scene, curve_assets, 1.0F);
+        expect(step_pose.deformed_vertices.size() == 3U &&
+                   std::abs(step_pose.deformed_vertices[1].y + 0.5F) < 0.001F &&
+                   std::abs(step_pose.deformed_vertices[0].z) < 0.001F,
+               "STEP animation holds the previous pose and morph weight");
+        animator.clip = 1;
+        expect(curve_scene.set_animator(root, animator), "select cubic animation");
+        const auto cubic_pose = relay::build_render_scene(curve_scene, curve_assets, 1.0F);
+        expect(cubic_pose.deformed_vertices.size() == 3U &&
+                   std::abs(cubic_pose.deformed_vertices[0].z - 1.0F) < 0.001F &&
+                   std::abs(cubic_pose.deformed_vertices[1].x) < 0.001F &&
+                   std::abs(cubic_pose.deformed_vertices[1].y - 0.70710678F) < 0.001F,
+               "cubic position, morph and normalized quaternion curves preserve glTF tangents");
+    }
+
+    for (const auto count : {2U, 4'000'001U}) {
+        const auto document = std::string{R"({"buffers":[{"byteLength":4,"uri":"data:application/octet-stream;base64,AACAPw=="}],"bufferViews":[{"buffer":0,"byteLength":4}],"accessors":[{"bufferView":0,"componentType":5126,"count":)"} +
+            std::to_string(count) + R"(,"type":"SCALAR"}]})";
+        bool rejected = false;
+        try {
+            relay::detail::GltfAnimationReader reader{"bounded.gltf", [&](const std::string&, std::vector<std::uint8_t>& bytes) {
+                bytes.assign(document.begin(), document.end()); return true;
+            }};
+            (void)reader.accessor(0U, 1U);
+        } catch (const std::exception&) { rejected = true; }
+        expect(rejected, "native animation accessor decoder rejects view overflow and excessive sample counts");
+    }
+
+    relay::AssetRegistry static_dynamic_assets;
+    relay::Scene static_dynamic_scene;
+    relay::ModelImportSettings static_dynamic_settings;
+    static_dynamic_settings.preset = "static_mesh";
+    const auto static_dynamic = relay::import_model_asset(assets_root, "relay-dynamic-golden.gltf",
+        static_dynamic_assets, &static_dynamic_scene, dynamic_error, static_dynamic_settings);
+    const auto* static_model = static_dynamic_assets.find_model(static_dynamic.model);
+    const auto* static_mesh = static_dynamic.meshes.empty() ? nullptr : static_dynamic_assets.find_mesh(static_dynamic.meshes.front());
+    const auto static_render = relay::build_render_scene(static_dynamic_scene, static_dynamic_assets, 1.0F);
+    expect(static_dynamic.imported && static_model && static_model->clips.empty() && static_mesh &&
+               static_mesh->skin.empty() && static_mesh->morph_targets.empty() && static_render.lights.empty() &&
+               static_render.deformed_vertices.empty() && static_dynamic.content_id != dynamic.content_id,
+           "static_mesh consistently strips dynamic channels/components and uses a distinct durable identity");
 
     relay::AssetRegistry golden_gltf_registry;
     relay::AssetRegistry golden_glb_registry;
@@ -751,7 +1006,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 4U && relay::protocol_methods().size() == 38U,
+    expect(relay::protocol_schema_version == 5U && relay::protocol_methods().size() == 41U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");

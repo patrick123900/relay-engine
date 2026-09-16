@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <sstream>
+#include <iomanip>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -308,10 +310,51 @@ inline std::string json_escape(const std::string_view value) {
         case '\n': escaped += "\\n"; break;
         case '\r': escaped += "\\r"; break;
         case '\t': escaped += "\\t"; break;
-        default: escaped += character; break;
+        default:
+            if (static_cast<unsigned char>(character) < 0x20U) {
+                constexpr char hex[] = "0123456789abcdef";
+                escaped += "\\u00";
+                escaped += hex[static_cast<unsigned char>(character) >> 4U];
+                escaped += hex[static_cast<unsigned char>(character) & 15U];
+            } else
+                escaped += character;
+            break;
         }
     }
     return escaped;
+}
+
+inline std::string json_stringify(const JsonValue &value) {
+    if (value.is_null())
+        return "null";
+    if (const auto *b = value.boolean())
+        return *b ? "true" : "false";
+    if (const auto *n = value.number()) {
+        std::ostringstream stream;
+        stream << std::setprecision(17) << *n;
+        return stream.str();
+    }
+    if (const auto *s = value.string())
+        return "\"" + json_escape(*s) + "\"";
+    std::string output;
+    if (const auto *a = value.array()) {
+        output = "[";
+        for (std::size_t i = 0; i < a->size(); ++i) {
+            if (i)
+                output += ',';
+            output += json_stringify((*a)[i]);
+        }
+        return output + "]";
+    }
+    output = "{";
+    bool first = true;
+    for (const auto &[key, v] : *value.object()) {
+        if (!first)
+            output += ',';
+        first = false;
+        output += "\"" + json_escape(key) + "\":" + json_stringify(v);
+    }
+    return output + "}";
 }
 
 inline const JsonValue* field(const JsonValue::Object& object, const std::string_view name) {

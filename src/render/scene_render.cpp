@@ -145,6 +145,15 @@ RenderMatrix perspective(const Camera& camera, const float aspect_ratio) {
     const float far_plane = static_cast<float>(camera.far_plane);
     const float focal_length = 1.0F / std::tan(fov * 0.5F);
     RenderMatrix result;
+    if (camera.orthographic_height > 0.0) {
+        result = identity();
+        const auto height = static_cast<float>(camera.orthographic_height);
+        result.values[0] = 2.0F / (height * std::max(aspect_ratio, 0.001F));
+        result.values[5] = -2.0F / height;
+        result.values[10] = 1.0F / (near_plane - far_plane);
+        result.values[14] = near_plane / (near_plane - far_plane);
+        return result;
+    }
     result.values[0] = focal_length / std::max(aspect_ratio, 0.001F);
     result.values[5] = -focal_length; // Vulkan's framebuffer Y axis points down.
     result.values[10] = far_plane / (near_plane - far_plane);
@@ -196,6 +205,114 @@ std::array<float, 4> entity_color(const Entity entity) {
     return {channel(0U), channel(8U), channel(16U), 1.0F};
 }
 
+template <class Key>
+std::pair<std::size_t, float> key_interval(const std::vector<Key> &keys, double time) {
+    if (keys.size() < 2U || time <= keys.front().time)
+        return {0U, 0.0F};
+    const auto upper = std::upper_bound(keys.begin(), keys.end(), time,
+                                        [](double t, const Key &key) { return t < key.time; });
+    if (upper == keys.end())
+        return {keys.size() - 1U, 0.0F};
+    const auto index = static_cast<std::size_t>(upper - keys.begin() - 1);
+    return {index, static_cast<float>((time - keys[index].time) /
+                                      (keys[index + 1U].time - keys[index].time))};
+}
+
+double hermite(double x, double y, double out, double in, double a, double duration) {
+    const auto a2 = a * a, a3 = a2 * a;
+    return (2 * a3 - 3 * a2 + 1) * x + (a3 - 2 * a2 + a) * duration * out + (-2 * a3 + 3 * a2) * y +
+           (a3 - a2) * duration * in;
+}
+Vec3 sample_vector(const std::vector<VectorKey> &keys, double time, Vec3 fallback,
+                   AnimationInterpolation mode) {
+    if (keys.empty())
+        return fallback;
+    const auto [i, a] = key_interval(keys, time);
+    const auto &x = keys[i].value;
+    const auto &y = keys[std::min(i + 1U, keys.size() - 1U)].value;
+    if (mode == AnimationInterpolation::step)
+        return x;
+    if (mode == AnimationInterpolation::cubic && i + 1U < keys.size()) {
+        const auto duration = keys[i + 1U].time - keys[i].time;
+        const auto &out = keys[i].out_tangent;
+        const auto &in = keys[i + 1U].in_tangent;
+        return {hermite(x.x, y.x, out.x, in.x, a, duration),
+                hermite(x.y, y.y, out.y, in.y, a, duration),
+                hermite(x.z, y.z, out.z, in.z, a, duration)};
+    }
+    return {x.x + (y.x - x.x) * a, x.y + (y.y - x.y) * a, x.z + (y.z - x.z) * a};
+}
+
+RenderMatrix animated_local(const Transform &base, const NodeTrack &track, double time) {
+    auto transform = base;
+    transform.position =
+        sample_vector(track.positions, time, base.position, track.position_interpolation);
+    transform.scale = sample_vector(track.scales, time, base.scale, track.scale_interpolation);
+    if (track.rotations.empty())
+        return local_matrix(transform);
+    const auto [i, alpha] = key_interval(track.rotations, time);
+    auto q = track.rotations[i].value;
+    auto target = track.rotations[std::min(i + 1U, track.rotations.size() - 1U)].value;
+    const bool cubic = track.rotation_interpolation == AnimationInterpolation::cubic;
+    double dot = 0.0;
+    for (unsigned k = 0; k < 4; ++k)
+        dot += q[k] * target[k];
+    if (!cubic && dot < 0.0) {
+        for (auto &v : target)
+            v = -v;
+        dot = -dot;
+    }
+    const auto blend = track.rotation_interpolation == AnimationInterpolation::step ? 0.0 : alpha;
+    double a = 1.0 - blend, b = blend;
+    if (!cubic && dot < 0.9995) {
+        const double angle = std::acos(std::clamp(dot, -1.0, 1.0));
+        a = std::sin((1.0 - blend) * angle) / std::sin(angle);
+        b = std::sin(blend * angle) / std::sin(angle);
+    }
+    double length = 0.0;
+    for (unsigned k = 0; k < 4; ++k) {
+        q[k] = cubic && i + 1U < track.rotations.size()
+                   ? hermite(q[k], target[k], track.rotations[i].out_tangent[k],
+                             track.rotations[i + 1U].in_tangent[k], alpha,
+                             track.rotations[i + 1U].time - track.rotations[i].time)
+                   : a * q[k] + b * target[k];
+        length += q[k] * q[k];
+    }
+    length = std::sqrt(length);
+    if (length < 1e-12)
+        return local_matrix(transform);
+    for (auto &v : q)
+        v /= length;
+    const auto [x, y, z, w] = q;
+    auto rotation = identity();
+    rotation.values[0] = static_cast<float>(1 - 2 * (y * y + z * z));
+    rotation.values[1] = static_cast<float>(2 * (x * y + w * z));
+    rotation.values[2] = static_cast<float>(2 * (x * z - w * y));
+    rotation.values[4] = static_cast<float>(2 * (x * y - w * z));
+    rotation.values[5] = static_cast<float>(1 - 2 * (x * x + z * z));
+    rotation.values[6] = static_cast<float>(2 * (y * z + w * x));
+    rotation.values[8] = static_cast<float>(2 * (x * z + w * y));
+    rotation.values[9] = static_cast<float>(2 * (y * z - w * x));
+    rotation.values[10] = static_cast<float>(1 - 2 * (x * x + y * y));
+    return multiply(translation(transform.position), multiply(rotation, scaling(transform.scale)));
+}
+
+Vec3 transform_point(const RenderMatrix &m, Vec3 p, bool direction = false) {
+    const auto &v = m.values;
+    return {v[0] * p.x + v[4] * p.y + v[8] * p.z + (direction ? 0.0 : v[12]),
+            v[1] * p.x + v[5] * p.y + v[9] * p.z + (direction ? 0.0 : v[13]),
+            v[2] * p.x + v[6] * p.y + v[10] * p.z + (direction ? 0.0 : v[14])};
+}
+Vec3 normalized(Vec3 v) {
+    const auto length = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (length > 1e-12) {
+        v.x /= length;
+        v.y /= length;
+        v.z /= length;
+    }
+    return v;
+}
+
 } // namespace
 
 RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
@@ -204,6 +321,22 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
     const auto entities = scene.entities();
     std::unordered_map<std::uint64_t, RenderMatrix> world_matrices;
     world_matrices.reserve(entities.size());
+    std::unordered_map<std::uint64_t, std::unordered_map<std::uint32_t, Entity>> model_nodes;
+    for (const auto entity : entities) {
+        if (const auto &binding = scene.get(entity)->model_node)
+            model_nodes[binding->root.packed()][binding->node] = entity;
+    }
+    const auto clip_for =
+        [&](const ModelNode &binding) -> std::pair<const AnimationClip *, double> {
+        const auto *root = scene.get(binding.root);
+        if (!root || !root->animator)
+            return {nullptr, 0.0};
+        const auto &animator = *root->animator;
+        const auto *model = assets.find_model(animator.model);
+        if (!model || animator.clip >= model->clips.size())
+            return {nullptr, 0.0};
+        return {&model->clips[animator.clip], animator.time_seconds};
+    };
 
     const auto resolve_world = [&](const auto& self, const Entity entity) -> RenderMatrix {
         if (const auto found = world_matrices.find(entity.packed()); found != world_matrices.end()) {
@@ -211,6 +344,15 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         }
         const auto* record = scene.get(entity);
         auto world = record == nullptr ? identity() : local_matrix(record->transform);
+        if (record && record->model_node) {
+            const auto [clip, time] = clip_for(*record->model_node);
+            if (clip)
+                for (const auto &track : clip->tracks)
+                    if (track.node == record->model_node->node) {
+                        world = animated_local(record->transform, track, time);
+                        break;
+                    }
+        }
         if (record != nullptr && record->parent.valid()) {
             world = multiply(self(self, record->parent), world);
         }
@@ -228,6 +370,13 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
     }
     output.camera.view_projection = multiply(perspective(selected_camera, aspect_ratio),
                                              inverse(camera_world));
+    output.camera_position = transform_point(camera_world, {});
+    for (const auto entity : entities)
+        if (const auto &light = scene.get(entity)->light) {
+            const auto world = resolve_world(resolve_world, entity);
+            output.lights.push_back({*light, transform_point(world, {}),
+                                     normalized(transform_point(world, {0, 0, -1}, true))});
+        }
 
     output.instances.reserve(entities.size());
     for (const auto entity : entities) {
@@ -240,8 +389,138 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         const auto& material = record->mesh_renderer->material;
         const auto* mesh_asset = assets.find_mesh(mesh);
         const auto model_view_projection = multiply(output.camera.view_projection, model);
-        if (mesh_asset != nullptr &&
-            outside_frustum(model_view_projection, mesh_asset->bounds_min, mesh_asset->bounds_max)) {
+        std::vector<MeshVertex> deformed;
+        auto low = mesh_asset ? mesh_asset->bounds_min : std::array<float, 3>{};
+        auto high = mesh_asset ? mesh_asset->bounds_max : std::array<float, 3>{};
+        if (mesh_asset && (!mesh_asset->skin.empty() || !mesh_asset->morph_targets.empty())) {
+            if (output.deformed_vertices.size() + mesh_asset->vertex_count > 4'000'000U) {
+                ++output.deformation_overflow;
+                continue;
+            }
+            const auto start = static_cast<std::size_t>(mesh_asset->vertex_offset);
+            const auto vertices = assets.mesh_vertices();
+            if (start + mesh_asset->vertex_count <= vertices.size()) {
+                deformed.assign(vertices.begin() + start,
+                                vertices.begin() + start + mesh_asset->vertex_count);
+                const EntityRecord *binding_record = record;
+                while (!binding_record->model_node && binding_record->parent.valid())
+                    binding_record = scene.get(binding_record->parent);
+                auto weights = record->mesh_renderer->morph_weights;
+                if (weights.empty()) {
+                    for (const auto &target : mesh_asset->morph_targets)
+                        weights.push_back(target.weight);
+                    if (binding_record->model_node) {
+                        const auto [clip, time] = clip_for(*binding_record->model_node);
+                        const auto suffix = mesh.find_last_of('.');
+                        const auto mesh_index =
+                            static_cast<std::uint32_t>(std::stoul(mesh.substr(suffix + 1U)));
+                        if (clip)
+                            for (const auto &track : clip->morph_tracks)
+                                if (track.mesh == mesh_index && !track.keys.empty()) {
+                                    const auto [i, a] = key_interval(track.keys, time);
+                                    weights = track.keys[i].weights;
+                                    const auto &next =
+                                        track.keys[std::min(i + 1U, track.keys.size() - 1U)]
+                                            .weights;
+                                    for (std::size_t t = 0; t < weights.size(); ++t) {
+                                        if (track.interpolation == AnimationInterpolation::cubic &&
+                                            i + 1U < track.keys.size())
+                                            weights[t] = hermite(
+                                                weights[t], next[t], track.keys[i].out_tangent[t],
+                                                track.keys[i + 1U].in_tangent[t], a,
+                                                track.keys[i + 1U].time - track.keys[i].time);
+                                        else if (track.interpolation !=
+                                                 AnimationInterpolation::step)
+                                            weights[t] += (next[t] - weights[t]) * a;
+                                    }
+                                }
+                    }
+                }
+                for (std::size_t t = 0;
+                     t < std::min(weights.size(), mesh_asset->morph_targets.size()); ++t) {
+                    const auto &target = mesh_asset->morph_targets[t];
+                    for (std::size_t v = 0; v < deformed.size(); ++v) {
+                        auto &p = deformed[v];
+                        const auto &d = target.deltas[v];
+                        const float w = static_cast<float>(weights[t]);
+                        p.x += w * d.x;
+                        p.y += w * d.y;
+                        p.z += w * d.z;
+                        p.nx += w * d.nx;
+                        p.ny += w * d.ny;
+                        p.nz += w * d.nz;
+                        p.tx += w * d.tx;
+                        p.ty += w * d.ty;
+                        p.tz += w * d.tz;
+                    }
+                }
+                std::vector<RenderMatrix> joints;
+                if (binding_record->model_node)
+                    for (const auto &joint : mesh_asset->joints) {
+                        const auto &nodes = model_nodes[binding_record->model_node->root.packed()];
+                        const auto found = nodes.find(joint.node);
+                        joints.push_back(
+                            found == nodes.end()
+                                ? identity()
+                                : multiply(inverse(model),
+                                           multiply(resolve_world(resolve_world, found->second),
+                                                    RenderMatrix{joint.inverse_bind})));
+                    }
+                std::vector<RenderMatrix> normal_joints;
+                for (const auto &joint : joints) {
+                    const auto inverted = inverse(joint);
+                    RenderMatrix normal;
+                    for (unsigned r = 0; r < 4; ++r)
+                        for (unsigned c = 0; c < 4; ++c)
+                            normal.values[c * 4 + r] = inverted.values[r * 4 + c];
+                    normal_joints.push_back(normal);
+                }
+                for (std::size_t v = 0; v < deformed.size(); ++v) {
+                    auto &p = deformed[v];
+                    if (!joints.empty() && v < mesh_asset->skin.size() &&
+                        !mesh_asset->skin[v].empty()) {
+                        Vec3 position{}, normal{}, tangent{};
+                        for (const auto &weight : mesh_asset->skin[v]) {
+                            const auto &matrix = joints[weight.joint];
+                            const auto point = transform_point(matrix, {p.x, p.y, p.z});
+                            const auto n = transform_point(normal_joints[weight.joint],
+                                                           {p.nx, p.ny, p.nz}, true);
+                            const auto t = transform_point(matrix, {p.tx, p.ty, p.tz}, true);
+                            position.x += point.x * weight.weight;
+                            position.y += point.y * weight.weight;
+                            position.z += point.z * weight.weight;
+                            normal.x += n.x * weight.weight;
+                            normal.y += n.y * weight.weight;
+                            normal.z += n.z * weight.weight;
+                            tangent.x += t.x * weight.weight;
+                            tangent.y += t.y * weight.weight;
+                            tangent.z += t.z * weight.weight;
+                        }
+                        p.x = static_cast<float>(position.x);
+                        p.y = static_cast<float>(position.y);
+                        p.z = static_cast<float>(position.z);
+                        normal = normalized(normal);
+                        tangent = normalized(tangent);
+                        p.nx = static_cast<float>(normal.x);
+                        p.ny = static_cast<float>(normal.y);
+                        p.nz = static_cast<float>(normal.z);
+                        p.tx = static_cast<float>(tangent.x);
+                        p.ty = static_cast<float>(tangent.y);
+                        p.tz = static_cast<float>(tangent.z);
+                    }
+                    if (v == 0U) {
+                        low = {p.x, p.y, p.z};
+                        high = low;
+                    } else
+                        for (unsigned c = 0; c < 3; ++c) {
+                            const float value = c == 0 ? p.x : c == 1 ? p.y : p.z;
+                            low[c] = std::min(low[c], value);
+                            high[c] = std::max(high[c], value);
+                        }
+                }
+            }
+        }
+        if (mesh_asset != nullptr && outside_frustum(model_view_projection, low, high)) {
             ++output.culled;
             continue;
         }
@@ -262,6 +541,12 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
                        ? assets.texture_index(name) : missing_texture;
         };
         RenderInstance instance;
+        if (!deformed.empty()) {
+            instance.deformed_vertex_offset =
+                static_cast<std::int32_t>(output.deformed_vertices.size());
+            output.deformed_vertices.insert(output.deformed_vertices.end(), deformed.begin(),
+                                            deformed.end());
+        }
         instance.entity = entity;
         instance.model = model;
         instance.model_view_projection = model_view_projection;

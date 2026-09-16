@@ -91,7 +91,20 @@ struct VulkanWindow::Impl {
     std::vector<GpuTexture> textures;
     VkDescriptorSetLayout texture_layout{};
     VkDescriptorPool texture_pool{};
-    VkDescriptorSet texture_set{};
+    std::array<VkDescriptorSet, frames_in_flight> texture_sets{};
+    std::array<VkBuffer, frames_in_flight> deformed_buffers{}, lighting_buffers{};
+    std::array<VkDeviceMemory, frames_in_flight> deformed_memories{}, lighting_memories{};
+    std::array<VkDeviceSize, frames_in_flight> deformed_capacities{};
+    struct alignas(16) GpuLight {
+        std::array<float, 4> position_type{}, direction_inner{}, color_intensity{},
+            attenuation_outer{};
+        std::array<float, 4> range{};
+    };
+    struct alignas(16) GpuLighting {
+        std::array<float, 4> camera_count{0, 0, 5, 0};
+        std::array<GpuLight, 16> lights{};
+    };
+    static_assert(sizeof(GpuLight)==80U && sizeof(GpuLighting)==1296U);
     VkSwapchainKHR swapchain{};
     VkFormat swapchain_format{VK_FORMAT_UNDEFINED};
     VkExtent2D swapchain_extent{};
@@ -136,6 +149,10 @@ struct VulkanWindow::Impl {
         cleanup_swapchain();
         if (device != VK_NULL_HANDLE) {
             for (std::size_t index = 0; index < frames_in_flight; ++index) {
+                vkDestroyBuffer(device, deformed_buffers[index], nullptr);
+                vkFreeMemory(device, deformed_memories[index], nullptr);
+                vkDestroyBuffer(device, lighting_buffers[index], nullptr);
+                vkFreeMemory(device, lighting_memories[index], nullptr);
                 vkDestroyFence(device, frame_fences[index], nullptr);
                 vkDestroySemaphore(device, render_finished[index], nullptr);
                 vkDestroySemaphore(device, image_available[index], nullptr);
@@ -518,7 +535,7 @@ struct VulkanWindow::Impl {
         material_memory = VK_NULL_HANDLE;
         vkDestroyDescriptorPool(device, texture_pool, nullptr);
         texture_pool = VK_NULL_HANDLE;
-        texture_set = VK_NULL_HANDLE;
+        texture_sets.fill(VK_NULL_HANDLE);
         for (const auto& texture : textures) {
             vkDestroySampler(device, texture.sampler, nullptr);
             vkDestroyImageView(device, texture.view, nullptr);
@@ -795,7 +812,7 @@ struct VulkanWindow::Impl {
         }
         auto result = VK_SUCCESS;
         if (texture_layout == VK_NULL_HANDLE) {
-            std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+            std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
             bindings[0].binding = 0U;
             bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             bindings[0].descriptorCount = bindless_texture_capacity;
@@ -804,6 +821,8 @@ struct VulkanWindow::Impl {
             bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             bindings[1].descriptorCount = 1U;
             bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bindings[2] = bindings[1];
+            bindings[2].binding = 2U;
             VkDescriptorSetLayoutCreateInfo layout_info{};
             layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
             layout_info.bindingCount = static_cast<std::uint32_t>(bindings.size());
@@ -812,20 +831,23 @@ struct VulkanWindow::Impl {
         }
         const std::array pool_sizes{
             VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                 bindless_texture_capacity},
-            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1U}};
+                                 bindless_texture_capacity * frames_in_flight},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2U * frames_in_flight}};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pool_info.maxSets = 1U;
+        pool_info.maxSets = frames_in_flight;
         pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
         pool_info.pPoolSizes = pool_sizes.data();
         if (result == VK_SUCCESS) result = vkCreateDescriptorPool(device, &pool_info, nullptr, &texture_pool);
         VkDescriptorSetAllocateInfo set_info{};
         set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         set_info.descriptorPool = texture_pool;
-        set_info.descriptorSetCount = 1U;
-        set_info.pSetLayouts = &texture_layout;
-        if (result == VK_SUCCESS) result = vkAllocateDescriptorSets(device, &set_info, &texture_set);
+        std::array<VkDescriptorSetLayout, frames_in_flight> layouts{};
+        layouts.fill(texture_layout);
+        set_info.descriptorSetCount = frames_in_flight;
+        set_info.pSetLayouts = layouts.data();
+        if (result == VK_SUCCESS)
+            result = vkAllocateDescriptorSets(device, &set_info, texture_sets.data());
         if (result != VK_SUCCESS) {
             last_error = vk_error("bindless texture descriptor allocation", result);
             return false;
@@ -840,21 +862,33 @@ struct VulkanWindow::Impl {
         VkDescriptorBufferInfo material_info{};
         material_info.buffer = material_buffer;
         material_info.range = gpu_materials.size() * sizeof(GpuMaterial);
-        std::array<VkWriteDescriptorSet, 2> writes{};
+        std::array<VkWriteDescriptorSet, 3> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = texture_set;
         writes[0].dstBinding = 0U;
         writes[0].descriptorCount = bindless_texture_capacity;
         writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[0].pImageInfo = image_infos.data();
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = texture_set;
         writes[1].dstBinding = 1U;
         writes[1].descriptorCount = 1U;
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[1].pBufferInfo = &material_info;
-        vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(),
-                               0U, nullptr);
+        for (std::size_t f = 0; f < frames_in_flight; ++f) {
+            if (!lighting_buffers[f] &&
+                !create_buffer(sizeof(GpuLighting), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                               lighting_buffers[f], lighting_memories[f]))
+                return false;
+            VkDescriptorBufferInfo lighting_info{lighting_buffers[f], 0, sizeof(GpuLighting)};
+            writes[2] = writes[1];
+            writes[2].dstBinding = 2;
+            writes[2].pBufferInfo = &lighting_info;
+            for (auto &write : writes)
+                write.dstSet = texture_sets[f];
+            vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(),
+                                   0U, nullptr);
+        }
         uploaded_asset_revision = assets->revision();
         return true;
     }
@@ -1353,6 +1387,70 @@ struct VulkanWindow::Impl {
     bool record_commands(const VkCommandBuffer commands, const std::uint32_t image_index,
                          const float elapsed_seconds, const Scene* scene,
                          const VkBuffer capture_buffer) {
+        RenderScene render_scene;
+        if (scene && !scene->entities().empty())
+            render_scene =
+                build_render_scene(*scene, *assets,
+                                   static_cast<float>(swapchain_extent.width) /
+                                       static_cast<float>(std::max(swapchain_extent.height, 1U)));
+        if (render_scene.deformation_overflow) {
+            last_error = "scene exceeds four million deformed vertices per frame";
+            return false;
+        }
+        // This frame's fence has completed. Host writes never race another frame's reads.
+        const VkDeviceSize bytes = render_scene.deformed_vertices.size() * sizeof(MeshVertex);
+        if (bytes > deformed_capacities[current_frame]) {
+            vkDestroyBuffer(device, deformed_buffers[current_frame], nullptr);
+            vkFreeMemory(device, deformed_memories[current_frame], nullptr);
+            deformed_buffers[current_frame] = VK_NULL_HANDLE;
+            deformed_memories[current_frame] = VK_NULL_HANDLE;
+            if (!create_buffer(bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                               deformed_buffers[current_frame], deformed_memories[current_frame]))
+                return false;
+            deformed_capacities[current_frame] = bytes;
+        }
+        const auto write_memory = [&](VkDeviceMemory memory, const void *data, VkDeviceSize size) {
+            void *mapped = nullptr;
+            const auto result = vkMapMemory(device, memory, 0, size, 0, &mapped);
+            if (result != VK_SUCCESS) {
+                last_error = vk_error("animation/light frame upload", result);
+                return false;
+            }
+            std::memcpy(mapped, data, static_cast<std::size_t>(size));
+            vkUnmapMemory(device, memory);
+            return true;
+        };
+        if (bytes && !write_memory(deformed_memories[current_frame],
+                                   render_scene.deformed_vertices.data(), bytes))
+            return false;
+        GpuLighting lighting;
+        lighting.camera_count = {
+            static_cast<float>(render_scene.camera_position.x),
+            static_cast<float>(render_scene.camera_position.y),
+            static_cast<float>(render_scene.camera_position.z),
+            static_cast<float>(std::min<std::size_t>(16, render_scene.lights.size()))};
+        for (std::size_t i = 0; i < std::min<std::size_t>(16, render_scene.lights.size()); ++i) {
+            const auto &source = render_scene.lights[i];
+            auto &target = lighting.lights[i];
+            const auto &l = source.light;
+            target.position_type = {
+                static_cast<float>(source.position.x), static_cast<float>(source.position.y),
+                static_cast<float>(source.position.z), static_cast<float>(l.type)};
+            target.direction_inner = {
+                static_cast<float>(source.direction.x), static_cast<float>(source.direction.y),
+                static_cast<float>(source.direction.z), static_cast<float>(std::cos(l.inner_cone))};
+            target.color_intensity = {static_cast<float>(l.color.x), static_cast<float>(l.color.y),
+                                      static_cast<float>(l.color.z),
+                                      static_cast<float>(l.intensity)};
+            target.attenuation_outer = {
+                static_cast<float>(l.attenuation.x), static_cast<float>(l.attenuation.y),
+                static_cast<float>(l.attenuation.z), static_cast<float>(std::cos(l.outer_cone))};
+            target.range[0] = static_cast<float>(l.range);
+        }
+        if (!write_memory(lighting_memories[current_frame], &lighting, sizeof(lighting)))
+            return false;
         VkCommandBufferBeginInfo begin_info{};
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         auto result = vkBeginCommandBuffer(commands, &begin_info);
@@ -1389,23 +1487,27 @@ struct VulkanWindow::Impl {
         const VkDeviceSize vertex_offset = 0U;
         vkCmdBindVertexBuffers(commands, 0U, 1U, &mesh_vertex_buffer, &vertex_offset);
         vkCmdBindIndexBuffer(commands, mesh_index_buffer, 0U, VK_INDEX_TYPE_UINT32);
-        vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0U,
-                                1U, &texture_set, 0U, nullptr);
+        vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0U, 1U,
+                                &texture_sets[current_frame], 0U, nullptr);
         latest_draw_calls = 0U;
         if (scene != nullptr && !scene->entities().empty()) {
-            const float aspect = static_cast<float>(swapchain_extent.width) /
-                                 static_cast<float>(std::max(swapchain_extent.height, 1U));
-            const auto render_scene = build_render_scene(*scene, *assets, aspect);
             for (const auto& instance : render_scene.instances) {
                 const auto* mesh = assets->find_mesh(instance.mesh);
                 if (mesh == nullptr) continue;
+                const auto buffer = instance.deformed_vertex_offset >= 0
+                                        ? deformed_buffers[current_frame]
+                                        : mesh_vertex_buffer;
+                vkCmdBindVertexBuffers(commands, 0, 1, &buffer, &vertex_offset);
                 const DrawPushConstants constants{instance.model_view_projection.values,
                                                   instance.model.values};
                 vkCmdPushConstants(commands, pipeline_layout,
                                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                    sizeof(constants), &constants);
                 vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
-                                 mesh->vertex_offset, instance.material_index);
+                                 instance.deformed_vertex_offset >= 0
+                                     ? instance.deformed_vertex_offset
+                                     : mesh->vertex_offset,
+                                 instance.material_index);
                 ++latest_draw_calls;
             }
         } else {

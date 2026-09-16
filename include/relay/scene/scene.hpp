@@ -42,6 +42,8 @@ struct Camera {
     double near_plane{0.1};
     double far_plane{1000.0};
     bool active{true};
+    // Zero selects perspective; otherwise the full orthographic viewport height.
+    double orthographic_height{};
 
     auto operator<=>(const Camera&) const = default;
 };
@@ -49,11 +51,39 @@ struct Camera {
 struct MeshRenderer {
     std::string mesh{"builtin.triangle"};
     std::string material{"builtin.orange"};
+    std::vector<double> morph_weights{};
 
     auto operator<=>(const MeshRenderer&) const = default;
 };
 
-enum class ReflectedFieldType { string, entity, vec3, number, boolean };
+struct Animator {
+    std::string model;
+    std::uint32_t clip{};
+    double time_seconds{};
+    double speed{1.0};
+    bool playing{false};
+    bool loop{true};
+    auto operator<=>(const Animator &) const = default;
+};
+
+struct ModelNode {
+    Entity root;
+    std::uint32_t node{};
+    auto operator<=>(const ModelNode &) const = default;
+};
+
+struct Light {
+    enum class Type : std::uint8_t { directional, point, spot } type{Type::point};
+    Vec3 color{1.0, 1.0, 1.0};
+    double intensity{1.0};
+    Vec3 attenuation{0.0, 0.0, 1.0};
+    double inner_cone{0.0};
+    double outer_cone{0.7853981633974483};
+    double range{}; // Zero means infinite.
+    auto operator<=>(const Light &) const = default;
+};
+
+enum class ReflectedFieldType { string, entity, vec3, number, boolean, number_array };
 
 struct ReflectedField {
     std::string_view name;
@@ -72,6 +102,9 @@ struct EntityRecord {
     Entity parent{};
     std::optional<Camera> camera;
     std::optional<MeshRenderer> mesh_renderer;
+    std::optional<Animator> animator{};
+    std::optional<ModelNode> model_node{};
+    std::optional<Light> light{};
 };
 
 struct SceneSlotState {
@@ -98,6 +131,8 @@ public:
     [[nodiscard]] bool set_parent(Entity entity, Entity parent);
     [[nodiscard]] bool set_camera(Entity entity, std::optional<Camera> camera);
     [[nodiscard]] bool set_mesh_renderer(Entity entity, std::optional<MeshRenderer> renderer);
+    [[nodiscard]] bool set_animator(Entity entity, std::optional<Animator> animator);
+    [[nodiscard]] bool set_light(Entity entity, std::optional<Light> light);
     [[nodiscard]] std::optional<Entity> active_camera() const;
 
     [[nodiscard]] SceneState capture_state() const;

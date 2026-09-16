@@ -286,6 +286,14 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                     result.error = "camera projection values are outside their valid ranges";
                     return result;
                 }
+                if (result.source_version >= 4U) {
+                    const auto *height = field(*camera_object, "orthographic_height");
+                    if (!height || !height->number() || *height->number() < 0.0) {
+                        result.error = "camera requires a nonnegative orthographic_height";
+                        return result;
+                    }
+                    camera->orthographic_height = *height->number();
+                }
             }
         }
         std::optional<MeshRenderer> mesh_renderer;
@@ -306,11 +314,97 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                     return result;
                 }
                 mesh_renderer = MeshRenderer{*mesh->string(), *material->string()};
+                if (result.source_version >= 4U) {
+                    const auto *weights = field(*renderer_object, "morph_weights");
+                    if (!weights || !weights->array() || weights->array()->size() > 64U) {
+                        result.error = "renderer requires at most 64 morph weights";
+                        return result;
+                    }
+                    for (const auto &weight : *weights->array()) {
+                        if (!weight.number() || std::abs(*weight.number()) > 100.0) {
+                            result.error = "invalid morph weight";
+                            return result;
+                        }
+                        mesh_renderer->morph_weights.push_back(*weight.number());
+                    }
+                }
             }
         }
         slot.generation = parsed_entity->generation;
         slot.alive = true;
         slot.record = EntityRecord{*name->string(), transform, parent, camera, mesh_renderer};
+        if (result.source_version >= 4U) {
+            const auto *animator = field(*entity_object, "animator");
+            const auto *binding = field(*entity_object, "model_node");
+            const auto *light = field(*entity_object, "light");
+            if (!animator || !binding || !light) {
+                result.error = "version 4 entity requires animator, model_node and light fields";
+                return result;
+            }
+            if (!animator->is_null()) {
+                const auto *o = animator->object();
+                std::uint32_t clip = 0;
+                if (!o || !field(*o, "model") || !field(*o, "model")->string() ||
+                    !read_integer(field(*o, "clip"), clip) || !field(*o, "time_seconds") ||
+                    !field(*o, "time_seconds")->number() || !field(*o, "speed") ||
+                    !field(*o, "speed")->number() || !field(*o, "playing") ||
+                    !field(*o, "playing")->boolean() || !field(*o, "loop") ||
+                    !field(*o, "loop")->boolean()) {
+                    result.error = "invalid animator component";
+                    return result;
+                }
+                slot.record.animator =
+                    Animator{*field(*o, "model")->string(),        clip,
+                             *field(*o, "time_seconds")->number(), *field(*o, "speed")->number(),
+                             *field(*o, "playing")->boolean(),     *field(*o, "loop")->boolean()};
+            }
+            if (!binding->is_null()) {
+                const auto *o = binding->object();
+                std::uint32_t node = 0;
+                if (!o || !field(*o, "root") || !field(*o, "root")->string() ||
+                    !read_integer(field(*o, "node"), node)) {
+                    result.error = "invalid model node component";
+                    return result;
+                }
+                const auto root_entity = Entity::parse(*field(*o, "root")->string());
+                if (!root_entity) {
+                    result.error = "invalid model root handle";
+                    return result;
+                }
+                slot.record.model_node = ModelNode{*root_entity, node};
+            }
+            if (!light->is_null()) {
+                const auto *o = light->object();
+                Light l;
+                std::uint32_t type = 0;
+                if (!o || !read_integer(field(*o, "type"), type) || type > 2U ||
+                    !read_vec3(field(*o, "color"), l.color) ||
+                    !read_vec3(field(*o, "attenuation"), l.attenuation) ||
+                    !field(*o, "intensity") || !field(*o, "intensity")->number() ||
+                    !field(*o, "inner_cone") || !field(*o, "inner_cone")->number() ||
+                    !field(*o, "outer_cone") || !field(*o, "outer_cone")->number()) {
+                    result.error = "invalid light component";
+                    return result;
+                }
+                l.type = static_cast<Light::Type>(type);
+                l.intensity = *field(*o, "intensity")->number();
+                l.inner_cone = *field(*o, "inner_cone")->number();
+                l.outer_cone = *field(*o, "outer_cone")->number();
+                if (!field(*o, "range") || !field(*o, "range")->number()) {
+                    result.error = "light requires range";
+                    return result;
+                }
+                l.range = *field(*o, "range")->number();
+                slot.record.light = l;
+            }
+            Scene validator;
+            const auto handle = validator.create();
+            if (!validator.set_animator(handle, slot.record.animator) ||
+                !validator.set_light(handle, slot.record.light)) {
+                result.error = "component values outside valid ranges";
+                return result;
+            }
+        }
         ++result.entity_count;
     }
 
@@ -359,6 +453,16 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
         }
     }
     if (!hierarchy_is_valid(state, result.error)) return result;
+    for (const auto &slot : state.slots)
+        if (slot.alive && slot.record.model_node) {
+            const auto model_root = slot.record.model_node->root;
+            if (model_root.index >= state.slots.size() || !state.slots[model_root.index].alive ||
+                state.slots[model_root.index].generation != model_root.generation ||
+                !state.slots[model_root.index].record.animator) {
+                result.error = "model node references a missing, stale or non-model root";
+                return result;
+            }
+        }
     std::optional<Entity> active_camera;
     for (std::uint32_t index = 0; index < state.slots.size(); ++index) {
         const auto& slot = state.slots[index];

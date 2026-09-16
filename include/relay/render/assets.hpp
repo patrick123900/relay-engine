@@ -30,6 +30,21 @@ struct MeshVertex {
     float tw{1.0F};
 };
 
+struct SkinWeight {
+    std::uint32_t joint{};
+    float weight{};
+};
+struct SkinJoint {
+    std::uint32_t node{};
+    std::array<float, 16> inverse_bind{};
+};
+struct MorphTarget {
+    std::string name;
+    double weight{};
+    // Position/normal/tangent deltas, applied before skinning.
+    std::vector<MeshVertex> deltas;
+};
+
 struct MeshAsset {
     std::string name;
     std::uint32_t first_index{};
@@ -39,6 +54,53 @@ struct MeshAsset {
     // registry when the mesh is added; used for frustum culling.
     std::array<float, 3> bounds_min{};
     std::array<float, 3> bounds_max{};
+    std::uint32_t vertex_count{};
+    std::vector<SkinJoint> joints{};
+    std::vector<std::vector<SkinWeight>> skin{};
+    std::vector<MorphTarget> morph_targets{};
+};
+
+enum class AnimationInterpolation : std::uint8_t { linear, step, cubic };
+struct VectorKey {
+    double time{};
+    Vec3 value;
+    Vec3 in_tangent{}, out_tangent{};
+};
+struct RotationKey {
+    double time{};
+    std::array<double, 4> value;
+    std::array<double, 4> in_tangent{}, out_tangent{};
+}; // xyzw quaternion
+struct NodeTrack {
+    std::uint32_t node{};
+    std::vector<VectorKey> positions, scales;
+    std::vector<RotationKey> rotations;
+    AnimationInterpolation position_interpolation{}, scale_interpolation{},
+        rotation_interpolation{};
+};
+struct MorphKey {
+    double time{};
+    std::vector<double> weights;
+    std::vector<double> in_tangent{}, out_tangent{};
+};
+struct MorphTrack {
+    std::uint32_t mesh{};
+    std::vector<MorphKey> keys;
+    AnimationInterpolation interpolation{};
+};
+struct AnimationClip {
+    std::string name;
+    double duration_seconds{};
+    std::vector<NodeTrack> tracks;
+    std::vector<MorphTrack> morph_tracks;
+};
+struct ModelAsset {
+    std::string name;
+    std::vector<std::string> nodes;
+    std::vector<std::int32_t> parents{};
+    std::vector<Transform> rest_transforms{};
+    std::vector<std::string> binding_layout{};
+    std::vector<AnimationClip> clips;
 };
 
 struct MaterialAsset {
@@ -94,6 +156,9 @@ public:
     [[nodiscard]] const MeshAsset* find_mesh(std::string_view name) const;
     [[nodiscard]] const MaterialAsset* find_material(std::string_view name) const;
     [[nodiscard]] const TextureAsset* find_texture(std::string_view name) const;
+    [[nodiscard]] const ModelAsset *find_model(std::string_view name) const;
+    [[nodiscard]] std::span<const ModelAsset> models() const;
+    bool register_model(ModelAsset model);
     [[nodiscard]] std::uint32_t texture_index(std::string_view name) const;
     [[nodiscard]] std::uint32_t material_index(std::string_view name) const;
 
@@ -115,6 +180,7 @@ private:
     std::vector<MeshAsset> meshes_;
     std::vector<MaterialAsset> materials_;
     std::vector<TextureAsset> textures_;
+    std::vector<ModelAsset> models_;
     std::uint64_t revision_{1U};
 };
 
@@ -125,6 +191,7 @@ struct ModelImportResult {
     std::vector<std::string> meshes;
     std::vector<std::string> materials;
     std::vector<std::string> textures;
+    std::string model;
     std::vector<std::string> warnings;
     std::vector<Entity> roots;
     std::string source_adapter{"direct"};
@@ -140,8 +207,7 @@ struct ModelImportResult {
 
 struct ModelImportSettings {
     BlenderConversionSettings blender;
-    // `scene` retains conversion-time animation/camera/light data for later import stages;
-    // `static_mesh` strips those channels from Blender conversion output.
+    // `scene` imports dynamic data and camera/light components; `static_mesh` keeps rest geometry.
     std::string preset{"scene"};
 };
 

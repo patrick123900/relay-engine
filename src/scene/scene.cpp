@@ -56,17 +56,50 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
         output << "{\"field_of_view_y_degrees\":" << record.camera->field_of_view_y_degrees
                << ",\"near_plane\":" << record.camera->near_plane
                << ",\"far_plane\":" << record.camera->far_plane
-               << ",\"active\":" << (record.camera->active ? "true" : "false") << '}';
+               << ",\"active\":" << (record.camera->active ? "true" : "false")
+               << ",\"orthographic_height\":" << record.camera->orthographic_height << '}';
     } else {
         output << "null";
     }
     output << ",\"mesh_renderer\":";
     if (record.mesh_renderer.has_value()) {
-        output << "{\"mesh\":\"" << escape_json(record.mesh_renderer->mesh)
-               << "\",\"material\":\"" << escape_json(record.mesh_renderer->material) << "\"}";
+        output << "{\"mesh\":\"" << escape_json(record.mesh_renderer->mesh) << "\",\"material\":\""
+               << escape_json(record.mesh_renderer->material) << "\",\"morph_weights\":[";
+        for (std::size_t i = 0; i < record.mesh_renderer->morph_weights.size(); ++i) {
+            if (i)
+                output << ',';
+            output << record.mesh_renderer->morph_weights[i];
+        }
+        output << "]}";
     } else {
         output << "null";
     }
+    output << ",\"animator\":";
+    if (record.animator) {
+        const auto &a = *record.animator;
+        output << "{\"model\":\"" << escape_json(a.model) << "\",\"clip\":" << a.clip
+               << ",\"time_seconds\":" << a.time_seconds << ",\"speed\":" << a.speed
+               << ",\"playing\":" << (a.playing ? "true" : "false")
+               << ",\"loop\":" << (a.loop ? "true" : "false") << '}';
+    } else
+        output << "null";
+    output << ",\"model_node\":";
+    if (record.model_node) {
+        output << "{\"root\":\"" << record.model_node->root.to_string()
+               << "\",\"node\":" << record.model_node->node << '}';
+    } else
+        output << "null";
+    output << ",\"light\":";
+    if (record.light) {
+        const auto &l = *record.light;
+        output << "{\"type\":" << static_cast<unsigned>(l.type) << ",\"color\":";
+        append_vec3(output, l.color);
+        output << ",\"intensity\":" << l.intensity << ",\"attenuation\":";
+        append_vec3(output, l.attenuation);
+        output << ",\"inner_cone\":" << l.inner_cone << ",\"outer_cone\":" << l.outer_cone
+               << ",\"range\":" << l.range << '}';
+    } else
+        output << "null";
     output << '}';
 }
 
@@ -77,6 +110,8 @@ std::string_view field_type_name(const ReflectedFieldType type) {
     case ReflectedFieldType::vec3: return "vec3";
     case ReflectedFieldType::number: return "number";
     case ReflectedFieldType::boolean: return "boolean";
+    case ReflectedFieldType::number_array:
+        return "number_array";
     }
     return "unknown";
 }
@@ -190,10 +225,11 @@ bool Scene::set_camera(const Entity entity, std::optional<Camera> camera) {
     auto* record = get(entity);
     if (record == nullptr) return false;
     if (camera.has_value()) {
-        if (!std::isfinite(camera->field_of_view_y_degrees) ||
-            !std::isfinite(camera->near_plane) || !std::isfinite(camera->far_plane) ||
-            camera->field_of_view_y_degrees <= 1.0 || camera->field_of_view_y_degrees >= 179.0 ||
-            camera->near_plane <= 0.0 || camera->far_plane <= camera->near_plane) {
+        if (!std::isfinite(camera->field_of_view_y_degrees) || !std::isfinite(camera->near_plane) ||
+            !std::isfinite(camera->far_plane) || camera->field_of_view_y_degrees <= 1.0 ||
+            camera->field_of_view_y_degrees >= 179.0 || camera->near_plane <= 0.0 ||
+            camera->far_plane <= camera->near_plane ||
+            !std::isfinite(camera->orthographic_height) || camera->orthographic_height < 0.0) {
             return false;
         }
         if (camera->active) {
@@ -209,11 +245,51 @@ bool Scene::set_camera(const Entity entity, std::optional<Camera> camera) {
 bool Scene::set_mesh_renderer(const Entity entity, std::optional<MeshRenderer> renderer) {
     auto* record = get(entity);
     if (record == nullptr) return false;
-    if (renderer.has_value() && (renderer->mesh.empty() || renderer->material.empty() ||
-                                renderer->mesh.size() > 128U || renderer->material.size() > 128U)) {
+    if (renderer.has_value() &&
+        (renderer->mesh.empty() || renderer->material.empty() || renderer->mesh.size() > 128U ||
+         renderer->material.size() > 128U || renderer->morph_weights.size() > 64U)) {
         return false;
     }
+    if (renderer)
+        for (const auto w : renderer->morph_weights) {
+            if (!std::isfinite(w) || std::abs(w) > 100.0)
+                return false;
+        }
     record->mesh_renderer = std::move(renderer);
+    return true;
+}
+
+bool Scene::set_animator(const Entity entity, std::optional<Animator> animator) {
+    auto *record = get(entity);
+    if (!record)
+        return false;
+    if (animator && (animator->model.empty() || animator->model.size() > 128U ||
+                     !std::isfinite(animator->time_seconds) || animator->time_seconds < 0.0 ||
+                     !std::isfinite(animator->speed) || std::abs(animator->speed) > 100.0))
+        return false;
+    record->animator = std::move(animator);
+    return true;
+}
+
+bool Scene::set_light(const Entity entity, std::optional<Light> light) {
+    auto *record = get(entity);
+    if (!record)
+        return false;
+    if (light) {
+        const auto valid = [](const Vec3 &v) {
+            return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) && v.x >= 0.0 &&
+                   v.y >= 0.0 && v.z >= 0.0;
+        };
+        if (static_cast<unsigned>(light->type) > 2U || !valid(light->color) ||
+            !valid(light->attenuation) || !std::isfinite(light->intensity) ||
+            light->intensity < 0.0 || !std::isfinite(light->inner_cone) ||
+            !std::isfinite(light->outer_cone) || light->inner_cone < 0.0 ||
+            light->outer_cone <= 0.0 || light->outer_cone > 1.5707963267948966 ||
+            light->inner_cone > light->outer_cone || !std::isfinite(light->range) ||
+            light->range < 0.0)
+            return false;
+    }
+    record->light = std::move(light);
     return true;
 }
 
@@ -272,7 +348,7 @@ std::string Scene::list_json() const {
 std::string Scene::serialize_json() const {
     std::ostringstream output;
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
-    output << "{\"format\":\"relay.scene\",\"version\":3,\"components\":[";
+    output << "{\"format\":\"relay.scene\",\"version\":4,\"components\":[";
     const auto& descriptors = component_descriptors();
     for (std::size_t descriptor_index = 0; descriptor_index < descriptors.size(); ++descriptor_index) {
         if (descriptor_index != 0) output << ',';
@@ -306,16 +382,44 @@ std::string Scene::serialize_json() const {
 const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
     static const std::vector<ComponentDescriptor> descriptors{
         {"Name", 0x01U, {{"value", ReflectedFieldType::string}}},
-        {"Transform", 0x02U, {{"position", ReflectedFieldType::vec3},
-                              {"rotation_degrees", ReflectedFieldType::vec3},
-                              {"scale", ReflectedFieldType::vec3}}},
+        {"Transform",
+         0x02U,
+         {{"position", ReflectedFieldType::vec3},
+          {"rotation_degrees", ReflectedFieldType::vec3},
+          {"scale", ReflectedFieldType::vec3}}},
         {"Hierarchy", 0x03U, {{"parent", ReflectedFieldType::entity}}},
-        {"Camera", 0x04U, {{"field_of_view_y_degrees", ReflectedFieldType::number},
-                            {"near_plane", ReflectedFieldType::number},
-                            {"far_plane", ReflectedFieldType::number},
-                            {"active", ReflectedFieldType::boolean}}},
-        {"MeshRenderer", 0x05U, {{"mesh", ReflectedFieldType::string},
-                                  {"material", ReflectedFieldType::string}}},
+        {"Camera",
+         0x04U,
+         {{"field_of_view_y_degrees", ReflectedFieldType::number},
+          {"near_plane", ReflectedFieldType::number},
+          {"far_plane", ReflectedFieldType::number},
+          {"active", ReflectedFieldType::boolean},
+          {"orthographic_height", ReflectedFieldType::number}}},
+        {"MeshRenderer",
+         0x05U,
+         {{"mesh", ReflectedFieldType::string},
+          {"material", ReflectedFieldType::string},
+          {"morph_weights", ReflectedFieldType::number_array}}},
+        {"Animator",
+         0x06U,
+         {{"model", ReflectedFieldType::string},
+          {"clip", ReflectedFieldType::number},
+          {"time_seconds", ReflectedFieldType::number},
+          {"speed", ReflectedFieldType::number},
+          {"playing", ReflectedFieldType::boolean},
+          {"loop", ReflectedFieldType::boolean}}},
+        {"ModelNode",
+         0x07U,
+         {{"root", ReflectedFieldType::entity}, {"node", ReflectedFieldType::number}}},
+        {"Light",
+         0x08U,
+         {{"type", ReflectedFieldType::number},
+          {"color", ReflectedFieldType::vec3},
+          {"intensity", ReflectedFieldType::number},
+          {"attenuation", ReflectedFieldType::vec3},
+          {"inner_cone", ReflectedFieldType::number},
+          {"outer_cone", ReflectedFieldType::number},
+          {"range", ReflectedFieldType::number}}},
     };
     return descriptors;
 }

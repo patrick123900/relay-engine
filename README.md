@@ -94,7 +94,8 @@ The complete method, MCP-tool and parameter reference is generated from the vers
 [`docs/protocol.md`](docs/protocol.md).
 
 Scene files live in `scenes/`. Control and MCP calls accept only a filename—not a path—so they
-cannot escape that directory. Version 3 adds persistent mesh renderers, while version 2 introduced
+cannot escape that directory. Version 4 adds animation state, model-node bindings, morph weights,
+punctual lights and orthographic cameras. Version 3 added persistent mesh renderers, while version 2 introduced
 perspective cameras alongside the reflected component metadata, full-precision transforms and
 allocator generations from version 1. The loader migrates all earlier versions, including version 0 files whose entities were top-level
 and whose transform rotation field was named `rotation`. Unknown future versions,
@@ -105,8 +106,13 @@ Model files live in `assets/`. Relay treats glTF 2.0 (`.gltf`/`.glb`) as its nat
 interchange format, matching Godot's preferred pipeline. FBX, OBJ and DAE use Assimp. `.blend`
 sources are converted through Blender's glTF exporter into a content-addressed cache before entering
 the same import path. Imported static geometry includes UVs, generated normals/tangents, node
-hierarchies, PBR factors and PNG/JPEG image textures. Skeletons, skinning, morph targets and
-animation playback are reported as deferred rather than silently presented as complete.
+hierarchies, PBR factors and PNG/JPEG image textures. Dynamic imports include skeleton hierarchy,
+inverse bind matrices, normalized skin weights, node/morph animation clips and morph targets.
+Playback is deterministic and independently controlled per model instance. glTF/GLB preserves
+LINEAR, STEP and CUBICSPLINE interpolation; CPU deformation is streamed to per-frame Vulkan buffers.
+`scene.set_animation` selects, seeks and plays clips; `scene.set_morph` overrides or resets weights.
+`render.assets` lists models/clips and mesh joint/morph counts. FBX remains on Assimp, verified by
+the Blender-exported animated/skin/morph fixture.
 
 Imports are sandboxed. A model may only be named by a top-level filename inside `assets/`, and every
 dependency it goes on to reference — external `.bin` buffers, images — is canonicalized and must
@@ -124,10 +130,14 @@ Blender is discovered as `blender` on `PATH`; set `RELAY_BLENDER_EXECUTABLE` to 
 chosen executable when it is installed in a mounted system-runtime directory (`/usr` or `/opt` on
 Linux). The `scene` import preset retains conversion-time
 animation/camera/light channels, while `static_mesh` strips them from Blender's cached GLB.
-Perspective cameras are instantiated as inactive camera components under their original nodes,
+Perspective and orthographic cameras are instantiated as inactive components under their original nodes,
 preserving projection and hierarchy; they can be activated through the existing camera interface
 and survive scene save/load. The static-mesh preset also excludes camera components for direct
-imports. Orthographic cameras and invalid projection/orientation data produce diagnostics.
+imports, together with skinning, morphs and clips. Camera-only scenes are supported. Invalid
+projection/orientation data produces diagnostics. Imported directional, point and spot lights
+preserve color, attenuation, cone angles and optional range; `scene.set_light` controls them.
+The initial Vulkan light budget is 16 lights per scene; area/ambient lights are diagnosed as unsupported.
+Windows/macOS still fail closed for untrusted Blender conversion; the default OS sandbox is Linux-only.
 
 Each import is content-addressed with a versioned SHA-256 digest (`sha256-v1-<hex>`), and recorded in
 a project manifest at `assets/.relay-imports.json` alongside its source name, importer version,
@@ -212,7 +222,7 @@ Both CMake builds and `npm run check` reject stale generated C++, TypeScript or 
 
 Near-term milestones, in the order they should be taken:
 
-1. Add skeleton, skin-weight, animation, morph-target and imported-light support, then orthographic cameras.
+1. Add asynchronous Vulkan capture/readback and the human editor interface.
 2. Expand import presets as those data types become editable in Relay.
 3. Replace whole-registry hot refresh with versioned asynchronous resource uploads.
 

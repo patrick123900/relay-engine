@@ -113,8 +113,7 @@ Current major layers:
   immediately.
 - Hierarchy-only nodes do not render placeholder geometry; only entities with a mesh-renderer
   component are drawable.
-- The importer reports deferred animations and skeletons/skin weights as warnings rather than
-  pretending the import is complete.
+- Phase D adds engine-owned skeletons, skin/morph deformation, animation playback and imported cameras/lights.
 - Tiny OBJ and embedded-buffer glTF fixtures plus a golden PBR glTF/GLB pair are covered by tests.
 
 ### Durable and safe asset foundation
@@ -237,14 +236,14 @@ Godot FBX behavior.
 
 ### Static model data boundaries
 
-- Vertex data contains positions, UV0, normals and tangents, but not vertex colors, joints or
-  weights.
+- Vertex data contains positions, UV0, normals and tangents; skin influences/inverse binds and morph
+  deltas live alongside the mesh rather than in the fixed GPU vertex layout. Vertex colors remain unsupported.
 - Imported image decoding currently supports PNG and JPEG; other glTF image formats are rejected.
 - Materials preserve PBR factors and base-color, metallic/roughness, normal, occlusion and emissive
   textures. Alpha modes and double-sided state are retained, but blended materials do not yet have
   a transparent draw queue and single-sided materials currently share the no-cull pipeline.
-- Skeletons, skinning, morph targets and animation playback are absent.
-- Cameras and lights embedded in imported scenes are not instantiated.
+- CPU skin/morph deformation and deterministic per-instance animation playback are implemented.
+- Perspective/orthographic cameras and directional/point/spot lights are instantiated and persisted.
 
 ### Remaining asset lifecycle gaps
 
@@ -320,7 +319,7 @@ TODO for a rotating Vulkan staging/readback ring that feeds asynchronous capture
 
 ## What to build next
 
-The **Renderable Static glTF v1** milestone is complete. Phase D is in progress.
+The **Renderable Static glTF v1** milestone and Phase D importing milestone are complete.
 
 ### Phase A — durable and safe asset foundation (complete)
 
@@ -379,7 +378,7 @@ decoding, generated tangent space and every PBR channel are additionally covered
 The implementation is deliberately still small: textures are capped at 16, live refresh rebuilds
 the full registry after waiting for the device, and alpha blending needs a transparent queue.
 
-### Phase D — finish Godot-oriented importing (in progress)
+### Phase D — finish Godot-oriented importing (complete)
 
 1. Add the Blender executable adapter used conceptually by Godot: detect Blender, convert `.blend`
    to cached glTF/GLB, capture diagnostics and hash the converted dependencies.
@@ -416,12 +415,50 @@ inactive. Assimp's glTF importer supplies a full horizontal angle despite its ca
 half-angle convention; Relay normalizes glTF/GLB cameras before conversion. Camera projection and
 orientation are validated, camera counts are capped at 4096, and camera data participates in asset
 identity. Existing scene serialization and camera control work unchanged. The camera golden fixture
-tests aspect-sensitive FOV, hierarchy, activation, save/load, static-mesh exclusion and orthographic
-diagnostics. Camera-only models are still rejected by the mesh-oriented asset registry.
+tests aspect-sensitive FOV, hierarchy, activation, save/load and static-mesh exclusion. Orthographic
+and camera-only imports now work too, with correct Vulkan projection/depth conventions.
 
-Still outstanding in Phase D: skeleton/skin data, animation clips and playback, morph targets,
-imported lights and orthographic cameras. Windows/macOS need a platform sandbox equivalent
-to the Linux Bubblewrap path before accepting untrusted `.blend` files without administrator opt-in.
+The remaining Phase D features are implemented:
+
+- Model assets own node hierarchy/rest transforms and node/morph clips. Meshes own joint-to-node
+  bindings, inverse bind matrices, normalized influences and position/normal/tangent morph deltas.
+- Animator state lives on the imported model root; fixed steps advance time, pause freezes it,
+  looping/reverse speed and terminal nonlooping poses work independently across instances.
+- Native glTF/GLB animation accessor decoding retains LINEAR, STEP and CUBICSPLINE curves, including
+  sparse accessors and cubic tangents/quaternion normalization, which Assimp otherwise discards.
+- Valid implicit-zero glTF accessors are materialized in bounded memory before Assimp parsing,
+  fixing Blender's zero-filled morph-normal exports without disabling morph normals.
+- CPU morph-before-skin deformation updates bounds before culling and streams instance-specific
+  vertices into fence-protected per-frame Vulkan buffers. Normal palettes are computed per joint.
+- Cameras include orthographic projection. Directional/point/spot lights preserve attenuation,
+  color, cones and optional range and drive the initial Vulkan PBR lighting path.
+- Scene format v4 persists animator/model-node/light components, morph overrides and orthographic
+  height; older scenes migrate. Protocol v5 adds animation, morph and light control.
+- Manifest v3 records binding-layout and clip-order metadata. Compatible changed sources rebind
+  renderer and animator IDs; changed hierarchy/rest/bind/morph layouts or clip ordering are diagnosed
+  without silently retargeting saved playback. Old manifests remain readable but lack dynamic remap metadata.
+- Limits: 8192 nodes, hierarchy depth 256, 4096 meshes, 1M vertices and 256 clips/1M keys per import,
+  256 joints per mesh, eight influences per vertex, 64 morph targets and 64 MiB morph payload;
+  animation accessor samples/buffers are bounded. Vulkan permits 4M deformed vertices per frame and
+  initially renders 16 lights. Oversized deformation fails explicitly rather than growing indefinitely.
+
+Golden fixtures cover LINEAR/STEP/cubic poses, weighted skinning, morph overrides, quaternion
+interpolation, pause/step/stop, independent instances, persistence and compatible/incompatible reloads.
+They also cover unnamed joints, optional identity inverse-bind matrices, static-preset exclusion and
+native animation accessor count/view bounds. Dev/release builds, native tests, generated protocol
+validation and MCP type-check/build passed. Real Vulkan playback/resize/capture passed for glTF,
+FBX and sandboxed `.blend` on the Radeon RX 9070 XT, as did the built-in Vulkan resize regression.
+Real Blender 5.2.1 LTS GLB/FBX round trips preserve clips, skins and morphs; Assimp's FBX
+`node*local-mesh-index` morph convention is normalized. FBX therefore stays on Assimp, not ufbx.
+`tools/generate_phase_d_fixtures.py` reproduces the Blender/GLB/FBX fixtures.
+`relay_demo --vulkan-model-smoke [filename]` exercises playback, resize and GPU capture.
+
+Platform/security boundaries remain: Windows/macOS do not yet have an OS sandbox equivalent to
+Linux Bubblewrap, and refuse untrusted `.blend` conversion without the administrator trusted-input
+opt-in. No Windows/macOS runtime verification is claimed. Crossfade/retargeting, vertex-cache
+animation, area lights, transparent sorting and GPU skinning are later features, not this import milestone.
+Meshes shared by nodes with different glTF skins must currently be separated in the source model;
+the importer rejects incompatible sharing rather than silently applying the wrong skeleton.
 
 ### Later milestones
 
@@ -438,13 +475,11 @@ to the Linux Bubblewrap path before accepting untrusted `.blend` files without a
 
 Use this as the next instruction after giving the agent this handoff:
 
-> Continue Phase D from HANDOFF.md. The Blender-to-GLB adapter, `scene`/`static_mesh` presets and
-> changed-asset scene rebinding are complete. Extend the engine-owned asset model with skeletons,
-> skin weights, animation clips and morph targets, then add serializable scene components for
-> imported lights. Perspective camera importing is complete; orthographic and camera-only imports
-> remain unsupported. Keep glTF/GLB as the normalized path and Assimp as the current FBX/
-> OBJ/DAE fallback. Add representative fixtures and preserve strict bounds on all imported counts
-> and payloads. Run dev/release, ctest, MCP validation and real Blender/Vulkan smoke tests.
+> Phase D is complete; inspect HANDOFF.md and choose the next later milestone with the user.
+> The import pipeline supports skeletons/skin/morphs, deterministic animation, cameras/lights,
+> Blender conversion, presets and safe compatible reload. Preserve glTF/GLB normalization,
+> Assimp FBX fallback, golden fixtures and import bounds. Do not remove fail-closed untrusted
+> Blender conversion on platforms without an OS sandbox.
 
 ## Key files to inspect first
 

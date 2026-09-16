@@ -152,6 +152,49 @@ int run_vulkan_capture(const std::string_view path_text) {
     return 0;
 }
 
+int run_vulkan_model_smoke(const std::string_view filename) {
+    relay::Engine engine;
+    std::string error;
+    const auto imported =
+        relay::import_model_asset("assets", filename, engine.assets(), &engine.scene(), error);
+    if (!imported.imported) {
+        std::cerr << error << '\n';
+        return 1;
+    }
+    std::cout << imported.json() << '\n' << engine.assets().to_json() << '\n';
+    const auto root = imported.roots.front();
+    auto animator = *engine.scene().get(root)->animator;
+    const auto *model = engine.assets().find_model(animator.model);
+    animator.playing = model && !model->clips.empty();
+    (void)engine.scene().set_animator(root, animator);
+    relay::VulkanWindow window("Relay Phase D Model Smoke", 640, 360, engine.assets());
+    if (!window.valid()) {
+        std::cerr << window.error() << '\n';
+        return 1;
+    }
+    for (unsigned frame = 0; frame < 90; ++frame) {
+        if (frame == 45)
+            window.resize(960, 540);
+        (void)window.poll_quit();
+        engine.step();
+        if (!window.draw(engine.scene(), engine.status().elapsed_seconds)) {
+            std::cerr << window.error() << '\n';
+            return 1;
+        }
+    }
+    animator = *engine.scene().get(root)->animator;
+    animator.time_seconds =
+        model && !model->clips.empty() ? model->clips.front().duration_seconds * 0.5 : 0.0;
+    (void)engine.scene().set_animator(root, animator);
+    if (!window.capture_image("/tmp/relay-phase-d-smoke.png", engine.scene(),
+                              engine.status().elapsed_seconds)) {
+        std::cerr << window.error() << '\n';
+        return 1;
+    }
+    std::cout << "Phase D Vulkan model smoke passed on " << window.device_name() << '\n';
+    return 0;
+}
+
 struct LiveInputState {
     std::mutex mutex;
     std::deque<std::string> requests;
@@ -265,6 +308,9 @@ int main(const int argument_count, char** arguments) {
     if (mode == "--headless") return run_headless_demo();
 #ifdef RELAY_HAS_VULKAN_WINDOW
     if (mode == "--vulkan-smoke") return run_vulkan_smoke();
+    if (mode == "--vulkan-model-smoke")
+        return run_vulkan_model_smoke(argument_count > 2 ? arguments[2]
+                                                         : "relay-dynamic-golden.gltf");
     if (mode == "--vulkan-capture") {
         return run_vulkan_capture(argument_count > 2 ? std::string_view(arguments[2])
                                                      : std::string_view{});

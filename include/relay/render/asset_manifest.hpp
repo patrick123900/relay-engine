@@ -10,11 +10,11 @@
 
 namespace relay {
 
-inline constexpr std::uint32_t import_manifest_version = 2;
+inline constexpr std::uint32_t import_manifest_version = 3;
 
 // Bump when a change to the importer would produce different geometry or identities from the same
 // source file. Recorded per entry so a stale cache is detectable rather than silently trusted.
-inline constexpr std::uint32_t model_importer_version = 4;
+inline constexpr std::uint32_t model_importer_version = 5;
 
 struct ImportManifestEntry {
     std::string source;
@@ -25,6 +25,8 @@ struct ImportManifestEntry {
     std::vector<std::string> materials;
     std::vector<std::string> textures;
     std::string preset{"scene"};
+    std::vector<std::string> nodes{};
+    std::vector<std::string> clips{};
 };
 
 struct ImportReloadReport {

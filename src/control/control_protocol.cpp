@@ -353,9 +353,15 @@ std::string ControlProtocol::handle(const std::string_view request) {
         ImportManifest manifest;
         std::string manifest_error;
         if (manifest.load(assets_root, manifest_error)) {
-            manifest.record({*safe_name, model_importer_version, imported.content_id,
-                             imported.dependencies, imported.meshes, imported.materials,
-                             imported.textures, imported.preset});
+            ImportManifestEntry entry{
+                *safe_name,      model_importer_version, imported.content_id, imported.dependencies,
+                imported.meshes, imported.materials,     imported.textures,   imported.preset};
+            if (const auto *model = engine_.assets().find_model(imported.model)) {
+                entry.nodes = model->binding_layout;
+                for (const auto &clip : model->clips)
+                    entry.clips.push_back(clip.name);
+            }
+            manifest.record(std::move(entry));
             if (!manifest.save(assets_root, manifest_error)) {
                 engine_.logs().write(LogLevel::warning,
                                      "Import manifest not updated: " + manifest_error);
@@ -534,6 +540,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
             }
             if (const auto value = number_field(request, "near_plane")) camera->near_plane = *value;
             if (const auto value = number_field(request, "far_plane")) camera->far_plane = *value;
+            if (const auto value = number_field(request, "orthographic_height"))
+                camera->orthographic_height = *value;
             if (camera->far_plane <= camera->near_plane) {
                 return error_response(id, "camera far_plane must be greater than near_plane");
             }
@@ -546,6 +554,89 @@ std::string ControlProtocol::handle(const std::string_view request) {
         engine_.logs().write(LogLevel::info,
                              std::string(enabled ? "Configured camera for " : "Removed camera from ") +
                                  entity->to_string());
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.set_animation" || method == "scene.set_morph" ||
+        method == "scene.set_light") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        const auto record = *engine_.scene().get(*entity);
+        bool changed = false;
+        if (method == "scene.set_animation") {
+            if (!record.animator)
+                return error_response(id, "entity is not an imported model root");
+            auto animator = *record.animator;
+            const auto *model = engine_.assets().find_model(animator.model);
+            if (!model)
+                return error_response(id, "model asset is unavailable");
+            if (const auto value = number_field(request, "clip"))
+                animator.clip = static_cast<std::uint32_t>(*value);
+            if (animator.clip >= model->clips.size())
+                return error_response(id, "animation clip is unavailable");
+            animator.playing = boolean_field(request, "playing", animator.playing);
+            animator.loop = boolean_field(request, "loop", animator.loop);
+            if (const auto value = number_field(request, "speed"))
+                animator.speed = *value;
+            if (const auto value = number_field(request, "time_seconds"))
+                animator.time_seconds = *value;
+            animator.time_seconds =
+                std::min(animator.time_seconds, model->clips[animator.clip].duration_seconds);
+            changed = engine_.scene_history().execute("Configure animation", [&](Scene &scene) {
+                return scene.set_animator(*entity, animator);
+            });
+        } else if (method == "scene.set_morph") {
+            if (!record.mesh_renderer)
+                return error_response(id, "entity has no mesh renderer");
+            auto renderer = *record.mesh_renderer;
+            const auto *mesh = engine_.assets().find_mesh(renderer.mesh);
+            if (!mesh)
+                return error_response(id, "mesh asset is unavailable");
+            if (boolean_field(request, "reset", false))
+                renderer.morph_weights.clear();
+            else {
+                const auto target =
+                    static_cast<std::size_t>(number_field(request, "target").value_or(0.0));
+                if (target >= mesh->morph_targets.size())
+                    return error_response(id, "morph target is unavailable");
+                if (renderer.morph_weights.empty())
+                    for (const auto &morph : mesh->morph_targets)
+                        renderer.morph_weights.push_back(morph.weight);
+                renderer.morph_weights[target] = number_field(request, "weight").value_or(0.0);
+            }
+            changed = engine_.scene_history().execute("Configure morph weights", [&](Scene &scene) {
+                return scene.set_mesh_renderer(*entity, renderer);
+            });
+        } else {
+            std::optional<Light> light;
+            if (boolean_field(request, "enabled", true)) {
+                light = record.light.value_or(Light{});
+                const auto type = string_field(request, "type");
+                if (!type.empty())
+                    light->type = type == "directional" ? Light::Type::directional
+                                  : type == "spot"      ? Light::Type::spot
+                                                        : Light::Type::point;
+                const auto assign = [&](std::string_view key, double &target) {
+                    if (const auto value = number_field(request, key))
+                        target = *value;
+                };
+                assign("red", light->color.x);
+                assign("green", light->color.y);
+                assign("blue", light->color.z);
+                assign("intensity", light->intensity);
+                assign("constant", light->attenuation.x);
+                assign("linear", light->attenuation.y);
+                assign("quadratic", light->attenuation.z);
+                assign("inner_cone", light->inner_cone);
+                assign("outer_cone", light->outer_cone);
+                assign("range", light->range);
+            }
+            changed = engine_.scene_history().execute(
+                "Configure light", [&](Scene &scene) { return scene.set_light(*entity, light); });
+        }
+        if (!changed)
+            return error_response(id, "invalid component configuration");
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }

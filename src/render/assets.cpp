@@ -1,8 +1,10 @@
 #include "relay/render/assets.hpp"
+#include "relay/core/json.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <sstream>
 
 namespace relay {
@@ -156,7 +158,9 @@ std::string AssetRegistry::to_json() const {
                                      : static_cast<std::uint32_t>(vertices_.size());
         output << "{\"name\":\"" << meshes_[index].name << "\",\"vertices\":"
                << next_vertex - static_cast<std::uint32_t>(meshes_[index].vertex_offset)
-               << ",\"indices\":" << meshes_[index].index_count << '}';
+               << ",\"indices\":" << meshes_[index].index_count
+               << ",\"joints\":" << meshes_[index].joints.size()
+               << ",\"morph_targets\":" << meshes_[index].morph_targets.size() << '}';
     }
     output << "],\"materials\":[";
     for (std::size_t index = 0; index < materials_.size(); ++index) {
@@ -196,11 +200,39 @@ std::string AssetRegistry::to_json() const {
                                                                             "clamp_to_edge")
                << "\"}";
     }
+    output << "],\"models\":[";
+    for (std::size_t i = 0; i < models_.size(); ++i) {
+        if (i)
+            output << ',';
+        output << "{\"name\":\"" << json_escape(models_[i].name)
+               << "\",\"nodes\":" << models_[i].nodes.size() << ",\"clips\":[";
+        for (std::size_t c = 0; c < models_[i].clips.size(); ++c) {
+            if (c)
+                output << ',';
+            output << "{\"index\":" << c << ",\"name\":\"" << json_escape(models_[i].clips[c].name)
+                   << "\",\"duration_seconds\":" << models_[i].clips[c].duration_seconds << '}';
+        }
+        output << "]}";
+    }
     output << "]}";
     return output.str();
 }
 
 std::uint64_t AssetRegistry::revision() const { return revision_; }
+
+const ModelAsset *AssetRegistry::find_model(const std::string_view name) const {
+    const auto found = std::find_if(models_.begin(), models_.end(),
+                                    [&](const auto &model) { return model.name == name; });
+    return found == models_.end() ? nullptr : &*found;
+}
+std::span<const ModelAsset> AssetRegistry::models() const { return models_; }
+bool AssetRegistry::register_model(ModelAsset model) {
+    if (model.name.empty() || model.nodes.empty())
+        return false;
+    if (!find_model(model.name))
+        models_.push_back(std::move(model));
+    return true;
+}
 
 bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
                                       std::vector<std::uint32_t> indices_to_add,
@@ -211,6 +243,36 @@ bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
     if (std::all_of(meshes.begin(), meshes.end(), [this](const MeshAsset& mesh) {
             return find_mesh(mesh.name) != nullptr;
         })) return true;
+    if (vertices_.size() + vertices.size() > 16'000'000U ||
+        indices_.size() + indices_to_add.size() > 32'000'000U)
+        return false;
+    for (auto &mesh : meshes) {
+        if (mesh.vertex_offset < 0 || mesh.first_index > indices_to_add.size() ||
+            mesh.index_count > indices_to_add.size() - mesh.first_index ||
+            mesh.joints.size() > 256U || mesh.morph_targets.size() > 64U)
+            return false;
+        if (!mesh.vertex_count) {
+            for (std::size_t i = mesh.first_index; i < mesh.first_index + mesh.index_count; ++i)
+                mesh.vertex_count = std::max(mesh.vertex_count, indices_to_add[i] + 1U);
+        }
+        if (static_cast<std::size_t>(mesh.vertex_offset) + mesh.vertex_count > vertices.size())
+            return false;
+        for (std::size_t i = mesh.first_index; i < mesh.first_index + mesh.index_count; ++i)
+            if (indices_to_add[i] >= mesh.vertex_count)
+                return false;
+        if (!mesh.skin.empty() && mesh.skin.size() != mesh.vertex_count)
+            return false;
+        for (const auto &influences : mesh.skin) {
+            if (influences.size() > 8U)
+                return false;
+            for (const auto &w : influences)
+                if (w.joint >= mesh.joints.size() || !std::isfinite(w.weight) || w.weight < 0.0F)
+                    return false;
+        }
+        for (const auto &target : mesh.morph_targets)
+            if (target.deltas.size() != mesh.vertex_count)
+                return false;
+    }
     const auto first_new_mesh = meshes_.size();
     const auto vertex_base = static_cast<std::int32_t>(vertices_.size());
     const auto index_base = static_cast<std::uint32_t>(indices_.size());

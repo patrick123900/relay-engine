@@ -4,6 +4,7 @@ layout(location = 0) in vec2 texture_coordinates;
 layout(location = 1) in vec3 surface_normal;
 layout(location = 2) in vec4 surface_tangent;
 layout(location = 3) flat in uint material_index;
+layout(location = 4) in vec3 world_position;
 layout(location = 0) out vec4 output_color;
 
 layout(set = 0, binding = 0) uniform sampler2D textures[16];
@@ -17,6 +18,11 @@ struct MaterialData {
 layout(std430, set = 0, binding = 1) readonly buffer MaterialBuffer {
     MaterialData materials[];
 };
+struct LightData { vec4 position_type; vec4 direction_inner; vec4 color_intensity; vec4 attenuation_outer; vec4 range; };
+layout(std430,set=0,binding=2) readonly buffer LightingBuffer {
+    vec4 camera_count;
+    LightData lights[16];
+} lighting;
 
 layout(push_constant) uniform FrameData {
     mat4 model_view_projection;
@@ -56,8 +62,29 @@ void main() {
     bool double_sided = ((material.texture_indices.w >> 18u) & 0x1u) != 0u;
     if (double_sided && !gl_FrontFacing) normal = -normal;
 
-    vec3 view_direction = vec3(0.0, 0.0, 1.0);
+    vec3 view_direction = normalize(lighting.camera_count.xyz-world_position);
+    vec3 direct_color=vec3(0.0);
+    uint count=uint(lighting.camera_count.w);
+    for (uint light_index=0;light_index<max(count,1u);++light_index) {
     vec3 light_direction = normalize(vec3(0.45, 0.65, 0.75));
+    vec3 radiance=vec3(2.4);
+    if (count>0u) {
+        LightData light=lighting.lights[light_index];
+        radiance=light.color_intensity.rgb*light.color_intensity.w;
+        if (light.position_type.w==0.0) light_direction=-light.direction_inner.xyz;
+        else {
+            vec3 delta=light.position_type.xyz-world_position;
+            float distance=length(delta);
+            light_direction=delta/max(distance,0.0001);
+            radiance/=max(dot(light.attenuation_outer.xyz,vec3(1.0,distance,distance*distance)),0.0001);
+            if (light.range.x>0.0) radiance*=pow(clamp(1.0-pow(distance/light.range.x,4.0),0.0,1.0),2.0);
+            if (light.position_type.w==2.0) {
+                float cosine=dot(-light_direction,light.direction_inner.xyz);
+                float inner=light.direction_inner.w,outer=light.attenuation_outer.w;
+                radiance*=inner-outer>0.00001 ? clamp((cosine-outer)/(inner-outer),0.0,1.0) : step(outer,cosine);
+            }
+        }
+    }
     vec3 half_direction = normalize(view_direction + light_direction);
     float n_dot_l = max(dot(normal, light_direction), 0.0);
     float n_dot_v = max(dot(normal, view_direction), 0.001);
@@ -75,6 +102,8 @@ void main() {
     vec3 specular = distribution * geometry_v * geometry_l * fresnel /
                     max(4.0 * n_dot_v * n_dot_l, 0.0001);
     vec3 diffuse = (1.0 - fresnel) * (1.0 - metallic) * base_color.rgb / pi;
+    direct_color+=(diffuse+specular)*n_dot_l*radiance;
+    }
 
     float occlusion = 1.0;
     uint occlusion_texture = material.texture_indices.w & 0xffu;
@@ -88,7 +117,7 @@ void main() {
         emissive *= texture(textures[emissive_texture], texture_coordinates).rgb;
     }
     vec3 ambient = base_color.rgb * 0.08 * occlusion;
-    vec3 color = ambient + (diffuse + specular) * n_dot_l * 2.4 + emissive;
+    vec3 color = ambient + direct_color + emissive;
     color = color / (color + vec3(1.0));
     output_color = vec4(color, base_color.a);
 }

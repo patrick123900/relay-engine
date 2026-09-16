@@ -36,13 +36,25 @@ struct RenderInstance {
     // Base color, metallic-roughness and normal occupy xyz. The packed w contains occlusion and
     // emissive indices plus alpha-mode/double-sided flags.
     std::array<std::uint32_t, 4> pbr_textures{};
+    // Nonnegative selects an instance-specific slice in RenderScene::deformed_vertices.
+    std::int32_t deformed_vertex_offset{-1};
+};
+
+struct RenderLight {
+    Light light;
+    Vec3 position;
+    Vec3 direction;
 };
 
 struct RenderScene {
     RenderCamera camera{};
     std::vector<RenderInstance> instances;
+    std::vector<MeshVertex> deformed_vertices;
+    std::vector<RenderLight> lights;
+    Vec3 camera_position{0.0, 0.0, 5.0};
     // Drawable entities rejected by frustum culling this frame.
     std::size_t culled{};
+    std::size_t deformation_overflow{};
 };
 
 [[nodiscard]] RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,

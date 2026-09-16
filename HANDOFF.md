@@ -410,8 +410,17 @@ FBX remains on Assimp for now. Adding ufbx would add another dependency and para
 animation normalization path; revisit that decision when FBX-specific fixtures demonstrate a
 correctness gap rather than introducing it speculatively.
 
-Still outstanding in Phase D: skeleton/skin data, animation clips and playback, morph targets, and
-scene components for imported cameras and lights. Windows/macOS need a platform sandbox equivalent
+Perspective camera importing is implemented: camera-local position/orientation is attached beneath
+the matching imported node, projection is converted to Relay's vertical FOV, and cameras start
+inactive. Assimp's glTF importer supplies a full horizontal angle despite its camera API's documented
+half-angle convention; Relay normalizes glTF/GLB cameras before conversion. Camera projection and
+orientation are validated, camera counts are capped at 4096, and camera data participates in asset
+identity. Existing scene serialization and camera control work unchanged. The camera golden fixture
+tests aspect-sensitive FOV, hierarchy, activation, save/load, static-mesh exclusion and orthographic
+diagnostics. Camera-only models are still rejected by the mesh-oriented asset registry.
+
+Still outstanding in Phase D: skeleton/skin data, animation clips and playback, morph targets,
+imported lights and orthographic cameras. Windows/macOS need a platform sandbox equivalent
 to the Linux Bubblewrap path before accepting untrusted `.blend` files without administrator opt-in.
 
 ### Later milestones
@@ -432,7 +441,8 @@ Use this as the next instruction after giving the agent this handoff:
 > Continue Phase D from HANDOFF.md. The Blender-to-GLB adapter, `scene`/`static_mesh` presets and
 > changed-asset scene rebinding are complete. Extend the engine-owned asset model with skeletons,
 > skin weights, animation clips and morph targets, then add serializable scene components for
-> imported cameras and lights. Keep glTF/GLB as the normalized path and Assimp as the current FBX/
+> imported lights. Perspective camera importing is complete; orthographic and camera-only imports
+> remain unsupported. Keep glTF/GLB as the normalized path and Assimp as the current FBX/
 > OBJ/DAE fallback. Add representative fixtures and preserve strict bounds on all imported counts
 > and payloads. Run dev/release, ctest, MCP validation and real Blender/Vulkan smoke tests.
 

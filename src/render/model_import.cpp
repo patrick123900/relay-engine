@@ -282,6 +282,23 @@ std::string imported_content_hash(const aiScene& scene,
         hash_bytes(digest, texture.rgba.data(), texture.rgba.size());
     }
     hash_node(digest, *scene.mRootNode);
+    if (scene.mNumCameras != 0U) {
+        constexpr std::string_view marker = "relay-cameras-v1";
+        hash_bytes(digest, marker.data(), marker.size());
+        hash_bytes(digest, &scene.mNumCameras, sizeof(scene.mNumCameras));
+        for (unsigned index = 0; index < scene.mNumCameras; ++index) {
+            const auto& camera = *scene.mCameras[index];
+            hash_bytes(digest, camera.mName.C_Str(), camera.mName.length);
+            hash_bytes(digest, &camera.mPosition, sizeof(camera.mPosition));
+            hash_bytes(digest, &camera.mLookAt, sizeof(camera.mLookAt));
+            hash_bytes(digest, &camera.mUp, sizeof(camera.mUp));
+            hash_bytes(digest, &camera.mHorizontalFOV, sizeof(camera.mHorizontalFOV));
+            hash_bytes(digest, &camera.mAspect, sizeof(camera.mAspect));
+            hash_bytes(digest, &camera.mClipPlaneNear, sizeof(camera.mClipPlaneNear));
+            hash_bytes(digest, &camera.mClipPlaneFar, sizeof(camera.mClipPlaneFar));
+            hash_bytes(digest, &camera.mOrthographicWidth, sizeof(camera.mOrthographicWidth));
+        }
+    }
     return std::string{asset_identity_prefix} + digest.hex();
 }
 
@@ -357,15 +374,66 @@ Transform imported_transform(const aiMatrix4x4& matrix) {
             {scale.x, scale.y, scale.z}};
 }
 
+struct ImportedCamera {
+    Transform transform;
+    Camera camera;
+};
+
+std::optional<ImportedCamera> imported_camera(const aiCamera& source) {
+    if (source.mOrthographicWidth != 0.0F) return std::nullopt;
+    auto forward = source.mLookAt;
+    auto up = source.mUp;
+    const auto finite_vector = [](const aiVector3D& v) {
+        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+    };
+    if (!finite_vector(forward) || !finite_vector(up) || !finite_vector(source.mPosition) ||
+        forward.SquareLength() < 1e-12F || up.SquareLength() < 1e-12F) return std::nullopt;
+    forward.Normalize();
+    auto right = forward ^ up;
+    if (right.SquareLength() < 1e-12F) return std::nullopt;
+    right.Normalize();
+    up = right ^ forward;
+    // Relay cameras look along local -Z. Assimp's vectors are relative to the named node.
+    const aiMatrix4x4 pose{right.x, up.x, -forward.x, source.mPosition.x,
+                          right.y, up.y, -forward.y, source.mPosition.y,
+                          right.z, up.z, -forward.z, source.mPosition.z,
+                          0.0F, 0.0F, 0.0F, 1.0F};
+    const double aspect = source.mAspect == 0.0F ? 1.0 : source.mAspect;
+    const double fov = 2.0 * std::atan(std::tan(source.mHorizontalFOV) / aspect) *
+                       57.295779513082320876;
+    if (!std::isfinite(aspect) || aspect <= 0.0 ||
+        !std::isfinite(source.mHorizontalFOV) || source.mHorizontalFOV <= 0.0F ||
+        source.mHorizontalFOV >= 1.5707963267948966 ||
+        !std::isfinite(fov) || fov <= 1.0 || fov >= 179.0 ||
+        !std::isfinite(source.mClipPlaneNear) || !std::isfinite(source.mClipPlaneFar) ||
+        source.mClipPlaneNear <= 0.0F || source.mClipPlaneFar <= source.mClipPlaneNear) {
+        return std::nullopt;
+    }
+    return ImportedCamera{imported_transform(pose),
+                          Camera{fov, source.mClipPlaneNear, source.mClipPlaneFar, false}};
+}
+
 Entity instantiate_node(const aiNode* node, const Entity parent, Scene& scene,
                         const std::vector<std::string>& mesh_names,
                         const std::vector<std::string>& material_names,
-                        const aiScene& imported, std::vector<Entity>& roots) {
+                        const aiScene& imported, std::vector<Entity>& roots,
+                        const bool include_cameras) {
     auto name = std::string{node->mName.C_Str()};
     if (name.empty()) name = "Imported Node";
     const auto entity = scene.create(name, parent);
     (void)scene.set_transform(entity, imported_transform(node->mTransformation));
     if (!parent.valid()) roots.push_back(entity);
+    if (include_cameras) {
+        for (unsigned index = 0; index < imported.mNumCameras; ++index) {
+            const auto& source = *imported.mCameras[index];
+            if (source.mName != node->mName) continue;
+            if (const auto camera = imported_camera(source)) {
+                const auto child = scene.create(name + " Camera", entity);
+                (void)scene.set_transform(child, camera->transform);
+                (void)scene.set_camera(child, camera->camera);
+            }
+        }
+    }
     for (unsigned index = 0; index < node->mNumMeshes; ++index) {
         const auto mesh_index = node->mMeshes[index];
         Entity render_entity = entity;
@@ -380,7 +448,7 @@ Entity instantiate_node(const aiNode* node, const Entity parent, Scene& scene,
     }
     for (unsigned index = 0; index < node->mNumChildren; ++index) {
         (void)instantiate_node(node->mChildren[index], entity, scene, mesh_names, material_names,
-                               imported, roots);
+                               imported, roots, include_cameras);
     }
     return entity;
 }
@@ -518,6 +586,18 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
                     ? "model import failed: " + std::string{importer.GetErrorString()}
                     : "model import blocked: " + sandbox->rejection();
         return result;
+    }
+    if (imported->mNumCameras > 4096U) {
+        error = "model exceeds the 4096-camera import limit";
+        return result;
+    }
+    // Assimp's glTF2 importer stores the FULL horizontal angle, unlike aiCamera's documented
+    // half-angle convention. Normalize it before using the common camera conversion path.
+    const auto import_extension = import_path.extension().string();
+    if (import_extension == ".gltf" || import_extension == ".glb") {
+        for (unsigned index = 0; index < imported->mNumCameras; ++index) {
+            imported->mCameras[index]->mHorizontalFOV *= 0.5F;
+        }
     }
     std::vector<MaterialAsset> new_materials;
     new_materials.reserve(imported->mNumMaterials);
@@ -716,11 +796,25 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
     if (imported->HasAnimations()) result.warnings.push_back("animations are not imported yet");
     if (has_skeleton) result.warnings.push_back("skeletons and skin weights are not imported yet");
     if (has_morph_targets) result.warnings.push_back("morph targets are not imported yet");
-    if (imported->HasCameras()) result.warnings.push_back("imported cameras are not instantiated yet");
+    if (settings.preset == "scene") {
+        for (unsigned index = 0; index < imported->mNumCameras; ++index) {
+            const auto& camera = *imported->mCameras[index];
+            if (camera.mOrthographicWidth != 0.0F) {
+                result.warnings.push_back("orthographic camera '" + std::string{camera.mName.C_Str()} +
+                                          "' is not supported");
+            } else if (!imported_camera(camera)) {
+                result.warnings.push_back("camera '" + std::string{camera.mName.C_Str()} +
+                                          "' has invalid projection or orientation");
+            } else if (imported->mRootNode->FindNode(camera.mName) == nullptr) {
+                result.warnings.push_back("camera '" + std::string{camera.mName.C_Str()} +
+                                          "' has no matching scene node");
+            }
+        }
+    }
     if (imported->HasLights()) result.warnings.push_back("imported lights are not instantiated yet");
     if (scene != nullptr) {
         instantiate_node(imported->mRootNode, {}, *scene, result.meshes, result.materials,
-                         *imported, result.roots);
+                         *imported, result.roots, settings.preset == "scene");
     }
     result.imported = true;
     return result;

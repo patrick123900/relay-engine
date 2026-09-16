@@ -304,6 +304,73 @@ int main() {
                registry.revision() == asset_revision + 1U,
            "reimporting identical model content reuses stable asset identities");
 
+    relay::Scene camera_scene;
+    const auto existing_camera = camera_scene.create("Existing camera");
+    expect(camera_scene.set_camera(existing_camera, relay::Camera{}), "create existing camera");
+    const auto camera_import = relay::import_model_asset(assets_root, "relay-camera-golden.gltf",
+                                                         registry, &camera_scene, import_error);
+    relay::Entity imported_camera_entity{};
+    std::size_t camera_count = 0;
+    for (const auto entity : camera_scene.entities()) {
+        const auto* record = camera_scene.get(entity);
+        if (record->camera && entity != existing_camera) {
+            imported_camera_entity = entity;
+            ++camera_count;
+        }
+    }
+    const auto* camera_record = camera_scene.get(imported_camera_entity);
+    expect(camera_import.imported && camera_count == 1U && camera_record &&
+               !camera_record->camera->active &&
+               std::abs(camera_record->camera->field_of_view_y_degrees - 60.0) < 0.001 &&
+               std::abs(camera_record->camera->near_plane - 0.25) < 0.001 &&
+               std::abs(camera_record->camera->far_plane - 200.0) < 0.001 &&
+               camera_scene.active_camera() == existing_camera,
+           "perspective cameras preserve projection without stealing the active camera: " +
+               import_error + camera_scene.serialize_json());
+    expect(camera_import.json().find("orthographic camera") != std::string::npos,
+           "unsupported orthographic cameras produce an explicit diagnostic");
+    if (camera_record) {
+        const auto* node = camera_scene.get(camera_record->parent);
+        expect(node && node->name == "Perspective" && node->transform.position.z == 5.0 &&
+                   std::abs(camera_record->transform.rotation_degrees.y) < 0.001 &&
+                   camera_record->transform.position == relay::Vec3{},
+               "camera-local orientation and node hierarchy are preserved");
+    }
+    relay::Scene static_camera_scene;
+    relay::ModelImportSettings static_camera_settings;
+    static_camera_settings.preset = "static_mesh";
+    const auto static_camera_import = relay::import_model_asset(
+        assets_root, "relay-camera-golden.gltf", registry, &static_camera_scene,
+        import_error, static_camera_settings);
+    bool static_has_camera = false;
+    for (const auto entity : static_camera_scene.entities()) {
+        static_has_camera = static_has_camera || static_camera_scene.get(entity)->camera.has_value();
+    }
+    expect(static_camera_import.imported && !static_has_camera,
+           "static_mesh preset excludes cameras for direct glTF imports too");
+    const auto camera_round_trip = std::filesystem::temp_directory_path() /
+                                   "relay-imported-camera.relay.json";
+    expect(relay::save_scene_file_atomic(camera_scene, camera_round_trip, import_error),
+           "imported camera scene saves: " + import_error);
+    const auto camera_loaded = relay::load_scene_file(camera_round_trip);
+    if (camera_loaded) {
+        relay::Scene restored_camera_scene;
+        restored_camera_scene.restore_state(*camera_loaded.state);
+        expect(restored_camera_scene.serialize_json() == camera_scene.serialize_json(),
+               "imported camera projection, hierarchy and activation survive restart");
+    } else {
+        expect(false, "imported camera scene loads: " + camera_loaded.error);
+    }
+    std::filesystem::remove(camera_round_trip);
+    if (camera_record) {
+        auto camera = *camera_record->camera;
+        camera.active = true;
+        expect(camera_scene.set_camera(imported_camera_entity, camera) &&
+                   relay::build_render_scene(camera_scene, registry, 2.0F).camera.entity ==
+                       imported_camera_entity,
+               "imported cameras can be activated through the existing scene interface");
+    }
+
     relay::AssetRegistry golden_gltf_registry;
     relay::AssetRegistry golden_glb_registry;
     std::string golden_error;

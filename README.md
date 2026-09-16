@@ -124,6 +124,10 @@ Blender is discovered as `blender` on `PATH`; set `RELAY_BLENDER_EXECUTABLE` to 
 chosen executable when it is installed in a mounted system-runtime directory (`/usr` or `/opt` on
 Linux). The `scene` import preset retains conversion-time
 animation/camera/light channels, while `static_mesh` strips them from Blender's cached GLB.
+Perspective cameras are instantiated as inactive camera components under their original nodes,
+preserving projection and hierarchy; they can be activated through the existing camera interface
+and survive scene save/load. The static-mesh preset also excludes camera components for direct
+imports. Orthographic cameras and invalid projection/orientation data produce diagnostics.
 
 Each import is content-addressed with a versioned SHA-256 digest (`sha256-v1-<hex>`), and recorded in
 a project manifest at `assets/.relay-imports.json` alongside its source name, importer version,
@@ -208,7 +212,7 @@ Both CMake builds and `npm run check` reject stale generated C++, TypeScript or 
 
 Near-term milestones, in the order they should be taken:
 
-1. Add skeleton, skin-weight, animation, morph-target, imported-camera and imported-light support.
+1. Add skeleton, skin-weight, animation, morph-target and imported-light support, then orthographic cameras.
 2. Expand import presets as those data types become editable in Relay.
 3. Replace whole-registry hot refresh with versioned asynchronous resource uploads.
 

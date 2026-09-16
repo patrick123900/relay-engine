@@ -26,9 +26,10 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_render_capture_status{{
     {"job", ProtocolValueType::integer, true, false, true, false, 1, 0, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 2> fields_assets_import_model{{
+constexpr std::array<ProtocolFieldSpec, 3> fields_assets_import_model{{
     {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 5U, 128U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.(gltf|glb|fbx|obj|dae|blend)$", ""},
     {"instantiate", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"preset", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "scene|static_mesh"},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_logs_read{{

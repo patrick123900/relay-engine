@@ -1,5 +1,6 @@
 #include "relay/core/hash.hpp"
 #include "relay/render/assets.hpp"
+#include "relay/render/blender_adapter.hpp"
 #include "relay/render/image_decode.hpp"
 #include "relay/scene/scene.hpp"
 
@@ -55,7 +56,8 @@ std::optional<std::filesystem::path> resolve_inside(const std::filesystem::path&
     const auto canonical = std::filesystem::weakly_canonical(candidate, code);
     if (code) return std::nullopt;
     const auto relative = canonical.lexically_relative(root);
-    if (relative.empty() || relative.native().starts_with("..")) return std::nullopt;
+    if (relative.empty() || relative.begin() == relative.end() ||
+        *relative.begin() == std::filesystem::path{".."}) return std::nullopt;
     return canonical;
 }
 
@@ -410,7 +412,12 @@ std::string ModelImportResult::json() const {
         if (i) output << ',';
         output << '"' << roots[i].to_string() << '"';
     }
-    output << "],\"dependencies\":[";
+    output << "],\"adapter\":\"" << escape_json(source_adapter)
+           << "\",\"preset\":\"" << escape_json(preset)
+           << "\",\"conversion_cache_hit\":" << (conversion_cache_hit ? "true" : "false")
+           << ",\"conversion_sandboxed\":" << (conversion_sandboxed ? "true" : "false")
+           << ",\"conversion_diagnostics\":\"" << escape_json(conversion_diagnostics) << '"'
+           << ",\"dependencies\":[";
     for (std::size_t i = 0; i < dependencies.size(); ++i) {
         if (i) output << ',';
         output << '"' << escape_json(dependencies[i]) << '"';
@@ -426,7 +433,7 @@ std::string ModelImportResult::json() const {
 
 std::string model_import_capabilities_json() {
 #ifdef RELAY_HAS_ASSIMP
-    return R"({"available":true,"native_recommended":[".gltf",".glb"],"formats":[".gltf",".glb",".fbx",".obj",".dae",".blend"],"backend":"Assimp","identity":"sha256-v1","image_decoders":["png","jpeg"],"sandbox":{"root":"assets","max_dependency_files":64,"max_dependency_bytes":67108864},"notes":{".blend":"Godot-style Blender-to-glTF conversion is planned; direct Assimp loading is currently used","materials":"glTF metallic-roughness factors and base-color, metallic-roughness, normal, occlusion and emissive textures are imported","animation":"detected and reported but not yet instantiated"}})";
+    return R"({"available":true,"native_recommended":[".gltf",".glb"],"formats":[".gltf",".glb",".fbx",".obj",".dae",".blend"],"backend":"Assimp","identity":"sha256-v1","image_decoders":["png","jpeg"],"presets":["scene","static_mesh"],"sandbox":{"root":"assets","max_dependency_files":64,"max_dependency_bytes":67108864},"adapters":{".blend":{"backend":"Blender glTF exporter","cache":"assets/.relay-cache/blender","autoexec":false,"timeout_seconds":120,"sandbox":"Bubblewrap on Linux; other platforms require administrator trusted-input opt-in"}},"notes":{"materials":"glTF metallic-roughness factors and base-color, metallic-roughness, normal, occlusion and emissive textures are imported","animation":"exported from Blender and detected, but not yet instantiated"}})";
 #else
     return R"({"available":false,"native_recommended":[".gltf",".glb"],"formats":[],"backend":"none","identity":"sha256-v1","reason":"Relay was built without Assimp"})";
 #endif
@@ -434,9 +441,15 @@ std::string model_import_capabilities_json() {
 
 ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
                                      const std::string_view filename, AssetRegistry& registry,
-                                     Scene* scene, std::string& error) {
+                                     Scene* scene, std::string& error,
+                                     const ModelImportSettings& settings) {
     ModelImportResult result;
     result.source_format = std::filesystem::path{filename}.extension().string();
+    result.preset = settings.preset;
+    if (settings.preset != "scene" && settings.preset != "static_mesh") {
+        error = "model import preset must be 'scene' or 'static_mesh'";
+        return result;
+    }
 
     std::error_code code;
     const auto root = std::filesystem::weakly_canonical(assets_root, code);
@@ -457,15 +470,50 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
     error = "this Relay build does not include the Assimp model importer";
     return result;
 #else
+    std::filesystem::path import_path = std::filesystem::path{filename};
+    if (result.source_format == ".blend") {
+        auto blender_settings = settings.blender;
+        if (settings.preset == "static_mesh") {
+            blender_settings.export_animations = false;
+            blender_settings.export_cameras = false;
+            blender_settings.export_lights = false;
+        }
+        const auto converted = convert_blend_to_glb(root, *model_path, blender_settings, error);
+        if (!converted.converted) {
+            if (!converted.diagnostics.empty()) {
+                const auto end = std::min<std::size_t>(converted.diagnostics.size(), 1024U);
+                error += ": " + converted.diagnostics.substr(0U, end);
+            }
+            return result;
+        }
+        import_path = converted.converted_model;
+        result.source_adapter = "blender-glb";
+        result.conversion_cache_hit = converted.cache_hit;
+        result.conversion_sandboxed = converted.sandboxed;
+        result.conversion_diagnostics =
+            converted.diagnostics.substr(0U, std::min<std::size_t>(4096U,
+                                                                   converted.diagnostics.size()));
+        result.dependencies.push_back(std::filesystem::path{filename}.generic_string());
+        for (const auto& dependency : converted.dependencies) {
+            result.dependencies.push_back(dependency.generic_string());
+        }
+    }
     Assimp::Importer importer;
     // The importer takes ownership of the handler; the observer stays valid while it is alive.
     auto* sandbox = new SandboxedIOSystem(root);
     importer.SetIOHandler(sandbox);
-    const auto* imported = importer.ReadFile(std::string{filename}, aiProcess_Triangulate |
+    const auto* imported = importer.ReadFile(import_path.generic_string(), aiProcess_Triangulate |
         aiProcess_JoinIdenticalVertices | aiProcess_ImproveCacheLocality |
         aiProcess_SortByPType | aiProcess_ValidateDataStructure | aiProcess_GenSmoothNormals |
         aiProcess_CalcTangentSpace);
     if (imported == nullptr || imported->mRootNode == nullptr) {
+        if (result.source_format == ".blend" && result.conversion_cache_hit) {
+            std::error_code remove_error;
+            std::filesystem::remove(root / import_path, remove_error);
+            if (!remove_error) {
+                return import_model_asset(assets_root, filename, registry, scene, error, settings);
+            }
+        }
         error = sandbox->rejection().empty()
                     ? "model import failed: " + std::string{importer.GetErrorString()}
                     : "model import blocked: " + sandbox->rejection();
@@ -584,7 +632,11 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
         result.warnings.push_back("blocked dependency: " + sandbox->rejection());
     }
     for (const auto& dependency : sandbox->dependencies()) {
-        result.dependencies.push_back(dependency.lexically_relative(root).generic_string());
+        const auto relative = dependency.lexically_relative(root).generic_string();
+        if (std::find(result.dependencies.begin(), result.dependencies.end(), relative) ==
+            result.dependencies.end()) {
+            result.dependencies.push_back(relative);
+        }
     }
     // Identity covers normalized geometry, generated normals/tangents, material factors and decoded
     // image pixels, so changes in external image dependencies produce new durable asset IDs.
@@ -609,9 +661,11 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
     std::vector<MeshAsset> new_meshes;
     new_meshes.reserve(imported->mNumMeshes);
     bool has_skeleton = false;
+    bool has_morph_targets = false;
     for (unsigned mesh_index = 0; mesh_index < imported->mNumMeshes; ++mesh_index) {
         const auto* source = imported->mMeshes[mesh_index];
         has_skeleton = has_skeleton || source->HasBones();
+        has_morph_targets = has_morph_targets || source->mNumAnimMeshes > 0U;
         const auto vertex_offset = static_cast<std::int32_t>(new_vertices.size());
         const auto first_index = static_cast<std::uint32_t>(new_indices.size());
         for (unsigned vertex = 0; vertex < source->mNumVertices; ++vertex) {
@@ -646,7 +700,10 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
         error = "model contains no triangle meshes";
         return result;
     }
-    if (registry.textures().size() + new_textures.size() > bindless_texture_capacity) {
+    const bool already_registered = std::all_of(new_meshes.begin(), new_meshes.end(),
+        [&](const auto& mesh) { return registry.find_mesh(mesh.name) != nullptr; });
+    if (!already_registered &&
+        registry.textures().size() + new_textures.size() > bindless_texture_capacity) {
         error = "model textures exceed the 16-slot texture table capacity";
         return result;
     }
@@ -658,6 +715,9 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
     }
     if (imported->HasAnimations()) result.warnings.push_back("animations are not imported yet");
     if (has_skeleton) result.warnings.push_back("skeletons and skin weights are not imported yet");
+    if (has_morph_targets) result.warnings.push_back("morph targets are not imported yet");
+    if (imported->HasCameras()) result.warnings.push_back("imported cameras are not instantiated yet");
+    if (imported->HasLights()) result.warnings.push_back("imported lights are not instantiated yet");
     if (scene != nullptr) {
         instantiate_node(imported->mRootNode, {}, *scene, result.meshes, result.materials,
                          *imported, result.roots);

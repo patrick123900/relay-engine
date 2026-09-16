@@ -157,14 +157,15 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         description: "Import a model from the project-local assets directory using a content-addressed identity and optionally instantiate its node hierarchy.",
         inputSchema: z.object({
             "filename": z.string().min(5).max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._-]*\\.(gltf|glb|fbx|obj|dae|blend)$")).describe("Safe project-local model filename without directory components"),
-            "instantiate": z.boolean().default(true).describe("Create the imported model hierarchy in the active scene")
+            "instantiate": z.boolean().default(true).describe("Create the imported model hierarchy in the active scene"),
+            "preset": z.enum(["scene", "static_mesh"]).default("scene").describe("Scene preserves conversion-time animation, camera and light data; static_mesh strips those channels")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["asset_import_model"];
         if (override)
             return override(input);
-        return invoke("assets.import_model", { "filename": input["filename"], "instantiate": input["instantiate"] });
+        return invoke("assets.import_model", { "filename": input["filename"], "instantiate": input["instantiate"], "preset": input["preset"] });
     });
     server.registerTool("logs_read", {
         title: "Read Relay logs",

@@ -8,6 +8,7 @@ npm-debug.log*
 
 # Generated import cache. It is rebuilt from the models in assets/ on demand.
 /assets/.relay-imports.json
+/assets/.relay-cache/
 
 # Local runtime output
 /outputs/

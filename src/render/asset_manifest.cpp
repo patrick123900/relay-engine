@@ -70,10 +70,40 @@ bool replace_atomically(const std::filesystem::path& temporary,
 std::string ImportReloadReport::json() const {
     std::ostringstream output;
     output << "{\"restored\":" << restored << ",\"changed\":" << changed
-           << ",\"failed\":" << failed << ",\"messages\":";
+           << ",\"failed\":" << failed << ",\"rebound\":" << rebound
+           << ",\"messages\":";
     write_string_array(output, messages);
     output << '}';
     return output.str();
+}
+
+std::size_t ImportReloadReport::rebind_scene(Scene& scene) {
+    std::size_t count = 0U;
+    const auto resolve = [&](const std::string& original) {
+        std::string replacement = original;
+        bool found = false;
+        for (const auto& [old_id, new_id] : asset_remaps) {
+            if (original != old_id) continue;
+            if (found && replacement != new_id) {
+                messages.push_back("ambiguous changed-asset mapping left unchanged: " + original);
+                return original;
+            }
+            replacement = new_id;
+            found = true;
+        }
+        return replacement;
+    };
+    for (const auto entity : scene.entities()) {
+        const auto* record = scene.get(entity);
+        if (record == nullptr || !record->mesh_renderer.has_value()) continue;
+        auto renderer = *record->mesh_renderer;
+        renderer.mesh = resolve(renderer.mesh);
+        renderer.material = resolve(renderer.material);
+        const bool changed_renderer = renderer != *record->mesh_renderer;
+        if (changed_renderer && scene.set_mesh_renderer(entity, std::move(renderer))) ++count;
+    }
+    rebound += count;
+    return count;
 }
 
 std::filesystem::path ImportManifest::path_for(const std::filesystem::path& assets_root) {
@@ -106,7 +136,8 @@ bool ImportManifest::load(const std::filesystem::path& assets_root, std::string&
     const auto& root = *document->object();
     const auto* version = field(root, "version");
     if (version == nullptr || version->number() == nullptr ||
-        static_cast<std::uint32_t>(*version->number()) != import_manifest_version) {
+        (*version->number() != 1.0 &&
+         *version->number() != static_cast<double>(import_manifest_version))) {
         error = "import manifest version is missing or unsupported";
         return false;
     }
@@ -135,6 +166,8 @@ bool ImportManifest::load(const std::filesystem::path& assets_root, std::string&
         entry.meshes = read_string_array(field(*record, "meshes"));
         entry.materials = read_string_array(field(*record, "materials"));
         entry.textures = read_string_array(field(*record, "textures"));
+        const auto* preset = field(*record, "preset");
+        if (preset != nullptr && preset->string() != nullptr) entry.preset = *preset->string();
         entries_.push_back(std::move(entry));
     }
     return true;
@@ -157,6 +190,7 @@ bool ImportManifest::save(const std::filesystem::path& assets_root, std::string&
         write_string_array(output, entry.materials);
         output << ",\"textures\":";
         write_string_array(output, entry.textures);
+        output << ",\"preset\":\"" << json_escape(entry.preset) << '"';
         output << '}';
     }
     output << "]}\n";
@@ -207,10 +241,13 @@ ImportReloadReport reload_imported_assets(const std::filesystem::path& assets_ro
         report.messages.push_back(error);
         return report;
     }
-    for (const auto& entry : manifest.entries()) {
+    const auto entries = manifest.entries();
+    for (const auto& entry : entries) {
         std::string import_error;
+        ModelImportSettings settings;
+        settings.preset = entry.preset;
         const auto imported = import_model_asset(assets_root, entry.source, registry, nullptr,
-                                                 import_error);
+                                                 import_error, settings);
         if (!imported.imported) {
             ++report.failed;
             report.messages.push_back("could not restore '" + entry.source + "': " + import_error);
@@ -222,16 +259,29 @@ ImportReloadReport reload_imported_assets(const std::filesystem::path& assets_ro
                                       std::to_string(entry.importer_version) +
                                       "; assets were rebuilt with version " +
                                       std::to_string(model_importer_version));
-            continue;
-        }
-        if (imported.content_id != entry.content_id) {
+        } else if (imported.content_id != entry.content_id) {
             ++report.changed;
             report.messages.push_back("'" + entry.source +
-                                      "' changed on disk; scene references to its previous assets "
-                                      "will not resolve");
+                                      "' changed on disk; compatible saved scene references will "
+                                      "be rebound by asset index");
+        } else {
+            ++report.restored;
             continue;
         }
-        ++report.restored;
+        const auto add_remaps = [&](const std::vector<std::string>& old_ids,
+                                    const std::vector<std::string>& new_ids) {
+            if (old_ids.size() != new_ids.size()) {
+                report.messages.push_back("'" + entry.source +
+                                          "' changed asset count; that asset group was not rebound");
+                return;
+            }
+            const auto count = old_ids.size();
+            for (std::size_t index = 0; index < count; ++index) {
+                report.asset_remaps.emplace_back(old_ids[index], new_ids[index]);
+            }
+        };
+        add_remaps(entry.meshes, imported.meshes);
+        add_remaps(entry.materials, imported.materials);
     }
     return report;
 }

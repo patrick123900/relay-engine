@@ -332,17 +332,22 @@ std::string ControlProtocol::handle(const std::string_view request) {
         const auto safe_name = safe_model_filename(filename);
         if (!safe_name) return error_response(id, "filename must be a supported model name without directories");
         const bool instantiate = boolean_field(request, "instantiate", true);
+        ModelImportSettings settings;
+        settings.preset = string_field(request, "preset");
+        if (settings.preset.empty()) settings.preset = "scene";
         const std::filesystem::path assets_root{"assets"};
         std::string error;
         ModelImportResult imported;
         if (instantiate) {
             const bool changed = engine_.scene_history().execute("Import " + filename, [&](Scene& scene) {
-                imported = import_model_asset(assets_root, *safe_name, engine_.assets(), &scene, error);
+                imported = import_model_asset(assets_root, *safe_name, engine_.assets(), &scene,
+                                              error, settings);
                 return imported.imported;
             });
             if (!changed) return error_response(id, error.empty() ? "model import failed" : error);
         } else {
-            imported = import_model_asset(assets_root, *safe_name, engine_.assets(), nullptr, error);
+            imported = import_model_asset(assets_root, *safe_name, engine_.assets(), nullptr,
+                                          error, settings);
             if (!imported.imported) return error_response(id, error);
         }
         ImportManifest manifest;
@@ -350,7 +355,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         if (manifest.load(assets_root, manifest_error)) {
             manifest.record({*safe_name, model_importer_version, imported.content_id,
                              imported.dependencies, imported.meshes, imported.materials,
-                             imported.textures});
+                             imported.textures, imported.preset});
             if (!manifest.save(assets_root, manifest_error)) {
                 engine_.logs().write(LogLevel::warning,
                                      "Import manifest not updated: " + manifest_error);
@@ -618,15 +623,16 @@ std::string ControlProtocol::handle(const std::string_view request) {
         const auto state = std::move(*loaded.state);
         // Imported assets live outside the scene file, so restore them before the scene that
         // references them by id.
-        const auto reload = reload_imported_assets(std::filesystem::path{"assets"}, engine_.assets());
-        for (const auto& message : reload.messages) {
-            engine_.logs().write(LogLevel::warning, "Imported asset reload: " + message);
-        }
+        auto reload = reload_imported_assets(std::filesystem::path{"assets"}, engine_.assets());
         if (!engine_.scene_history().execute("Load " + filename, [&](Scene& scene) {
                 scene.restore_state(state);
+                (void)reload.rebind_scene(scene);
                 return true;
             })) {
             return error_response(id, "could not apply loaded scene");
+        }
+        for (const auto& message : reload.messages) {
+            engine_.logs().write(LogLevel::warning, "Imported asset reload: " + message);
         }
         engine_.logs().write(LogLevel::info, "Loaded scene " + path->string());
         return response_prefix(id) + "{\"path\":\"" + escape_json(path->string()) +

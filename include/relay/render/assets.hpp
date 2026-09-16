@@ -1,5 +1,6 @@
 #pragma once
 
+#include "relay/render/blender_adapter.hpp"
 #include "relay/scene/scene.hpp"
 
 #include <array>
@@ -126,10 +127,22 @@ struct ModelImportResult {
     std::vector<std::string> textures;
     std::vector<std::string> warnings;
     std::vector<Entity> roots;
+    std::string source_adapter{"direct"};
+    std::string preset{"scene"};
+    bool conversion_cache_hit{};
+    bool conversion_sandboxed{};
+    std::string conversion_diagnostics;
     // Every file read during the import, relative to the assets root, in the order first opened.
     std::vector<std::string> dependencies;
 
     [[nodiscard]] std::string json() const;
+};
+
+struct ModelImportSettings {
+    BlenderConversionSettings blender;
+    // `scene` retains conversion-time animation/camera/light data for later import stages;
+    // `static_mesh` strips those channels from Blender conversion output.
+    std::string preset{"scene"};
 };
 
 [[nodiscard]] std::string model_import_capabilities_json();
@@ -140,6 +153,7 @@ struct ModelImportResult {
 [[nodiscard]] ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
                                                    std::string_view filename,
                                                    AssetRegistry& registry, Scene* scene,
-                                                   std::string& error);
+                                                   std::string& error,
+                                                   const ModelImportSettings& settings = {});
 
 } // namespace relay

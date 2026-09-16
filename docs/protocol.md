@@ -18,7 +18,7 @@ Schema version: `4` · Native methods: `38` · MCP tools: `38`
 | `render.shader_interfaces` | `render_shader_interfaces` | — | read-only | Read SPIR-V-reflected stages, locations, descriptor bindings and push-constant sizes from the live Vulkan pipeline. |
 | `render.assets` | `render_assets` | — | read-only | List built-in and imported meshes, materials and textures currently available to scene renderer components. |
 | `assets.formats` | `asset_import_formats` | — | read-only | Report model formats and feature coverage available in this Relay build, including Godot-compatible interchange paths. |
-| `assets.import_model` | `asset_import_model` | `filename`: string (required)<br>`instantiate`: boolean = `true` | mutating | Import a model from the project-local assets directory using a content-addressed identity and optionally instantiate its node hierarchy. |
+| `assets.import_model` | `asset_import_model` | `filename`: string (required)<br>`instantiate`: boolean = `true`<br>`preset`: string = `"scene"` | mutating | Import a model from the project-local assets directory using a content-addressed identity and optionally instantiate its node hierarchy. |
 | `logs.read` | `logs_read` | `after`: integer = `0` | read-only | Read structured engine log entries newer than a sequence number. |
 | `performance.read` | `performance_read` | `afterFrame`: integer = `0`<br>`limit`: integer = `30` | read-only | Read bounded per-frame CPU/GPU timing, draw/resource counts, entities and process memory. |
 | `input.recent` | `input_recent` | — | read-only | Read the bounded normalized keyboard, mouse and gamepad input event history. |

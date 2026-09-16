@@ -427,6 +427,118 @@ int main() {
         expect(external.content_id.rfind("sha256-v1-", 0U) == 0U,
                "asset identities carry a versioned SHA-256 scheme");
 
+#ifndef _WIN32
+        // Exercise the Blender process boundary without depending on the host Blender version. The
+        // stand-in accepts the same fixed argv shape and emits a known-good GLB into Relay's cache.
+        const auto fake_blender = sandbox_root / "fake-blender";
+        write_file(fake_blender,
+                   "#!/bin/sh\n"
+                   "if [ \"$1\" = \"--version\" ]; then echo 'Blender 4.3.0 test'; exit 0; fi\n"
+                   "for value in \"$@\"; do output=\"$value\"; done\n"
+                   "directory=$(dirname \"$0\")\n"
+                   "dependency=\"$directory/external.bin\"\n"
+                   "if [ -f \"$directory/escape-dependency\" ]; then "
+                   "dependency=\"$directory/../relay-phase-a-outside/secret.bin\"; fi\n"
+                   "if [ \"$output\" = \"relay-dependencies\" ]; then "
+                   "echo \"RELAY_DEPENDENCIES:[\\\"$dependency\\\"]\"; "
+                   "exit 0; fi\n"
+                   "if [ -f \"$directory/slow-conversion\" ]; then sleep 5; fi\n"
+                   "cp \"$(dirname \"$0\")/fixture.glb\" \"$output\"\n");
+        std::filesystem::permissions(
+            fake_blender,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+                std::filesystem::perms::owner_exec,
+            std::filesystem::perm_options::replace);
+        std::filesystem::copy_file(assets_root / "relay-pbr-golden.glb",
+                                   sandbox_root / "fixture.glb");
+        write_file(sandbox_root / "source.blend", "Relay Blender adapter fixture");
+        relay::ModelImportSettings blender_settings;
+        blender_settings.blender.executable = fake_blender;
+        blender_settings.blender.timeout_seconds = 5U;
+        blender_settings.blender.allow_unsandboxed = true; // Only this known local stand-in.
+        relay::AssetRegistry blend_registry;
+        std::string blend_error;
+        const auto blend = relay::import_model_asset(sandbox_root, "source.blend", blend_registry,
+                                                      nullptr, blend_error, blender_settings);
+        expect(blend.imported && blend.source_adapter == "blender-glb" &&
+                   !blend.conversion_cache_hit && blend.source_format == ".blend" &&
+                   std::find(blend.dependencies.begin(), blend.dependencies.end(),
+                             std::string{"source.blend"}) != blend.dependencies.end(),
+               "Blender sources convert through the fixed, contained GLB adapter: " + blend_error);
+        relay::AssetRegistry cached_blend_registry;
+        const auto cached_blend = relay::import_model_asset(
+            sandbox_root, "source.blend", cached_blend_registry, nullptr, blend_error,
+            blender_settings);
+        expect(cached_blend.imported && cached_blend.conversion_cache_hit &&
+                   cached_blend.content_id == blend.content_id,
+               "unchanged Blender content reuses its versioned conversion cache: " + blend_error);
+        relay::ModelImportSettings static_blender_settings = blender_settings;
+        static_blender_settings.preset = "static_mesh";
+        relay::AssetRegistry static_blend_registry;
+        const auto static_blend = relay::import_model_asset(
+            sandbox_root, "source.blend", static_blend_registry, nullptr, blend_error,
+            static_blender_settings);
+        expect(static_blend.imported && !static_blend.conversion_cache_hit &&
+                   static_blend.preset == "static_mesh" &&
+                   static_blend.dependencies.back() != blend.dependencies.back(),
+               "Blender import presets receive distinct content-addressed conversion caches: " +
+                   blend_error);
+        write_file(sandbox_root / cached_blend.dependencies.back(), "glTFbroken-cache-payload");
+        relay::AssetRegistry repaired_blend_registry;
+        const auto repaired_blend = relay::import_model_asset(
+            sandbox_root, "source.blend", repaired_blend_registry, nullptr, blend_error,
+            blender_settings);
+        expect(repaired_blend.imported && !repaired_blend.conversion_cache_hit &&
+                   repaired_blend.content_id == blend.content_id,
+               "invalid cached GLB data is discarded and regenerated: " + blend_error);
+        write_file(sandbox_root / "external.bin", triangle_buffer_bytes(-0.2F));
+        relay::AssetRegistry changed_blend_registry;
+        const auto changed_blend = relay::import_model_asset(
+            sandbox_root, "source.blend", changed_blend_registry, nullptr, blend_error,
+            blender_settings);
+        expect(changed_blend.imported && !changed_blend.conversion_cache_hit &&
+                   changed_blend.dependencies.back() != blend.dependencies.back(),
+               "changed external Blender dependencies invalidate the conversion cache: " +
+                   blend_error);
+        write_file(sandbox_root / "escape-dependency", "escape");
+        relay::AssetRegistry blocked_blend_registry;
+        const auto blocked_blend = relay::import_model_asset(
+            sandbox_root, "source.blend", blocked_blend_registry, nullptr, blend_error,
+            blender_settings);
+        expect(!blocked_blend.imported &&
+                   blend_error.find("outside the assets directory") != std::string::npos &&
+                   blocked_blend_registry.revision() == 1U,
+               "Blender preflight refuses external dependencies outside the asset root");
+        std::filesystem::remove(sandbox_root / "escape-dependency");
+        write_file(sandbox_root / "external.bin", triangle_buffer_bytes(-0.1F));
+        write_file(sandbox_root / "slow-conversion", "slow");
+        auto timeout_settings = blender_settings;
+        timeout_settings.blender.timeout_seconds = 1U;
+        const auto timed_out_blend = relay::import_model_asset(
+            sandbox_root, "source.blend", blocked_blend_registry, nullptr, blend_error,
+            timeout_settings);
+        expect(!timed_out_blend.imported && blend_error.find("timed out") != std::string::npos,
+               "Blender conversion timeouts terminate the subprocess and reject partial output");
+        std::filesystem::remove(sandbox_root / "slow-conversion");
+
+        const auto escaped_cache_root = sandbox_root / "escaped-cache";
+        std::filesystem::create_directories(escaped_cache_root);
+        std::filesystem::copy_file(fake_blender, escaped_cache_root / "fake-blender");
+        write_file(escaped_cache_root / "source.blend", "cache escape fixture");
+        write_file(escaped_cache_root / "external.bin", "dependency");
+        std::filesystem::create_directory_symlink(outside_root,
+                                                  escaped_cache_root / ".relay-cache");
+        auto escaped_cache_settings = blender_settings.blender;
+        escaped_cache_settings.executable = escaped_cache_root / "fake-blender";
+        const auto escaped_cache = relay::convert_blend_to_glb(
+            escaped_cache_root, escaped_cache_root / "source.blend", escaped_cache_settings,
+            blend_error);
+        expect(!escaped_cache.converted &&
+                   blend_error.find("cache resolves outside") != std::string::npos &&
+                   !std::filesystem::exists(outside_root / "blender"),
+               "cache symlink escapes are rejected before creating directories outside assets");
+#endif
+
         // A manifest must let a fresh registry rebuild the same asset ids after a restart.
         write_file(sandbox_root / "external.bin", triangle_buffer_bytes(-0.5F));
         relay::ImportManifest manifest;
@@ -449,9 +561,26 @@ int main() {
         // A source file that changed since the manifest was written must be reported, not hidden.
         write_file(sandbox_root / "external.bin", triangle_buffer_bytes(-0.25F));
         relay::AssetRegistry stale_registry;
-        const auto stale_report = reload_imported_assets(sandbox_root, stale_registry);
+        auto stale_report = reload_imported_assets(sandbox_root, stale_registry);
         expect(stale_report.changed == 1U && stale_report.restored == 0U,
                "a changed dependency is reported rather than silently re-pointed");
+        relay::Scene stale_scene;
+        const auto stale_entity = stale_scene.create("Previously imported mesh");
+        expect(stale_scene.set_mesh_renderer(
+                   stale_entity, relay::MeshRenderer{external.meshes.front(),
+                                                     external.materials.front()}),
+               "test scene can reference the previous imported asset identity");
+        expect(stale_report.rebind_scene(stale_scene) == 1U &&
+                   stale_scene.get(stale_entity)->mesh_renderer->mesh == changed.meshes.front() &&
+                   stale_registry.find_mesh(changed.meshes.front()) != nullptr,
+               "changed imports automatically rebind saved scene renderers to rebuilt assets");
+        relay::ImportReloadReport ambiguous_report;
+        ambiguous_report.asset_remaps = {{changed.meshes.front(), "asset.new-a.mesh.0"},
+                                         {changed.meshes.front(), "asset.new-b.mesh.0"}};
+        expect(ambiguous_report.rebind_scene(stale_scene) == 0U &&
+                   stale_scene.get(stale_entity)->mesh_renderer->mesh == changed.meshes.front() &&
+                   !ambiguous_report.messages.empty(),
+               "conflicting source mappings do not silently rebind a scene to the wrong mesh");
 
         std::filesystem::remove_all(sandbox_root);
         std::filesystem::remove_all(outside_root);

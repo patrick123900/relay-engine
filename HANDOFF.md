@@ -1,6 +1,6 @@
 # Relay Engine — Session Handoff
 
-Last updated: 2026-09-15
+Last updated: 2026-09-16
 
 ## User’s product goal
 
@@ -99,6 +99,8 @@ Current major layers:
 - Assimp-backed model importer is optional at build time.
 - Accepted project-file extensions are `.gltf`, `.glb`, `.fbx`, `.obj`, `.dae` and `.blend`.
 - glTF 2.0/GLB is the recommended native interchange path, matching Godot’s recommendation.
+- `.blend` sources use Blender's glTF exporter with script auto-execution disabled, bounded
+  diagnostics, a timeout and a content-addressed cache below `assets/.relay-cache/blender`.
 - Imported static geometry includes positions, UV0, generated normals/tangents and triangle indices.
 - Node transforms/hierarchy and PBR material factors are imported. Embedded and external PNG/JPEG
   images support base-color, metallic/roughness, normal, occlusion and emissive channels.
@@ -126,10 +128,10 @@ Current major layers:
   Relative escapes, absolute paths and symlinked escapes are refused; reads are capped at 64
   dependency files and 64 MiB each, and the importer is given no write path.
 - Imports are recorded in a project manifest (`assets/.relay-imports.json`) holding the source name,
-  importer version, content id, dependency list and generated asset ids.
+  importer version, preset, content id, dependency list and generated asset ids.
 - `scene.load` rebuilds imported assets from that manifest before applying the scene, and reports
-  restored/changed/failed counts in its response. A source file that changed since the manifest was
-  written is reported rather than silently re-pointed.
+  restored/changed/failed/rebound counts in its response. A source file that changed since the
+  manifest was written is rebuilt and compatible saved mesh/material ids are rebound by index.
 - Scene files, the import manifest and any future on-disk format share one strict JSON reader.
 
 ### Agent observability and debugging
@@ -224,9 +226,9 @@ These distinctions must remain explicit in future status reports.
 ### Import compatibility is not yet Godot feature parity
 
 Relay recognizes the main model extensions used by Godot, but does not yet reproduce all of Godot’s
-import behavior. glTF/GLB is the reliable recommended path. Godot imports `.blend` by launching
-Blender and converting to glTF; Relay currently asks Assimp to load `.blend` directly. Modern Blender
-files may therefore fail or differ. A Blender-to-glTF adapter is still required.
+import behavior. glTF/GLB is the reliable recommended path. Like Godot, Relay imports `.blend` by
+launching Blender and converting to a cached GLB. Relay's exporter settings are intentionally small
+and do not yet mirror Godot's complete import-remap UI.
 
 Reference: [Godot — Available 3D formats](https://docs.godotengine.org/en/latest/tutorials/assets_pipeline/importing_3d_scenes/available_formats.html).
 
@@ -262,11 +264,15 @@ are still outstanding:
 
 ### Import sandbox boundary
 
-Every dependency read now resolves through a canonicalizing `IOSystem` rooted at `assets/`, so a
-model cannot reach outside the project. Two caveats remain explicit:
+Every dependency Assimp reads resolves through a canonicalizing `IOSystem` rooted at `assets/`, so
+that stage cannot reach outside the project. Two caveats remain explicit:
 
-- `.blend` is still handed to Assimp directly, so the sandbox does not cover a future Blender
-  subprocess adapter. That adapter will need its own containment.
+- Blender conversion uses Bubblewrap on Linux with isolated filesystem/network/environment,
+  read-only system runtimes/assets, private temporary storage and the conversion cache as its only
+  persistent writable mount. Auto-execution is disabled and process-group cleanup enforces a
+  120-second timeout. Other
+  platforms fail closed unless an administrator opts into `RELAY_BLENDER_TRUSTED=1`; that mode must
+  only be used for trusted files and is never an agent-controlled protocol field.
 - Data URIs are decoded by Assimp in memory and are bounded only by the containing file's size
   limit, not by a separate decoded-size budget.
 
@@ -314,7 +320,7 @@ TODO for a rotating Vulkan staging/readback ring that feeds asynchronous capture
 
 ## What to build next
 
-The **Renderable Static glTF v1** milestone is complete through Phase C. Phase D is next.
+The **Renderable Static glTF v1** milestone is complete. Phase D is in progress.
 
 ### Phase A — durable and safe asset foundation (complete)
 
@@ -361,8 +367,8 @@ observed output and clean runs, not by validation layers. Installing them remain
 The Phase C import and rendering path has landed. The importer generates normals/tangents, decodes
 embedded and external PNG/JPEG images, retains the full static glTF PBR material record, selects
 sRGB or linear Vulkan formats, applies glTF sampler settings and safely refreshes live GPU
-resources. The shader renders
-base-color, metallic/roughness, normal, occlusion and emissive inputs. The golden fixture is present
+resources. The shader renders base-color, metallic/roughness, normal, occlusion and emissive inputs.
+The golden fixture is present
 as both `assets/relay-pbr-golden.gltf` and `assets/relay-pbr-golden.glb`.
 
 Definition of done, verified: the representative GLB renders its textured metallic and rough
@@ -373,13 +379,40 @@ decoding, generated tangent space and every PBR channel are additionally covered
 The implementation is deliberately still small: textures are capped at 16, live refresh rebuilds
 the full registry after waiting for the device, and alpha blending needs a transparent queue.
 
-### Phase D — finish Godot-oriented importing
+### Phase D — finish Godot-oriented importing (in progress)
 
 1. Add the Blender executable adapter used conceptually by Godot: detect Blender, convert `.blend`
    to cached glTF/GLB, capture diagnostics and hash the converted dependencies.
 2. Decide whether to retain Assimp FBX or add ufbx for closer Godot behavior.
 3. Add skeleton, skin weights, animation clips, morph targets, imported cameras and lights.
 4. Add import settings/presets and reimport-on-change.
+
+The Phase D foundation is complete. `.blend` no longer goes directly through Assimp: Relay detects
+Blender (or `RELAY_BLENDER_EXECUTABLE`), launches it without a shell, disables embedded-script
+auto-execution, bounds diagnostics and execution time, and preflights external image/library/font/
+cache-file dependencies. Each path must remain inside `assets/`. The validated GLB cache key covers
+source and dependency bytes, Blender version, adapter version and import preset. Linux conversion
+uses Bubblewrap to isolate filesystem, network and environment access. Cache paths are canonicalized
+inside `assets/` and reject symlink escapes before creating directories. The `scene` and
+`static_mesh` presets are exposed through the generated protocol. Changed imports are rebuilt during
+`scene.load`, with compatible saved mesh/material references rebound by index. Asset groups whose
+counts changed and conflicting source mappings are left untouched with diagnostics. The manifest
+baseline is not overwritten during automatic reload, so older saved scenes remain remappable.
+Index-based rebinding assumes stable mesh/material ordering; structural reordering still requires
+explicit reimport rather than treating the same asset count as semantic identity.
+
+Verified on Blender 5.2.1 LTS: a fresh sandboxed conversion imported successfully, reused its cache
+on the next import and rendered in the live Vulkan editor on the RX 9070 XT. Native tests cover
+dependency cache invalidation, corrupted-cache regeneration, external-path and cache-symlink
+escapes, conversion timeout cleanup and changed/ambiguous scene rebinding.
+
+FBX remains on Assimp for now. Adding ufbx would add another dependency and parallel material/
+animation normalization path; revisit that decision when FBX-specific fixtures demonstrate a
+correctness gap rather than introducing it speculatively.
+
+Still outstanding in Phase D: skeleton/skin data, animation clips and playback, morph targets, and
+scene components for imported cameras and lights. Windows/macOS need a platform sandbox equivalent
+to the Linux Bubblewrap path before accepting untrusted `.blend` files without administrator opt-in.
 
 ### Later milestones
 
@@ -396,13 +429,12 @@ the full registry after waiting for the device, and alpha blending needs a trans
 
 Use this as the next instruction after giving the agent this handoff:
 
-> Continue Relay Engine with Phase D from HANDOFF.md. Phases A-C are complete. Start with the
-> Blender-to-glTF adapter used conceptually by Godot: detect a configured Blender executable,
-> convert `.blend` files into a contained cache, capture actionable diagnostics, include conversion
-> inputs in durable identity and keep every subprocess and dependency inside an explicit sandbox.
-> Add import settings and reimport-on-change without weakening the existing path and symlink checks.
-> Keep direct Assimp import for glTF/GLB and the current FBX/OBJ/DAE fallback. Add focused tests, then
-> run dev/release, ctest, MCP validation and a real GPU smoke test.
+> Continue Phase D from HANDOFF.md. The Blender-to-GLB adapter, `scene`/`static_mesh` presets and
+> changed-asset scene rebinding are complete. Extend the engine-owned asset model with skeletons,
+> skin weights, animation clips and morph targets, then add serializable scene components for
+> imported cameras and lights. Keep glTF/GLB as the normalized path and Assimp as the current FBX/
+> OBJ/DAE fallback. Add representative fixtures and preserve strict bounds on all imported counts
+> and payloads. Run dev/release, ctest, MCP validation and real Blender/Vulkan smoke tests.
 
 ## Key files to inspect first
 

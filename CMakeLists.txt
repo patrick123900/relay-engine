@@ -28,6 +28,7 @@ add_library(relay_engine
     src/render/software_renderer.cpp
     src/render/asset_manifest.cpp
     src/render/assets.cpp
+    src/render/blender_adapter.cpp
     src/render/image_decode.cpp
     src/render/model_import.cpp
     src/render/scene_render.cpp

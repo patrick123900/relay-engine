@@ -102,24 +102,35 @@ duplicate handles, non-finite numbers, malformed component metadata, stale paren
 cycles are rejected before the live scene is changed.
 
 Model files live in `assets/`. Relay treats glTF 2.0 (`.gltf`/`.glb`) as its native, recommended
-interchange format, matching Godot's preferred pipeline. The first importer also accepts FBX, OBJ,
-DAE and Blender files through Assimp. Imported static geometry includes UVs, generated
-normals/tangents, node hierarchies, PBR factors and PNG/JPEG image textures. Skeletons, skinning,
-morph targets and animation playback are reported as deferred rather than silently presented as
-complete. Blender-to-glTF conversion matching Godot's exact `.blend` workflow is also planned.
+interchange format, matching Godot's preferred pipeline. FBX, OBJ and DAE use Assimp. `.blend`
+sources are converted through Blender's glTF exporter into a content-addressed cache before entering
+the same import path. Imported static geometry includes UVs, generated normals/tangents, node
+hierarchies, PBR factors and PNG/JPEG image textures. Skeletons, skinning, morph targets and
+animation playback are reported as deferred rather than silently presented as complete.
 
 Imports are sandboxed. A model may only be named by a top-level filename inside `assets/`, and every
 dependency it goes on to reference — external `.bin` buffers, images — is canonicalized and must
 resolve inside that same directory. Relative escapes, absolute paths and symlinks that leave the
 asset root are refused, reads are capped at 64 dependency files and 64 MiB each, and the importer is
-given no write path.
+given no write path. Blender conversion uses fixed arguments, disables file-embedded script
+auto-execution, preflights export-related external paths, enforces a timeout and writes below
+`assets/.relay-cache/blender`. Source and external dependency hashes invalidate the cache. On Linux,
+Bubblewrap isolates the filesystem, network and environment: system runtimes are read-only, assets
+are read-only except for the conversion cache, and the user's home is not exposed. Conversion fails
+closed on other platforms unless an administrator explicitly opts into trusted-input conversion with
+`RELAY_BLENDER_TRUSTED=1`. Do not enable that mode for untrusted `.blend` files.
+
+Blender is discovered as `blender` on `PATH`; set `RELAY_BLENDER_EXECUTABLE` to an administrator-
+chosen executable when it is installed in a mounted system-runtime directory (`/usr` or `/opt` on
+Linux). The `scene` import preset retains conversion-time
+animation/camera/light channels, while `static_mesh` strips them from Blender's cached GLB.
 
 Each import is content-addressed with a versioned SHA-256 digest (`sha256-v1-<hex>`), and recorded in
 a project manifest at `assets/.relay-imports.json` alongside its source name, importer version,
 dependency list and generated asset ids. Loading a scene rebuilds those assets first, so a scene
 saved with imported meshes opens correctly in a fresh process without a manual reimport. If a source
-file changed since the manifest was written, `scene.load` reports it rather than silently binding the
-scene to different assets.
+file changed since the manifest was written, `scene.load` reports it, rebuilds the assets and rebinds
+compatible saved mesh/material references by import index.
 
 For a long-lived local connection, run Relay on an IPv4 loopback port:
 
@@ -197,8 +208,8 @@ Both CMake builds and `npm run check` reject stale generated C++, TypeScript or 
 
 Near-term milestones, in the order they should be taken:
 
-1. Add the Blender-to-glTF adapter used by Godot's `.blend` workflow and improve reimport settings.
-2. Add skeleton, skin-weight, animation, morph-target, imported-camera and imported-light support.
+1. Add skeleton, skin-weight, animation, morph-target, imported-camera and imported-light support.
+2. Expand import presets as those data types become editable in Relay.
 3. Replace whole-registry hot refresh with versioned asynchronous resource uploads.
 
 See [`HANDOFF.md`](HANDOFF.md) for the full phase breakdown and the current list of known

@@ -5,15 +5,16 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace relay {
 
-inline constexpr std::uint32_t import_manifest_version = 1;
+inline constexpr std::uint32_t import_manifest_version = 2;
 
 // Bump when a change to the importer would produce different geometry or identities from the same
 // source file. Recorded per entry so a stale cache is detectable rather than silently trusted.
-inline constexpr std::uint32_t model_importer_version = 2;
+inline constexpr std::uint32_t model_importer_version = 3;
 
 struct ImportManifestEntry {
     std::string source;
@@ -23,15 +24,20 @@ struct ImportManifestEntry {
     std::vector<std::string> meshes;
     std::vector<std::string> materials;
     std::vector<std::string> textures;
+    std::string preset{"scene"};
 };
 
 struct ImportReloadReport {
     std::size_t restored{};
     std::size_t changed{};
     std::size_t failed{};
+    std::size_t rebound{};
     std::vector<std::string> messages;
+    std::vector<std::pair<std::string, std::string>> asset_remaps;
 
     [[nodiscard]] std::string json() const;
+    // Rebinds saved mesh-renderer ids after a source or importer version changed.
+    std::size_t rebind_scene(Scene& scene);
 };
 
 // A project-local record of every model import, sufficient to rebuild the imported half of an

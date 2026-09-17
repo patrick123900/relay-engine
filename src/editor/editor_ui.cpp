@@ -26,6 +26,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <sstream>
 #include <vector>
 
@@ -36,6 +37,10 @@ namespace {
 // inexpensive; mutations invalidate the scene immediately instead of waiting for the next idle
 // refresh.
 constexpr double refresh_interval_seconds = 0.5;
+// While a selected animator is playing, the inspector is showing a value that moves every frame,
+// and a twice-a-second playhead is not usable for judging a pose. Polling faster stays read-only
+// and untraced, and the cadence drops back the moment playback stops.
+constexpr double playback_refresh_interval_seconds = 0.05;
 constexpr std::size_t maximum_log_lines = 512U;
 
 std::string number_text(const double value) {
@@ -230,6 +235,18 @@ struct EditorUi::Impl {
         return commit;
     }
 
+    // Keep the draft stable across refreshes, but apply each change for live pose scrubbing.
+    bool slider_scalar(const char* label, double& current, const double minimum,
+                       const double maximum, const char* format) {
+        auto& draft = drafts[ImGui::GetID(label)];
+        const bool changed = ImGui::SliderScalar(
+            label, ImGuiDataType_Double, &draft.begin(current), &minimum, &maximum, format);
+        if (ImGui::IsItemActivated()) ++animation_gesture;
+        current = std::clamp(draft.value, minimum, maximum);
+        draft.finish(ImGui::IsItemActive());
+        return changed;
+    }
+
     unsigned drag_vector3(const char* label, std::array<double, 3>& value, float speed,
                           float label_width) {
         constexpr std::array<const char*, 3> names{"X", "Y", "Z"};
@@ -291,11 +308,23 @@ struct EditorUi::Impl {
     std::string status_message;
     bool status_is_error{false};
     double seconds_since_refresh{refresh_interval_seconds};
+    // The asset and model lists are far more expensive to serialize than the scene listing, so
+    // they keep the slow cadence even when the rest of the panels are polling for a playhead.
+    double seconds_since_assets{refresh_interval_seconds};
+    bool animator_playing{false};
     bool refresh_pending{true};
     bool assets_pending{true};
 
+    [[nodiscard]] double refresh_interval() const {
+        return animator_playing ? playback_refresh_interval_seconds : refresh_interval_seconds;
+    }
+
     // Inspector edit buffers, so a drag in progress is not overwritten by a background refresh.
     std::map<std::string, std::vector<double>, std::less<>> morph_defaults;
+    struct ClipInfo { std::string name; double duration_seconds{}; };
+    // Clip names and lengths per model, so the animator can offer a named list and a time slider
+    // bounded by the clip rather than a bare index field and an unbounded number.
+    std::map<std::string, std::vector<ClipInfo>, std::less<>> model_clips;
 
     // Editor viewpoint. This is view state, not scene state: it creates no entity, is never saved,
     // never enters the undo history and is never sent over the protocol, so navigating the viewport
@@ -325,12 +354,23 @@ struct EditorUi::Impl {
     // A fresh token per drag. Updates sharing it collapse into one undo entry; a new drag must not
     // fold into an earlier, unrelated edit of the same entity.
     std::uint64_t gizmo_gesture{0};
+    std::uint64_t animation_gesture{0};
     ImGuizmo::OPERATION gizmo_operation{ImGuizmo::TRANSLATE};
     ImGuizmo::MODE gizmo_mode{ImGuizmo::LOCAL};
     // Screen-space bounds of the area left clear for the scene, in the window's pixel coordinates.
     ImVec2 viewport_min{}, viewport_max{};
 
     std::array<char, 129> scene_filename{"main.relay.json"};
+    // The scene's current content revision and the one last written to or read from a file. They
+    // only differ when there is unsaved authoring work, because undoing back to a saved state
+    // restores that state's revision. Playback time never enters the history and so never counts.
+    std::uint64_t scene_revision{0}, saved_revision{0};
+    // False until this scene has actually been written to or opened from `scene_filename`, so the
+    // title can distinguish a named file from the untitled scene the editor starts with.
+    bool scene_has_file{false};
+    std::string window_title;
+    [[nodiscard]] bool scene_modified() const { return scene_revision != saved_revision; }
+
     std::array<char, 129> model_filename{"relay-pbr-golden.glb"};
     std::array<char, 129> create_name{"Entity"};
     std::string renaming;
@@ -341,6 +381,10 @@ struct EditorUi::Impl {
     std::array<bool, 6> panel_open{true, true, true, true, true, true};
     enum class FileAction { none, open, save_as, import, screenshot, recording };
     FileAction file_action{FileAction::none};
+    // What to carry out once the user has answered the unsaved-work prompt.
+    enum class PendingAction { none, new_scene, open_scene, quit };
+    PendingAction pending_action{PendingAction::none};
+    bool open_discard_dialog{false};
     bool open_file_dialog{false}, show_help{false}, show_about{false};
     std::array<char, 129> action_filename{};
     std::string dialog_error;
@@ -378,6 +422,9 @@ struct EditorUi::Impl {
             return std::nullopt;
         }
         const auto* result = field(*object, "result");
+        if (result) {
+            if (const auto revision = response_revision(*result)) scene_revision = *revision;
+        }
         return result == nullptr ? JsonValue{} : *result;
     }
 
@@ -404,12 +451,18 @@ struct EditorUi::Impl {
 
     void refresh() {
         refresh_pending = false;
-        const bool periodic = seconds_since_refresh >= refresh_interval_seconds;
-        if (periodic) seconds_since_refresh = 0.0;
+        seconds_since_refresh = 0.0;
+        const bool periodic = seconds_since_assets >= refresh_interval_seconds;
+        if (periodic) seconds_since_assets = 0.0;
         if (auto status = call("runtime.status")) runtime_status = std::move(*status);
         if (auto list = call("scene.list")) {
             scene_list = std::move(*list);
             rebuild_index();
+        }
+        animator_playing = false;
+        if (const auto* entity = selection.empty() ? nullptr : find_entity(selection)) {
+            if (const auto* animator = component(*entity, "animator"))
+                animator_playing = boolean_or(*animator, "playing", false);
         }
         if (auto logs = call("logs.read", "\"after\":" + std::to_string(last_log_sequence))) {
             append_logs(*logs);
@@ -431,6 +484,11 @@ struct EditorUi::Impl {
             };
             collect("undo", undo_labels);
             collect("redo", redo_labels);
+            if (object != nullptr) {
+                if (const auto* state = field(*object, "state"); state && state->object())
+                    scene_revision =
+                        static_cast<std::uint64_t>(number_or(*state->object(), "revision", 0.0));
+            }
         }
         if (periodic || assets_pending) {
             if (auto models = call("assets.available")) {
@@ -482,6 +540,7 @@ struct EditorUi::Impl {
         mesh_names.clear();
         material_names.clear();
         morph_defaults.clear();
+        model_clips.clear();
         const auto* object = assets->object();
         if (object == nullptr) return;
         const auto collect = [&](const std::string_view key, std::vector<std::string>& target) {
@@ -507,6 +566,23 @@ struct EditorUi::Impl {
                         for (const auto& value : *defaults->array())
                             if (value.number()) target.push_back(*value.number());
                     }
+        if (const auto* models = field(*object, "models"); models && models->array())
+            for (const auto& model : *models->array()) {
+                const auto* record = model.object();
+                if (record == nullptr) continue;
+                auto& target = model_clips[string_or(*record, "name")];
+                const auto* clips = field(*record, "clips");
+                if (clips == nullptr || clips->array() == nullptr) continue;
+                for (const auto& clip : *clips->array())
+                    if (const auto* entry = clip.object())
+                        target.push_back(ClipInfo{string_or(*entry, "name"),
+                                                  number_or(*entry, "duration_seconds", 0.0)});
+            }
+    }
+
+    [[nodiscard]] std::span<const ClipInfo> clips_for(const std::string_view model) const {
+        const auto found = model_clips.find(model);
+        return found == model_clips.end() ? std::span<const ClipInfo>{} : found->second;
     }
 
     void append_logs(const JsonValue& logs) {
@@ -809,6 +885,7 @@ struct EditorUi::Impl {
                 mutate("scene.create", "\"name\":\"Entity\",\"parent\":\"" + handle + '"',
                        "Entity created");
             }
+            if (ImGui::MenuItem("Duplicate", "Ctrl+D")) duplicate_selection();
             if (ImGui::MenuItem("Move to root")) {
                 mutate("scene.set_parent", entity_field(handle) + ",\"parent\":null", "Reparented");
             }
@@ -1011,21 +1088,63 @@ struct EditorUi::Impl {
                    entity_field(selection) + ",\"loop\":" + (loop ? "false" : "true"),
                    "Loop updated");
         }
-        ImGui::SetNextItemWidth(120.0F);
-        auto& clip_draft = drafts[ImGui::GetID("Clip")];
-        clip = static_cast<int>(clip_draft.begin(clip));
-        ImGui::InputInt("Clip", &clip);
-        clip_draft.value = clip;
-        const bool clip_commit = ImGui::IsItemDeactivatedAfterEdit();
-        clip_draft.finish(ImGui::IsItemActive());
-        if (clip_commit && clip >= 0 && clip <= 255) {
-            mutate("scene.set_animation",
-                   entity_field(selection) + ",\"clip\":" + std::to_string(clip), "Clip selected");
+        ImGui::SameLine();
+        // Restarting is the commonest thing to want after watching a clip once, and it is a seek
+        // rather than a new kind of operation.
+        if (ImGui::Button("Restart")) {
+            mutate("scene.set_animation", entity_field(selection) + ",\"time_seconds\":0",
+                   "Animation restarted");
         }
-        if (drag_scalar("Time", time_seconds, 0.01F) && time_seconds >= 0.0) {
+
+        const auto clips = clips_for(string_or(*animator, "model"));
+        const auto clip_label = [&](const std::size_t index) {
+            const auto name = index < clips.size() ? clips[index].name : std::string{};
+            return name.empty() ? "Clip " + std::to_string(index) : name;
+        };
+        if (clips.empty()) {
+            // The model's clip list has not arrived yet, so fall back to the raw index rather than
+            // showing an empty list that cannot be used.
+            ImGui::SetNextItemWidth(120.0F * ui_scale);
+            auto& clip_draft = drafts[ImGui::GetID("Clip")];
+            clip = static_cast<int>(clip_draft.begin(clip));
+            ImGui::InputInt("Clip", &clip);
+            clip_draft.value = clip;
+            const bool clip_commit = ImGui::IsItemDeactivatedAfterEdit();
+            clip_draft.finish(ImGui::IsItemActive());
+            if (clip_commit && clip >= 0 && clip <= 255) {
+                mutate("scene.set_animation",
+                       entity_field(selection) + ",\"clip\":" + std::to_string(clip),
+                       "Clip selected");
+            }
+        } else if (ImGui::BeginCombo("Clip", clip_label(static_cast<std::size_t>(clip)).c_str())) {
+            for (std::size_t index = 0; index < clips.size(); ++index) {
+                if (ImGui::Selectable(clip_label(index).c_str(),
+                                      index == static_cast<std::size_t>(clip))) {
+                    mutate("scene.set_animation",
+                           entity_field(selection) + ",\"clip\":" + std::to_string(index),
+                           "Clip selected");
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        const double duration = static_cast<std::size_t>(clip) < clips.size()
+                                    ? clips[static_cast<std::size_t>(clip)].duration_seconds
+                                    : 0.0;
+        // A slider bounded by the clip is what makes scrubbing usable; an unknown or zero-length
+        // clip keeps the open-ended drag so the field never becomes unusable.
+        const bool seeked = duration > 0.0
+                                ? slider_scalar("Time", time_seconds, 0.0, duration, "%.3f s")
+                                : drag_scalar("Time", time_seconds, 0.01F);
+        if (seeked && time_seconds >= 0.0) {
             mutate("scene.set_animation",
-                   entity_field(selection) + ",\"time_seconds\":" + number_text(time_seconds),
+                   entity_field(selection) + ",\"time_seconds\":" + number_text(time_seconds) +
+                       (duration > 0.0 ? ",\"gesture\":" + std::to_string(animation_gesture)
+                                       : std::string{}),
                    "Animation seeked");
+        }
+        if (duration > 0.0) {
+            ImGui::TextColored(editor_color(editor_palette().text_faint), "Length %.3f s", duration);
         }
         if (drag_scalar("Speed", speed, 0.01F)) {
             mutate("scene.set_animation",
@@ -1196,9 +1315,127 @@ struct EditorUi::Impl {
         draw_light_section(*entity);
     }
 
-    void save_scene() {
-        mutate("scene.save", "\"filename\":\"" + json_escape(scene_filename.data()) + '\"',
-               "Scene saved");
+    // Pulls the scene revision out of wherever a response carries it: `scene.history` nests it
+    // under `state`, mutations under `history`, and `scene.save` reports it at the top level.
+    static std::optional<std::uint64_t> response_revision(const JsonValue& value) {
+        const auto* object = value.object();
+        if (object == nullptr) return std::nullopt;
+        for (const auto* key : {"history", "state"}) {
+            if (const auto* nested = field(*object, key); nested && nested->object())
+                object = nested->object();
+        }
+        const auto* revision = field(*object, "revision");
+        if (revision == nullptr || revision->number() == nullptr) return std::nullopt;
+        return static_cast<std::uint64_t>(*revision->number());
+    }
+
+    void set_scene_filename(const std::string& filename) {
+        const auto length = std::min(filename.size(), scene_filename.size() - 1U);
+        std::copy_n(filename.begin(), length, scene_filename.begin());
+        scene_filename[length] = '\0';
+    }
+
+    // Saving and opening both settle the unsaved-work marker, so they share one path instead of
+    // each having to remember to update it. The revision comes from the response rather than a
+    // later poll, so an edit arriving in between cannot be mistaken for saved work.
+    bool open_or_save_scene(const bool opening, const std::string& filename) {
+        const auto result = call(opening ? "scene.load" : "scene.save",
+                                 "\"filename\":\"" + json_escape(filename) + '\"');
+        if (!result) return false;
+        if (const auto revision = response_revision(*result)) {
+            scene_revision = *revision;
+            saved_revision = *revision;
+        }
+        set_scene_filename(filename);
+        scene_has_file = true;
+        refresh_pending = true;
+        if (opening) {
+            assets_pending = true;
+            select({});
+        }
+        set_status((opening ? "Opened " : "Saved ") + filename, false);
+        return true;
+    }
+
+    bool save_scene() {
+        // Without a file behind it yet, Save has to ask where the scene should go rather than
+        // silently claiming whatever name the field happens to be holding.
+        if (!scene_has_file) {
+            file_dialog(FileAction::save_as, scene_filename.data());
+            return false;
+        }
+        return open_or_save_scene(false, scene_filename.data());
+    }
+
+    // Selecting the copy is what makes duplicate useful for laying a scene out: the next drag or
+    // inspector edit lands on the new object rather than the one it was made from.
+    void duplicate_selection() {
+        if (selection.empty()) return;
+        const auto result = call("scene.duplicate", entity_field(selection));
+        if (!result) return;
+        set_status("Duplicated entity", false);
+        refresh_pending = true;
+        if (const auto* object = result->object()) {
+            if (auto copy = string_or(*object, "entity"); !copy.empty()) {
+                refresh();
+                select(copy);
+            }
+        }
+    }
+
+    void new_scene() {
+        const auto result = call("scene.clear");
+        if (!result) return;
+        // An empty scene has nothing to lose, so it starts clean; it is untitled until saved, so
+        // the next Save asks for a name instead of overwriting the file that was open before.
+        if (const auto revision = response_revision(*result)) {
+            scene_revision = *revision;
+            saved_revision = *revision;
+        }
+        scene_has_file = false;
+        select({});
+        refresh_pending = true;
+        assets_pending = true;
+        set_status("New scene", false);
+    }
+
+    // Anything that throws away the current scene routes through here, so unsaved work cannot be
+    // discarded by a single menu click.
+    void discarding_action(const PendingAction action) {
+        // An external caller may have edited since the last panel refresh. Check the current
+        // revision before deciding that it is safe to discard the scene.
+        if (!call("scene.history")) return;
+        if (!scene_modified()) {
+            run_pending_action(action);
+            return;
+        }
+        pending_action = action;
+        open_discard_dialog = true;
+    }
+
+    void run_pending_action(const PendingAction action) {
+        switch (action) {
+        case PendingAction::none: break;
+        case PendingAction::new_scene: new_scene(); break;
+        case PendingAction::open_scene: file_dialog(FileAction::open, scene_filename.data()); break;
+        case PendingAction::quit: mutate("runtime.quit", {}, "Closing editor"); break;
+        }
+    }
+
+    [[nodiscard]] std::string scene_title() const {
+        return std::string(scene_has_file ? scene_filename.data() : "Untitled scene") +
+               (scene_modified() ? "*" : "");
+    }
+
+    // The window title is where a person tracks which scene they are editing and whether it still
+    // needs saving, so it follows the same revision comparison the File menu uses.
+    void update_window_title() {
+        // The window keeps "Relay Editor" as its trailing name so anything matching on it, the
+        // desktop harnesses included, still finds the window once the scene name is in front.
+        auto title = scene_title() + " - Relay Editor";
+        if (sdl_window == nullptr || title == window_title) return;
+        window_title = std::move(title);
+        SDL_SetWindowTitle(sdl_window, window_title.c_str());
     }
 
     void file_dialog(FileAction action, const std::string& filename) {
@@ -1242,10 +1479,11 @@ struct EditorUi::Impl {
             future_action("New project...");
             future_action("Open project...");
             ImGui::Separator();
-            future_action("New scene...");
+            if (ImGui::MenuItem("New scene", "Ctrl+N"))
+                discarding_action(PendingAction::new_scene);
             if (ImGui::MenuItem("Open scene...", "Ctrl+O"))
-                file_dialog(FileAction::open, scene_filename.data());
-            if (ImGui::MenuItem("Save scene", "Ctrl+S"))
+                discarding_action(PendingAction::open_scene);
+            if (ImGui::MenuItem("Save scene", "Ctrl+S", false, scene_modified() || !scene_has_file))
                 save_scene();
             if (ImGui::MenuItem("Save scene as...", "Ctrl+Shift+S"))
                 file_dialog(FileAction::save_as, scene_filename.data());
@@ -1255,7 +1493,7 @@ struct EditorUi::Impl {
             future_action("Export project...");
             ImGui::Separator();
             if (ImGui::MenuItem("Quit"))
-                mutate("runtime.quit", {}, "Closing editor");
+                discarding_action(PendingAction::quit);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Edit")) {
@@ -1267,7 +1505,8 @@ struct EditorUi::Impl {
             future_action("Cut");
             future_action("Copy");
             future_action("Paste");
-            future_action("Duplicate");
+            if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, !selection.empty()))
+                duplicate_selection();
             if (ImGui::MenuItem("Delete selection", "Delete", false, !selection.empty())) {
                 if (mutate("scene.destroy", entity_field(selection), "Entity destroyed"))
                     select({});
@@ -1388,6 +1627,44 @@ struct EditorUi::Impl {
     }
 
     void draw_dialogs() {
+        if (open_discard_dialog) {
+            ImGui::OpenPopup("Unsaved changes");
+            open_discard_dialog = false;
+        }
+        if (ImGui::BeginPopupModal("Unsaved changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("%s has unsaved changes.", scene_has_file ? scene_filename.data()
+                                                                 : "This untitled scene");
+            const auto action = pending_action;
+            const char* verb = action == PendingAction::quit      ? "Quit anyway"
+                               : action == PendingAction::open_scene ? "Open anyway"
+                                                                     : "Discard and continue";
+            // Enter takes the safe branch and only when there is a file to take it to. Leaving a
+            // prompt that can only be answered with the mouse strands anyone who reached it from
+            // a keyboard shortcut, but defaulting to discarding unsaved work would be worse.
+            const bool confirmed = ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                                   ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+            if (scene_has_file) {
+                const bool save_now = ImGui::Button("Save and continue");
+                ImGui::SetItemDefaultFocus();
+                if ((save_now || confirmed) && save_scene()) {
+                    ImGui::CloseCurrentPopup();
+                    run_pending_action(action);
+                }
+                ImGui::SameLine();
+            } else {
+                ImGui::TextDisabled("Use File > Save scene as... first to keep it.");
+            }
+            if (ImGui::Button(verb)) {
+                ImGui::CloseCurrentPopup();
+                run_pending_action(action);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                pending_action = PendingAction::none;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
         if (open_file_dialog) {
             ImGui::OpenPopup("Project action");
             open_file_dialog = false;
@@ -1425,15 +1702,8 @@ struct EditorUi::Impl {
                 const auto filename = json_escape(action_filename.data());
                 bool success = false;
                 if (scene_action) {
-                    success =
-                        mutate(file_action == FileAction::open ? "scene.load" : "scene.save",
-                               "\"filename\":\"" + filename + '\"',
-                               file_action == FileAction::open ? "Scene loaded" : "Scene saved");
-                    if (success) {
-                        scene_filename = action_filename;
-                        if (file_action == FileAction::open)
-                            select({});
-                    }
+                    success = open_or_save_scene(file_action == FileAction::open,
+                                                 action_filename.data());
                 } else if (file_action == FileAction::import) {
                     import_model(action_filename.data());
                     success = !status_is_error;
@@ -1463,8 +1733,9 @@ struct EditorUi::Impl {
                 ImGui::TextUnformatted(
                     "MMB: orbit | Shift+MMB: pan | Wheel: zoom\nRMB / Shift+F: freelook | WASD/QE: "
                     "fly\nShift: faster | Alt: slower | Escape: leave freelook\nF: frame selection "
-                    "| W/E/R: move/rotate/scale\nCtrl+Z: undo | Ctrl+Shift+Z: redo\nCtrl+S: save | "
-                    "Ctrl+O: open | Delete: delete selection\nDrag panel tabs to dock; Shift-drag "
+                    "| W/E/R: move/rotate/scale\nCtrl+Z: undo | Ctrl+Shift+Z: redo\nCtrl+D: "
+                    "duplicate | Delete: delete selection\nCtrl+N: new scene | Ctrl+O: open | "
+                    "Ctrl+S: save | Ctrl+Shift+S: save as\nDrag panel tabs to dock; Shift-drag "
                     "to float.");
             }
             ImGui::End();
@@ -1537,9 +1808,15 @@ struct EditorUi::Impl {
             return;
         const auto& shortcuts = ImGui::GetIO();
         if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-            if (shortcuts.KeyShift) file_dialog(FileAction::save_as, scene_filename.data()); else save_scene();
+            if (shortcuts.KeyShift) file_dialog(FileAction::save_as, scene_filename.data());
+            else (void)save_scene();
         }
-        if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) file_dialog(FileAction::open, scene_filename.data());
+        if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false))
+            discarding_action(PendingAction::open_scene);
+        if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N, false))
+            discarding_action(PendingAction::new_scene);
+        if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false) && !selection.empty())
+            duplicate_selection();
         if (ImGui::IsKeyPressed(ImGuiKey_W, false)) gizmo_operation = ImGuizmo::TRANSLATE;
         if (ImGui::IsKeyPressed(ImGuiKey_E, false))
             gizmo_operation = ImGuizmo::ROTATE;
@@ -1777,6 +2054,10 @@ void EditorUi::invalidate() {
 bool EditorUi::handle_event(const void* const sdl_event) {
     if (!impl_->imgui_context_created) return false;
     const auto* event = static_cast<const SDL_Event*>(sdl_event);
+    if (event->type == SDL_EVENT_QUIT) {
+        impl_->discarding_action(Impl::PendingAction::quit);
+        return true;
+    }
     if (event->type == SDL_EVENT_MOUSE_MOTION && impl_->mouse_captured) {
         // ImGui stays at the viewport anchor while freelook uses unbounded relative motion.
         impl_->relative_delta.x += event->motion.xrel;
@@ -1837,13 +2118,16 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     ImGuizmo::BeginFrame();
     impl_->frame_open = true;
 
-    impl_->seconds_since_refresh += static_cast<double>(ImGui::GetIO().DeltaTime);
-    if (impl_->refresh_pending || impl_->seconds_since_refresh >= refresh_interval_seconds) {
+    const auto delta = static_cast<double>(ImGui::GetIO().DeltaTime);
+    impl_->seconds_since_refresh += delta;
+    impl_->seconds_since_assets += delta;
+    if (impl_->refresh_pending || impl_->seconds_since_refresh >= impl_->refresh_interval()) {
         impl_->refresh();
     }
 
     (void)width;
     (void)height;
+    impl_->update_window_title();
     impl_->draw_menu_bar();
     const auto toolbar_height = 28.0F * impl_->ui_scale +
                                 2.0F * ImGui::GetStyle().WindowPadding.y;

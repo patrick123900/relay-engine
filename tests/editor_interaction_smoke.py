@@ -70,7 +70,9 @@ class Editor:
             raise RuntimeError("editor did not start: " + ready)
         self.next_id = 1
         time.sleep(1.5)
-        self.window = xdo("search", "--name", "^Relay Editor$").split("\n")[-1]
+        # The editor puts the scene name and its unsaved marker in front of "Relay Editor", so the
+        # match is anchored on the trailing name rather than the whole title.
+        self.window = xdo("search", "--name", "Relay Editor$").split("\n")[-1]
         if not self.window:
             raise RuntimeError("could not find the editor window")
         # Avoid unreachable targets at mixed-scale monitor seams, especially compact icons.

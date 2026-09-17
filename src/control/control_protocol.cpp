@@ -130,6 +130,7 @@ std::optional<Entity> entity_field(const std::string_view json, const std::strin
 std::string history_json(const SceneHistory& history) {
     return "{\"undo_depth\":" + std::to_string(history.undo_depth()) +
            ",\"redo_depth\":" + std::to_string(history.redo_depth()) +
+           ",\"revision\":" + std::to_string(history.revision()) +
            ",\"next_undo\":\"" + escape_json(history.next_undo_label()) +
            "\",\"next_redo\":\"" + escape_json(history.next_redo_label()) + "\"}";
 }
@@ -614,6 +615,37 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) + "{\"destroyed\":\"" + entity->to_string() +
                "\",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }
+    if (method == "scene.duplicate") {
+        const auto entity = entity_field(request, "entity");
+        if (!entity.has_value() || !entity->valid()) return error_response(id, "invalid entity handle");
+        Entity copy{};
+        if (!engine_.scene_history().execute("Duplicate " + entity->to_string(),
+                                             [&](Scene& scene) {
+                                                 copy = scene.duplicate(*entity);
+                                                 return copy.valid();
+                                             })) {
+            return error_response(
+                id, "entity does not exist, has a stale handle, or its subtree is too large");
+        }
+        engine_.logs().write(LogLevel::info,
+                             "Duplicated entity " + entity->to_string() + " as " + copy.to_string());
+        return response_prefix(id) + "{\"entity\":\"" + copy.to_string() + "\",\"source\":\"" +
+               entity->to_string() + "\",\"history\":" + history_json(engine_.scene_history()) +
+               "}}";
+    }
+    if (method == "scene.clear") {
+        const auto removed = engine_.scene().entities().size();
+        if (!engine_.scene_history().execute("Clear scene", [](Scene& scene) {
+                scene.clear();
+                return true;
+            })) {
+            return error_response(id, "could not clear the scene");
+        }
+        engine_.logs().write(LogLevel::info,
+                             "Cleared scene, removing " + std::to_string(removed) + " entities");
+        return response_prefix(id) + "{\"removed\":" + std::to_string(removed) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
     if (method == "scene.set_transform") {
         const auto entity = entity_field(request, "entity");
         if (!entity.has_value() || !entity->valid()) return error_response(id, "invalid entity handle");
@@ -697,9 +729,10 @@ std::string ControlProtocol::handle(const std::string_view request) {
                 animator.time_seconds = *value;
             animator.time_seconds =
                 std::min(animator.time_seconds, model->clips[animator.clip].duration_seconds);
-            changed = engine_.scene_history().execute("Configure animation", [&](Scene &scene) {
-                return scene.set_animator(*entity, animator);
-            });
+            changed = engine_.scene_history().execute(
+                "Configure animation " + entity->to_string(),
+                [&](Scene &scene) { return scene.set_animator(*entity, animator); },
+                unsigned_field(request, "gesture", 0U));
         } else if (method == "scene.set_morph") {
             if (!record.mesh_renderer)
                 return error_response(id, "entity has no mesh renderer");
@@ -815,9 +848,12 @@ std::string ControlProtocol::handle(const std::string_view request) {
         std::string error;
         if (!save_scene_file_atomic(engine_.scene(), *path, error)) return error_response(id, error);
         engine_.logs().write(LogLevel::info, "Saved scene atomically to " + path->string());
+        // Reporting the revision the file holds lets a caller recognise later edits without
+        // keeping its own change log, and lets the editor clear its unsaved-work marker.
         return response_prefix(id) + "{\"path\":\"" + escape_json(path->string()) +
                "\",\"version\":" + std::to_string(scene_file_version) +
-               ",\"entities\":" + std::to_string(engine_.scene().entities().size()) + "}}";
+               ",\"entities\":" + std::to_string(engine_.scene().entities().size()) +
+               ",\"revision\":" + std::to_string(engine_.scene_history().revision()) + "}}";
     }
     if (method == "scene.load") {
         const auto filename = string_field(request, "filename");

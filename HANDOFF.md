@@ -2,6 +2,17 @@
 
 Last updated: 2026-09-17
 
+## Desktop interaction rule — read first
+
+Follow [AGENTS.md](AGENTS.md). Never control the user's mouse or keyboard, change focus, or open/show/activate/move/resize
+windows without specific advance approval for those actions in the current task. Work in the
+background using builds, headless tests and protocol checks. Desktop and windowed GPU tests are
+optional, approval-only checks; record them as pending when approval has not been given.
+Historical test results, reproduction commands and saved permissions do not authorize desktop use.
+Agents must first run relevant background/headless builds and tests autonomously. Do not skip
+these checks or default to asking for desktop access. Only ask after completing background checks
+if an important verification gap cannot reasonably be covered without desktop interaction.
+
 ## Next-session starting point
 
 - Branch: `main`; GitHub: https://github.com/patrick123900/relay-engine (public).
@@ -9,8 +20,8 @@ Last updated: 2026-09-17
   This snapshot includes Phase E, Phase F and the editor follow-ups; use `git log -1` for its commit.
 - Phases A–D meet their recorded milestone definitions on the tested Linux/Vulkan path, not full
   Godot compatibility or Windows/macOS parity. Deferred work is listed explicitly below.
-- Current on-disk/API versions: scene v4, import manifest v3, protocol v7 with 47 native methods
-  and 47 generated MCP tools.
+- Current on-disk/API versions: scene v4, import manifest v3, protocol v8 with 49 native methods
+  and 49 generated MCP tools.
 - Phase E and the tested Linux/Vulkan Phase F milestone are implemented. The user authorized
   committing and pushing the accumulated implementation/documentation on 2026-09-17. Later phase
   labels organize proposed work; they do not claim full editor completion or platform parity.
@@ -163,8 +174,8 @@ Current major layers:
 
 ### Control protocol and MCP
 
-- Protocol schema version 7.
-- 47 native methods and 47 generated MCP tools.
+- Protocol schema version 8.
+- 49 native methods and 49 generated MCP tools.
 - Strict generated validation for required fields, types, ranges, patterns, enums, nullability,
   unknown fields and duplicate JSON keys.
 - Generated safety annotations identify read-only, destructive and idempotent operations.
@@ -917,18 +928,25 @@ Definition of done: a small playable game can be authored in Relay, packaged and
 
 Use this as the next instruction after giving the agent this handoff:
 
-> Inspect HANDOFF.md, README.md and the current branch before changing code. A–F are complete for
-> the tested Linux/Vulkan milestones on `main`, with explicit carry-forward limits. Continue editor usability:
-> daily editing, project/save workflows and animation controls, validated through real human input.
-> Keep Phase G permissions ahead of broader agent access and embedded chat. Keep every editor mutation
-> routed through ControlProtocol rather than touching Scene directly, keep one undo entry per
-> gesture, keep read-only methods untraced, and keep the UI excluded from captures so golden images
-> stay comparable. Preserve the deterministic CPU capture source and capture provenance, glTF/GLB
-> animation normalization, Assimp FBX fallback, golden fixtures, import bounds and compatible
-> scene/manifest reload. Never relax fail-closed untrusted Blender conversion on platforms without
-> an OS sandbox. Verify generated protocol consistency, native/MCP tests, real GPU
-> playback/resize/capture and the current `tests/editor_visuals_smoke.py` before declaring anything
-> complete.
+> Read AGENTS.md first: never control mouse/keyboard, change focus or open windows without
+> specific advance user approval for the current task. Inspect HANDOFF.md, README.md and the
+> current branch before changing code. A–F are complete for
+> the tested Linux/Vulkan milestones on `main`, with explicit carry-forward limits, and the daily
+> editing and save workflow above is implemented on top of them. Continue editor usability:
+> multi-selection and cut/copy/paste, a project model above single scene files, and an animation
+> timeline, validated with background/headless checks by default. Real desktop input requires
+> specific user approval first. Keep Phase G permissions ahead of broader agent
+> access and embedded chat. Keep every editor mutation routed through ControlProtocol rather than
+> touching Scene directly, keep one undo entry per gesture, keep read-only methods untraced, and
+> keep the UI excluded from captures so golden images stay comparable. Keep the unsaved marker a
+> comparison of scene revisions rather than a change count, so undoing back to a saved state still
+> reads as saved, and keep runtime-only state such as animation playback time out of the undo
+> history. Preserve the deterministic CPU capture source and capture provenance, glTF/GLB animation
+> normalization, Assimp FBX fallback, golden fixtures, import bounds and compatible scene/manifest
+> reload. Never relax fail-closed untrusted Blender conversion on platforms without an OS sandbox.
+> Verify generated protocol consistency and background native/MCP tests. Windowed GPU checks
+> and `tests/editor_*_smoke.py` are optional and require specific advance user approval. Report
+> unrun desktop verification as pending; it must not block completion of background work.
 
 ## Key files to inspect first
 
@@ -967,7 +985,8 @@ Use this as the next instruction after giving the agent this handoff:
 - Prefer project-relative safe filenames at the protocol boundary; validate all transitive resource
   access too.
 - Preserve deterministic behavior and stable identifiers across save/load and process restarts.
-- Continue verifying meaningful renderer milestones with both automated tests and real GPU captures.
+- Verify renderer milestones with background tests. Windowed GPU captures and desktop checks
+  require specific advance user approval; otherwise report that verification as pending.
 - Do not describe capability detection as feature implementation.
 - Do not describe accepted file extensions as full Godot import parity.
 
@@ -1005,7 +1024,8 @@ sections record tests at the layout that existed then, rather than validation of
   import bounds and compatible scene v4 / manifest v3 reload remain unchanged. Untrusted Blender
   conversion remains fail-closed on platforms without an OS sandbox.
 
-Current verification and reproduction:
+Current verification and reproduction (windowed GPU and desktop commands require specific
+advance user approval; these commands do not grant it):
 
 ```sh
 cmake --build --preset dev -j4
@@ -1040,10 +1060,98 @@ Carry forward:
 - [ ] Recalibrate the five older pixel-coordinate desktop suites for maximized startup, 17-unit
   fonts and the fixed toolbar. They last passed before these layout changes; do not claim a fresh
   pass from those historical results. The current visuals suite remains runnable independently.
-- [ ] Improve daily editing, project/save workflows and animation controls; multi-selection and
-  copy/paste are still deferred. Keep scene edits on ControlProtocol and one undo entry per gesture.
 - [ ] Phase G capability grants before broader agent access / embedded chat.
 - [ ] Preserve the earlier A–D importer/resource-lifecycle checklist and platform sandbox TODOs.
+
+## Daily editing and save workflow — 2026-09-17
+
+This continues the editor-usability work above: duplication, knowing whether a scene needs saving,
+starting and reopening scenes, and animator controls that can actually be used to judge a pose.
+
+Protocol v8 adds two methods, 49 native methods and 49 generated MCP tools. Scene v4 and manifest
+v3 are unchanged, and no capture, import or sandbox behaviour moved.
+
+- `scene.duplicate` copies an entity and its descendants beside the original as one transaction.
+  Components are preserved. A copied camera is forced inactive, because duplicating an object
+  should never silently steal the view and the scene holds at most one active camera. A copy of a
+  whole imported model rebinds its `model_node` roots to itself so it drives its own animation,
+  while a copy of a single node from inside a model stays bound to the original model root, which
+  is the instance it still belongs to. The copied root is renamed `X Copy`, then `X Copy 2`, and a
+  copy of a copy does not grow `X Copy Copy`. A subtree is bounded at
+  `Scene::maximum_duplicate_entities` (4096) and an oversized one is refused whole rather than
+  copied part-way.
+- `scene.clear` empties the scene as one undoable transaction, destroying each entity so handles
+  taken beforehand stay stale instead of aliasing whatever is created next.
+- `SceneHistory::revision()` names the authored content instead of counting changes. Each
+  transaction carries a unique serial and the revision is the serial on top of the undo stack, so
+  undoing back to a state that was already saved restores that state's revision and the editor
+  stops reporting unsaved work. An update folded into a gesture takes a new serial, so a scene
+  saved mid-drag does not look saved for the rest of the drag. Eviction and `clear()` move the
+  base revision to the state underneath the stack rather than resetting to zero.
+- The revision appears in `history_json`, so every response that already embedded history now
+  carries it, and `scene.save` reports the revision the file holds. Result fields are not part of
+  the generated schema, so these are additive.
+
+Editor behaviour:
+
+- The window title is `<scene file or "Untitled scene">[*] - Relay Editor`. The trailing name is
+  kept so anything matching on it, the desktop harnesses included, still finds the window.
+- File gains New scene (`Ctrl+N`). New, Open and Quit (including the native window close button) route through one guard that prompts when
+  there is unsaved work. `Enter` saves and continues, but only when the scene already has a file;
+  defaulting to discarding unsaved work would be worse than leaving that choice explicit. `Escape`
+  cancels. Save with no file behind it yet opens Save As rather than claiming whatever name the
+  field happened to hold.
+- Edit > Duplicate (`Ctrl+D`) and a hierarchy context-menu entry issue `scene.duplicate` and select
+  the copy, so the next drag or inspector edit lands on the new object.
+- The animator section offers clips by name from `render.assets` and a time slider bounded by the
+  selected clip's length, with the clip length shown and a Restart control. An unknown or
+  zero-length clip falls back to the previous open-ended drag rather than becoming unusable, and a
+  model whose clip list has not arrived yet still gets the raw index field. The slider uses the
+  draft buffer across refreshes and sends each changed time immediately. A shared animation gesture
+  token folds these live updates into one undo entry.
+- Animation playback mutates animator time outside the history, so a playing clip does not mark
+  the scene modified. Because that makes the inspector's playhead move without any transaction,
+  panels poll at 20 Hz instead of 2 Hz while a selected animator is playing; the expensive asset
+  and model listings keep the slow cadence, and read-only polling is still untraced.
+
+Verified on this host:
+
+- Warning-free dev and Release builds, both native suites, no generated protocol drift, MCP
+  `check`/`build`, and the MCP capture smoke reporting 49 tools with deterministic provenance and
+  an explicit GPU request failing closed in headless mode.
+- Native tests cover the revision round trip through undo/redo, a folded gesture still moving the
+  revision, `scene.save` reporting it, duplication as one undo entry with descendants and
+  components intact, the inactive copied camera, `model_node` rebinding for a whole model versus a
+  single node, the subtree bound refusing without leaving a partial copy, and clear/undo.
+- `tests/editor_workflow_smoke.py` passes 23 real-input checks: Ctrl+D duplication with its
+  selection proven by what `Delete` removes, whole-gesture undo, the unsaved prompt blocking and
+  then returning keyboard control, Save As, New scene, reopening, and the inspector's play and
+  restart controls found by their effect rather than by fixed coordinates.
+- `tests/editor_visuals_smoke.py` still passes, including with the new window title.
+- Real RX 9070 XT/RADV dynamic-golden playback/resize/asynchronous PNG/WebM passes unchanged:
+  `source=vulkan`, 31 frames, 30 explicitly reported resolution-change drops.
+
+Two things worth knowing before extending this:
+
+- Synthetic key delivery on this desktop is not fully reliable. A repeated `Ctrl+O` reached the
+  editor roughly half the time when sent per-window and most of the time through XTEST, so the
+  workflow suite sends shortcuts through XTEST and retries interactions that have a checkable
+  outcome, printing when it retried. Every assertion is still against engine state. An earlier
+  version of that suite failed for a different reason worth remembering: it cleared the dialog's
+  prefilled filename with `Ctrl+A`, which did not always reach the field, so the new name was
+  appended to the old one and the editor was asked to open `<name><name>`.
+- Driven testing is what surfaced that the unsaved-changes prompt could not be answered from the
+  keyboard at all, which strands anyone who reached it from a shortcut. That is now fixed.
+
+Deferred from this work:
+
+- [ ] Multi-selection and cut/copy/paste. Duplication is per-entity for now.
+- [ ] A project model above single scene files; File still offers only scenes, and New/Open/Export
+      project remain Coming soon.
+- [ ] An animation timeline. The inspector controls one animator at a time with no curve editing,
+      and Tools > Animation timeline is still a placeholder.
+- [ ] The playback poll rate is a fixed 20 Hz while an animator plays. If that becomes a cost,
+      drive the playhead from the editor's own clock between polls instead of polling harder.
 
 Publishing scope: include native/editor/capture implementation, generated protocol/MCP artifacts,
 shaders, regression scripts and documentation. Exclude build products, captures, import caches,
@@ -1053,3 +1161,17 @@ Publication checks rerun on the final snapshot (2026-09-17): dev/release builds 
 generated protocol check, MCP check/build and 47-tool headless capture smoke, current desktop
 visuals regression, and RADV real-GPU dynamic playback/resize/asynchronous PNG/WebM all passed.
 Historical desktop coordinate suites remain explicitly deferred as above.
+
+
+Audit follow-up (2026-09-17): animation time sliders now seek while held down, using a generated
+`scene.set_animation` gesture parameter and entity-specific history labels to keep one scrub in one
+undo entry. Mutation responses immediately update the editor revision, closing the brief stale-state
+window in the unsaved-work guard. Native SDL quit events now route through the editor guard rather
+than bypassing it in the Vulkan window. Native regression coverage includes live seeks, whole-scrub
+undo and a new gesture after undo; the desktop workflow checks seek state before mouse release.
+
+Audit validation: dev build and `ctest --preset dev` passed; generated artifacts are current;
+MCP build/check and capture smoke passed. The desktop workflow passed all 25 checks, including
+pose changes before slider release and one undo entry throughout the drag. A separate desktop
+check on the final build verified that Alt+F4 leaves an unsaved scene open and intact, and Escape
+cancels the close prompt. Desktop tests required access outside the sandbox to the X11 session.

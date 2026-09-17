@@ -466,6 +466,24 @@ int main() {
                    std::abs(half_pose.deformed_vertices[2].y - 0.75F) < 0.001F,
                "morph interpolation is applied before weighted skinning at the expected half-time "
                "pose");
+        const auto scrub_depth = dynamic_engine.scene_history().undo_depth();
+        expect(command("scene.set_animation", root,
+                       ",\"time_seconds\":0.2,\"gesture\":17").find("\"ok\":true") != std::string::npos,
+               "a live scrub applies its first pose immediately");
+        expect(command("scene.set_animation", root,
+                       ",\"time_seconds\":0.4,\"gesture\":17").find("\"ok\":true") != std::string::npos &&
+                   dynamic_engine.scene().get(root)->animator->time_seconds == 0.4 &&
+                   dynamic_engine.scene_history().undo_depth() == scrub_depth + 1U,
+               "successive scrub updates change the pose in one undo transaction");
+        expect(dynamic_engine.scene_history().undo() &&
+                   dynamic_engine.scene().get(root)->animator->time_seconds == 0.5,
+               "undoing a scrub restores the time before the drag");
+        (void)command("scene.set_animation", root,
+                      ",\"time_seconds\":0.3,\"gesture\":18");
+        expect(dynamic_engine.scene_history().undo_depth() == scrub_depth + 1U &&
+                   dynamic_engine.scene_history().redo_depth() == 0U,
+               "a new scrub after undo starts a new transaction and discards redo");
+        (void)dynamic_engine.scene_history().undo();
         const auto mesh_entity = half_pose.instances.front().entity;
         const auto posed_bounds = relay::compute_scene_bounds(dynamic_engine.scene(), dynamic_engine.assets(), mesh_entity);
         const auto& world = half_pose.instances.front().model.values;
@@ -1079,7 +1097,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 7U && relay::protocol_methods().size() == 47U,
+    expect(relay::protocol_schema_version == 8U && relay::protocol_methods().size() == 49U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");
@@ -1547,7 +1565,158 @@ int main() {
                "inspecting a destroyed selection fails instead of returning stale state");
     }
 
+    // Daily editing workflow: unsaved-work tracking, duplication and starting a new scene. The
+    // editor's modified marker is a comparison of two revisions, so the revision has to name the
+    // content rather than count the edits.
+    {
+        const auto handle_of = [](const std::string& response) {
+            const std::string marker = R"("entity":")";
+            const auto start = response.find(marker);
+            if (start == std::string::npos) return std::string{};
+            const auto begin = start + marker.size();
+            return response.substr(begin, response.find('"', begin) - begin);
+        };
+        auto& workflow_history = engine.scene_history();
+
+        const auto saved = workflow_history.revision();
+        const auto probe =
+            handle_of(protocol.handle(R"({"id":230,"method":"scene.create","name":"Workflow"})"));
+        expect(workflow_history.revision() != saved,
+               "an edit moves the scene revision away from the saved one");
+        (void)protocol.handle(R"({"id":231,"method":"scene.undo"})");
+        expect(workflow_history.revision() == saved,
+               "undoing back to a saved state restores its revision, so the editor stops "
+               "reporting unsaved work");
+        (void)protocol.handle(R"({"id":232,"method":"scene.redo"})");
+        expect(workflow_history.revision() != saved, "redoing an edit makes the scene modified again");
+        expect(protocol.handle(R"({"id":233,"method":"scene.history"})")
+                       .find(R"("revision":)" + std::to_string(workflow_history.revision())) !=
+                   std::string::npos,
+               "scene.history reports the revision the editor compares against");
+
+        // A scene saved mid-drag must not look saved for the rest of that drag, so a folded
+        // gesture update has to move the revision even though it adds no undo entry.
+        (void)protocol.handle(R"({"id":234,"method":"scene.set_transform","entity":")" + probe +
+                              R"(","px":1,"gesture":91})");
+        const auto mid_drag = workflow_history.revision();
+        const auto mid_drag_depth = workflow_history.undo_depth();
+        (void)protocol.handle(R"({"id":235,"method":"scene.set_transform","entity":")" + probe +
+                              R"(","px":2,"gesture":91})");
+        expect(workflow_history.revision() != mid_drag && workflow_history.undo_depth() == mid_drag_depth,
+               "an update folded into a drag still moves the revision");
+        expect(protocol.handle(
+                   R"({"id":236,"method":"scene.save","filename":"workflow-test.relay.json"})")
+                       .find(R"("revision":)" + std::to_string(workflow_history.revision())) !=
+                   std::string::npos,
+               "scene.save reports the revision the file holds");
+
+        // Duplicating a subtree is one transaction, whatever it contains.
+        const auto group =
+            handle_of(protocol.handle(R"({"id":237,"method":"scene.create","name":"Group"})"));
+        const auto leaf = handle_of(protocol.handle(
+            R"({"id":238,"method":"scene.create","name":"Leaf","parent":")" + group + R"("})"));
+        (void)protocol.handle(
+            R"({"id":239,"method":"scene.set_renderer","entity":")" + leaf +
+            R"(","enabled":true,"mesh":"builtin.quad","material":"builtin.azure"})");
+        (void)protocol.handle(R"({"id":240,"method":"scene.set_camera","entity":")" + group +
+                              R"(","enabled":true,"active":true})");
+        const auto before_copy = workflow_history.undo_depth();
+        const auto copy = handle_of(
+            protocol.handle(R"({"id":241,"method":"scene.duplicate","entity":")" + group + R"("})"));
+        expect(!copy.empty() && copy != group, "duplicate returns a new root handle");
+        expect(workflow_history.undo_depth() == before_copy + 1U, "duplicating a subtree is one undo entry");
+        const auto copied = relay::Entity::parse(copy).value();
+        const auto* copied_record = engine.scene().get(copied);
+        expect(copied_record != nullptr && copied_record->name == "Group Copy",
+               "a duplicated root is named apart from the original");
+        expect(copied_record->camera.has_value() && !copied_record->camera->active &&
+                   engine.scene().active_camera() == relay::Entity::parse(group).value(),
+               "a duplicated camera is copied but never takes over as the active camera");
+        std::size_t copied_children = 0;
+        for (const auto candidate : engine.scene().entities()) {
+            const auto* record = engine.scene().get(candidate);
+            if (record->parent != copied) continue;
+            ++copied_children;
+            expect(record->name == "Leaf" && record->mesh_renderer.has_value() &&
+                       record->mesh_renderer->mesh == "builtin.quad",
+                   "duplication copies descendants with their components intact");
+        }
+        expect(copied_children == 1U, "a duplicated subtree copies each descendant exactly once");
+        (void)protocol.handle(R"({"id":242,"method":"scene.undo"})");
+        expect(!engine.scene().contains(copied),
+               "undoing a duplication removes the whole copied subtree");
+        expect(protocol.handle(R"({"id":243,"method":"scene.duplicate","entity":"4294967295:1"})")
+                       .find(R"("ok":false)") != std::string::npos,
+               "duplicating a stale handle fails instead of creating an empty copy");
+
+        // Starting a new scene throws everything away in one step that can be taken back.
+        const auto populated = engine.scene().entities().size();
+        const auto before_clear = workflow_history.undo_depth();
+        expect(populated > 0 &&
+                   protocol.handle(R"({"id":244,"method":"scene.clear"})").find(R"("ok":true)") !=
+                       std::string::npos &&
+                   engine.scene().entities().empty(),
+               "clearing the scene removes every entity");
+        expect(workflow_history.undo_depth() == before_clear + 1U, "clearing the scene is one undo entry");
+        (void)protocol.handle(R"({"id":245,"method":"scene.undo"})");
+        expect(engine.scene().entities().size() == populated,
+               "undoing a clear restores the whole scene");
+    }
+
+    // Duplication rules that are easier to state against a scene built by hand than through a
+    // model import: which copies drive their own animation, and where the subtree bound falls.
+    {
+        relay::Scene model_scene;
+        const auto root = model_scene.create("Rig");
+        const auto bone = model_scene.create("Bone", root);
+        const auto elsewhere = model_scene.create("Elsewhere");
+        model_scene.get(root)->model_node = relay::ModelNode{root, 0};
+        model_scene.get(bone)->model_node = relay::ModelNode{root, 1};
+        model_scene.get(elsewhere)->model_node = relay::ModelNode{root, 2};
+        expect(model_scene.set_animator(root, relay::Animator{"asset.model"}),
+               "a model root carries the animator the copy has to rebind");
+
+        const auto copied_root = model_scene.duplicate(root);
+        expect(copied_root.valid() && model_scene.get(copied_root)->model_node->root == copied_root,
+               "a copy of a whole imported model binds its nodes to itself");
+        std::size_t rebound = 0;
+        for (const auto candidate : model_scene.entities()) {
+            const auto* record = model_scene.get(candidate);
+            if (record->parent == copied_root && record->model_node) {
+                ++rebound;
+                expect(record->model_node->root == copied_root,
+                       "copied descendants follow the copied model root, not the original");
+            }
+        }
+        expect(rebound == 1U, "the copied model root keeps exactly its own descendants");
+        expect(model_scene.get(root)->model_node->root == root &&
+                   model_scene.get(root)->animator.has_value(),
+               "duplicating a model leaves the original binding and animator untouched");
+
+        // One node lifted out of a model still belongs to that model instance, so its binding is
+        // deliberately left pointing at the original root rather than at a copy that has none.
+        const auto copied_outsider = model_scene.duplicate(elsewhere);
+        expect(copied_outsider.valid() &&
+                   model_scene.get(copied_outsider)->model_node->root == root,
+               "a copy of one node from inside a model stays bound to the original model root");
+
+        relay::Scene chain;
+        auto tip = chain.create("Chain");
+        const auto chain_root = tip;
+        for (std::size_t link = 1; link <= relay::Scene::maximum_duplicate_entities; ++link) {
+            tip = chain.create("Link", tip);
+        }
+        const auto chain_size = chain.entities().size();
+        expect(!chain.duplicate(chain_root).valid(),
+               "a subtree past the duplication bound is refused rather than copied part-way");
+        expect(chain.entities().size() == chain_size,
+               "a refused duplication leaves no partial copy behind");
+        expect(chain.duplicate(chain.entities()[1]).valid(),
+               "a subtree exactly at the duplication bound is copied");
+    }
+
     std::filesystem::remove("scenes/protocol-test.relay.json");
+    std::filesystem::remove("scenes/workflow-test.relay.json");
     std::filesystem::remove("traces/test.relay-trace.jsonl");
     std::filesystem::remove("captures/test-observability.webm");
     std::filesystem::remove(round_trip_path);

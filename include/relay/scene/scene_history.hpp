@@ -27,6 +27,11 @@ public:
 
     [[nodiscard]] std::size_t undo_depth() const;
     [[nodiscard]] std::size_t redo_depth() const;
+    // Names the authored content rather than counting changes: undoing back to a state that was
+    // already saved restores that state's revision, so the editor stops reporting unsaved work
+    // instead of treating the round trip as two further modifications. Runtime state that never
+    // enters the history — animation playback time, for instance — deliberately leaves it alone.
+    [[nodiscard]] std::uint64_t revision() const;
     [[nodiscard]] std::string_view next_undo_label() const;
     [[nodiscard]] std::string_view next_redo_label() const;
     // Labels newest first, so the editor can show the history as a list rather than a depth count.
@@ -39,12 +44,18 @@ private:
         SceneState before;
         SceneState after;
         std::uint64_t gesture{};
+        // Unique per transaction, so the state it produced can be recognised again after an undo.
+        std::uint64_t serial{};
     };
 
     Scene& scene_;
     std::size_t capacity_;
     std::vector<Transaction> undo_stack_;
     std::vector<Transaction> redo_stack_;
+    std::uint64_t serial_counter_{0};
+    // The revision of the state underneath the undo stack. It only moves when that state stops
+    // being the one the stack was built on: a clear, or an eviction dropping the oldest entry.
+    std::uint64_t base_revision_{0};
 };
 
 } // namespace relay

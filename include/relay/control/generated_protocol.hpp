@@ -8,7 +8,7 @@
 
 namespace relay {
 
-inline constexpr unsigned protocol_schema_version = 7U;
+inline constexpr unsigned protocol_schema_version = 8U;
 
 enum class ProtocolValueType { string, integer, number, boolean };
 

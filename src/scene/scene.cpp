@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <utility>
 
@@ -300,6 +301,67 @@ bool Scene::set_light(const Entity entity, std::optional<Light> light) {
     return true;
 }
 
+void Scene::clear() {
+    // Destroying each survivor keeps the generation bump, so handles taken before the clear stay
+    // stale rather than aliasing whatever is created next.
+    for (const auto entity : entities()) {
+        if (contains(entity)) destroy_recursive(entity);
+    }
+}
+
+Entity Scene::duplicate(const Entity source) {
+    if (!contains(source)) return {};
+
+    // Breadth-first from the source, so a parent is always copied before its children and the
+    // result does not depend on slot reuse order.
+    std::vector<Entity> originals{source};
+    for (std::size_t visited = 0; visited < originals.size(); ++visited) {
+        if (originals.size() > maximum_duplicate_entities) return {};
+        const auto parent = originals[visited];
+        for (std::uint32_t index = 0; index < slots_.size(); ++index) {
+            if (slots_[index].alive && slots_[index].record.parent == parent) {
+                originals.push_back(Entity{index, slots_[index].generation});
+            }
+        }
+    }
+    if (originals.size() > maximum_duplicate_entities) return {};
+
+    std::map<Entity, Entity> copies;
+    for (const auto original : originals) {
+        auto name = get(original)->name;
+        const auto copy = create(std::move(name));
+        if (!copy.valid()) {
+            // Leave the scene as it was found rather than half a subtree.
+            for (const auto& mapping : copies) destroy_recursive(mapping.second);
+            return {};
+        }
+        copies.emplace(original, copy);
+    }
+
+    for (const auto original : originals) {
+        const auto copy = copies.at(original);
+        auto record = *get(original);
+        // The root copy becomes a sibling of the original; everything below it follows its copied
+        // parent. `create` already validated the handles, so no cycle can be introduced here.
+        const auto parent = copies.find(record.parent);
+        record.parent = parent == copies.end() ? record.parent : parent->second;
+        // Duplicating a camera must not steal the view, and the scene holds at most one active
+        // camera. The copy is created inactive and can be activated deliberately.
+        if (record.camera) record.camera->active = false;
+        // A copy of a whole imported model drives itself; a copy of one node from inside a model
+        // still belongs to the original model instance, so that binding is left pointing at it.
+        if (record.model_node) {
+            const auto root = copies.find(record.model_node->root);
+            if (root != copies.end()) record.model_node->root = root->second;
+        }
+        slots_[copy.index].record = std::move(record);
+    }
+
+    const auto root = copies.at(source);
+    slots_[root.index].record.name = unique_copy_name(get(source)->name);
+    return root;
+}
+
 std::optional<Entity> Scene::active_camera() const {
     for (std::uint32_t index = 0; index < slots_.size(); ++index) {
         const auto& slot = slots_[index];
@@ -308,6 +370,31 @@ std::optional<Entity> Scene::active_camera() const {
         }
     }
     return std::nullopt;
+}
+
+std::string Scene::unique_copy_name(const std::string_view name) const {
+    // Duplicating a copy should stay "Foo Copy 2" rather than growing "Foo Copy Copy".
+    auto base = name;
+    if (const auto marker = base.rfind(" Copy"); marker != std::string_view::npos) {
+        const auto tail = base.substr(marker + 5U);
+        if (tail.empty() || tail.find_first_not_of("0123456789 ") == std::string_view::npos) {
+            base = base.substr(0, marker);
+        }
+    }
+    if (base.empty()) base = name;
+    // set_name caps names at 128 bytes; this leaves room for the longest suffix appended below.
+    base = base.substr(0, 110U);
+    const auto taken = [this](const std::string_view candidate) {
+        for (const auto& slot : slots_) {
+            if (slot.alive && slot.record.name == candidate) return true;
+        }
+        return false;
+    };
+    std::string candidate = std::string(base) + " Copy";
+    for (unsigned suffix = 2; suffix < 10000U && taken(candidate); ++suffix) {
+        candidate = std::string(base) + " Copy " + std::to_string(suffix);
+    }
+    return candidate;
 }
 
 bool Scene::would_create_cycle(const Entity entity, Entity parent) const {

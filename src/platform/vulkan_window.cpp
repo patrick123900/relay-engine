@@ -2049,7 +2049,6 @@ bool VulkanWindow::poll_quit() {
             impl_->overlay != nullptr && impl_->overlay_ready && impl_->overlay->handle_event(&event);
         if (consumed_by_overlay) {
             if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) impl_->resized = true;
-            if (event.type == SDL_EVENT_QUIT) return true;
             continue;
         }
         if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {

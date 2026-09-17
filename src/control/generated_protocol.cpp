@@ -66,6 +66,10 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scene_destroy{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 1> fields_scene_duplicate{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 11> fields_scene_set_transform{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"px", ProtocolValueType::number, false, false, false, false, 0, 0, 0U, 0U, "", ""},
@@ -102,13 +106,14 @@ constexpr std::array<ProtocolFieldSpec, 2> fields_scene_set_parent{{
     {"parent", ProtocolValueType::string, true, true, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 6> fields_scene_set_animation{{
+constexpr std::array<ProtocolFieldSpec, 7> fields_scene_set_animation{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"clip", ProtocolValueType::integer, false, false, true, true, 0, 255, 0U, 0U, "", ""},
     {"playing", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"loop", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"speed", ProtocolValueType::number, false, false, true, true, -100, 100, 0U, 0U, "", ""},
     {"time_seconds", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_morph{{
@@ -168,7 +173,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_trace_replay{{
     {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.relay-trace\\.jsonl$", ""},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 47> methods{{
+constexpr std::array<ProtocolMethodSpec, 49> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current run, pause, frame, simulation time and resolution state.", true, false, false, no_fields},
     {"runtime.pause", "runtime_pause", "Pause Relay runtime", "Pause automatic simulation so the scene can be inspected deterministically.", false, false, true, no_fields},
     {"runtime.resume", "runtime_resume", "Resume Relay runtime", "Resume automatic simulation after an inspection or controlled frame step.", false, false, true, no_fields},
@@ -195,6 +200,8 @@ constexpr std::array<ProtocolMethodSpec, 47> methods{{
     {"scene.inspect", "scene_inspect", "Inspect scene entity", "Inspect one entity using its stable generation-checked handle.", true, false, false, fields_scene_inspect},
     {"scene.create", "scene_create", "Create scene entity", "Create a named entity, optionally parented to another live entity.", false, false, false, fields_scene_create},
     {"scene.destroy", "scene_destroy", "Destroy scene entity", "Destroy an entity and its descendants as one undoable transaction.", false, true, false, fields_scene_destroy},
+    {"scene.duplicate", "scene_duplicate", "Duplicate scene entity", "Copy an entity and its descendants beside the original as one undoable transaction. Components are preserved, a copied camera is never the active one, and a copy of a whole imported model drives its own animation.", false, false, false, fields_scene_duplicate},
+    {"scene.clear", "scene_clear", "Clear the scene", "Destroy every entity as one undoable transaction, leaving an empty scene to start new work in.", false, true, false, no_fields},
     {"scene.set_transform", "scene_set_transform", "Set entity transform", "Update selected local position, Euler rotation or scale fields in one transaction.", false, false, false, fields_scene_set_transform},
     {"scene.set_camera", "scene_set_camera", "Configure entity camera", "Add, update or remove a perspective or orthographic camera; activating one deactivates the previous camera.", false, false, false, fields_scene_set_camera},
     {"scene.set_renderer", "scene_set_renderer", "Configure entity renderer", "Attach a registered built-in or imported mesh and material to an entity, or remove its renderer component.", false, false, false, fields_scene_set_renderer},

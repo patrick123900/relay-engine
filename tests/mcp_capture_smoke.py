@@ -41,7 +41,8 @@ try:
     process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
     process.stdin.flush()
     names = {tool["name"] for tool in call("tools/list", {})["tools"]}
-    assert len(names) == 47 and "render_capture_cancel" in names and "scene_pick" in names
+    assert len(names) == 49 and "render_capture_cancel" in names and "scene_pick" in names
+    assert {"scene_duplicate", "scene_clear"} <= names
     _, captured = tool("render_capture_async", {"filename": "mcp-phase-e.png", "source": "deterministic"})
     assert captured["source"] == "deterministic", captured
     for _ in range(100):
@@ -53,7 +54,8 @@ try:
     assert status["state"] == "complete" and status["source"] == "deterministic", status
     result, failure = tool("render_capture_async", {"filename": "mcp-no-gpu.png", "source": "vulkan"})
     assert result.get("isError") and "Vulkan" in str(failure), (result, failure)
-    print("MCP capture smoke passed: 47 tools, deterministic provenance, GPU request fails closed")
+    print(f"MCP capture smoke passed: {len(names)} tools, deterministic provenance, "
+          "GPU request fails closed")
 finally:
     process.stdin.close()
     try:

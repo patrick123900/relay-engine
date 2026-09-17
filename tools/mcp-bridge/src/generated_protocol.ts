@@ -436,6 +436,38 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "scene_duplicate",
+    {
+      title: "Duplicate scene entity",
+      description: "Copy an entity and its descendants beside the original as one undoable transaction. Components are preserved, a copied camera is never the active one, and a copy of a whole imported model drives its own animation.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_duplicate"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.duplicate", {"entity": input["entity"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_clear",
+    {
+      title: "Clear the scene",
+      description: "Destroy every entity as one undoable transaction, leaving an empty scene to start new work in.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["scene_clear"];
+        if (override) return override({});
+        return invoke("scene.clear", {});
+      },
+  );
+
+  server.registerTool(
     "scene_set_transform",
     {
       title: "Set entity transform",
@@ -564,14 +596,15 @@ export function registerGeneratedTools(
         "playing": z.boolean().optional(),
         "loop": z.boolean().optional(),
         "speed": z.number().finite().min(-100).max(100).optional(),
-        "timeSeconds": z.number().finite().min(0).max(1000000).optional()
+        "timeSeconds": z.number().finite().min(0).max(1000000).optional(),
+        "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one scrub gesture; zero creates a separate undo entry")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
     },
     async (input) => {
         const override = overrides["scene_set_animation"];
         if (override) return override(input as JsonObject);
-        return invoke("scene.set_animation", {"entity": input["entity"], "clip": input["clip"], "playing": input["playing"], "loop": input["loop"], "speed": input["speed"], "time_seconds": input["timeSeconds"]});
+        return invoke("scene.set_animation", {"entity": input["entity"], "clip": input["clip"], "playing": input["playing"], "loop": input["loop"], "speed": input["speed"], "time_seconds": input["timeSeconds"], "gesture": input["gesture"]});
       },
   );
 

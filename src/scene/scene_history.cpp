@@ -21,12 +21,20 @@ bool SceneHistory::execute(std::string label, const std::function<bool(Scene&)>&
     // match: an earlier edit of the same entity carries the same label but is a separate step.
     if (gesture != 0U && !undo_stack_.empty() && undo_stack_.back().gesture == gesture && undo_stack_.back().label == label) {
         undo_stack_.back().after = scene_.capture_state();
+        // The folded transaction now produces a different state, so it needs a new identity. Reusing
+        // the old serial would let a scene saved mid-drag look unmodified for the rest of the drag.
+        undo_stack_.back().serial = ++serial_counter_;
         redo_stack_.clear();
         return true;
     }
-    if (undo_stack_.size() == capacity_) undo_stack_.erase(undo_stack_.begin());
-    undo_stack_.push_back(
-        Transaction{std::move(label), std::move(before), scene_.capture_state(), gesture});
+    if (undo_stack_.size() == capacity_) {
+        // Once the oldest transaction is gone, the state beneath the stack is the one that
+        // transaction produced, so it inherits that transaction's revision.
+        base_revision_ = undo_stack_.front().serial;
+        undo_stack_.erase(undo_stack_.begin());
+    }
+    undo_stack_.push_back(Transaction{std::move(label), std::move(before), scene_.capture_state(),
+                                      gesture, ++serial_counter_});
     redo_stack_.clear();
     return true;
 }
@@ -50,12 +58,19 @@ bool SceneHistory::redo() {
 }
 
 void SceneHistory::clear() {
+    // Clearing discards the route back through these states but not the state itself, so the
+    // current revision becomes the one underneath the now-empty stack.
+    base_revision_ = revision();
     undo_stack_.clear();
     redo_stack_.clear();
 }
 
 std::size_t SceneHistory::undo_depth() const { return undo_stack_.size(); }
 std::size_t SceneHistory::redo_depth() const { return redo_stack_.size(); }
+
+std::uint64_t SceneHistory::revision() const {
+    return undo_stack_.empty() ? base_revision_ : undo_stack_.back().serial;
+}
 
 std::vector<std::string> SceneHistory::undo_labels() const {
     std::vector<std::string> labels;

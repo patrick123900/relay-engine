@@ -1,5 +1,13 @@
 # Relay Engine
 
+Agent desktop policy: follow [AGENTS.md](AGENTS.md). Never control mouse/keyboard, change focus, or open/show/activate/move/resize windows
+without specific advance user approval for the current task. Use background/headless checks by
+default. Desktop and windowed GPU tests below are optional, approval-only reproduction commands.
+Agents must first run relevant background/headless builds and tests autonomously. Do not skip
+these checks or default to asking for desktop access. Only ask after completing background checks
+if an important verification gap cannot reasonably be covered without desktop interaction.
+
+
 Relay is an experimental, native game engine designed as a shared workspace for human developers
 and software agents. Its north star is simple: anything a human can inspect or operate in the editor
 should also have a typed, observable and safe automation surface.
@@ -102,9 +110,18 @@ They provide hierarchy selection/reparenting/renaming, component and animation e
 import, undo history, logs and scene presentation. Playback, stepping, undo/redo and editing modes
 live in a fixed toolbar; scene save/load lives in File.
 
-The menu bar provides **File, Edit, Scene, View, Run, Tools, Layout and Help**. Open/Save As
-use project-local filename dialogs; `Ctrl+O`, `Ctrl+S` and `Ctrl+Shift+S` provide quick access.
-Scene can add empty nodes, quads, triangles, cameras and three light types. View can hide or
+The menu bar provides **File, Edit, Scene, View, Run, Tools, Layout and Help**. New/Open/Save As
+use project-local filename dialogs; `Ctrl+N`, `Ctrl+O`, `Ctrl+S` and `Ctrl+Shift+S` provide quick
+access. The window title carries the scene's filename, or `Untitled scene`, and an asterisk while
+there is unsaved work. Starting a new scene, opening another one or quitting with unsaved work asks
+first; `Enter` saves and continues when the scene already has a file and `Escape` cancels. Saving is
+what clears the marker, and undoing back to a saved state clears it too, because the comparison is
+between scene revisions rather than a count of edits. Animation playback time never enters the undo
+history, so a playing clip does not report the scene as modified.
+Scene can add empty nodes, quads, triangles, cameras and three light types. **Edit > Duplicate**
+(`Ctrl+D`, also on the hierarchy context menu) copies the selection and everything beneath it beside
+the original as one undoable step, names the copy apart from its source, and selects it so the next
+edit lands on the copy. View can hide or
 reopen every panel and reset the editor camera. Run controls simulation and exact single-frame
 stepping. Tools queues real GPU PNG screenshots and records WebM at 30 fps, up to ten seconds,
 with an early-stop action. Recording follows simulation frames: resume or step a paused runtime.
@@ -152,7 +169,8 @@ Use the toolbar camera icon or **View > Scene camera** to see the scene's active
 Transform edits commit once per gesture rather than once per frame, so one inspector drag or one
 gizmo drag is one undo entry, and values are carried as full-precision doubles to match Relay's
 transform storage. A gizmo drag sends many updates carrying a shared gesture token, which the scene
-history folds into the single transaction that token opened.
+history folds into the single transaction that token opened. Animation time sliders also update
+the pose throughout a drag and fold the scrub into one undo entry.
 
 Inspector widgets retain drafts through release and commit only the edited channels, preserving
 other values and following later agent edits or undo. Imported morph targets can be overridden
@@ -180,13 +198,33 @@ panel while retaining the other panes. Separate desktop windows are not supporte
 Panels poll read-only methods roughly twice a second. Read-only requests are not recorded in
 deterministic traces, so polling cannot bury the operations that changed the scene.
 
+The desktop suites below open windows, change focus and control the real mouse and keyboard.
+Their isolated layout does not isolate desktop input. Agents must obtain specific user approval
+before running them; otherwise leave desktop verification pending and continue background work.
+
 `tests/editor_visuals_smoke.py` is the current real desktop check for amber mesh outlines,
 vertical grid movement, capture isolation and resize/reframing. It requires a desktop session,
-xdotool, Spectacle and Pillow, and uses an isolated layout. Run it from the repository root:
+xdotool, Spectacle and Pillow, and uses an isolated layout. Only after specific user approval,
+run it from the repository root:
 
 ```sh
 python3 tests/editor_visuals_smoke.py
 ```
+
+`tests/editor_workflow_smoke.py` is the current real desktop check for the everyday editing and
+save workflow: duplication and its selection, the unsaved-work guard and its cancel, Save As, New
+scene, reopening, and the animator's play and restart controls. It asserts engine state over the
+protocol and reads the unsaved marker back from the window manager. It needs a desktop session and
+xdotool, and uses an isolated layout:
+
+```sh
+python3 tests/editor_workflow_smoke.py
+```
+
+Synthetic key delivery on this desktop is not completely reliable — a repeated `Ctrl+O` reached the
+editor most but not all of the time — so interactions with a checkable outcome are retried and the
+suite prints when it retried. Every assertion is still made against engine state, so a real
+regression fails rather than being retried away.
 
 Earlier desktop suites cover hierarchy/gizmo interaction, inspector/morph edits, Godot navigation,
 docking/persistence and menus (`tests/editor_{interaction,regression,navigation,layout,menu}_smoke.py`).
@@ -194,9 +232,8 @@ They passed before the font, maximized-startup and fixed-toolbar changes; their 
 coordinates and Controls-panel calibration need updating before they can validate the current
 layout. These desktop checks are separate from `ctest`.
 
-Not implemented yet: multi-selection, copy/paste and an embedded chat panel. Daily editor
-workflows and animation controls remain the next priority; capability grants must precede broader
-agent access and embedded chat.
+Not implemented yet: multi-selection, cut/copy/paste and an embedded chat panel. Capability grants
+must precede broader agent access and embedded chat.
 
 Build the interface with `-DRELAY_ENABLE_EDITOR_UI=ON` (the default). Dear ImGui is fetched from a
 checksum-pinned v1.92.1-docking release and ImGuizmo from a checksum-pinned commit; both are linked only
@@ -236,7 +273,9 @@ inverse bind matrices, normalized skin weights, node/morph animation clips and m
 Playback is deterministic and independently controlled per model instance. glTF/GLB preserves
 LINEAR, STEP and CUBICSPLINE interpolation; CPU deformation is streamed to per-frame Vulkan buffers.
 `scene.set_animation` selects, seeks and plays clips; `scene.set_morph` overrides or resets weights.
-`render.assets` lists models/clips and mesh joint/morph counts. FBX remains on Assimp, verified by
+`render.assets` lists models/clips and mesh joint/morph counts, which is what lets the inspector
+offer clips by name and bound its time slider by the selected clip's length rather than showing a
+raw index and an open-ended number. FBX remains on Assimp, verified by
 the Blender-exported animated/skin/morph fixture.
 
 Imports are sandboxed. A model may only be named by a top-level filename inside `assets/`, and every
@@ -287,7 +326,7 @@ Probe the graphics device directly:
 ./build/dev/relay_demo --probe-vulkan
 ```
 
-Run a short real-presentation smoke test that draws, resizes the window, recreates the swapchain and
+Only after specific user approval, run a real-presentation smoke test that draws, resizes the window, recreates the swapchain and
 draws again:
 
 ```sh
@@ -303,7 +342,7 @@ Capture the actual Vulkan swapchain through a synchronized GPU-to-CPU transfer:
 ## MCP bridge
 
 The official MCP TypeScript SDK powers Relay's first model-facing bridge. It launches and owns a
-headless runtime, then exposes forty-seven narrowly scoped tools with JSON Schema validation and safety
+headless runtime, then exposes forty-nine narrowly scoped tools with JSON Schema validation and safety
 annotations. Engine messages stay on a private child-process channel so MCP's standard output is
 never polluted by runtime logs.
 
@@ -347,7 +386,8 @@ Both CMake builds and `npm run check` reject stale generated C++, TypeScript or 
 
 Near-term milestones, in the order they should be taken:
 
-1. Polish the editor: daily editing, project/save workflows and animation controls.
+1. Continue editor polish: multi-selection and cut/copy/paste, a project model above single
+   scene files, and an animation timeline rather than per-entity inspector controls.
 2. Add per-session capability grants before broader agent access, then embedded chat.
 3. Expand import presets and replace whole-registry refresh with asynchronous resource uploads.
 
@@ -374,7 +414,7 @@ active jobs. Full queues/rings report capture failures or recording drops. Cance
 at a different resolution after resize count as drops. Start a new recording to use the new size.
 Odd dimensions are padded for VP9. Shutdown drains readbacks and joins the workers.
 
-Protocol v7 has 47 native methods and generated MCP tools. Scene v4 and manifest v3 are unchanged.
+Protocol v8 has 49 native methods and generated MCP tools. Scene v4 and manifest v3 are unchanged.
 Linux/RADV is the verified platform; no Windows/macOS parity is claimed.
 
 ```sh

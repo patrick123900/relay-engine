@@ -1,7 +1,8 @@
 #pragma once
 
-#include <cstdint>
 #include <compare>
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -120,8 +121,17 @@ struct SceneState {
 
 class Scene {
 public:
+    // A duplicated subtree is bounded so one call cannot grow the scene without limit.
+    static constexpr std::size_t maximum_duplicate_entities = 4096;
+
     [[nodiscard]] Entity create(std::string name = "Entity", Entity parent = {});
     [[nodiscard]] bool destroy(Entity entity);
+    // Copies `source` and everything beneath it, placing the copy beside the original. Components
+    // are preserved, except that a copied camera is never the active one. Returns an invalid
+    // entity if the source is gone or the subtree exceeds `maximum_duplicate_entities`.
+    [[nodiscard]] Entity duplicate(Entity source);
+    // Destroys every entity, leaving handles taken beforehand stale rather than reusable.
+    void clear();
     [[nodiscard]] bool contains(Entity entity) const;
     [[nodiscard]] EntityRecord* get(Entity entity);
     [[nodiscard]] const EntityRecord* get(Entity entity) const;
@@ -146,6 +156,7 @@ public:
 
 private:
     void destroy_recursive(Entity entity);
+    [[nodiscard]] std::string unique_copy_name(std::string_view name) const;
     [[nodiscard]] bool would_create_cycle(Entity entity, Entity parent) const;
 
     std::vector<SceneSlotState> slots_;

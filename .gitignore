@@ -24,6 +24,11 @@ npm-debug.log*
 !/captures/pbr-golden.png
 
 # Editor and operating-system noise
+/.relay/
 .DS_Store
 *.swp
 *.tmp
+
+# Python smoke-test bytecode
+__pycache__/
+*.py[cod]

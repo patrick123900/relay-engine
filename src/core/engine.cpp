@@ -15,9 +15,10 @@ Engine::Engine(EngineConfig config)
 }
 
 Engine::~Engine() {
+    if (gpu_flush_) gpu_flush_();
     if (video_.status().recording) {
         std::string ignored_error;
-        (void)video_.stop(ignored_error);
+        (void)stop_video(ignored_error);
     }
 }
 
@@ -49,7 +50,7 @@ void Engine::resume() {
 void Engine::request_shutdown() {
     if (video_.status().recording) {
         std::string error;
-        if (!video_.stop(error)) logs_.write(LogLevel::error, "Video finalization failed: " + error);
+        if (!stop_video(error)) logs_.write(LogLevel::error, "Video finalization failed: " + error);
     }
     running_ = false;
     logs_.write(LogLevel::info, "Runtime shutdown requested");
@@ -65,7 +66,23 @@ bool Engine::capture(const std::filesystem::path& path, std::string& error) {
     return captured;
 }
 
-std::uint64_t Engine::capture_async(const std::filesystem::path& path, std::string& error) {
+void Engine::set_gpu_capture_source(GpuFrameSource source, std::function<void()> flush) {
+    if (gpu_flush_) gpu_flush_();
+    gpu_source_ = std::move(source);
+    gpu_flush_ = std::move(flush);
+}
+
+std::uint64_t Engine::capture_async(const std::filesystem::path& path, std::string& error, std::string source) {
+    if (source != "vulkan" && source != "deterministic") { error = "unknown capture source"; return 0; }
+    if (source == "vulkan") {
+        if (!gpu_source_) { error = "Vulkan capture requires a live GPU renderer"; return 0; }
+        const auto id = capture_queue_.reserve(path, source, error);
+        if (!id) return 0;
+        if (!gpu_source_([this, id](OwnedFrame frame, std::string failure) {
+            capture_queue_.deliver(id, std::move(frame), std::move(failure));
+        }, error)) capture_queue_.deliver(id, {}, error);
+        return id;
+    }
     const auto id = capture_queue_.submit(renderer_.frame(), path, error);
     if (id != 0U) logs_.write(LogLevel::info, "Queued frame capture " + std::to_string(id));
     return id;
@@ -76,11 +93,15 @@ CaptureJobStatus Engine::capture_status(const std::uint64_t id) const {
 }
 
 bool Engine::start_video(const std::filesystem::path& path, const std::uint32_t fps,
-                         const std::uint32_t maximum_frames, std::string& error) {
-    return video_.start(path, fps, maximum_frames, config_.fixed_delta_seconds, error);
+                         const std::uint32_t maximum_frames, std::string& error, std::string source) {
+    if (source != "vulkan" && source != "deterministic") { error = "unknown video source"; return false; }
+    if (source == "vulkan" && !gpu_source_) { error = "Vulkan video requires a live GPU renderer"; return false; }
+    if (!video_.start(path, fps, maximum_frames, config_.fixed_delta_seconds, error)) return false;
+    video_.set_source(std::move(source));
+    return true;
 }
 
-bool Engine::stop_video(std::string& error) { return video_.stop(error); }
+bool Engine::stop_video(std::string& error) { if (gpu_flush_) gpu_flush_(); return video_.stop(error); }
 
 VideoStatus Engine::video_status() const { return video_.status(); }
 
@@ -168,7 +189,14 @@ void Engine::advance_one_frame() {
         }
     }
     renderer_.render(frame_index_, elapsed_seconds_);
-    video_.record(renderer_.frame());
+    if (video_.status().recording && video_.status().source == "vulkan") {
+        if (video_.sample_due()) {
+            std::string error;
+            if (!gpu_source_([this](OwnedFrame frame, std::string failure) {
+                if (failure.empty()) video_.record_sample(frame.view()); else video_.drop();
+            }, error)) video_.drop();
+        }
+    } else video_.record(renderer_.frame());
     const auto end = std::chrono::steady_clock::now();
     const auto milliseconds = std::chrono::duration<double, std::milli>(end - start).count();
     performance_.record_cpu(frame_index_, milliseconds, scene_.entities().size());

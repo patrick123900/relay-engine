@@ -186,23 +186,46 @@ CaptureQueue::~CaptureQueue() {
 
 std::uint64_t CaptureQueue::submit(const FrameView frame, std::filesystem::path path,
                                    std::string& error) {
+    if (!validate_frame(frame, error)) return 0;
+    const auto id = reserve(std::move(path), "deterministic", error);
+    if (id) deliver(id, {frame.width, frame.height, {frame.rgba.begin(), frame.rgba.end()}});
+    return id;
+}
+
+std::uint64_t CaptureQueue::reserve(std::filesystem::path path, std::string source, std::string& error) {
     std::scoped_lock lock(mutex_);
-    if (stopping_ || pending_.size() >= capacity_) {
-        error = "capture queue is full";
-        return 0;
+    std::size_t active = 0;
+    for (const auto& [id, job] : jobs_) {
+        (void)id;
+        if (job.status.state == CaptureJobState::queued || job.status.state == CaptureJobState::writing) ++active;
     }
-    while (jobs_.size() >= capacity_ * 16U) {
-        const auto oldest = jobs_.begin();
-        if (oldest->second.status.state == CaptureJobState::queued ||
-            oldest->second.status.state == CaptureJobState::writing) break;
-        jobs_.erase(oldest);
+    if (stopping_ || active >= capacity_) { error = "capture queue is full"; return 0; }
+    while (jobs_.size() >= 4096U) {
+        auto found = std::find_if(jobs_.begin(), jobs_.end(), [](const auto& entry) {
+            return entry.second.status.state == CaptureJobState::complete || entry.second.status.state == CaptureJobState::failed;
+        });
+        if (found == jobs_.end()) break;
+        jobs_.erase(found);
     }
     const auto id = next_id_++;
-    OwnedFrame owned{frame.width, frame.height, std::vector<std::uint8_t>(frame.rgba.begin(), frame.rgba.end())};
-    jobs_.emplace(id, Job{CaptureJobStatus{id, CaptureJobState::queued, std::move(path), {}}, std::move(owned)});
-    pending_.push_back(id);
-    ready_.notify_one();
+    jobs_.emplace(id, Job{{id, CaptureJobState::queued, std::move(path), {}, std::move(source)}, {}});
+    error.clear();
     return id;
+}
+
+void CaptureQueue::deliver(std::uint64_t id, OwnedFrame frame, std::string error) {
+    std::scoped_lock lock(mutex_);
+    auto& job = jobs_.at(id);
+    if (job.status.state != CaptureJobState::queued) return;
+    if (!error.empty() || !validate_frame(frame.view(), error)) {
+        job.status.state = CaptureJobState::failed;
+        job.status.error = std::move(error);
+    } else {
+        job.frame = std::move(frame);
+        pending_.push_back(id);
+        ready_.notify_one();
+    }
+    idle_.notify_all();
 }
 
 CaptureJobStatus CaptureQueue::status(const std::uint64_t id) const {
@@ -212,9 +235,25 @@ CaptureJobStatus CaptureQueue::status(const std::uint64_t id) const {
                                : found->second.status;
 }
 
+bool CaptureQueue::cancel(std::uint64_t id) {
+    std::scoped_lock lock(mutex_);
+    const auto found = jobs_.find(id);
+    if (found == jobs_.end() || found->second.status.state != CaptureJobState::queued) return false;
+    found->second.status.state = CaptureJobState::failed;
+    found->second.status.error = "capture cancelled";
+    found->second.frame = {};
+    std::erase(pending_, id);
+    idle_.notify_all();
+    return true;
+}
+
 void CaptureQueue::wait_idle() {
     std::unique_lock lock(mutex_);
-    idle_.wait(lock, [this] { return pending_.empty() && !writing_; });
+    idle_.wait(lock, [this] {
+        return std::none_of(jobs_.begin(), jobs_.end(), [](const auto& entry) {
+            return entry.second.status.state == CaptureJobState::queued || entry.second.status.state == CaptureJobState::writing;
+        });
+    });
 }
 
 void CaptureQueue::run() {
@@ -250,10 +289,15 @@ void CaptureQueue::run() {
 }
 
 VideoRecorder::VideoRecorder(CaptureQueue& captures) : captures_(captures) {}
+VideoRecorder::~VideoRecorder() { if (finalization_.valid()) finalization_.wait(); }
 
 bool VideoRecorder::start(std::filesystem::path path, const std::uint32_t fps,
                           const std::uint32_t maximum_frames, const double fixed_delta_seconds,
                           std::string& error) {
+    if (finalization_.valid() && finalization_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        error = "the previous video is still finalizing"; return false;
+    }
+    finalization_ = {};
     if (!video_encoder_available()) {
         error = "FFmpeg was not found when Relay was configured; WebM recording is unavailable";
         return false;
@@ -276,20 +320,32 @@ bool VideoRecorder::start(std::filesystem::path path, const std::uint32_t fps,
         error = "could not create video frame directory: " + filesystem_error.message();
         return false;
     }
-    status_ = {true, std::move(path), fps, 0U, 0U};
+    status_ = {"deterministic", false, {}, true, std::move(path), fps, 0U, 0U};
     maximum_frames_ = maximum_frames;
     source_fps_ = 1.0 / fixed_delta_seconds;
     sampling_accumulator_ = source_fps_;
+    width_ = height_ = 0;
     jobs_.clear();
     error.clear();
     return true;
 }
 
-void VideoRecorder::record(const FrameView frame) {
-    if (!status_.recording || status_.submitted_frames >= maximum_frames_) return;
+bool VideoRecorder::sample_due() {
+    if (!status_.recording || status_.submitted_frames >= maximum_frames_) return false;
     sampling_accumulator_ += static_cast<double>(status_.fps);
-    if (sampling_accumulator_ < source_fps_) return;
+    if (sampling_accumulator_ < source_fps_) return false;
     sampling_accumulator_ -= source_fps_;
+    return true;
+}
+
+void VideoRecorder::record(const FrameView frame) {
+    if (sample_due()) record_sample(frame);
+}
+
+void VideoRecorder::record_sample(const FrameView frame) {
+    if (!status_.recording || status_.submitted_frames >= maximum_frames_) return;
+    if (width_ && (width_ != frame.width || height_ != frame.height)) { ++status_.dropped_frames; return; }
+    width_ = frame.width; height_ = frame.height;
     std::ostringstream filename;
     filename << "frame-" << std::setw(8) << std::setfill('0') << status_.submitted_frames << ".png";
     std::string error;
@@ -308,30 +364,37 @@ bool VideoRecorder::stop(std::string& error) {
         return false;
     }
     status_.recording = false;
+    finalization_ = std::async(std::launch::async, [this] { return finalize(); }).share();
+    error.clear();
+    return true;
+}
+
+std::string VideoRecorder::finalize() {
+    std::string error;
     captures_.wait_idle();
     for (const auto job : jobs_) {
         const auto capture = captures_.status(job);
         if (capture.state != CaptureJobState::complete) {
             error = "video frame capture failed: " + capture.error;
-            return false;
+            return error;
         }
     }
     if (jobs_.empty()) {
         error = "video has no captured frames";
-        return false;
+        return error;
     }
     std::error_code filesystem_error;
     std::filesystem::create_directories(status_.path.parent_path(), filesystem_error);
     if (filesystem_error) {
         error = "could not create video output directory";
-        return false;
+        return error;
     }
 #ifdef _WIN32
     const auto command = "\"" + std::string(ffmpeg_executable) +
                          "\" -hide_banner -loglevel error -y -framerate " +
                          std::to_string(status_.fps) + " -i \"" +
                          (temporary_directory_ / "frame-%08d.png").string() +
-                         "\" -c:v libvpx-vp9 -pix_fmt yuv420p \"" + status_.path.string() + "\"";
+                         "\" -vf \"pad=ceil(iw/2)*2:ceil(ih/2)*2\" -c:v libvpx-vp9 -pix_fmt yuv420p \"" + status_.path.string() + "\"";
 #else
     auto quote = [](const std::string& value) {
         std::string output{"'"};
@@ -342,18 +405,25 @@ bool VideoRecorder::stop(std::string& error) {
                          " -hide_banner -loglevel error -y -framerate " +
                          std::to_string(status_.fps) + " -i " +
                          quote((temporary_directory_ / "frame-%08d.png").string()) +
-                         " -c:v libvpx-vp9 -pix_fmt yuv420p " + quote(status_.path.string());
+                         " -vf 'pad=ceil(iw/2)*2:ceil(ih/2)*2' -c:v libvpx-vp9 -pix_fmt yuv420p " + quote(status_.path.string());
 #endif
     if (std::system(command.c_str()) != 0) {
         error = "FFmpeg WebM encoding failed; captured PNG frames remain in " +
                 temporary_directory_.string();
-        return false;
+        return error;
     }
     std::filesystem::remove_all(temporary_directory_, filesystem_error);
     error.clear();
-    return true;
+    return {};
 }
 
-VideoStatus VideoRecorder::status() const { return status_; }
+VideoStatus VideoRecorder::status() const {
+    auto result = status_;
+    if (finalization_.valid()) {
+        result.finalizing = finalization_.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+        if (!result.finalizing) result.error = finalization_.get();
+    }
+    return result;
+}
 
 } // namespace relay

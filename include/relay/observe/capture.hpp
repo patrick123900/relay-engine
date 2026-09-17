@@ -7,6 +7,7 @@
 #include <deque>
 #include <filesystem>
 #include <map>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -33,6 +34,7 @@ struct CaptureJobStatus {
     CaptureJobState state{CaptureJobState::queued};
     std::filesystem::path path;
     std::string error;
+    std::string source{"deterministic"};
 };
 
 class CaptureQueue {
@@ -45,6 +47,9 @@ public:
     [[nodiscard]] std::uint64_t submit(FrameView frame, std::filesystem::path path,
                                        std::string& error);
     [[nodiscard]] CaptureJobStatus status(std::uint64_t id) const;
+    std::uint64_t reserve(std::filesystem::path path, std::string source, std::string& error);
+    void deliver(std::uint64_t id, OwnedFrame frame, std::string error = {});
+    bool cancel(std::uint64_t id);
     void wait_idle();
 
 private:
@@ -67,6 +72,9 @@ private:
 };
 
 struct VideoStatus {
+    std::string source{"deterministic"};
+    bool finalizing{false};
+    std::string error;
     bool recording{false};
     std::filesystem::path path;
     std::uint32_t fps{30};
@@ -77,19 +85,27 @@ struct VideoStatus {
 class VideoRecorder {
 public:
     explicit VideoRecorder(CaptureQueue& captures);
+    ~VideoRecorder();
     [[nodiscard]] bool start(std::filesystem::path path, std::uint32_t fps,
                              std::uint32_t maximum_frames, double fixed_delta_seconds,
                              std::string& error);
     void record(FrameView frame);
+    bool sample_due();
+    void record_sample(FrameView frame);
+    void drop() { ++status_.dropped_frames; }
+    void set_source(std::string source) { status_.source = std::move(source); }
     [[nodiscard]] bool stop(std::string& error);
     [[nodiscard]] VideoStatus status() const;
 
 private:
+    std::string finalize();
+    std::shared_future<std::string> finalization_;
     CaptureQueue& captures_;
     VideoStatus status_;
     std::filesystem::path temporary_directory_;
     std::vector<std::uint64_t> jobs_;
     std::uint32_t maximum_frames_{};
+    std::uint32_t width_{}, height_{};
     double source_fps_{};
     double sampling_accumulator_{};
 };

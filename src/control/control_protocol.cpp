@@ -6,6 +6,7 @@
 #include "relay/render/asset_manifest.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/render/render_graph.hpp"
+#include "relay/render/scene_render.hpp"
 #include "relay/scene/scene_io.hpp"
 
 #include <algorithm>
@@ -14,6 +15,8 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <iomanip>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <utility>
@@ -236,7 +239,14 @@ std::string ControlProtocol::handle(const std::string_view request) {
     if (!validate_protocol_request(request, method, validation_error)) {
         return error_response(id, validation_error);
     }
-    if (!method.starts_with("trace.")) engine_.record_trace_event("command", std::string(request));
+    // Traces exist to reproduce state changes, so read-only queries are not recorded. The editor
+    // polls scene.list, logs.read and friends continuously; tracing those would bury the operations
+    // that actually changed the scene and make trace files grow with idle time rather than work.
+    const auto* const specification = find_protocol_method(method);
+    const bool read_only = specification != nullptr && specification->read_only;
+    if (!method.starts_with("trace.") && !read_only) {
+        engine_.record_trace_event("command", std::string(request));
+    }
 
     if (method == "runtime.status") {
         const auto status = engine_.status();
@@ -275,6 +285,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         if (!path) return error_response(id, "path must be a safe .png or .bmp name without directories");
         std::string error;
         const auto source = string_field(request, "source");
+        if (source == "vulkan" && !capture_handler_) return error_response(id, "Vulkan capture requires a live GPU renderer");
         const bool captured = capture_handler_ && source != "deterministic"
                                   ? capture_handler_(*path, error)
                                   : engine_.capture(*path, error);
@@ -378,10 +389,15 @@ std::string ControlProtocol::handle(const std::string_view request) {
         const auto path = safe_capture_path(path_value.empty() ? "frame.png" : path_value);
         if (!path) return error_response(id, "path must be a safe .png or .bmp name without directories");
         std::string error;
-        const auto job = engine_.capture_async(*path, error);
+        const auto source = string_field(request, "source").empty() ? engine_.capture_source() : string_field(request, "source");
+        const auto job = engine_.capture_async(*path, error, source);
         if (job == 0U) return error_response(id, error);
         return response_prefix(id) + "{\"job\":" + std::to_string(job) +
-               ",\"path\":\"" + escape_json(path->generic_string()) + "\",\"state\":\"queued\"}}";
+               ",\"path\":\"" + escape_json(path->generic_string()) + "\",\"source\":\"" + source + "\",\"state\":\"queued\"}}";
+    }
+    if (method == "render.capture_cancel") {
+        const auto cancelled = engine_.cancel_capture(unsigned_field(request, "job", 0));
+        return response_prefix(id) + "{\"cancelled\":" + (cancelled ? "true" : "false") + "}}";
     }
     if (method == "render.capture_status") {
         const auto job = unsigned_field(request, "job", 0);
@@ -389,7 +405,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         if (!status.error.empty() && status.path.empty()) return error_response(id, status.error);
         return response_prefix(id) + "{\"job\":" + std::to_string(job) +
                ",\"path\":\"" + escape_json(status.path.string()) + "\",\"state\":\"" +
-               capture_state_name(status.state) + "\",\"error\":\"" +
+               capture_state_name(status.state) + "\",\"source\":\"" + status.source + "\",\"error\":\"" +
                escape_json(status.error) + "\"}}";
     }
     if (method == "performance.read") {
@@ -436,9 +452,10 @@ std::string ControlProtocol::handle(const std::string_view request) {
         const auto maximum_frames = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
             unsigned_field(request, "maximum_frames", 300), 1U, 3600U));
         std::string error;
-        if (!engine_.start_video(*path, fps, maximum_frames, error)) return error_response(id, error);
+        const auto source = string_field(request, "source").empty() ? engine_.capture_source() : string_field(request, "source");
+        if (!engine_.start_video(*path, fps, maximum_frames, error, source)) return error_response(id, error);
         return response_prefix(id) + "{\"recording\":true,\"path\":\"" +
-               escape_json(path->string()) + "\",\"fps\":" + std::to_string(fps) +
+               escape_json(path->string()) + "\",\"source\":\"" + source + "\",\"fps\":" + std::to_string(fps) +
                ",\"maximum_frames\":" + std::to_string(maximum_frames) + "}}";
     }
     if (method == "video.capabilities") {
@@ -453,7 +470,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) + "{\"recording\":false,\"path\":\"" +
                escape_json(status.path.string()) + "\",\"frames\":" +
                std::to_string(status.submitted_frames) + ",\"dropped_frames\":" +
-               std::to_string(status.dropped_frames) + "}}";
+               std::to_string(status.dropped_frames) + ",\"source\":\"" + status.source + "\",\"finalizing\":" + (status.finalizing ? "true" : "false") + ",\"error\":\"" + escape_json(status.error) + "\"}}";
     }
     if (method == "video.status") {
         const auto status = engine_.video_status();
@@ -461,7 +478,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
                (status.recording ? "true" : "false") + ",\"path\":\"" +
                escape_json(status.path.string()) + "\",\"fps\":" + std::to_string(status.fps) +
                ",\"frames\":" + std::to_string(status.submitted_frames) +
-               ",\"dropped_frames\":" + std::to_string(status.dropped_frames) + "}}";
+               ",\"dropped_frames\":" + std::to_string(status.dropped_frames) + ",\"source\":\"" + status.source + "\",\"finalizing\":" + (status.finalizing ? "true" : "false") + ",\"error\":\"" + escape_json(status.error) + "\"}}";
     }
     if (method == "scene.list") {
         return response_prefix(id) + engine_.scene().list_json() + '}';
@@ -472,6 +489,102 @@ std::string ControlProtocol::handle(const std::string_view request) {
             return error_response(id, "entity does not exist or has a stale handle");
         }
         return response_prefix(id) + engine_.scene().entity_json(*entity) + '}';
+    }
+    if (method == "scene.rename") {
+        const auto entity = entity_field(request, "entity");
+        if (!entity.has_value() || !entity->valid()) return error_response(id, "invalid entity handle");
+        auto name = string_field(request, "name");
+        if (name.empty()) return error_response(id, "name must not be empty");
+        if (!engine_.scene_history().execute("Rename " + entity->to_string(),
+                                             [&](Scene& scene) {
+                                                 return scene.set_name(*entity, name);
+                                             })) {
+            return error_response(id, "entity does not exist or has a stale handle");
+        }
+        engine_.logs().write(LogLevel::info, "Renamed " + entity->to_string() + " to " + name);
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.history") {
+        const auto& history = engine_.scene_history();
+        const auto undo = history.undo_labels();
+        const auto redo = history.redo_labels();
+        std::string output = "{\"undo\":[";
+        for (std::size_t index = 0; index < undo.size(); ++index) {
+            if (index != 0) output += ',';
+            output += '"' + escape_json(undo[index]) + '"';
+        }
+        output += "],\"redo\":[";
+        for (std::size_t index = 0; index < redo.size(); ++index) {
+            if (index != 0) output += ',';
+            output += '"' + escape_json(redo[index]) + '"';
+        }
+        output += "],\"state\":" + history_json(history) + '}';
+        return response_prefix(id) + output + '}';
+    }
+    if (method == "assets.available") {
+        // Only top-level files with an importable extension are listed. This mirrors what
+        // assets.import_model will accept and does not widen the import sandbox.
+        std::vector<std::string> names;
+        std::error_code failure;
+        std::filesystem::directory_iterator item{"assets", failure}, end;
+        for (; !failure && item != end; item.increment(failure)) {
+            std::error_code status_error;
+            if (!item->is_regular_file(status_error)) continue;
+            const auto name = item->path().filename().string();
+            if (safe_model_filename(name).has_value()) names.push_back(name);
+        }
+        std::sort(names.begin(), names.end());
+        std::string output = "{\"available\":" + std::string(failure ? "false" : "true") + ",\"models\":[";
+        for (std::size_t index = 0; index < names.size(); ++index) {
+            if (index != 0) output += ',';
+            output += '"' + escape_json(names[index]) + '"';
+        }
+        return response_prefix(id) + output + "]}}";
+    }
+    if (method == "scene.pick") {
+        const auto component = [&](const std::string_view key) {
+            const auto value = number_field(request, key);
+            return value.value_or(0.0);
+        };
+        const Vec3 origin{component("origin_x"), component("origin_y"), component("origin_z")};
+        const Vec3 direction{component("direction_x"), component("direction_y"),
+                             component("direction_z")};
+        if (direction.x == 0.0 && direction.y == 0.0 && direction.z == 0.0) {
+            return error_response(id, "pick direction must be nonzero");
+        }
+        const auto pick = pick_scene_entity(engine_.scene(), engine_.assets(), origin, direction);
+        if (!pick.error.empty()) return error_response(id, pick.error);
+        if (!pick.hit) {
+            return response_prefix(id) + "{\"entity\":null,\"distance\":null}}";
+        }
+        std::ostringstream output;
+        output << std::setprecision(std::numeric_limits<double>::max_digits10);
+        output << "{\"entity\":\"" << pick.entity.to_string() << "\",\"distance\":" << pick.distance
+               << '}';
+        return response_prefix(id) + output.str() + '}';
+    }
+    if (method == "scene.bounds") {
+        const auto entity = entity_field(request, "entity");
+        if (!entity.has_value() || !entity->valid() || !engine_.scene().contains(*entity)) {
+            return error_response(id, "entity does not exist or has a stale handle");
+        }
+        const auto bounds = compute_scene_bounds(engine_.scene(), engine_.assets(), *entity);
+        if (!bounds.valid) return error_response(id, "scene exceeds the deformation query budget");
+        std::ostringstream output;
+        output << std::setprecision(std::numeric_limits<double>::max_digits10);
+        const auto vector = [&output](const Vec3& value) {
+            output << '[' << value.x << ',' << value.y << ',' << value.z << ']';
+        };
+        output << "{\"has_geometry\":" << (bounds.has_geometry ? "true" : "false")
+               << ",\"position\":";
+        vector(bounds.position);
+        output << ",\"minimum\":";
+        vector(bounds.minimum);
+        output << ",\"maximum\":";
+        vector(bounds.maximum);
+        output << '}';
+        return response_prefix(id) + output.str() + '}';
     }
     if (method == "scene.create") {
         auto name = string_field(request, "name");
@@ -516,9 +629,10 @@ std::string ControlProtocol::handle(const std::string_view request) {
         if (const auto value = number_field(request, "sx")) transform.scale.x = *value;
         if (const auto value = number_field(request, "sy")) transform.scale.y = *value;
         if (const auto value = number_field(request, "sz")) transform.scale.z = *value;
-        if (!engine_.scene_history().execute("Transform " + entity->to_string(), [&](Scene& scene) {
-                return scene.set_transform(*entity, transform);
-            })) {
+        const auto gesture = unsigned_field(request, "gesture", 0U);
+        if (!engine_.scene_history().execute(
+                "Transform " + entity->to_string(),
+                [&](Scene& scene) { return scene.set_transform(*entity, transform); }, gesture)) {
             return error_response(id, "could not update transform");
         }
         engine_.logs().write(LogLevel::info, "Updated transform for " + entity->to_string());

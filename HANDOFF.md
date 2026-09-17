@@ -1,6 +1,22 @@
 # Relay Engine — Session Handoff
 
-Last updated: 2026-09-16
+Last updated: 2026-09-17
+
+## Next-session starting point
+
+- Branch: `main`; GitHub: https://github.com/patrick123900/relay-engine (public).
+- Previous published baseline: `4742eff` (Phase D) and `9db0fff` (sandbox documentation).
+  This snapshot includes Phase E, Phase F and the editor follow-ups; use `git log -1` for its commit.
+- Phases A–D meet their recorded milestone definitions on the tested Linux/Vulkan path, not full
+  Godot compatibility or Windows/macOS parity. Deferred work is listed explicitly below.
+- Current on-disk/API versions: scene v4, import manifest v3, protocol v7 with 47 native methods
+  and 47 generated MCP tools.
+- Phase E and the tested Linux/Vulkan Phase F milestone are implemented. The user authorized
+  committing and pushing the accumulated implementation/documentation on 2026-09-17. Later phase
+  labels organize proposed work; they do not claim full editor completion or platform parity.
+- The Phase E and Phase F sections below record this session; earlier phase results remain
+  historical. The user now prioritizes editor usability before embedded chat; Phase G permissions
+  remain a prerequisite for broader agent access.
 
 ## User’s product goal
 
@@ -62,9 +78,9 @@ Current major layers:
 - Mesh renderer component storing mesh and material asset IDs.
 - Component reflection metadata.
 - Transactional scene undo/redo with a bounded history.
-- Scene format version 3 with strict validation, full-precision transforms, allocator generations,
-  cameras and mesh renderers.
-- Migration support for scene versions 0, 1 and 2.
+- Scene format version 4 with strict validation, full-precision transforms, allocator generations,
+  cameras, mesh renderers, animators, model-node bindings, morph overrides and lights.
+- Migration support for scene versions 0, 1, 2 and 3.
 - Atomic cross-platform scene saves.
 
 ### Rendering
@@ -147,8 +163,8 @@ Current major layers:
 
 ### Control protocol and MCP
 
-- Protocol schema version 4.
-- 38 native methods and 38 generated MCP tools.
+- Protocol schema version 7.
+- 47 native methods and 47 generated MCP tools.
 - Strict generated validation for required fields, types, ranges, patterns, enums, nullability,
   unknown fields and duplicate JSON keys.
 - Generated safety annotations identify read-only, destructive and idempotent operations.
@@ -302,15 +318,17 @@ native agent on `--agent-stdio` can no longer write into the process working dir
 file-writing protocol method now enforces its own directory natively rather than relying on the
 TypeScript bridge.
 
-Real GPU screenshots use a synchronous swapchain readback and work. Background screenshot encoding
-and WebM recording still consume the deterministic CPU-renderer stream. They therefore cannot yet
-diagnose shader, lighting, ray-tracing, DLSS/FSR or driver-specific GPU output. The README contains a
-TODO for a rotating Vulkan staging/readback ring that feeds asynchronous captures and recordings.
+Phase E now feeds real Vulkan pixels into background images and WebM. Two fence-tracked slots
+retain submitted extent/format across resize, with 64 MiB per-slot and eight active image jobs.
+Explicit Vulkan requests fail without a live renderer; status reports the source. Recordings keep
+the first sampled resolution and report differently sized frames as drops. Start a new recording
+after resize to use its resolution. `video.stop` starts background finalization; completion/errors
+are observable through `video.status`. Cancellation retains GPU storage until fence completion.
 
 ### Human editor and agent product surface are early
 
-- The “editor” is currently a Vulkan window plus protocol control, not a full scene-tree/inspector/
-  asset-browser UI.
+- The editor covers scene tree, inspector, viewport camera, gizmos, asset browser and undo history,
+  verified with driven mouse and keyboard input. See Phase F.
 - There is no built-in chat panel yet.
 - Model-provider and conversation state integration has not been built.
 - There are no per-session capability grants or authentication. The socket is loopback-only, but
@@ -460,26 +478,457 @@ animation, area lights, transparent sorting and GPU skinning are later features,
 Meshes shared by nodes with different glTF skins must currently be separated in the source model;
 the importer rejects incompatible sharing rather than silently applying the wrong skeleton.
 
-### Later milestones
+## Pending work carried forward from phases A–D
 
-- Asynchronous Vulkan screenshot/readback ring feeding image and WebM workers.
-- Human editor UI: scene tree, inspector, viewport gizmos, asset browser, undo history and embedded
-  agent chat.
-- Explicit agent capability/permission grants and auditable tool scopes.
-- Lighting, shadows, HDR and post-processing.
-- Render-backend abstraction followed by Direct3D 12 and Metal implementations.
-- Hardware ray tracing, followed by a denoising/upscaling abstraction and then DLSS/FSR integrations.
-- Game scripting/component authoring, packaging, hot reload and cross-platform export tooling.
+These are deferred limitations and verification gaps, not a claim that the recorded A–D definitions
+of done failed. Keep them open until implemented and tested; do not silently equate milestone
+completion with full platform, material or importer parity.
+
+### Phase A — asset lifecycle and safety follow-up
+
+- [ ] Make import undo/redo and asset ownership transactional, or explicitly define cache retention
+  and implement safe reclamation without invalidating scene/history references.
+- [ ] Record per-dependency hashes for change detection rather than requiring a full reimport to
+  discover dependency changes.
+- [ ] Define safe retirement/pruning of deleted-source manifest entries; preserve diagnostics and
+  avoid silently breaking saved scenes.
+- [ ] Add a separate decoded-size budget for data URIs, beyond the containing-file limit.
+
+### Phase B — renderer validation and scaling follow-up
+
+- [ ] Install/use Vulkan validation layers and repeat depth, resize and frames-in-flight regressions.
+  Earlier GPU results were observed without `VK_LAYER_KHRONOS_validation` on this host.
+- [ ] Add spatial acceleration, batching and instancing when scene-scale measurements justify them;
+  current culling is linear and each instance has its own draw call.
+- [ ] Make the render graph the backend's resource/synchronization authority rather than only an
+  inspectable description of part of the rendering flow.
+
+### Phase C — material correctness and resource lifecycle follow-up
+
+- [ ] Implement a transparent draw queue/sorting for retained alpha-blend materials.
+- [ ] Honor single-sided versus double-sided material state with appropriate culling/pipelines.
+- [ ] Replace whole-registry device-idle refresh with incremental/versioned asynchronous mesh,
+  material and texture uploads with safe retirement of resources still in flight.
+- [ ] Remove or make configurable the fixed 16-texture capacity when extending material coverage.
+- [ ] Add vertex-color support and additional image formats only with explicit supported-format
+  reporting and fixtures; PNG/JPEG remain the implemented image formats.
+
+### Phase D — platform conversion and importer follow-up
+
+- [ ] Add and verify Windows/macOS OS-level Blender conversion sandboxes equivalent to Linux
+  Bubblewrap. This is also tracked in the README's Importing TODOs. Until then, untrusted `.blend`
+  conversion must fail closed; `RELAY_BLENDER_TRUSTED=1` is administrator-only trusted-input opt-in.
+- [ ] Run Windows/macOS build and import/cache/timeout/security regressions; no runtime verification
+  on those platforms is currently claimed.
+- [ ] Support a glTF mesh shared by nodes with different skins, if required; currently reject it
+  safely and ask authors to separate the source meshes.
+- [ ] Improve structural reimport mapping when needed. Stable counts alone are not semantic identity;
+  incompatible hierarchy/rest/bind/morph layouts and clip-order changes must remain diagnosed.
+- [ ] Expand editable import presets beyond `scene`/`static_mesh` as the corresponding editor
+  features land. Reimport-on-change currently occurs on scene load, not via a live file watcher.
+
+FBX stays on Assimp: the existing FBX round-trip fixtures passed, so adding ufbx is a conditional
+future decision, not an unfinished mandatory Phase D step. Crossfade/retargeting, vertex-cache
+animation, area lights and GPU skinning are later enhancements, not missing Phase D deliverables.
+
+## Next phases — proposed implementation order
+
+### Phase E — asynchronous real-GPU capture and recording (implemented; Linux verification below)
+
+- Add a bounded rotating Vulkan staging/readback ring, fence-based completion and safe handling
+  of swapchain resize/recreation; do not wait for device idle for every background capture.
+- Feed completed GPU frames into the existing image/WebM workers with bounded queues, explicit
+  drops/failures and observable job status. Retain the deterministic CPU source for headless tests.
+- Expose source selection and capture provenance through the single generated protocol schema;
+  never label CPU output as a GPU capture.
+
+Definition of done: asynchronous PNG and WebM show the actual Vulkan output, including animated
+models and lighting, while playback/resizing remains responsive; tests cover limits, cancellation,
+shutdown and failure paths, and real GPU output is verified.
+
+Phase E verification (2026-09-16):
+
+- Dev/release builds and native tests, generated protocol consistency, MCP check/build and the
+  real MCP headless capture smoke pass. Native tests cover bounded reservations, failed readback,
+  cancellation with late completion, shutdown draining and asynchronous video success/failure.
+- Real Radeon RX 9070 XT/RADV playback, resize and asynchronous PNG/WebM smoke passes for
+  glTF, GLB, Assimp FBX and sandboxed Blender golden inputs, plus the built-in Vulkan resize test.
+- Generated PNG and a decoded VP9 frame were inspected visually. The recording retains 640×360;
+  the screenshot after resize is 960×540. Resize drops are explicitly reported. The smoke writes
+  `/tmp/relay-phase-e.png` and `/tmp/relay-phase-e.webm`.
+- Protocol v6 adds source selection, pending-capture cancellation and video finalization status;
+  42 native methods/MCP tools. Scene v4, manifest v3, importer normalization/bounds, golden assets,
+  compatible reload and fail-closed Blender sandbox policies remain unchanged.
+- Final verification against the combined Phase E/F tree also passes: protocol v7/47 tools,
+  debug native suite, a separate Release build with `RELAY_BUILD_TESTS=ON`, generated/MCP checks
+  and capture smoke, and another real Vulkan asynchronous playback/resize/capture run.
+- This remains a bounded short-recording implementation: PNG intermediates feed FFmpeg; streaming
+  raw frames directly to an encoder and recording across resolution changes are future work.
+  No Windows/macOS runtime verification or OS sandbox parity is claimed.
+
+### Phase F — usable human editor (complete)
+
+- Build a scene tree/selection model, reflected component inspector, viewport camera/gizmos,
+  asset browser/import controls and undo history.
+- Add animation, morph and light editing, scene save/load and visible diagnostics.
+- Route editor mutations through the same native operations as automation; keep user input and
+  agent edits consistent and preserve deterministic stepping.
+
+Definition of done: a human can import, arrange, animate, save/reopen and inspect a small scene
+  without sending protocol commands, and equivalent agent operations produce the same state.
+
+Implemented 2026-09-16. The editor is a Dear ImGui interface on the live Vulkan window, with
+`--editor` for the interface alone and `--editor-ui-stdio` for the interface and the agent transport
+against one runtime. `--editor-stdio` is unchanged.
+
+Architecture:
+
+- `EditorUi` holds no reference to `Scene`, `SceneHistory` or `AssetRegistry`. Every panel issues the
+  same newline-delimited JSON requests agents send, through the same `ControlProtocol` instance, so
+  human and agent edits are one native operation, one undo history and one trace. There is no second
+  mutation path to keep in sync.
+- `EditorOverlay` is a narrow abstract seam in the window. Dear ImGui and ImGuizmo are linked only
+  into `relay_demo`; the engine library keeps no UI dependency. Both are checksum-pinned, ImGui to
+  release v1.92.1-docking and ImGuizmo to an exact commit.
+- The UI is recorded into the swapchain render pass only when no capture buffer is bound, so
+  captures, readbacks and golden images keep showing scene pixels.
+
+Panels and interaction:
+
+- Hierarchy tree with selection, drag-and-drop reparenting, renaming and a context menu.
+- Inspector for transform, camera, mesh renderer, animator, morph weights and lights, including
+  adding lights, light type, cone angles, range and attenuation.
+- Toolbar with pause/resume, single-frame step, undo/redo, scene save/load, view source toggle,
+  focus and gizmo mode.
+- Asset browser listing importable models from `assets/`, with preset selection; importing selects
+  and frames the new root.
+- Navigable undo history list and a diagnostics panel with engine logs and last-operation status.
+- Orbit/pan/dolly viewport camera, click-to-select, translate/rotate/scale gizmos, and `W`/`E`/`R`,
+  `F`, `Delete` and `Ctrl+Z` shortcuts that are suppressed while a text field has focus.
+
+Design decisions worth preserving:
+
+- The editor camera is view state, not scene state. It creates no entity, is never saved, never
+  enters the undo history and is never sent over the protocol, so navigating at mouse rate produces
+  no trace entries. It does apply to captures, because a screenshot should show what the operator
+  sees; the toolbar switches back to the scene camera.
+- Picking is stateless. `scene.pick` takes a world-space ray rather than reading a stored viewpoint,
+  so the engine holds no camera for the editor and an agent can pick with its own ray. `scene.bounds`
+  reports world-space extents for framing and locating.
+- The gizmo composes and decomposes transforms with Relay's own Euler order rather than the gizmo
+  library's. A native test asserts that composition matches the matrix `build_render_scene` produces,
+  so a convention drift cannot silently write back rotations that differ from what is drawn.
+- `SceneHistory::execute` gained a gesture token, surfaced as `gesture` on `scene.set_transform`.
+  Updates sharing a nonzero token fold into the transaction they extend, so one drag stays one undo
+  entry instead of filling the bounded history. The token matters: an earlier edit of the same
+  entity carries the same label, and matching on the label alone absorbed a new drag into that
+  unrelated transaction. Driven-input testing caught this; the native tests now cover it.
+- Read-only protocol methods are no longer recorded in traces. The editor polls twice a second, and
+  tracing that would make trace files grow with idle time and bury the requests that changed state.
+- `WorldResolver` in `scene_render.cpp` is now shared by rendering, picking and bounds, so the three
+  cannot disagree about where an entity is.
+
+Protocol v7 adds `scene.pick`, `scene.bounds`, `scene.rename`, `scene.history`, `assets.available`
+and the `gesture` parameter: 47 native methods and 47 generated MCP tools. Scene v4 and
+manifest v3 are unchanged.
+
+Two pre-existing defects were found and fixed while verifying, both unrelated to the editor:
+
+- `upload_buffer` and the texture upload called `vkResetFences` on `frame_fences[current_frame]`
+  during `initialize()`, before `create_sync_objects()` had created them. A null fence handle
+  segfaulted inside RADV, so `--vulkan-smoke` crashed on startup. Neither submit uses a fence — both
+  synchronize with `vkQueueWaitIdle` — so both calls were removed.
+- The live editor never exited on `runtime.quit` while a caller held its standard input open, because
+  the detached stdin reader stayed blocked in `getline`. The session now runs in an inner scope and
+  the process leaves deterministically once the window, engine and editor are destroyed. This
+  affected `--editor-stdio` too; it had not surfaced because the MCP bridge closes stdin.
+
+Verified on this host:
+
+- Clean dev and release builds with zero warnings, native tests pass, no generated protocol drift,
+  MCP `npm run check`/`build` pass and the MCP headless capture smoke reports 47 tools.
+- Native tests cover the editor contract: the exact requests each panel issues, one undo entry per
+  transform gesture, coalesced drags rewinding as a whole, full-precision values, camera activation,
+  combined mesh/material assignment, reparenting to root, rename, history labels, asset listing
+  filtering, pick hit/miss/degenerate-ray cases, bounds, and a destroyed selection failing
+  `scene.inspect`. The gizmo's transform composition is asserted against the renderer's own matrix.
+- Real Radeon RX 9070 XT/RADV: `--vulkan-smoke`, `--vulkan-model-smoke`, `--vulkan-async-smoke` and
+  `--vulkan-capture` pass. The editor was driven end to end through `--editor-ui-stdio`.
+- Visual evidence is `captures/phase-f-editor.png`. A `render.capture` taken while the interface was
+  on screen contained no UI and matched the editor viewpoint.
+
+Interaction verified with real input (`tests/editor_interaction_smoke.py`). The harness drives the
+editor with xdotool and asserts engine state over the protocol channel rather than reading
+screenshots. All of the following pass on this host:
+
+- The toolbar Pause button pauses the runtime, which also calibrates the coordinate path.
+- Double-clicking a model in the asset browser imports it and selects and frames its root.
+- Clicking a hierarchy row selects it, proven by `Delete` destroying exactly that entity.
+- Dragging the translate gizmo moves the entity and produces exactly one undo entry; `Ctrl+Z`
+  rewinds the whole gesture rather than its last update. Rotate and scale modes render.
+- Dragging one hierarchy row onto another reparents it.
+- Clicking an object in the viewport selects it through `scene.pick`.
+- Orbiting the camera adds nothing to the undo history and changes no entity.
+- Three seconds of editor polling records zero trace events.
+
+Two problems this driven testing exposed, both now fixed:
+
+- Gesture coalescing matched on the transaction label, so a gizmo drag folded into an earlier,
+  unrelated edit of the same entity instead of starting its own undo entry. Replaced with an
+  explicit per-drag token.
+- `Escape` closed the editor window instantly, discarding unsaved work on a key people press to
+  dismiss menus. Escape now only quits the bare demo window; the editor quits by closing the window.
+
+Notes for anyone re-running the harness: this desktop gates synthetic input behind a Remote Control
+permission prompt that must be granted once, and the compositor scales pointer coordinates, so the
+harness drives the pointer in a closed loop until it reports the intended position.
+
+Remaining interaction gaps:
+
+- Renaming through the context menu, the animator panel, and scene save/load are exercised
+  through the protocol but not yet through driven clicks.
+- Gizmo editing of an imported node driven by animation edits the stored transform, not the animated
+  pose layered on top of it. The parent chain is composed from the cached scene listing, which does
+  not include animation.
+
+Editor audit and hardening (2026-09-16):
+
+- The initial completion checks missed six human-facing defects: object-form transform vectors
+  were decoded as arrays, the renderer used the whole window while picking/gizmos used the center
+  panel, scalar drafts reset before release, lights decoded the wrong type/color layout, imported
+  morphs required an existing override, and transform buffers stayed stale after agent edits/undo.
+  These are corrected; inspector commits preserve all untouched channels.
+- Shared editor vector/draft, viewport and matrix/ray helpers remove duplicated conventions.
+  Normalized viewport coordinates account for logical vs framebuffer sizes. Picking/framing reuse
+  rendered skin/morph evaluation, with an explicit four-million-vertex deformation query budget.
+- Hierarchy lookup is indexed; asset snapshots no longer refresh on every gizmo update. History
+  labels are computed once per query; disappearing asset files fail without filesystem exceptions.
+  Gesture coalescing requires both token and transaction label, and mirrored matrix decomposition
+  preserves handedness. Editor-view mouse input is consumed before gameplay input/trace recording.
+- Strict warnings now apply to the demo/editor and native tests as well as the engine. Native
+  tests cover protocol vector shapes, draft release, scaled viewport layout, off-center picking
+  rays, mirrored transforms and dynamically deformed bounds.
+- `tests/editor_regression_smoke.py` passed real mouse/keyboard tests for non-default transforms,
+  spot-light intensity/type/color preservation, agent changes followed by a human edit and undo,
+  central viewport selection/gizmo alignment, camera field-of-view edits preserving other fields,
+  and a first morph override on the imported dynamic golden fixture.
+- Final dev and Release builds/tests pass with zero warnings; generated protocol consistency,
+  MCP check/build and the 47-tool headless capture smoke pass. The broader interaction harness
+  passes, including actual orbit input while tracing (zero events). The final regression harness
+  also captures the live GPU view: `captures/phase-f-audit-editor.png` shows the interface and
+  `captures/phase-f-audit-vulkan.png` contains matching scene pixels without interface/gizmo pixels.
+- Phase E remains verified on the final editor tree: built-in Vulkan presentation/resize and
+  asynchronous golden glTF/GLB/Assimp FBX/sandboxed Blender playback/resize/PNG/WebM all pass on
+  RX 9070 XT/RADV. Each recording reports `source=vulkan`, 31 submitted frames and 30 explicit
+  resolution-change drops. VP9 is 640×360; the resized screenshot is 960×540. Deterministic CPU
+  provenance and unsupported GPU requests failing closed remain covered by the MCP smoke.
+
+Editor navigation and gizmo follow-up (2026-09-16):
+
+- Perspective navigation now follows Godot defaults: MMB orbit, Shift+MMB pan, RMB or Shift+F
+  cursor-captured freelook, WASD/QE flight, Shift/Alt speed modifiers and wheel fly-speed adjustment.
+  Release RMB, toggle Shift+F or press Escape to exit; focus loss/destruction releases the pointer.
+  Authoring-view keyboard/mouse input is kept out of gameplay traces; scene-camera mode forwards
+  gameplay input outside panels. Gizmo shortcuts are suppressed during navigation.
+- Fixed a one-frame mismatch: camera input/shortcuts are resolved before both gizmo drawing and
+  scene rendering. Selection uses the same final camera snapshot.
+- Gizmos manipulate a world matrix with a rigid view and convert edits back through the affine
+  parent inverse. Parent scale is no longer folded into camera matrices. Drawing is clipped to
+  the central viewport, sizing is explicit, and handles at/behind the near plane are hidden.
+  Singular parents cannot generate invalid edits; each operation preserves untouched channels.
+- Framing distinguishes renderable bounds from positional light/camera/empty nodes. Positional
+  nodes use a three-unit standoff; tiny meshes have a minimum distance and normal geometry is fit
+  to both horizontal/vertical field of view. The Sun Light rotation gizmo no longer fills the view.
+- Native regressions cover fixed-eye freelook, orbit pivots, point/tiny bounds, fly-speed changes
+  and scaled/mirrored/singular parent conversion. Desktop evidence is
+  `captures/phase-f-light-focus.png` and `captures/phase-f-light-refocus.png`; the new
+  `tests/editor_navigation_smoke.py` verifies view changes, unchanged scene/history, zero navigation
+  trace events (including Shift+F/Escape), a usable Sun Light drag and whole-gesture undo, including
+  a small nonuniformly scaled parent. All three desktop suites pass on the final dev build; dev and
+  Release native tests, warning-free builds, generated consistency and the 47-tool MCP capture
+  smoke pass. Native dev/release suites must run sequentially: their existing fixed temporary
+  fixture paths collide if the two test processes run simultaneously.
+- Final real RADV/RX 9070 XT asynchronous dynamic-golden playback/resize/PNG/WebM smoke passes:
+  `source=vulkan`, 31 submitted frames, 30 explicitly reported resolution-change drops. Capture
+  provenance, deterministic CPU capture and Blender sandbox/import contracts are unchanged.
+
+Docking and layout follow-up (2026-09-17):
+
+- All seven editor panels (Controls, Hierarchy, Inspector, Assets, History, Diagnostics and
+  Viewport) use Dear ImGui's checksum-pinned v1.92.1-docking release. Drag tabs to dock, group or
+  float panels; drag dividers or floating edges/corners to resize. Floating panels stay inside the
+  SDL window; native desktop multi-window support remains deferred.
+- `EditorLayout` owns default docking, the Layout > Reset layout command and persistent settings
+  in `.relay/editor-layout.ini` (ignored by Git). `RELAY_EDITOR_LAYOUT_PATH` is a trusted local
+  test/configuration override. Preferences are separate from scene/manifest state and undo.
+- Vulkan scene drawing runs from a viewport-window draw callback, then ImGui restores its render
+  state. Scene and gizmo follow the panel's size, position and ordinary floating-window stacking.
+  Capture/readback paths still draw the scene directly and exclude editor chrome.
+- Docking backend renderer shutdown also destroys platform-window registration. Swapchain
+  invalidation now restarts SDL and Vulkan ImGui backends together while preserving the context,
+  panel layout and fonts, preventing mouse/keyboard input loss after native resizing.
+- `tests/editor_layout_smoke.py` verifies splitter resizing with unchanged scene/history,
+  picking/gizmo alignment, floating Inspector move/resize, saved-layout restart, reset and a
+  floating/resized Viewport's rendering and reversible edits. Evidence:
+  `captures/phase-f-docking-adjusted.png`, `captures/phase-f-docking-restored.png`, and
+  `captures/phase-f-docking-floating-viewport.png`.
+- The existing interaction, inspector regression and Godot-navigation desktop suites pass.
+  Harnesses use isolated layout files, updated docked-panel coordinates and explicit focus
+  restoration after screenshots. Warning-free dev/release builds, both native suites, generated
+  consistency and the 47-tool MCP deterministic capture/provenance smoke pass.
+- Repeated native window resize checks pass with live toolbar input after both swapchain
+  recreations. Real RX 9070 XT/RADV dynamic-golden animation/resize/asynchronous PNG/WebM
+  playback passes (`source=vulkan`, 31 frames, 30 explicitly reported resize drops).
+  Deterministic CPU capture, glTF/GLB normalization, FBX fallback, golden fixtures, import bounds,
+  scene/manifest compatibility and fail-closed Blender conversion remain unchanged.
+
+Menu-bar follow-up (2026-09-17):
+
+- File/Edit/Scene/View/Run/Tools/Layout/Help menus expose existing protocol-backed workflows.
+  Open/Save As/import use project-local filename dialogs with inline failures and Enter/Escape;
+  Ctrl+O/Ctrl+S/Ctrl+Shift+S shortcuts respect text fields and open popups.
+- Scene adds empty nodes, built-in quad/triangle meshes, cameras and directional/point/spot
+  lights. Component-bearing node creation uses the existing create + component transactions;
+  undoing the component and node remains two native history entries.
+- View can close/reopen all seven panels and reset the editor camera; Layout reset reopens all
+  defaults. Help supplies a controls reference and About window. Project/new-scene/export,
+  clipboard/duplicate, scripts, physics, audio, standalone build, rendering overlays and agent
+  workspace remain disabled placeholders marked Coming soon.
+- Tools queues explicit Vulkan PNG capture and starts/stops 30-fps WebM (300-frame limit).
+  Capture defaults use timestamped filenames. Dialogs identify provenance and excluded editor
+  chrome. Paused simulation requires resume or steps to feed recording; Tools shows background
+  finalization and disables new recording until it completes.
+- GPU-related menu actions are queued until after frame presentation. Readback submits its own
+  Vulkan frame, so submitting directly during menu build would reuse an acquired semaphore and
+  stall the renderer. `EditorUi::process_actions()` drains the requests from the desktop loop;
+  capture workers/protocol and deterministic CPU source remain unchanged.
+- `tests/editor_menu_smoke.py` passes real-input node/component creation, menu undo/redo,
+  compatible Save As/Open, asynchronous GPU PNG, WebM start/stop/finalization and Layout reset.
+  Evidence includes `captures/phase-f-file-menu.png`, `captures/phase-f-scene-menu.png` and
+  `captures/phase-f-menu-bar.png`. The docking test now opens Layout at its new menu position.
+- Live panel hide/reopen and Help checks pass with unchanged scene history; screenshots are
+  `captures/phase-f-inspector-hidden.png`, `captures/phase-f-inspector-reopened.png` and
+  `captures/phase-f-editor-controls.png`. Final dev/release builds and native tests, generated
+  consistency, 47-tool MCP provenance smoke and RX 9070 XT/RADV dynamic-golden GPU
+  playback/resize/PNG/WebM smoke pass (`source=vulkan`, 31 frames, 30 reported resize drops).
+
+Viewport and Controls polish (2026-09-17):
+
+- Editor background is neutral dark grey (linear RGB 0.018). Bare demo/runtime presentation keeps
+  its existing background. Empty Scene rendering no longer falls back to the demo triangle;
+  the standalone first-light demo still intentionally renders its demo content.
+- A procedural Vulkan XZ plane provides antialiased one-unit/ten-unit gridlines with minor-line
+  subpixel suppression and a 35–90-unit camera-distance fade. The grid uses the scene's depth,
+  draws after opaque meshes without writing depth, and respects viewport position/size/stacking.
+  View > Ground grid toggles it; scene-camera mode suppresses it. This is editor chrome and is
+  excluded from captures/readback, preserving scene-only golden fixture comparison.
+- Grid shaders share the existing 128-byte push-constant ABI (view-projection plus camera data),
+  checked through reflection. Their pipeline is rebuilt/destroyed with the swapchain and shader
+  compilation is a normal CMake build dependency. Empty scenes now also build their camera view
+  so an empty authoring viewport can show the grid without creating any entity.
+- Controls drops the Relay label, filename field and redundant Save/Open actions (File/shortcuts
+  remain available), uses vector icons with tooltips and displays smoothed ImGui editor FPS instead
+  of the simulation frame counter. Disabled controls retain disabled icon styling. Native docking
+  style places the header menu/hide-tab-bar button immediately left of its close button.
+- Desktop harness calibration now targets the compact simulation icon and places the test window
+  away from unreachable mixed-scale monitor seams. Visual evidence:
+  `captures/phase-f-grey-grid-empty.png` and `captures/phase-f-grey-grid-object.png`.
+- All five desktop suites pass on the final rendering/Controls implementation: interaction,
+  inspector/morph regression, Godot-style navigation/Sun Light, docking/restart/native resizing,
+  and menu PNG/WebM. The tab drag test targets the label rather than its newly shifted close
+  button. Harness warps use damped corrections and a relative fallback; the test window stays
+  fully on one display so monitor gaps cannot reject valid local widget targets.
+- Warning-free dev/release builds, both native suites, generated consistency and the 47-tool MCP
+  provenance smoke pass. RX 9070 XT/RADV real dynamic-golden playback/resize/asynchronous PNG/WebM
+  passes (`source=vulkan`, 31 frames, 30 explicitly reported resize drops). Deterministic CPU
+  capture, import normalization/fallbacks/bounds, scene/manifest reload and fail-closed Blender
+  sandbox requirements remain unchanged.
+
+Deferred from this phase, not blocking it:
+
+- [ ] Multi-selection, copy and paste.
+- [ ] Make the interaction harness runnable in CI. It currently needs a desktop session, xdotool and
+      a granted Remote Control permission, so it is a local check rather than part of `ctest`.
+- [ ] Per-triangle picking; `scene.pick` is bounds-level, which answers "which object" but not
+      "where on the surface".
+
+### Phase G — permissioned agent workflows and embedded chat
+
+- Add explicit per-session capability grants, auditable tool scopes and approval/denial paths for
+  mutations, filesystem effects and destructive operations before broader transport exposure.
+- Integrate a chat panel with the out-of-process bridge; keep provider credentials, conversation
+  history and model orchestration outside the C++ engine.
+- Expose bounded logs, captures, telemetry and action results in the human workflow.
+
+Definition of done: a user can grant limited access, collaborate with an agent and inspect its
+  actions; denied actions cannot mutate state or bypass native path restrictions.
+
+### Phase H — asset and rendering correctness/scaling
+
+- Address the A–C lifecycle follow-ups: safe reclamation, dependency digests, manifest retirement,
+  asynchronous versioned uploads and resource retirement.
+- Implement transparent rendering and material culling correctness; scale texture resources and
+  add batching/instancing/spatial indexing based on measurements.
+- Consolidate render-graph resource/synchronization ownership and evaluate GPU deformation when
+  CPU skin/morph streaming becomes a measured bottleneck.
+
+Definition of done: representative multi-model scenes hot-reimport safely without whole-device
+  stalls, preserve saved/playback bindings, render sidedness/transparency correctly and report
+  bounded, measured resource usage. This phase can be pulled earlier if E/F expose a blocker.
+
+### Phase I — lighting, shadows, HDR and post-processing
+
+- Extend the initial direct-light PBR path with shadows, image-based lighting, HDR render targets
+  and a post-processing/tone-mapping pipeline.
+- Add typed, inspectable settings and golden scenes/captures; expand light types/budgets as needed.
+
+Definition of done: representative lit scenes have verified shadows/HDR behavior and consistent
+  controls through both the editor and automation, with GPU capture and performance evidence.
+
+### Phase J — render-backend portability and platform verification
+
+- Introduce a backend boundary without losing the deterministic CPU oracle or working Vulkan path.
+- Add Direct3D 12 for Windows and Metal for macOS, plus build/package and platform test coverage.
+- Close the Windows/macOS Blender sandbox and verification TODOs before claiming safe conversion
+  support there; this safety work may be implemented earlier independently of new render backends.
+
+Definition of done: a representative saved project builds, imports, renders and captures correctly
+  on each claimed platform/backend, and unsupported capabilities fail explicitly.
+
+### Phase K — ray tracing and denoising/upscaling
+
+- Implement actual hardware ray-traced rendering behind capability checks and a usable fallback.
+- Add denoising and a backend-neutral upscaling interface, then integrate DLSS/FSR where supported.
+- Expose quality/performance controls and verify rendered results rather than capability detection.
+
+Definition of done: supported GPUs render verified ray-traced/upscaled output with measured costs;
+  unsupported configurations use a documented fallback without breaking the project.
+
+### Phase L — game authoring, packaging and export
+
+- Add game scripting/component authoring, safe hot reload and a project/plugin packaging model.
+- Build reproducible standalone game/export workflows for the supported platforms.
+- Preserve typed automation, deterministic tests and explicit permissions for new authoring tools.
+
+Definition of done: a small playable game can be authored in Relay, packaged and launched outside
+  the editor on supported platforms, with reproducible build/export tests.
 
 ## Recommended prompt for the next session
 
 Use this as the next instruction after giving the agent this handoff:
 
-> Phase D is complete; inspect HANDOFF.md and choose the next later milestone with the user.
-> The import pipeline supports skeletons/skin/morphs, deterministic animation, cameras/lights,
-> Blender conversion, presets and safe compatible reload. Preserve glTF/GLB normalization,
-> Assimp FBX fallback, golden fixtures and import bounds. Do not remove fail-closed untrusted
-> Blender conversion on platforms without an OS sandbox.
+> Inspect HANDOFF.md, README.md and the current branch before changing code. A–F are complete for
+> the tested Linux/Vulkan milestones on `main`, with explicit carry-forward limits. Continue editor usability:
+> daily editing, project/save workflows and animation controls, validated through real human input.
+> Keep Phase G permissions ahead of broader agent access and embedded chat. Keep every editor mutation
+> routed through ControlProtocol rather than touching Scene directly, keep one undo entry per
+> gesture, keep read-only methods untraced, and keep the UI excluded from captures so golden images
+> stay comparable. Preserve the deterministic CPU capture source and capture provenance, glTF/GLB
+> animation normalization, Assimp FBX fallback, golden fixtures, import bounds and compatible
+> scene/manifest reload. Never relax fail-closed untrusted Blender conversion on platforms without
+> an OS sandbox. Verify generated protocol consistency, native/MCP tests, real GPU
+> playback/resize/capture and the current `tests/editor_visuals_smoke.py` before declaring anything
+> complete.
 
 ## Key files to inspect first
 
@@ -498,6 +947,9 @@ Use this as the next instruction after giving the agent this handoff:
 - `src/render/scene_render.cpp`
 - `include/relay/platform/vulkan_window.hpp`
 - `src/platform/vulkan_window.cpp`
+- `include/relay/editor/editor_overlay.hpp`
+- `include/relay/editor/editor_ui.hpp`
+- `src/editor/editor_ui.cpp`
 - `include/relay/scene/scene.hpp`
 - `src/scene/scene.cpp`
 - `src/scene/scene_io.cpp`
@@ -518,3 +970,86 @@ Use this as the next instruction after giving the agent this handoff:
 - Continue verifying meaningful renderer milestones with both automated tests and real GPU captures.
 - Do not describe capability detection as feature implementation.
 - Do not describe accepted file extensions as full Godot import parity.
+
+## Current editor state and verification — 2026-09-17
+
+This section supersedes the dated palette, font, Controls-panel and grid notes above. Those earlier
+sections record tests at the layout that existed then, rather than validation of today's coordinates.
+
+- Maximized human-editor startup, high-density SDL framebuffer and per-frame scale refresh using
+  display scale / window pixel density. ImGui applies framebuffer scaling and font rasterization.
+  Native KDE/Wayland 110% was observed as preferred scale 132/120; no doubled content scaling.
+- Charcoal chrome based on HTML `#202020`, neutral grey surfaces and blue UI selections. Body and
+  heading fonts are 17 logical units; diagnostic monospace is 16, including fallback sizing.
+  Packed linear ImGui colours approximate the HTML base; viewport clear uses linear 0.014444.
+- Fixed icon toolbar beneath File/Edit; no Controls dock tab, close button or View-panel toggle.
+  Hierarchy, Inspector, Assets, History, Diagnostics and Viewport remain movable/resizable/dockable.
+  Old Controls settings migrate without resetting the other saved panes. Shared tabs are retained;
+  removing a dedicated Controls leaf merges its sibling into the parent. Layout reset restores six
+  content panes. Preferences remain separate from scene/manifest and undo history.
+- Godot-style camera navigation, same-frame camera/gizmo/render alignment and useful framing of
+  lights/cameras/empty nodes. Existing editor-contract and transform/morph fixes remain in place.
+- XZ grid: unit lines, ten-unit major lines, antialiasing/subpixel suppression and distance fade
+  35–90 units. Height planes are Y=0,10,20,...: Y=0 holds through camera Y=5, transitions 5–10;
+  Y=10 holds through 15, transitions 15–20, and so on. Below ground retain Y=0. Smoothstep weights
+  are continuous at boundaries. View > Ground grid toggles it; scene-camera mode suppresses it.
+- Selected editor-camera meshes have a yellow-orange silhouette (approximately `#FFB930`), including
+  drawable descendants. A depth-tested stencil mask and eight translated screen-space copies form
+  a two-logical-pixel outline, using the current MVP and deformed vertices. Alpha-mask cutouts are
+  respected; blended fragments with alpha below 0.05 are skipped. This is no scene mutation.
+- Vulkan depth/stencil formats: D32S8 preferred, D24S8 fallback. Stencil clears each render pass.
+  Grid/outline shaders are compiled by CMake and reflected against the 128-byte draw ABI; pipelines
+  are retired/recreated with swapchain resources. Decorations obey viewport scissor and UI z-order.
+- Exports omit UI, gizmos, grid and selection outlines, while preserving the editor viewpoint.
+  Deterministic CPU capture/provenance, glTF/GLB normalization, Assimp FBX fallback, golden fixtures,
+  import bounds and compatible scene v4 / manifest v3 reload remain unchanged. Untrusted Blender
+  conversion remains fail-closed on platforms without an OS sandbox.
+
+Current verification and reproduction:
+
+```sh
+cmake --build --preset dev -j4
+ctest --preset dev
+cmake --preset release -DRELAY_BUILD_TESTS=ON
+cmake --build --preset release -j4
+ctest --test-dir build/release --output-on-failure
+npm --prefix tools/mcp-bridge run check
+npm --prefix tools/mcp-bridge run build
+python3 tests/mcp_capture_smoke.py
+python3 tests/editor_visuals_smoke.py
+./build/dev/relay_demo --vulkan-async-smoke relay-dynamic-golden.gltf
+```
+
+- Dev/release native tests and generated protocol/MCP checks have passed. MCP smoke reports 47 tools,
+  deterministic provenance and an explicit GPU request failing closed in headless mode.
+- The current desktop regression verifies amber silhouette pixels, vertical flight across a full
+  interval, unchanged history, resize/reframing and byte-identical GPU exports before/after selection.
+  It requires xdotool, Spectacle, Pillow and an interactive desktop; it is not a headless CI test.
+- Actual desktop input also verified fixed-toolbar pause/resume and resistance to dragging, and
+  native Wayland verified maximized startup, fractional scaling and saved-layout migration.
+- Real RX 9070 XT/RADV GFX1201 dynamic-golden playback/resize/async PNG/WebM has passed with explicit
+  source=vulkan, 31 frames and 30 reported resolution-change drops. Earlier combined-tree tests also
+  exercised golden GLB, Assimp FBX and sandboxed Blender. No Windows/macOS parity is claimed.
+- Evidence is regenerated locally, not committed: `captures/editor-outline-framed.png`,
+  `captures/editor-grid-raised.png`, `captures/editor-outline-resized.png`,
+  `captures/editor-navy-fixed-toolbar.png` (older navy palette), `/tmp/relay-phase-e.png` and
+  `/tmp/relay-phase-e.webm`. Current palette/thresholds are defined in source, not older screenshots.
+
+Carry forward:
+
+- [ ] Recalibrate the five older pixel-coordinate desktop suites for maximized startup, 17-unit
+  fonts and the fixed toolbar. They last passed before these layout changes; do not claim a fresh
+  pass from those historical results. The current visuals suite remains runnable independently.
+- [ ] Improve daily editing, project/save workflows and animation controls; multi-selection and
+  copy/paste are still deferred. Keep scene edits on ControlProtocol and one undo entry per gesture.
+- [ ] Phase G capability grants before broader agent access / embedded chat.
+- [ ] Preserve the earlier A–D importer/resource-lifecycle checklist and platform sandbox TODOs.
+
+Publishing scope: include native/editor/capture implementation, generated protocol/MCP artifacts,
+shaders, regression scripts and documentation. Exclude build products, captures, import caches,
+Python bytecode, local layout preferences and the local manual-test scene `scenes/phase-f.relay.json`.
+
+Publication checks rerun on the final snapshot (2026-09-17): dev/release builds and native suites,
+generated protocol check, MCP check/build and 47-tool headless capture smoke, current desktop
+visuals regression, and RADV real-GPU dynamic playback/resize/asynchronous PNG/WebM all passed.
+Historical desktop coordinate suites remain explicitly deferred as above.

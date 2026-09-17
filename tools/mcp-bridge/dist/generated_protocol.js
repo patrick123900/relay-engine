@@ -73,16 +73,30 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("render_capture_async", {
         title: "Queue Relay frame capture",
-        description: "Copy the deterministic frame and encode it on Relay's bounded background worker.",
+        description: "Capture real Vulkan or deterministic CPU frames through bounded background image workers.",
         inputSchema: z.object({
-            "filename": z.string().regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._-]*\\.(bmp|png)$")).default("agent-async.png").describe("Safe PNG or BMP filename without directory components")
+            "filename": z.string().regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._-]*\\.(bmp|png)$")).default("agent-async.png").describe("Safe PNG or BMP filename without directory components"),
+            "source": z.enum(["vulkan", "deterministic"]).optional().describe("Capture provenance; omitted uses the active renderer. Vulkan requires a live editor.")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["render_capture_async"];
         if (override)
             return override(input);
-        return invoke("render.capture_async", { "path": input["filename"] });
+        return invoke("render.capture_async", { "path": input["filename"], "source": input["source"] });
+    });
+    server.registerTool("render_capture_cancel", {
+        title: "Cancel pending capture",
+        description: "Cancel a queued image or GPU readback job; writing and completed jobs cannot be cancelled. GPU slots remain alive until their fence completes.",
+        inputSchema: z.object({
+            "job": z.number().int().min(1)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["render_capture_cancel"];
+        if (override)
+            return override(input);
+        return invoke("render.capture_cancel", { "job": input["job"] });
     });
     server.registerTool("render_capture_status", {
         title: "Inspect capture job",
@@ -207,18 +221,19 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("video_start", {
         title: "Start Relay video",
-        description: "Begin sampling deterministic frames into a bounded asynchronous WebM recording.",
+        description: "Record real Vulkan or deterministic CPU frames to WebM with explicit frame drops.",
         inputSchema: z.object({
             "filename": z.string().regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._-]*\\.webm$")).default("agent-recording.webm").describe("Safe WebM filename without directory components"),
             "fps": z.number().int().min(1).max(60).default(30),
-            "maximumFrames": z.number().int().min(1).max(3600).default(300)
+            "maximumFrames": z.number().int().min(1).max(3600).default(300),
+            "source": z.enum(["vulkan", "deterministic"]).optional().describe("Capture provenance; omitted uses the active renderer. Vulkan requires a live editor.")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["video_start"];
         if (override)
             return override(input);
-        return invoke("video.start", { "filename": input["filename"], "fps": input["fps"], "maximum_frames": input["maximumFrames"] });
+        return invoke("video.start", { "filename": input["filename"], "fps": input["fps"], "maximum_frames": input["maximumFrames"], "source": input["source"] });
     });
     server.registerTool("video_capabilities", {
         title: "Inspect video capabilities",
@@ -233,7 +248,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("video_stop", {
         title: "Stop Relay video",
-        description: "Finish queued frames and encode the active recording to WebM with FFmpeg.",
+        description: "Drain pending readbacks and start background WebM finalization; poll video.status for completion and errors.",
         inputSchema: z.object({}),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async () => {
@@ -317,14 +332,15 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "rz": z.number().finite().optional(),
             "sx": z.number().finite().optional(),
             "sy": z.number().finite().optional(),
-            "sz": z.number().finite().optional()
+            "sz": z.number().finite().optional(),
+            "gesture": z.number().int().min(0).max(1000000000).default(0).describe("Nonzero token identifying one continuous drag. Updates sharing a token fold into a single undo step; use a fresh token per gesture")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["scene_set_transform"];
         if (override)
             return override(input);
-        return invoke("scene.set_transform", { "entity": input["entity"], "px": input["px"], "py": input["py"], "pz": input["pz"], "rx": input["rx"], "ry": input["ry"], "rz": input["rz"], "sx": input["sx"], "sy": input["sy"], "sz": input["sz"] });
+        return invoke("scene.set_transform", { "entity": input["entity"], "px": input["px"], "py": input["py"], "pz": input["pz"], "rx": input["rx"], "ry": input["ry"], "rz": input["rz"], "sx": input["sx"], "sy": input["sy"], "sz": input["sz"], "gesture": input["gesture"] });
     });
     server.registerTool("scene_set_camera", {
         title: "Configure entity camera",
@@ -455,6 +471,73 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override(input);
         return invoke("scene.set_light", { "entity": input["entity"], "enabled": input["enabled"], "type": input["type"], "red": input["red"], "green": input["green"], "blue": input["blue"], "intensity": input["intensity"], "constant": input["constant"], "linear": input["linear"], "quadratic": input["quadratic"], "inner_cone": input["innerCone"], "outer_cone": input["outerCone"], "range": input["range"] });
+    });
+    server.registerTool("scene_rename", {
+        title: "Rename scene entity",
+        description: "Change an entity's display name as one undoable transaction.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "name": z.string().min(1).max(128)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_rename"];
+        if (override)
+            return override(input);
+        return invoke("scene.rename", { "entity": input["entity"], "name": input["name"] });
+    });
+    server.registerTool("scene_history", {
+        title: "Inspect undo history",
+        description: "Read the labels currently on the undo and redo stacks, newest first.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["scene_history"];
+        if (override)
+            return override({});
+        return invoke("scene.history", {});
+    });
+    server.registerTool("asset_available_models", {
+        title: "List importable models",
+        description: "List model files present in the project assets directory that this build can import. Top-level files only; the import sandbox is unchanged.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["asset_available_models"];
+        if (override)
+            return override({});
+        return invoke("assets.available", {});
+    });
+    server.registerTool("scene_pick", {
+        title: "Pick scene entity",
+        description: "Find the nearest drawable entity a world-space ray enters. Bounds-level precision, not per-triangle. Stateless: the caller supplies the ray, so the engine stores no viewpoint.",
+        inputSchema: z.object({
+            "originX": z.number().finite().min(-1000000).max(1000000),
+            "originY": z.number().finite().min(-1000000).max(1000000),
+            "originZ": z.number().finite().min(-1000000).max(1000000),
+            "directionX": z.number().finite().min(-1000000).max(1000000),
+            "directionY": z.number().finite().min(-1000000).max(1000000),
+            "directionZ": z.number().finite().min(-1000000).max(1000000)
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_pick"];
+        if (override)
+            return override(input);
+        return invoke("scene.pick", { "origin_x": input["originX"], "origin_y": input["originY"], "origin_z": input["originZ"], "direction_x": input["directionX"], "direction_y": input["directionY"], "direction_z": input["directionZ"] });
+    });
+    server.registerTool("scene_bounds", {
+        title: "Inspect entity bounds",
+        description: "Read the world-space axis-aligned bounds and origin of an entity and its descendants, for framing a selection or locating an object.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_bounds"];
+        if (override)
+            return override(input);
+        return invoke("scene.bounds", { "entity": input["entity"] });
     });
     server.registerTool("scene_snapshot", {
         title: "Snapshot Relay scene",

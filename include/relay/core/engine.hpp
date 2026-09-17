@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 
 #include "relay/core/log.hpp"
 #include "relay/observe/capture.hpp"
@@ -44,10 +45,15 @@ public:
     void request_shutdown();
 
     [[nodiscard]] bool capture(const std::filesystem::path& path, std::string& error);
-    [[nodiscard]] std::uint64_t capture_async(const std::filesystem::path& path, std::string& error);
+    [[nodiscard]] std::uint64_t capture_async(const std::filesystem::path& path, std::string& error, std::string source = "deterministic");
+    using FrameReceiver = std::function<void(OwnedFrame, std::string)>;
+    using GpuFrameSource = std::function<bool(FrameReceiver, std::string&)>;
+    void set_gpu_capture_source(GpuFrameSource source, std::function<void()> flush);
+    [[nodiscard]] std::string capture_source() const { return gpu_source_ ? "vulkan" : "deterministic"; }
+    bool cancel_capture(std::uint64_t id) { return capture_queue_.cancel(id); }
     [[nodiscard]] CaptureJobStatus capture_status(std::uint64_t id) const;
     [[nodiscard]] bool start_video(const std::filesystem::path& path, std::uint32_t fps,
-                                   std::uint32_t maximum_frames, std::string& error);
+                                   std::uint32_t maximum_frames, std::string& error, std::string source = "deterministic");
     [[nodiscard]] bool stop_video(std::string& error);
     [[nodiscard]] VideoStatus video_status() const;
     void record_render_performance(double gpu_milliseconds, std::uint32_t draw_calls,
@@ -80,6 +86,8 @@ private:
     Scene scene_;
     SceneHistory scene_history_;
     AssetRegistry assets_;
+    GpuFrameSource gpu_source_;
+    std::function<void()> gpu_flush_;
     CaptureQueue capture_queue_;
     VideoRecorder video_{capture_queue_};
     PerformanceTracker performance_;

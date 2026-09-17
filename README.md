@@ -13,6 +13,9 @@ This repository currently contains the first vertical slice:
 - generation-checked entities with transforms, hierarchy, reflection and transactional undo/redo;
 - versioned scene files with strict validation, legacy migration and atomic cross-platform saves;
 - a human-facing SDL3 window;
+- a Dear ImGui editor with a scene tree, reflected inspector, viewport camera, transform gizmos,
+  asset browser, undo history and diagnostics, whose every mutation is routed through the same
+  control protocol agents use;
 - a dependency-free CPU renderer used as a temporary backend and test oracle;
 - a Vulkan presentation backend with swapchain recreation, synchronized frames and a GPU pipeline;
 - scene-driven Vulkan draws with resolved hierarchy transforms and an explicit perspective camera;
@@ -28,7 +31,7 @@ This repository currently contains the first vertical slice:
   sampler metadata, and base-color, metallic/roughness, normal, occlusion and emissive channels;
 - an engine-owned asset registry with versioned SHA-256 asset identities, a project import manifest
   that rebuilds imported assets on scene load, and importer dependency reads sandboxed to `assets/`;
-- synchronized Vulkan swapchain readback for agent-visible screenshots of the real GPU output;
+- fence-tracked Vulkan readback for screenshots and recording of the real GPU output;
 - dependency-free PNG/BMP encoding plus a bounded asynchronous capture worker;
 - short WebM recordings sampled without blocking frame encoding, with explicit dropped-frame counts;
 - bounded CPU/GPU timing, process-memory, draw-call, resource and entity telemetry;
@@ -76,6 +79,128 @@ captures cannot race GPU presentation:
 ```sh
 ./build/dev/relay_demo --editor-stdio
 ```
+
+## Human editor
+
+`--editor` opens the Dear ImGui editor interface on the live Vulkan window, and
+`--editor-ui-stdio` runs that interface and the agent transport against one runtime at the same
+time:
+
+```sh
+./build/dev/relay_demo --editor
+./build/dev/relay_demo --editor-ui-stdio
+```
+
+The editor holds no reference to the scene, the undo history or the asset registry. Every panel
+issues the same newline-delimited JSON requests an agent sends, through the same `ControlProtocol`
+instance, so a human drag in the inspector and an agent's `scene.set_transform` are literally the
+same native operation, land in the same undo history and are recorded in the same deterministic
+trace. Native tests assert that contract directly.
+
+The six movable panels are Hierarchy, Inspector, Assets, History, Diagnostics and Viewport.
+They provide hierarchy selection/reparenting/renaming, component and animation editing, model
+import, undo history, logs and scene presentation. Playback, stepping, undo/redo and editing modes
+live in a fixed toolbar; scene save/load lives in File.
+
+The menu bar provides **File, Edit, Scene, View, Run, Tools, Layout and Help**. Open/Save As
+use project-local filename dialogs; `Ctrl+O`, `Ctrl+S` and `Ctrl+Shift+S` provide quick access.
+Scene can add empty nodes, quads, triangles, cameras and three light types. View can hide or
+reopen every panel and reset the editor camera. Run controls simulation and exact single-frame
+stepping. Tools queues real GPU PNG screenshots and records WebM at 30 fps, up to ten seconds,
+with an early-stop action. Recording follows simulation frames: resume or step a paused runtime.
+Capture dialogs identify the Vulkan source and explain that editor panels are excluded.
+Help provides a controls reference and About window. Planned features such as project export,
+scripting, physics, audio, wireframe and an agent workspace are disabled and marked Coming soon.
+
+The authoring viewport uses a charcoal background based on `#202020` and an antialiased XZ grid.
+Grid lines are one unit apart, with major lines every ten units and a distance fade from 35 to
+90 units. Height levels are ten units apart: Y=0 holds until camera height 5, then smoothly
+crossfades to Y=10 between camera heights 5 and 10. Y=10 holds until height 15, then crossfades to
+Y=20 between heights 15 and 20; this repeats upward. Below ground, the grid remains at Y=0.
+**View > Ground grid** toggles the grid. An empty scene shows no demo triangle.
+
+In editor-camera mode, selected meshes have a thin yellow-orange (`#FFB930`) silhouette outline.
+It follows animated/deformed geometry, respects scene depth and material cutouts, and includes
+drawable descendants when a parent is selected. The grid and outline follow the viewport's
+position, size and stacking; they create no scene entities and stay out of exported captures.
+
+The fixed toolbar beneath the menu bar uses drawn icons with tooltips for simulation, undo/redo,
+camera mode, framing, transform modes and local/world axes. Its FPS display measures editor
+presentation independently of simulation pause/step. Dock-header menus sit immediately left of
+their close buttons.
+
+The perspective viewport uses Godot-style navigation: middle-drag orbits, Shift+middle-drag pans,
+and the wheel dollies. Hold right mouse or toggle `Shift+F` for cursor-captured freelook: mouse
+motion looks around, `WASD` flies, `E` rises and `Q` descends. Shift speeds up, Alt slows down, and
+the wheel changes fly speed. Release right mouse, toggle `Shift+F` again, or press Escape to leave
+freelook. `F` frames the selection; lights, cameras and empty nodes retain a useful standoff.
+The editor opens maximized with charcoal panels and blue UI selections. Text defaults to
+17 logical units (16 for diagnostics), and the UI follows SDL's desktop content scale. High-density
+framebuffers keep fonts sharp on fractional Wayland scaling; monitor/scale changes update the
+interface without restarting or multiplying the desktop scale twice.
+
+Translate, rotate and scale gizmos use `W`, `E` and `R` outside freelook, with a local/world toggle.
+Clicking an object selects it. `Delete` destroys the selection and
+`Ctrl+Z` / `Ctrl+Shift+Z` undo and redo. Keyboard shortcuts are ignored while a text field has
+focus.
+
+The editor camera is view state, not scene state: it creates no entity, is never saved, never enters
+the undo history and is never sent over the protocol, so navigating generates no trace entries. It
+does apply to captures, because a screenshot should show the viewport the operator is looking at.
+Use the toolbar camera icon or **View > Scene camera** to see the scene's active camera view.
+
+Transform edits commit once per gesture rather than once per frame, so one inspector drag or one
+gizmo drag is one undo entry, and values are carried as full-precision doubles to match Relay's
+transform storage. A gizmo drag sends many updates carrying a shared gesture token, which the scene
+history folds into the single transaction that token opened.
+
+Inspector widgets retain drafts through release and commit only the edited channels, preserving
+other values and following later agent edits or undo. Imported morph targets can be overridden
+without pre-existing overrides. Rendering, picking and gizmos share the central viewport, including
+framebuffer scaling; picking and framing use the current skinned/morphed bounds.
+
+Selection and picking are stateless on the engine side. `scene.pick` takes a world-space ray and
+returns the nearest entity whose mesh bounds it enters, so an agent can pick without an editor
+running, and `scene.bounds` reports an entity's world-space extent for framing or locating it. The
+gizmo composes and decomposes transforms using Relay's own Euler order rather than the gizmo
+library's, and a native test asserts that composition matches the matrix the renderer actually draws
+with.
+
+The interface is drawn into the swapchain render pass for presentation only and is deliberately
+excluded from every capture and readback, so existing golden images stay comparable.
+
+The six content panels can be resized with their dividers and moved by dragging their tabs.
+The toolbar stays fixed and cannot be closed or moved. Drop a tab on a docking guide to place it beside another panel or group
+panels into tabs. Hold Shift while dragging to keep a panel floating inside the editor window;
+resize floating panels by their edges or corners. The layout is remembered in
+`.relay/editor-layout.ini`; **Layout > Reset layout** restores the defaults. Layout changes do not
+modify the scene or undo history. Old saved layouts automatically retire the movable Controls
+panel while retaining the other panes. Separate desktop windows are not supported yet.
+
+Panels poll read-only methods roughly twice a second. Read-only requests are not recorded in
+deterministic traces, so polling cannot bury the operations that changed the scene.
+
+`tests/editor_visuals_smoke.py` is the current real desktop check for amber mesh outlines,
+vertical grid movement, capture isolation and resize/reframing. It requires a desktop session,
+xdotool, Spectacle and Pillow, and uses an isolated layout. Run it from the repository root:
+
+```sh
+python3 tests/editor_visuals_smoke.py
+```
+
+Earlier desktop suites cover hierarchy/gizmo interaction, inspector/morph edits, Godot navigation,
+docking/persistence and menus (`tests/editor_{interaction,regression,navigation,layout,menu}_smoke.py`).
+They passed before the font, maximized-startup and fixed-toolbar changes; their old hardcoded
+coordinates and Controls-panel calibration need updating before they can validate the current
+layout. These desktop checks are separate from `ctest`.
+
+Not implemented yet: multi-selection, copy/paste and an embedded chat panel. Daily editor
+workflows and animation controls remain the next priority; capability grants must precede broader
+agent access and embedded chat.
+
+Build the interface with `-DRELAY_ENABLE_EDITOR_UI=ON` (the default). Dear ImGui is fetched from a
+checksum-pinned v1.92.1-docking release and ImGuizmo from a checksum-pinned commit; both are linked only
+into `relay_demo`, so the engine library stays free of UI dependencies.
 
 Each request is a single line holding an `id`, a `method` and that method's parameters as
 **top-level fields**. Parameters are not nested inside a `params` object, so this is not JSON-RPC.
@@ -178,7 +303,7 @@ Capture the actual Vulkan swapchain through a synchronized GPU-to-CPU transfer:
 ## MCP bridge
 
 The official MCP TypeScript SDK powers Relay's first model-facing bridge. It launches and owns a
-headless runtime, then exposes thirty-eight narrowly scoped tools with JSON Schema validation and safety
+headless runtime, then exposes forty-seven narrowly scoped tools with JSON Schema validation and safety
 annotations. Engine messages stay on a private child-process channel so MCP's standard output is
 never polluted by runtime logs.
 
@@ -222,19 +347,43 @@ Both CMake builds and `npm run check` reject stale generated C++, TypeScript or 
 
 Near-term milestones, in the order they should be taken:
 
-1. Add asynchronous Vulkan capture/readback and the human editor interface.
-2. Expand import presets as those data types become editable in Relay.
-3. Replace whole-registry hot refresh with versioned asynchronous resource uploads.
+1. Polish the editor: daily editing, project/save workflows and animation controls.
+2. Add per-session capability grants before broader agent access, then embedded chat.
+3. Expand import presets and replace whole-registry refresh with asynchronous resource uploads.
 
 See [`HANDOFF.md`](HANDOFF.md) for the full phase breakdown and the current list of known
 boundaries.
 
-## Rendering TODOs
+## Asynchronous capture and recording
 
-- [ ] Add a rotating Vulkan staging-buffer readback ring for asynchronous GPU screenshots and
-  WebM recording. Until this lands, synchronous screenshots can capture the real Vulkan swapchain,
-  but background captures and video use the deterministic CPU stream. Revisit this before relying
-  on recordings to diagnose shaders, ray tracing, DLSS/FSR, lighting or driver-specific artifacts.
+`render.capture_async` and `video.start` accept `source: "vulkan"` or
+`source: "deterministic"`. Omitted sources use Vulkan in the live editor and the CPU oracle in
+headless mode. An explicit Vulkan request requires a live renderer and never falls back to CPU.
+Capture jobs and video status report their source. The synchronous MCP screenshot tool continues
+to default to Vulkan. Job status includes provenance; callers must inspect failure/error fields
+rather than treating an accepted request as a completed image or recording.
+
+Two rotating staging slots retain the submitted frame's dimensions and pixel format, and transfer
+completed pixels after their graphics fence signals. Image encoding and FFmpeg WebM finalization
+run on background workers. Each GPU slot is capped at 64 MiB; the shared image queue has eight
+active jobs. Full queues/rings report capture failures or recording drops. Cancellation through
+`render.capture_cancel` discards queued pixels but retains GPU storage until completion.
+
+`video.stop` drains pending GPU readbacks and starts finalization; poll `video.status` until
+`finalizing` is false and check `error`. A recording keeps its first sampled resolution; frames
+at a different resolution after resize count as drops. Start a new recording to use the new size.
+Odd dimensions are padded for VP9. Shutdown drains readbacks and joins the workers.
+
+Protocol v7 has 47 native methods and generated MCP tools. Scene v4 and manifest v3 are unchanged.
+Linux/RADV is the verified platform; no Windows/macOS parity is claimed.
+
+```sh
+./build/dev/relay_demo --vulkan-async-smoke relay-dynamic-golden.gltf
+python3 tests/mcp_capture_smoke.py
+```
+
+The GPU smoke exercises animation, resize, asynchronous PNG and WebM and writes evidence to
+`/tmp/relay-phase-e.png` and `/tmp/relay-phase-e.webm`.
 
 ## Importing TODOs
 

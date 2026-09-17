@@ -127,6 +127,7 @@ public:
     [[nodiscard]] const EntityRecord* get(Entity entity) const;
     [[nodiscard]] std::vector<Entity> entities() const;
 
+    [[nodiscard]] bool set_name(Entity entity, std::string name);
     [[nodiscard]] bool set_transform(Entity entity, const Transform& transform);
     [[nodiscard]] bool set_parent(Entity entity, Entity parent);
     [[nodiscard]] bool set_camera(Entity entity, std::optional<Camera> camera);

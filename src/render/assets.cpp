@@ -5,6 +5,8 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <limits>
+#include <iomanip>
 #include <sstream>
 
 namespace relay {
@@ -149,6 +151,7 @@ std::uint32_t AssetRegistry::material_index(const std::string_view name) const {
 
 std::string AssetRegistry::to_json() const {
     std::ostringstream output;
+    output << std::setprecision(std::numeric_limits<double>::max_digits10);
     output << "{\"texture_table_capacity\":" << bindless_texture_capacity
            << ",\"meshes\":[";
     for (std::size_t index = 0; index < meshes_.size(); ++index) {
@@ -160,7 +163,13 @@ std::string AssetRegistry::to_json() const {
                << next_vertex - static_cast<std::uint32_t>(meshes_[index].vertex_offset)
                << ",\"indices\":" << meshes_[index].index_count
                << ",\"joints\":" << meshes_[index].joints.size()
-               << ",\"morph_targets\":" << meshes_[index].morph_targets.size() << '}';
+               << ",\"morph_targets\":" << meshes_[index].morph_targets.size()
+               << ",\"morph_default_weights\":[";
+        for (std::size_t target = 0; target < meshes_[index].morph_targets.size(); ++target) {
+            if (target) output << ',';
+            output << meshes_[index].morph_targets[target].weight;
+        }
+        output << "]}";
     }
     output << "],\"materials\":[";
     for (std::size_t index = 0; index < materials_.size(); ++index) {

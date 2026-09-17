@@ -4,6 +4,7 @@ project(RelayEngine VERSION 0.1.0 LANGUAGES CXX)
 
 option(RELAY_BUILD_TESTS "Build Relay's tests" ON)
 option(RELAY_ENABLE_SDL "Build the SDL-powered human window" ON)
+option(RELAY_ENABLE_EDITOR_UI "Build the Dear ImGui human editor interface" ON)
 option(RELAY_FETCH_VULKAN_HEADERS "Fetch pinned Khronos headers when the system only has a loader" ON)
 
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
@@ -74,11 +75,14 @@ if(TARGET JPEG::JPEG)
     target_compile_definitions(relay_engine PRIVATE RELAY_HAS_JPEG=1)
 endif()
 
-if(MSVC)
-    target_compile_options(relay_engine PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(relay_engine PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-endif()
+function(relay_enable_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+endfunction()
+relay_enable_warnings(relay_engine)
 
 find_package(Vulkan QUIET)
 if(NOT TARGET Vulkan::Vulkan)
@@ -118,6 +122,7 @@ endif()
 
 add_executable(relay_demo apps/relay_demo/main.cpp)
 target_link_libraries(relay_demo PRIVATE Relay::Engine)
+relay_enable_warnings(relay_demo)
 
 if(RELAY_ENABLE_SDL)
     find_package(SDL3 CONFIG QUIET)
@@ -159,7 +164,33 @@ if(RELAY_ENABLE_SDL)
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/first_light.frag"
                 VERBATIM
             )
-            add_custom_target(relay_shaders DEPENDS "${RELAY_VERTEX_SHADER}" "${RELAY_FRAGMENT_SHADER}")
+            foreach(stage vert frag)
+                set(RELAY_GRID_${stage} "${RELAY_SHADER_OUTPUT_DIR}/editor_grid.${stage}.spv")
+                add_custom_command(
+                    OUTPUT "${RELAY_GRID_${stage}}"
+                    COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
+                    COMMAND "${RELAY_GLSLC}" -fshader-stage=${stage}
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/editor_grid.${stage}"
+                            -o "${RELAY_GRID_${stage}}"
+                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/editor_grid.${stage}"
+                    VERBATIM
+                )
+            endforeach()
+            foreach(stage vert frag)
+                set(RELAY_SELECTION_${stage} "${RELAY_SHADER_OUTPUT_DIR}/editor_selection.${stage}.spv")
+                add_custom_command(
+                    OUTPUT "${RELAY_SELECTION_${stage}}"
+                    COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
+                    COMMAND "${RELAY_GLSLC}" -fshader-stage=${stage}
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/editor_selection.${stage}"
+                            -o "${RELAY_SELECTION_${stage}}"
+                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/editor_selection.${stage}"
+                    VERBATIM
+                )
+            endforeach()
+            add_custom_target(relay_shaders DEPENDS "${RELAY_VERTEX_SHADER}" "${RELAY_FRAGMENT_SHADER}"
+                              "${RELAY_GRID_vert}" "${RELAY_GRID_frag}"
+                              "${RELAY_SELECTION_vert}" "${RELAY_SELECTION_frag}")
             add_dependencies(relay_demo relay_shaders)
             target_sources(relay_demo PRIVATE src/platform/vulkan_window.cpp)
             target_link_libraries(relay_demo PRIVATE Vulkan::Vulkan)
@@ -170,7 +201,64 @@ if(RELAY_ENABLE_SDL)
                 RELAY_HAS_VULKAN_WINDOW=1
                 RELAY_VERTEX_SHADER_PATH="${RELAY_VERTEX_SHADER}"
                 RELAY_FRAGMENT_SHADER_PATH="${RELAY_FRAGMENT_SHADER}"
+                RELAY_GRID_VERTEX_PATH="${RELAY_GRID_vert}"
+                RELAY_GRID_FRAGMENT_PATH="${RELAY_GRID_frag}"
+                RELAY_SELECTION_VERTEX_PATH="${RELAY_SELECTION_vert}"
+                RELAY_SELECTION_FRAGMENT_PATH="${RELAY_SELECTION_frag}"
             )
+
+            if(RELAY_ENABLE_EDITOR_UI)
+                # Dear ImGui is pinned to a tagged release rather than the untagged docking branch, so
+                # the editor build stays reproducible. The library is linked only into relay_demo:
+                # relay_engine must remain free of UI and model-facing dependencies.
+                include(FetchContent)
+                FetchContent_Declare(
+                    DearImGui
+                    URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.1-docking.tar.gz
+                    URL_HASH SHA256=2f308ae014a8f3a46d89cf4db71c814af815b704b8a88b7136bae148eb8f4b71
+                    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+                )
+                FetchContent_MakeAvailable(DearImGui)
+
+                # ImGuizmo has no release tagged against a current Dear ImGui, so it is pinned to an
+                # exact commit with its archive checksum rather than to a moving branch.
+                FetchContent_Declare(
+                    ImGuizmo
+                    URL https://github.com/CedricGuillemet/ImGuizmo/archive/18cef5e031d8c6973d80284c67f60549fafd78c1.tar.gz
+                    URL_HASH SHA256=6ad626f0687be12c2f3ba6542c0f1bdda9e71e395d0645e4cda37695354406d8
+                    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+                    # Point at a directory with no CMakeLists so upstream's build is not added.
+                    # It would compile unrelated widgets against an ImGui it cannot locate.
+                    SOURCE_SUBDIR relay-does-not-build-this
+                )
+                FetchContent_MakeAvailable(ImGuizmo)
+
+                add_library(relay_imgui STATIC
+                    "${dearimgui_SOURCE_DIR}/imgui.cpp"
+                    "${dearimgui_SOURCE_DIR}/imgui_draw.cpp"
+                    "${dearimgui_SOURCE_DIR}/imgui_tables.cpp"
+                    "${dearimgui_SOURCE_DIR}/imgui_widgets.cpp"
+                    "${dearimgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
+                    "${dearimgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp"
+                    "${imguizmo_SOURCE_DIR}/src/ImGuizmo.cpp"
+                )
+                target_compile_features(relay_imgui PUBLIC cxx_std_20)
+                # SYSTEM keeps third-party headers from emitting warnings into Relay's strict builds.
+                target_include_directories(relay_imgui SYSTEM PUBLIC
+                    "${dearimgui_SOURCE_DIR}"
+                    "${dearimgui_SOURCE_DIR}/backends"
+                    "${imguizmo_SOURCE_DIR}/src"
+                )
+                target_link_libraries(relay_imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan)
+                if(TARGET Vulkan::Headers)
+                    target_link_libraries(relay_imgui PUBLIC Vulkan::Headers)
+                endif()
+
+                target_sources(relay_demo PRIVATE src/editor/editor_ui.cpp src/editor/editor_theme.cpp
+                    src/editor/editor_layout.cpp)
+                target_link_libraries(relay_demo PRIVATE relay_imgui)
+                target_compile_definitions(relay_demo PRIVATE RELAY_HAS_EDITOR_UI=1)
+            endif()
         else()
             message(STATUS "Vulkan window disabled: Vulkan loader or glslc was not found")
         endif()
@@ -183,6 +271,7 @@ if(RELAY_BUILD_TESTS)
     enable_testing()
     add_executable(relay_tests tests/engine_tests.cpp)
     target_link_libraries(relay_tests PRIVATE Relay::Engine)
+    relay_enable_warnings(relay_tests)
     target_compile_definitions(relay_tests PRIVATE
         RELAY_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )

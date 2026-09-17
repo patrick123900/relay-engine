@@ -162,7 +162,7 @@ function createServer() {
         render_capture_async: async (input) => {
             const filename = input.filename;
             return toolResult({
-                ...(await relay.call("render.capture_async", { path: `captures/${filename}` })),
+                ...(await relay.call("render.capture_async", { path: `captures/${filename}`, ...(input.source ? { source: input.source } : {}) })),
                 absolutePath: path.join(projectRoot, "captures", filename),
             });
         },

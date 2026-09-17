@@ -205,6 +205,13 @@ std::vector<Entity> Scene::entities() const {
     return result;
 }
 
+bool Scene::set_name(const Entity entity, std::string name) {
+    auto* record = get(entity);
+    if (record == nullptr || name.empty() || name.size() > 128U) return false;
+    record->name = std::move(name);
+    return true;
+}
+
 bool Scene::set_transform(const Entity entity, const Transform& transform) {
     auto* record = get(entity);
     if (record == nullptr) return false;

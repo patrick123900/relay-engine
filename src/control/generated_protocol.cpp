@@ -18,8 +18,13 @@ constexpr std::array<ProtocolFieldSpec, 2> fields_render_capture{{
     {"source", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "vulkan|deterministic"},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 1> fields_render_capture_async{{
+constexpr std::array<ProtocolFieldSpec, 2> fields_render_capture_async{{
     {"path", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^(captures/)?[A-Za-z0-9][A-Za-z0-9._-]*\\.(bmp|png)$", ""},
+    {"source", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "vulkan|deterministic"},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_render_capture_cancel{{
+    {"job", ProtocolValueType::integer, true, false, true, false, 1, 0, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_render_capture_status{{
@@ -41,10 +46,11 @@ constexpr std::array<ProtocolFieldSpec, 2> fields_performance_read{{
     {"limit", ProtocolValueType::integer, false, false, true, true, 1, 240, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 3> fields_video_start{{
+constexpr std::array<ProtocolFieldSpec, 4> fields_video_start{{
     {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.webm$", ""},
     {"fps", ProtocolValueType::integer, false, false, true, true, 1, 60, 0U, 0U, "", ""},
     {"maximum_frames", ProtocolValueType::integer, false, false, true, true, 1, 3600, 0U, 0U, "", ""},
+    {"source", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "vulkan|deterministic"},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_scene_inspect{{
@@ -60,7 +66,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scene_destroy{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 10> fields_scene_set_transform{{
+constexpr std::array<ProtocolFieldSpec, 11> fields_scene_set_transform{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"px", ProtocolValueType::number, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"py", ProtocolValueType::number, false, false, false, false, 0, 0, 0U, 0U, "", ""},
@@ -71,6 +77,7 @@ constexpr std::array<ProtocolFieldSpec, 10> fields_scene_set_transform{{
     {"sx", ProtocolValueType::number, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"sy", ProtocolValueType::number, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"sz", ProtocolValueType::number, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 1000000000, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 7> fields_scene_set_camera{{
@@ -127,6 +134,24 @@ constexpr std::array<ProtocolFieldSpec, 13> fields_scene_set_light{{
     {"range", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 2> fields_scene_rename{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 6> fields_scene_pick{{
+    {"origin_x", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"origin_y", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"origin_z", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"direction_x", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"direction_y", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"direction_z", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_scene_bounds{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 1> fields_scene_save{{
     {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 12U, 128U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.relay\\.json$", ""},
 }};
@@ -143,14 +168,15 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_trace_replay{{
     {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.relay-trace\\.jsonl$", ""},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 41> methods{{
+constexpr std::array<ProtocolMethodSpec, 47> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current run, pause, frame, simulation time and resolution state.", true, false, false, no_fields},
     {"runtime.pause", "runtime_pause", "Pause Relay runtime", "Pause automatic simulation so the scene can be inspected deterministically.", false, false, true, no_fields},
     {"runtime.resume", "runtime_resume", "Resume Relay runtime", "Resume automatic simulation after an inspection or controlled frame step.", false, false, true, no_fields},
     {"runtime.step", "runtime_step", "Step Relay frames", "Advance an exact number of deterministic simulation frames, including while paused.", false, false, false, fields_runtime_step},
     {"runtime.quit", "runtime_shutdown", "Shut down Relay runtime", "Request an orderly shutdown of the runtime owned by this MCP bridge.", false, false, true, no_fields},
     {"render.capture", "render_capture", "Capture Relay frame", "Save the current rendered frame in Relay's captures directory for visual inspection.", false, false, false, fields_render_capture},
-    {"render.capture_async", "render_capture_async", "Queue Relay frame capture", "Copy the deterministic frame and encode it on Relay's bounded background worker.", false, false, false, fields_render_capture_async},
+    {"render.capture_async", "render_capture_async", "Queue Relay frame capture", "Capture real Vulkan or deterministic CPU frames through bounded background image workers.", false, false, false, fields_render_capture_async},
+    {"render.capture_cancel", "render_capture_cancel", "Cancel pending capture", "Cancel a queued image or GPU readback job; writing and completed jobs cannot be cancelled. GPU slots remain alive until their fence completes.", false, false, false, fields_render_capture_cancel},
     {"render.capture_status", "render_capture_status", "Inspect capture job", "Check whether an asynchronous capture is queued, writing, complete or failed.", true, false, false, fields_render_capture_status},
     {"render.capabilities", "render_capabilities", "Inspect graphics capabilities", "Create a temporary Vulkan device and report adapter and modern rendering support.", true, false, false, no_fields},
     {"render.graph", "render_graph", "Inspect render graph", "Read compiled render passes, resources, dependencies and access transitions.", true, false, false, no_fields},
@@ -161,9 +187,9 @@ constexpr std::array<ProtocolMethodSpec, 41> methods{{
     {"logs.read", "logs_read", "Read Relay logs", "Read structured engine log entries newer than a sequence number.", true, false, false, fields_logs_read},
     {"performance.read", "performance_read", "Read Relay performance", "Read bounded per-frame CPU/GPU timing, draw/resource counts, entities and process memory.", true, false, false, fields_performance_read},
     {"input.recent", "input_recent", "Read recent Relay input", "Read the bounded normalized keyboard, mouse and gamepad input event history.", true, false, false, no_fields},
-    {"video.start", "video_start", "Start Relay video", "Begin sampling deterministic frames into a bounded asynchronous WebM recording.", false, false, false, fields_video_start},
+    {"video.start", "video_start", "Start Relay video", "Record real Vulkan or deterministic CPU frames to WebM with explicit frame drops.", false, false, false, fields_video_start},
     {"video.capabilities", "video_capabilities", "Inspect video capabilities", "Report whether this Relay build found the FFmpeg WebM encoder.", true, false, false, no_fields},
-    {"video.stop", "video_stop", "Stop Relay video", "Finish queued frames and encode the active recording to WebM with FFmpeg.", false, false, false, no_fields},
+    {"video.stop", "video_stop", "Stop Relay video", "Drain pending readbacks and start background WebM finalization; poll video.status for completion and errors.", false, false, false, no_fields},
     {"video.status", "video_status", "Inspect Relay video", "Read recording state, submitted frames and explicitly reported frame drops.", true, false, false, no_fields},
     {"scene.list", "scene_list", "List scene entities", "List every live entity with its name, parent and local transform.", true, false, false, no_fields},
     {"scene.inspect", "scene_inspect", "Inspect scene entity", "Inspect one entity using its stable generation-checked handle.", true, false, false, fields_scene_inspect},
@@ -178,6 +204,11 @@ constexpr std::array<ProtocolMethodSpec, 41> methods{{
     {"scene.set_animation", "scene_set_animation", "Control imported animation", "Configure clip, playback, looping, speed and seek time on an imported model root.", false, false, false, fields_scene_set_animation},
     {"scene.set_morph", "scene_set_morph", "Set imported morph weight", "Override a mesh morph weight, or reset all overrides to imported defaults and animation.", false, false, false, fields_scene_set_morph},
     {"scene.set_light", "scene_set_light", "Configure scene light", "Add, update or remove a directional, point or spot light.", false, false, false, fields_scene_set_light},
+    {"scene.rename", "scene_rename", "Rename scene entity", "Change an entity's display name as one undoable transaction.", false, false, false, fields_scene_rename},
+    {"scene.history", "scene_history", "Inspect undo history", "Read the labels currently on the undo and redo stacks, newest first.", true, false, false, no_fields},
+    {"assets.available", "asset_available_models", "List importable models", "List model files present in the project assets directory that this build can import. Top-level files only; the import sandbox is unchanged.", true, false, false, no_fields},
+    {"scene.pick", "scene_pick", "Pick scene entity", "Find the nearest drawable entity a world-space ray enters. Bounds-level precision, not per-triangle. Stateless: the caller supplies the ray, so the engine stores no viewpoint.", true, false, false, fields_scene_pick},
+    {"scene.bounds", "scene_bounds", "Inspect entity bounds", "Read the world-space axis-aligned bounds and origin of an entity and its descendants, for framing a selection or locating an object.", true, false, false, fields_scene_bounds},
     {"scene.snapshot", "scene_snapshot", "Snapshot Relay scene", "Return deterministic scene JSON plus reflected component field metadata.", true, false, false, no_fields},
     {"scene.save", "scene_save", "Save Relay scene", "Atomically save the current scene in Relay's project-local scenes directory.", false, true, true, fields_scene_save},
     {"scene.load", "scene_load", "Load Relay scene", "Validate, migrate and load a project scene as one undoable transaction.", false, false, false, fields_scene_load},

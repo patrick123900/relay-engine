@@ -1,5 +1,9 @@
 #include "relay/control/control_protocol.hpp"
 #include "relay/control/generated_protocol.hpp"
+#include "relay/editor/editor_math.hpp"
+#include "relay/editor/editor_camera.hpp"
+#include "relay/editor/editor_state.hpp"
+#include "relay/editor/editor_viewport.hpp"
 #include "relay/core/engine.hpp"
 #include "relay/render/scene_render.hpp"
 #include "relay/render/asset_manifest.hpp"
@@ -122,14 +126,66 @@ std::string textured_external_gltf(const std::string& buffer_uri) {
 } // namespace
 
 int main() {
+    {
+        relay::Scene scene;
+        const auto entity = scene.create("Editor decoding");
+        relay::Transform transform;
+        transform.position = {2, 3, 4}; transform.rotation_degrees = {10, 20, 30}; transform.scale = {2, 3, 4};
+        (void)scene.set_transform(entity, transform);
+        // Keep the response alive: JsonParser borrows its input.
+        const auto response = scene.entity_json(entity);
+        relay::JsonParser decoder(response);
+        const auto decoded = decoder.parse();
+        const auto* component = relay::field(*decoded->object(), "transform")->object();
+        expect(relay::editor_vector(*component, "position", {0,0,0}) == std::array<double,3>{2,3,4}
+            && relay::editor_vector(*component, "rotation_degrees", {0,0,0}) == std::array<double,3>{10,20,30}
+            && relay::editor_vector(*component, "scale", {1,1,1}) == std::array<double,3>{2,3,4},
+            "editor decodes actual scene vector responses without replacing nondefault values");
+        relay::EditorScalarDraft draft;
+        draft.begin(2) = 5; draft.finish(true);
+        expect(draft.begin(99) == 5, "runtime refresh preserves the active inspector draft");
+        draft.finish(false);
+        expect(draft.value == 5 && draft.begin(99) == 99, "release retains the committed value then idle follows agent/undo state");
+        relay::EditorViewport region{0.21, 0.07, 0.58, 0.63};
+        const auto pixels = region.pixels(1280, 720);
+        const auto hidpi = region.pixels(2560, 1440);
+        expect(pixels.width > 0 && std::abs(static_cast<int>(hidpi.x) - 2 * static_cast<int>(pixels.x)) <= 1 && region.pixels(0,0).width == 0,
+            "editor viewport resolves bounded logical layout into framebuffer pixels, including HiDPI");
+        relay::AssetRegistry assets;
+        relay::ViewOverride view;
+        view.position = {3, 2, 5}; view.target = {};
+        const auto rendered = relay::build_render_scene(scene, assets, static_cast<float>(pixels.width) / static_cast<float>(pixels.height), &view);
+        const auto& matrix = rendered.camera.view_projection.values;
+        for (const auto point : std::array<relay::Vec3,3>{{{0,0,0},{1,.5,.3},{-.7,-.8,.2}}}) {
+            const double clip_x = matrix[0]*point.x + matrix[4]*point.y + matrix[8]*point.z + matrix[12];
+            const double clip_y = matrix[1]*point.x + matrix[5]*point.y + matrix[9]*point.z + matrix[13];
+            const double clip_w = matrix[3]*point.x + matrix[7]*point.y + matrix[11]*point.z + matrix[15];
+            const auto ray = relay::editor_screen_ray(view.position, view.target, view.camera.field_of_view_y_degrees,
+                static_cast<double>(pixels.width)/pixels.height, clip_x/clip_w, -clip_y/clip_w);
+            const relay::Vec3 to{point.x-view.position.x, point.y-view.position.y, point.z-view.position.z};
+            const double distance = to.x*ray.x + to.y*ray.y + to.z*ray.z;
+            expect(std::abs(to.x-distance*ray.x) < .00001 && std::abs(to.y-distance*ray.y) < .00001 && std::abs(to.z-distance*ray.z) < .00001,
+                "picking rays intersect off-center points projected by the real renderer");
+        }
+        for (const auto scale : std::array<relay::Vec3,3>{{{-2,3,4},{2,-3,4},{-2,-3,4}}}) {
+            const auto original = relay::editor_compose({2,3,4},{10,20,30},scale);
+            relay::Vec3 position, rotation, decomposed_scale;
+            relay::editor_decompose(original, position, rotation, decomposed_scale);
+            const auto rebuilt = relay::editor_compose(position, rotation, decomposed_scale);
+            bool matches = true;
+            for (std::size_t i = 0; i < original.size(); ++i) matches &= std::abs(original[i]-rebuilt[i]) < .00001;
+            expect(matches, "gizmo decomposition preserves mirrored transforms and handedness");
+        }
+    }
+
     relay::Scene scene;
-    const auto root = scene.create("Root");
-    const auto child = scene.create("Child", root);
-    expect(scene.contains(root) && scene.contains(child), "scene creates stable entity handles");
-    expect(scene.get(child)->parent == root, "scene records entity hierarchy");
-    expect(!scene.set_parent(root, child), "scene rejects hierarchy cycles");
-    const auto stale_child = child;
-    expect(scene.destroy(child), "scene destroys existing entities");
+    const auto scene_root = scene.create("Root");
+    const auto scene_child = scene.create("Child", scene_root);
+    expect(scene.contains(scene_root) && scene.contains(scene_child), "scene creates stable entity handles");
+    expect(scene.get(scene_child)->parent == scene_root, "scene records entity hierarchy");
+    expect(!scene.set_parent(scene_root, scene_child), "scene rejects hierarchy cycles");
+    const auto stale_child = scene_child;
+    expect(scene.destroy(scene_child), "scene destroys existing entities");
     expect(!scene.contains(stale_child), "destroyed handles become stale");
     const auto replacement = scene.create("Replacement");
     expect(replacement.index == stale_child.index && replacement.generation != stale_child.generation,
@@ -411,6 +467,23 @@ int main() {
                "morph interpolation is applied before weighted skinning at the expected half-time "
                "pose");
         const auto mesh_entity = half_pose.instances.front().entity;
+        const auto posed_bounds = relay::compute_scene_bounds(dynamic_engine.scene(), dynamic_engine.assets(), mesh_entity);
+        const auto& world = half_pose.instances.front().model.values;
+        for (const auto& vertex : half_pose.deformed_vertices) {
+            const relay::Vec3 point{world[0]*vertex.x + world[4]*vertex.y + world[8]*vertex.z + world[12],
+                world[1]*vertex.x + world[5]*vertex.y + world[9]*vertex.z + world[13],
+                world[2]*vertex.x + world[6]*vertex.y + world[10]*vertex.z + world[14]};
+            expect(point.x >= posed_bounds.minimum.x - .00001 && point.x <= posed_bounds.maximum.x + .00001
+                && point.y >= posed_bounds.minimum.y - .00001 && point.y <= posed_bounds.maximum.y + .00001
+                && point.z >= posed_bounds.minimum.z - .00001 && point.z <= posed_bounds.maximum.z + .00001,
+                "editor focus bounds contain the actual skin/morph-deformed pose");
+        }
+        const relay::Vec3 pick_origin{(posed_bounds.minimum.x + posed_bounds.maximum.x)/2,
+            (posed_bounds.minimum.y + posed_bounds.maximum.y)/2, posed_bounds.maximum.z + 5};
+        const auto posed_pick = relay::pick_scene_entity(dynamic_engine.scene(), dynamic_engine.assets(), pick_origin, {0,0,-1});
+        expect(posed_pick.hit && posed_pick.entity == mesh_entity && std::abs(posed_pick.distance - 5) < .00001,
+            "picking uses the rendered pose's bounds rather than undeformed mesh bounds");
+
         expect(command("scene.set_morph", mesh_entity, ",\"target\":0,\"weight\":0.25")
                        .find("\"ok\":true") != std::string::npos,
                "morph weights can be overridden through the protocol");
@@ -527,15 +600,15 @@ int main() {
     for (const auto *filename : {"relay-dynamic-golden.glb", "relay-dynamic-golden.fbx"}) {
         relay::AssetRegistry round_trip_assets;
         relay::Scene round_trip_scene;
-        const auto imported = relay::import_model_asset(assets_root, filename, round_trip_assets,
+        const auto round_trip = relay::import_model_asset(assets_root, filename, round_trip_assets,
                                                         &round_trip_scene, dynamic_error);
-        const auto *model = round_trip_assets.find_model(imported.model);
+        const auto *model = round_trip_assets.find_model(round_trip.model);
         bool has_skin = false, has_morph = false;
         for (const auto &mesh : round_trip_assets.meshes()) {
             has_skin = has_skin || !mesh.joints.empty();
             has_morph = has_morph || !mesh.morph_targets.empty();
         }
-        expect(imported.imported && model && !model->clips.empty() && has_skin && has_morph,
+        expect(round_trip.imported && model && !model->clips.empty() && has_skin && has_morph,
                std::string{"Blender round trip preserves clips, skin and morphs through "} +
                    filename + ": " + dynamic_error);
     }
@@ -1006,7 +1079,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 5U && relay::protocol_methods().size() == 41U,
+    expect(relay::protocol_schema_version == 7U && relay::protocol_methods().size() == 47U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");
@@ -1154,6 +1227,35 @@ int main() {
     std::filesystem::remove(png_path);
 
     const auto async_path = std::filesystem::temp_directory_path() / "relay-engine-async.png";
+    {
+        relay::CaptureQueue queue(1);
+        const auto reserved = queue.reserve("/tmp/relay-deferred.png", "vulkan", capture_error);
+        expect(reserved != 0 && queue.status(reserved).source == "vulkan", "deferred capture preserves GPU provenance");
+        expect(queue.reserve("/tmp/relay-overflow.png", "vulkan", capture_error) == 0, "readback reservations count toward queue bounds");
+        queue.deliver(reserved, {}, "GPU readback failed");
+        queue.wait_idle();
+        expect(queue.status(reserved).state == relay::CaptureJobState::failed, "readback failure reaches capture status");
+        const auto cancelled = queue.reserve("/tmp/relay-cancelled.png", "vulkan", capture_error);
+        expect(queue.cancel(cancelled), "GPU readback reservation can be cancelled");
+        queue.deliver(cancelled, {1, 1, {255, 0, 0, 255}});
+        queue.wait_idle();
+        expect(queue.status(cancelled).error == "capture cancelled" && !std::filesystem::exists("/tmp/relay-cancelled.png"), "late GPU completion cannot resurrect a cancelled capture");
+        const auto completed = queue.reserve("/tmp/relay-deferred.png", "vulkan", capture_error);
+        queue.deliver(completed, {1, 1, {255, 0, 0, 255}});
+        queue.wait_idle();
+        expect(queue.status(completed).state == relay::CaptureJobState::complete, "deferred GPU pixels reach image worker");
+        expect(protocol.handle(R"({"id":901,"method":"render.capture_async","source":"vulkan","path":"unavailable.png"})").find("requires a live") != std::string::npos, "explicit GPU capture never falls back to CPU");
+    }
+    {
+        relay::Engine::FrameReceiver pending;
+        {
+            relay::Engine runtime;
+            runtime.set_gpu_capture_source([&](auto receiver, std::string&) { pending = std::move(receiver); return true; },
+                [&] { if (pending) { auto receiver = std::move(pending); pending = {}; receiver({1, 1, {0, 255, 0, 255}}, {}); } });
+            expect(runtime.capture_async("/tmp/relay-shutdown-capture.png", capture_error, "vulkan") != 0, "GPU capture accepts delayed completion");
+        }
+        expect(!pending && std::filesystem::exists("/tmp/relay-shutdown-capture.png"), "shutdown drains GPU readbacks and image worker before destruction");
+    }
     const auto capture_job = engine.capture_async(async_path, capture_error);
     expect(capture_job != 0U, "asynchronous capture accepts a frame without blocking");
     relay::CaptureJobStatus async_status;
@@ -1182,9 +1284,14 @@ int main() {
     const auto before_traced_step = engine.status().frame_index;
     (void)protocol.handle(R"({"id":22,"method":"runtime.step","frames":3})");
     engine.apply_input_event("key:down:32");
+    // The editor polls these continuously. Recording them would make trace files grow with idle
+    // time and bury the requests that actually changed the scene, so read-only methods are skipped.
+    (void)protocol.handle(R"({"id":220,"method":"scene.list"})");
+    (void)protocol.handle(R"({"id":221,"method":"logs.read","after":0})");
+    (void)protocol.handle(R"({"id":222,"method":"runtime.status"})");
     expect(protocol.handle(R"({"id":23,"method":"trace.stop"})").find(R"("events":2)") !=
                std::string::npos,
-           "trace records agent commands and normalized input events");
+           "trace records agent commands and input events but not read-only polling");
     const auto replay = protocol.handle(
         R"({"id":24,"method":"trace.replay","filename":"test.relay-trace.jsonl"})");
     expect(replay.find(R"("commands":1)") != std::string::npos &&
@@ -1192,14 +1299,253 @@ int main() {
                engine.status().frame_index == before_traced_step + 6U,
            "trace replay reproduces command timing and injected inputs");
 
+    if (relay::video_encoder_available()) {
+        relay::CaptureQueue queue;
+        relay::VideoRecorder recorder(queue);
+        expect(recorder.start("/tmp/relay-empty-video.webm", 30, 10, 1.0 / 60.0, capture_error), "empty recording starts");
+        expect(recorder.stop(capture_error), "video stop starts background finalization");
+        for (unsigned attempt = 0; attempt < 1000 && recorder.status().finalizing; ++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        expect(!recorder.status().finalizing && recorder.status().error == "video has no captured frames", "WebM finalization errors remain observable");
+    }
     const auto video_start = protocol.handle(
         R"({"id":25,"method":"video.start","filename":"test-observability.webm","fps":10,"maximum_frames":10})");
     expect(video_start.find(R"("ok":true)") != std::string::npos, "protocol starts WebM recording");
     engine.step(12);
     const auto video_stop = protocol.handle(R"({"id":26,"method":"video.stop"})");
+    for (unsigned attempt = 0; attempt < 1000 && engine.video_status().finalizing; ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    expect(!engine.video_status().finalizing && engine.video_status().error.empty(), "WebM worker finalizes successfully");
     expect(video_stop.find(R"("ok":true)") != std::string::npos &&
                std::filesystem::file_size("captures/test-observability.webm") > 0U,
            "queued frames encode into a WebM recording");
+
+    // The gizmo composes and decomposes transforms itself rather than using the gizmo library's
+    // Euler order. If that convention drifted from the renderer's, dragging would silently write
+    // back rotations that do not match what is drawn, so the agreement is asserted directly.
+    {
+        relay::AssetRegistry gizmo_assets;
+        relay::Scene gizmo_scene;
+        const auto probe = gizmo_scene.create("Gizmo probe");
+        // Kept inside the default camera's frustum so the instance is not culled away.
+        const relay::Transform posed{{0.5, -0.25, 0.0}, {30.0, 40.0, 50.0}, {2.0, 0.5, 1.25}};
+        expect(gizmo_scene.set_transform(probe, posed) &&
+                   gizmo_scene.set_mesh_renderer(
+                       probe, relay::MeshRenderer{"builtin.quad", "builtin.orange"}),
+               "gizmo probe entity is renderable");
+        const auto rendered = relay::build_render_scene(gizmo_scene, gizmo_assets, 1.0F);
+        expect(rendered.instances.size() == 1U, "gizmo probe produces one render instance");
+
+        const auto composed =
+            relay::editor_compose(posed.position, posed.rotation_degrees, posed.scale);
+        double largest_difference = 0.0;
+        for (std::size_t index = 0; index < 16U; ++index) {
+            largest_difference =
+                std::max(largest_difference,
+                         static_cast<double>(std::abs(
+                             composed[index] - rendered.instances.front().model.values[index])));
+        }
+        expect(largest_difference < 1e-5,
+               "the editor's transform composition matches the matrix the renderer draws with");
+
+        relay::Vec3 position{};
+        relay::Vec3 rotation{};
+        relay::Vec3 scale{};
+        relay::editor_decompose(composed, position, rotation, scale);
+        expect(std::abs(position.x - posed.position.x) < 1e-4 &&
+                   std::abs(position.z - posed.position.z) < 1e-4,
+               "decomposing a gizmo matrix recovers its translation");
+        expect(std::abs(rotation.x - 30.0) < 1e-3 && std::abs(rotation.y - 40.0) < 1e-3 &&
+                   std::abs(rotation.z - 50.0) < 1e-3,
+               "decomposing a gizmo matrix recovers Relay's Euler angles, not another convention");
+        expect(std::abs(scale.x - 2.0) < 1e-4 && std::abs(scale.y - 0.5) < 1e-4 &&
+                   std::abs(scale.z - 1.25) < 1e-4,
+               "decomposing a gizmo matrix recovers its scale");
+
+        // Manipulate in world space with a rigid camera, then invert the parent to recover local
+        // edits. Parent scale must never enter the camera matrix or screen-size calculations.
+        const auto parent =
+            relay::editor_compose({5.0, 0.0, 0.0}, {0.0, 90.0, 0.0}, {1.0, 1.0, 1.0});
+        const auto child = relay::editor_compose({0.0, 1.0, 0.0}, {}, {1.0, 1.0, 1.0});
+        const auto world = relay::editor_multiply(parent, child);
+        expect(std::abs(world[13] - 1.0F) < 1e-5F && std::abs(world[12] - 5.0F) < 1e-5F,
+               "composing a parent and child transform places the child in world space");
+        for (const auto parent_scale : std::array<relay::Vec3, 3>{{{.01,.01,.01}, {2,3,.5}, {-2,3,4}}}) {
+            const auto scaled_parent = relay::editor_compose({5,2,3}, {10,35,20}, parent_scale);
+            const auto inverse = relay::editor_inverse_affine(scaled_parent);
+            expect(inverse.has_value(), "scaled/mirrored parent has an affine inverse");
+            if (!inverse) continue;
+            const auto local = relay::editor_multiply(*inverse, relay::editor_multiply(scaled_parent, child));
+            bool matches = true;
+            for (std::size_t i=0; i<local.size(); ++i) matches &= std::abs(local[i]-child[i]) < .0001;
+            expect(matches, "world gizmo manipulation converts back through scaled parent without view distortion");
+        }
+        expect(!relay::editor_inverse_affine(relay::editor_compose({}, {}, {0,1,1})),
+               "collapsed parent cannot silently produce invalid gizmo transforms");
+        relay::EditorCamera navigation;
+        const auto initial_eye = navigation.position();
+        const auto initial_target = navigation.target;
+        navigation.turn(50, 20, true);
+        const auto turned_eye = navigation.position();
+        expect(std::abs(turned_eye.x-initial_eye.x) < 1e-9 && std::abs(turned_eye.y-initial_eye.y) < 1e-9 && std::abs(turned_eye.z-initial_eye.z) < 1e-9,
+               "freelook rotates around the eye instead of orbiting the target");
+        navigation = {};
+        navigation.turn(50,20,false);
+        expect(navigation.target == initial_target && navigation.position() != initial_eye,
+               "middle-mouse orbit retains its target and moves the eye");
+        navigation.frame({0,0,0}, {1e-9,1e-9,1e-9}, false, 60, 1.5);
+        expect(navigation.distance == 3, "framing a light ignores noisy near-zero geometry extents");
+        navigation.frame({}, {.01,.01,.01}, true, 60, 1.5);
+        expect(navigation.distance >= .5, "framing tiny geometry stays outside the near plane");
+        const auto before_speed = navigation.fly_speed;
+        const auto before_distance = navigation.distance;
+        navigation.wheel(2,true);
+        expect(navigation.fly_speed > before_speed && navigation.distance == before_distance,
+               "freelook wheel changes fly speed without dollying");
+        const auto before_flight = navigation.position();
+        navigation.fly(1,0,0,.1,1);
+        expect(navigation.position() != before_flight, "WASD freelook translates the camera");
+    }
+
+    // Phase F editor contract. The human editor owns no mutation path of its own: every panel issues
+    // these exact ControlProtocol requests, so an inspector edit and an equivalent agent call must
+    // produce the same scene state and the same single undo entry.
+    {
+        const auto handle_of = [](const std::string& response) {
+            const std::string marker = R"("entity":")";
+            const auto start = response.find(marker);
+            if (start == std::string::npos) return std::string{};
+            const auto begin = start + marker.size();
+            return response.substr(begin, response.find('"', begin) - begin);
+        };
+        const auto entity = handle_of(
+            protocol.handle(R"({"id":200,"method":"scene.create","name":"EditorPanel"})"));
+        expect(!entity.empty(), "editor create panel returns a selectable handle");
+        const auto parsed_entity = relay::Entity::parse(entity).value();
+
+        const auto undo_before = engine.scene_history().undo_depth();
+        // One inspector drag commits every transform field in a single request.
+        const auto commit = protocol.handle(
+            R"({"id":201,"method":"scene.set_transform","entity":")" + entity +
+            R"(","px":1.5,"py":-2.25,"pz":0.75,"rx":0,"ry":45,"rz":0,"sx":2,"sy":2,"sz":2})");
+        expect(commit.find(R"("ok":true)") != std::string::npos,
+               "editor transform commit uses one protocol request");
+        expect(engine.scene_history().undo_depth() == undo_before + 1U,
+               "an editor transform gesture adds exactly one undo entry");
+        const auto* committed = engine.scene().get(parsed_entity);
+        expect(committed != nullptr && std::abs(committed->transform.position.x - 1.5) < 1e-9 &&
+                   std::abs(committed->transform.scale.y - 2.0) < 1e-9,
+               "editor transform commit preserves full-precision values");
+        expect(protocol.handle(R"({"id":202,"method":"scene.undo"})").find(R"("ok":true)") !=
+                       std::string::npos &&
+                   std::abs(engine.scene().get(parsed_entity)->transform.position.x) < 1e-9,
+               "undoing one editor gesture restores the whole transform");
+
+        // The camera panel sends every field it displays in one request.
+        expect(protocol.handle(R"({"id":203,"method":"scene.set_camera","entity":")" + entity +
+                               R"(","enabled":true,"active":true,"field_of_view_y_degrees":72,)"
+                               R"("near_plane":0.25,"far_plane":500,"orthographic_height":0})")
+                           .find(R"("ok":true)") != std::string::npos &&
+                   engine.scene().active_camera() == parsed_entity,
+               "editor camera panel activates a camera through the shared protocol");
+
+        // The renderer combos always send mesh and material together.
+        expect(protocol.handle(R"({"id":204,"method":"scene.set_renderer","entity":")" + entity +
+                               R"(","enabled":true,"mesh":"builtin.quad","material":"builtin.azure"})")
+                       .find(R"("ok":true)") != std::string::npos,
+               "editor renderer panel assigns mesh and material together");
+
+        // "Move to root" in the hierarchy context menu.
+        expect(protocol.handle(R"({"id":205,"method":"scene.set_parent","entity":")" + entity +
+                               R"(","parent":null})")
+                       .find(R"("ok":true)") != std::string::npos,
+               "editor reparent to root uses a null parent");
+
+        // A gizmo drag sends many updates but must remain one undoable step, otherwise a single
+        // drag would fill the bounded history and one undo would only rewind the last frame.
+        // The earlier ungrouped edit below shares this entity's label, which is exactly the case
+        // that must not be absorbed: a gesture is identified by its token, not by its label.
+        (void)protocol.handle(R"({"id":208,"method":"scene.set_transform","entity":")" + entity +
+                              R"(","px":-4})");
+        const auto drag_start = engine.scene_history().undo_depth();
+        for (int step = 1; step <= 6; ++step) {
+            (void)protocol.handle(R"({"id":209,"method":"scene.set_transform","entity":")" + entity +
+                                  R"(","px":)" + std::to_string(step) + R"(,"gesture":77})");
+        }
+        expect(engine.scene_history().undo_depth() == drag_start + 1U,
+               "a continuous gizmo drag collapses into one undo entry");
+        expect(std::abs(engine.scene().get(parsed_entity)->transform.position.x - 6.0) < 1e-9,
+               "a coalesced drag keeps the final dragged value");
+        expect(protocol.handle(R"({"id":210,"method":"scene.undo"})").find(R"("ok":true)") !=
+                       std::string::npos &&
+                   std::abs(engine.scene().get(parsed_entity)->transform.position.x + 4.0) < 1e-9,
+               "undoing a drag rewinds the whole gesture but not the edit that preceded it");
+
+        // A second drag must start its own entry rather than extending the first.
+        const auto second_drag_start = engine.scene_history().undo_depth();
+        (void)protocol.handle(R"({"id":211,"method":"scene.set_transform","entity":")" + entity +
+                              R"(","px":9,"gesture":78})");
+        (void)protocol.handle(R"({"id":212,"method":"scene.set_transform","entity":")" + entity +
+                              R"(","px":10,"gesture":78})");
+        expect(engine.scene_history().undo_depth() == second_drag_start + 1U,
+               "a new gesture token starts a new undo entry instead of extending the previous drag");
+
+        // Viewport picking is a stateless world-space ray, so agents can pick without an editor.
+        // The probe is parked away from the entities earlier tests left behind, so the assertion
+        // is about the ray rather than about which object happens to be nearest the origin.
+        (void)protocol.handle(R"({"id":213,"method":"scene.set_transform","entity":")" + entity +
+                              R"(","px":100,"py":0,"pz":0})");
+        expect(protocol.handle(R"({"id":214,"method":"scene.pick","origin_x":100,"origin_y":0,)"
+                               R"("origin_z":5,"direction_x":0,"direction_y":0,"direction_z":-1})")
+                       .find(R"("entity":")" + entity) != std::string::npos,
+               "a ray through an entity's bounds picks it");
+        expect(protocol.handle(R"({"id":215,"method":"scene.pick","origin_x":100,"origin_y":0,)"
+                               R"("origin_z":5,"direction_x":0,"direction_y":0,"direction_z":1})")
+                       .find(R"("entity":null)") != std::string::npos,
+               "a ray pointing away from every entity picks nothing");
+        expect(protocol.handle(R"({"id":216,"method":"scene.pick","origin_x":0,"origin_y":0,)"
+                               R"("origin_z":5,"direction_x":0,"direction_y":0,"direction_z":0})")
+                       .find(R"("ok":false)") != std::string::npos,
+               "a degenerate pick ray is refused rather than guessed");
+        expect(protocol.handle(R"({"id":217,"method":"scene.bounds","entity":")" + entity + R"("})")
+                       .find(R"("has_geometry":true)") != std::string::npos,
+               "entity bounds report drawable geometry for framing a selection");
+
+        // Renaming, the history list and the asset browser all go through the protocol too.
+        expect(protocol.handle(R"({"id":218,"method":"scene.rename","entity":")" + entity +
+                               R"(","name":"Renamed probe"})")
+                       .find(R"("name":"Renamed probe")") != std::string::npos,
+               "editor rename changes the entity name through the shared protocol");
+        expect(protocol.handle(R"({"id":219,"method":"scene.history"})").find(R"("Rename )") !=
+                   std::string::npos,
+               "the undo history exposes labels the editor can list");
+        // Built here rather than relying on the repository's assets directory, so the assertion
+        // holds wherever the suite is run from.
+        std::error_code listing_failure;
+        std::filesystem::create_directories("assets", listing_failure);
+        { std::ofstream{"assets/relay-listing-probe.gltf"} << "{}"; }
+        { std::ofstream{"assets/relay-listing-probe.txt"} << "not a model"; }
+        { std::ofstream{"assets/.relay-listing-hidden.gltf"} << "{}"; }
+        const auto listed = protocol.handle(R"({"id":220,"method":"assets.available"})");
+        expect(listed.find(R"("ok":true)") != std::string::npos &&
+                   listed.find("relay-listing-probe.gltf") != std::string::npos,
+               "the asset browser lists importable models from the project assets directory");
+        expect(listed.find("relay-listing-probe.txt") == std::string::npos &&
+                   listed.find(".relay-listing-hidden.gltf") == std::string::npos,
+               "the asset listing exposes only importable models, not other or hidden files");
+        std::filesystem::remove("assets/relay-listing-probe.gltf");
+        std::filesystem::remove("assets/relay-listing-probe.txt");
+        std::filesystem::remove("assets/.relay-listing-hidden.gltf");
+
+        // A selection whose entity was destroyed must be detectable, which is how the hierarchy
+        // clears a stale selection instead of inspecting a dangling handle.
+        expect(protocol.handle(R"({"id":206,"method":"scene.destroy","entity":")" + entity + R"("})")
+                       .find(R"("ok":true)") != std::string::npos,
+               "editor destroys the selected entity");
+        expect(protocol.handle(R"({"id":207,"method":"scene.inspect","entity":")" + entity + R"("})")
+                       .find(R"("ok":false)") != std::string::npos,
+               "inspecting a destroyed selection fails instead of returning stale state");
+    }
 
     std::filesystem::remove("scenes/protocol-test.relay.json");
     std::filesystem::remove("traces/test.relay-trace.jsonl");

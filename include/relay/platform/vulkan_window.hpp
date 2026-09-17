@@ -1,4 +1,6 @@
 #pragma once
+#include "relay/observe/capture.hpp"
+#include <functional>
 
 #include <cstdint>
 #include <filesystem>
@@ -9,6 +11,7 @@
 namespace relay {
 
 class AssetRegistry;
+class EditorOverlay;
 class Scene;
 
 class VulkanWindow {
@@ -16,7 +19,7 @@ public:
     // The registry supplies every mesh, material and texture this window uploads, and must outlive
     // the window. Imported content is picked up by comparing the registry revision each frame.
     VulkanWindow(std::string title, std::uint32_t width, std::uint32_t height,
-                 const AssetRegistry& assets);
+                 const AssetRegistry& assets, bool editor_window = false);
     ~VulkanWindow();
 
     VulkanWindow(const VulkanWindow&) = delete;
@@ -39,7 +42,14 @@ public:
     [[nodiscard]] std::uint32_t render_resource_count() const;
     [[nodiscard]] std::string render_graph_json() const;
     [[nodiscard]] std::string shader_interfaces_json() const;
+    using FrameReceiver = std::function<void(OwnedFrame, std::string)>;
+    bool readback_async(const Scene& scene, double elapsed_seconds, FrameReceiver receiver, std::string& error);
+    void flush_readbacks();
     void resize(std::uint32_t width, std::uint32_t height);
+    // Installs the human-facing UI layer. The overlay must outlive the window. It is drawn into the
+    // swapchain render pass for presentation only and is deliberately excluded from every capture
+    // and readback, so screenshots, recordings and golden comparisons keep showing scene pixels.
+    void set_overlay(EditorOverlay* overlay);
 
 private:
     struct Impl;

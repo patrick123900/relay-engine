@@ -11,11 +11,22 @@ SceneHistory::SceneHistory(Scene& scene, const std::size_t capacity)
     redo_stack_.reserve(capacity_);
 }
 
-bool SceneHistory::execute(std::string label, const std::function<bool(Scene&)>& operation) {
+bool SceneHistory::execute(std::string label, const std::function<bool(Scene&)>& operation,
+                           const std::uint64_t gesture) {
     auto before = scene_.capture_state();
     if (!operation(scene_)) return false;
+    // A continuing gesture folds into the transaction it is extending, keeping that transaction's
+    // original before-state. Dragging a gizmo therefore stays one undo entry however many updates
+    // it sends, instead of filling the bounded history with one entry per frame. The token has to
+    // match: an earlier edit of the same entity carries the same label but is a separate step.
+    if (gesture != 0U && !undo_stack_.empty() && undo_stack_.back().gesture == gesture && undo_stack_.back().label == label) {
+        undo_stack_.back().after = scene_.capture_state();
+        redo_stack_.clear();
+        return true;
+    }
     if (undo_stack_.size() == capacity_) undo_stack_.erase(undo_stack_.begin());
-    undo_stack_.push_back(Transaction{std::move(label), std::move(before), scene_.capture_state()});
+    undo_stack_.push_back(
+        Transaction{std::move(label), std::move(before), scene_.capture_state(), gesture});
     redo_stack_.clear();
     return true;
 }
@@ -45,6 +56,24 @@ void SceneHistory::clear() {
 
 std::size_t SceneHistory::undo_depth() const { return undo_stack_.size(); }
 std::size_t SceneHistory::redo_depth() const { return redo_stack_.size(); }
+
+std::vector<std::string> SceneHistory::undo_labels() const {
+    std::vector<std::string> labels;
+    labels.reserve(undo_stack_.size());
+    for (auto item = undo_stack_.rbegin(); item != undo_stack_.rend(); ++item) {
+        labels.push_back(item->label);
+    }
+    return labels;
+}
+
+std::vector<std::string> SceneHistory::redo_labels() const {
+    std::vector<std::string> labels;
+    labels.reserve(redo_stack_.size());
+    for (auto item = redo_stack_.rbegin(); item != redo_stack_.rend(); ++item) {
+        labels.push_back(item->label);
+    }
+    return labels;
+}
 
 std::string_view SceneHistory::next_undo_label() const {
     return undo_stack_.empty() ? std::string_view{} : undo_stack_.back().label;

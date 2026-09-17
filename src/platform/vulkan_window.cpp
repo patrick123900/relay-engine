@@ -1,4 +1,5 @@
 #include "relay/platform/vulkan_window.hpp"
+#include "relay/editor/editor_overlay.hpp"
 #include "relay/observe/capture.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/render/scene_render.hpp"
@@ -114,6 +115,8 @@ struct VulkanWindow::Impl {
     VkRenderPass render_pass{};
     VkPipelineLayout pipeline_layout{};
     VkPipeline pipeline{};
+    VkPipeline grid_pipeline{};
+    VkPipeline selection_mask_pipeline{}, selection_outline_pipeline{};
     // Each swapchain image owns its depth attachment. Multiple frames may be executing on the GPU
     // concurrently, so sharing one depth image across their framebuffers would introduce a write
     // hazard that the per-frame fences do not prevent.
@@ -129,6 +132,16 @@ struct VulkanWindow::Impl {
     std::array<VkSemaphore, frames_in_flight> image_available{};
     std::array<VkSemaphore, frames_in_flight> render_finished{};
     std::array<VkFence, frames_in_flight> frame_fences{};
+    struct Readback {
+        VkBuffer buffer{};
+        VkDeviceMemory memory{};
+        VkExtent2D extent{};
+        VkFormat format{};
+        std::uint64_t serial{};
+        FrameReceiver receiver;
+    };
+    std::array<Readback, frames_in_flight> readbacks{};
+    std::uint64_t readback_serial{};
     VkQueryPool timestamp_queries{};
     std::array<bool, frames_in_flight> timestamp_submitted{};
     float timestamp_period_nanoseconds{};
@@ -136,6 +149,7 @@ struct VulkanWindow::Impl {
     std::uint32_t latest_draw_calls{};
     std::size_t current_frame{};
     bool resized{false};
+    bool submission_failed{false};
     std::string selected_device_name;
     std::string last_error;
     std::vector<std::string> pending_input_events;
@@ -143,9 +157,16 @@ struct VulkanWindow::Impl {
     ShaderInterface vertex_interface;
     ShaderInterface fragment_interface;
     std::uint64_t uploaded_asset_revision{};
+    EditorOverlay* overlay{};
+    bool overlay_ready{false};
+    bool overlay_failed{false};
 
     ~Impl() {
         if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
+        flush_readbacks();
+        for (auto& slot : readbacks) {
+            if (device) { vkDestroyBuffer(device, slot.buffer, nullptr); vkFreeMemory(device, slot.memory, nullptr); }
+        }
         cleanup_swapchain();
         if (device != VK_NULL_HANDLE) {
             for (std::size_t index = 0; index < frames_in_flight; ++index) {
@@ -183,14 +204,16 @@ struct VulkanWindow::Impl {
         if (sdl_initialized) SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
     }
 
-    bool initialize(const std::string& title, const std::uint32_t width, const std::uint32_t height) {
+    bool initialize(const std::string& title, const std::uint32_t width, const std::uint32_t height, const bool editor_window) {
         if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
             last_error = SDL_GetError();
             return false;
         }
         sdl_initialized = true;
         window = SDL_CreateWindow(title.c_str(), static_cast<int>(width), static_cast<int>(height),
-                                  SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+                                  SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
+                                      (editor_window ? SDL_WINDOW_MAXIMIZED |
+                                                           SDL_WINDOW_HIGH_PIXEL_DENSITY : 0));
         if (window == nullptr) {
             last_error = SDL_GetError();
             return false;
@@ -490,6 +513,8 @@ struct VulkanWindow::Impl {
             submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submit.commandBufferCount = 1U;
             submit.pCommandBuffers = &commands;
+            // This upload synchronizes with vkQueueWaitIdle and submits no fence, so there is
+            // nothing to reset here. The frame fences do not exist yet during initialization.
             result = vkQueueSubmit(graphics_queue, 1U, &submit, VK_NULL_HANDLE);
             if (result == VK_SUCCESS) result = vkQueueWaitIdle(graphics_queue);
         }
@@ -712,6 +737,8 @@ struct VulkanWindow::Impl {
             submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submit.commandBufferCount = 1U;
             submit.pCommandBuffers = &commands;
+            // Same as the mesh upload: no fence is submitted, and initialization has not created
+            // the frame fences yet.
             result = vkQueueSubmit(graphics_queue, 1U, &submit, VK_NULL_HANDLE);
             if (result == VK_SUCCESS) result = vkQueueWaitIdle(graphics_queue);
         }
@@ -968,7 +995,7 @@ struct VulkanWindow::Impl {
         transfer_source_supported =
             (capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0U;
         create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                 (transfer_source_supported ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0U);
+                                 (transfer_source_supported ? static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_TRANSFER_SRC_BIT) : 0U);
         const std::array queue_indices{graphics_family, present_family};
         if (graphics_family != present_family) {
             create_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
@@ -1016,8 +1043,7 @@ struct VulkanWindow::Impl {
 
     // Picks the first depth format the device can use as an optimally tiled depth attachment.
     VkFormat select_depth_format() const {
-        static constexpr std::array candidates{VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT,
-                                               VK_FORMAT_D24_UNORM_S8_UINT};
+        static constexpr std::array candidates{VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT};
         for (const auto candidate : candidates) {
             VkFormatProperties properties{};
             vkGetPhysicalDeviceFormatProperties(physical_device, candidate, &properties);
@@ -1079,7 +1105,7 @@ struct VulkanWindow::Impl {
             view_info.image = depth.image;
             view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
             view_info.format = depth_format;
-            view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
             view_info.subresourceRange.levelCount = 1U;
             view_info.subresourceRange.layerCount = 1U;
             result = vkCreateImageView(device, &view_info, nullptr, &depth.view);
@@ -1109,7 +1135,7 @@ struct VulkanWindow::Impl {
         depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         // Depth is consumed entirely within the pass; nothing reads it afterwards.
         depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        depth_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depth_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         depth_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depth_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         depth_attachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -1139,7 +1165,7 @@ struct VulkanWindow::Impl {
         dependencies[1].dstStageMask = transfer_source_supported ? VK_PIPELINE_STAGE_TRANSFER_BIT
                                                                   : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
         dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        dependencies[1].dstAccessMask = transfer_source_supported ? VK_ACCESS_TRANSFER_READ_BIT : 0U;
+        dependencies[1].dstAccessMask = transfer_source_supported ? static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_READ_BIT) : 0U;
         const std::array attachments{color_attachment, depth_attachment};
         VkRenderPassCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -1291,6 +1317,99 @@ struct VulkanWindow::Impl {
         if (result == VK_SUCCESS) {
             result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline);
         }
+        if (result == VK_SUCCESS) {
+            const auto selection_vertex = read_shader(RELAY_SELECTION_VERTEX_PATH, last_error);
+            const auto selection_fragment = read_shader(RELAY_SELECTION_FRAGMENT_PATH, last_error);
+            const auto vertex_layout = reflect_spirv(selection_vertex);
+            const auto fragment_layout = reflect_spirv(selection_fragment);
+            if (!vertex_layout.valid || !fragment_layout.valid ||
+                vertex_layout.push_constant_bytes != sizeof(DrawPushConstants) ||
+                fragment_layout.push_constant_bytes != sizeof(DrawPushConstants)) {
+                last_error = "selection shader layout does not match native push constants";
+                result = VK_ERROR_INITIALIZATION_FAILED;
+            }
+            VkShaderModule selection_vertex_module{}, selection_fragment_module{};
+            vertex_info.codeSize = selection_vertex.size() * sizeof(std::uint32_t);
+            vertex_info.pCode = selection_vertex.data();
+            fragment_info.codeSize = selection_fragment.size() * sizeof(std::uint32_t);
+            fragment_info.pCode = selection_fragment.data();
+            if (result == VK_SUCCESS)
+                result = vkCreateShaderModule(device, &vertex_info, nullptr, &selection_vertex_module);
+            if (result == VK_SUCCESS)
+                result = vkCreateShaderModule(device, &fragment_info, nullptr, &selection_fragment_module);
+            auto selection_stages = stages;
+            selection_stages[0].module = selection_vertex_module;
+            selection_stages[1].module = selection_fragment_module;
+            pipeline_info.pStages = selection_stages.data();
+            vertex_input.vertexAttributeDescriptionCount = 2;
+            depth_stencil.depthWriteEnable = VK_FALSE;
+            depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+            depth_stencil.stencilTestEnable = VK_TRUE;
+            depth_stencil.front = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP,
+                                   VK_COMPARE_OP_ALWAYS, 0xff, 0xff, 1};
+            depth_stencil.back = depth_stencil.front;
+            const auto color_mask = blend_attachment.colorWriteMask;
+            blend_attachment.colorWriteMask = 0;
+            if (result == VK_SUCCESS)
+                result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                                   nullptr, &selection_mask_pipeline);
+            blend_attachment.colorWriteMask = color_mask;
+            depth_stencil.front.passOp = VK_STENCIL_OP_KEEP;
+            depth_stencil.front.compareOp = VK_COMPARE_OP_NOT_EQUAL;
+            depth_stencil.front.writeMask = 0;
+            depth_stencil.back = depth_stencil.front;
+            if (result == VK_SUCCESS)
+                result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                                   nullptr, &selection_outline_pipeline);
+            vkDestroyShaderModule(device, selection_fragment_module, nullptr);
+            vkDestroyShaderModule(device, selection_vertex_module, nullptr);
+            depth_stencil.stencilTestEnable = VK_FALSE;
+            depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS;
+        }
+        if (result == VK_SUCCESS) {
+            const auto grid_vertex = read_shader(RELAY_GRID_VERTEX_PATH, last_error);
+            const auto grid_fragment = read_shader(RELAY_GRID_FRAGMENT_PATH, last_error);
+            const auto grid_vertex_interface = reflect_spirv(grid_vertex);
+            const auto grid_fragment_interface = reflect_spirv(grid_fragment);
+            if (!grid_vertex_interface.valid || !grid_fragment_interface.valid ||
+                grid_vertex_interface.push_constant_bytes != sizeof(DrawPushConstants) ||
+                grid_fragment_interface.push_constant_bytes != sizeof(DrawPushConstants)) {
+                last_error = "editor grid shader layout does not match native push constants";
+                result = VK_ERROR_INITIALIZATION_FAILED;
+            }
+            VkShaderModule grid_vertex_module{}, grid_fragment_module{};
+            if (grid_vertex.empty() || grid_fragment.empty())
+                result = VK_ERROR_INITIALIZATION_FAILED;
+            if (result == VK_SUCCESS) {
+                vertex_info.codeSize = grid_vertex.size() * sizeof(std::uint32_t);
+                vertex_info.pCode = grid_vertex.data();
+                fragment_info.codeSize = grid_fragment.size() * sizeof(std::uint32_t);
+                fragment_info.pCode = grid_fragment.data();
+                result = vkCreateShaderModule(device, &vertex_info, nullptr, &grid_vertex_module);
+                if (result == VK_SUCCESS)
+                    result = vkCreateShaderModule(device, &fragment_info, nullptr,
+                                                  &grid_fragment_module);
+            }
+            auto grid_stages = stages;
+            grid_stages[0].module = grid_vertex_module;
+            grid_stages[1].module = grid_fragment_module;
+            pipeline_info.pStages = grid_stages.data();
+            vertex_input.vertexBindingDescriptionCount = 0;
+            vertex_input.vertexAttributeDescriptionCount = 0;
+            depth_stencil.depthWriteEnable = VK_FALSE;
+            blend_attachment.blendEnable = VK_TRUE;
+            blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+            blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+            if (result == VK_SUCCESS)
+                result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                                   nullptr, &grid_pipeline);
+            vkDestroyShaderModule(device, grid_fragment_module, nullptr);
+            vkDestroyShaderModule(device, grid_vertex_module, nullptr);
+        }
         vkDestroyShaderModule(device, fragment_module, nullptr);
         vkDestroyShaderModule(device, vertex_module, nullptr);
         if (result != VK_SUCCESS) {
@@ -1312,7 +1431,8 @@ struct VulkanWindow::Impl {
             create_info.width = swapchain_extent.width;
             create_info.height = swapchain_extent.height;
             create_info.layers = 1;
-            const auto result = vkCreateFramebuffer(device, &create_info, nullptr, &framebuffers[index]);
+            const auto result =
+                vkCreateFramebuffer(device, &create_info, nullptr, &framebuffers[index]);
             if (result != VK_SUCCESS) {
                 last_error = vk_error("vkCreateFramebuffer", result);
                 return false;
@@ -1346,8 +1466,18 @@ struct VulkanWindow::Impl {
 
     void cleanup_swapchain() {
         if (device == VK_NULL_HANDLE) return;
+        // The overlay builds pipelines against render_pass, which is about to be destroyed.
+        if (overlay != nullptr && overlay_ready) {
+            overlay->invalidate();
+            overlay_ready = false;
+        }
         for (const auto framebuffer : framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
         framebuffers.clear();
+        vkDestroyPipeline(device, selection_mask_pipeline, nullptr);
+        vkDestroyPipeline(device, selection_outline_pipeline, nullptr);
+        selection_mask_pipeline = selection_outline_pipeline = VK_NULL_HANDLE;
+        vkDestroyPipeline(device, grid_pipeline, nullptr);
+        grid_pipeline = VK_NULL_HANDLE;
         vkDestroyPipeline(device, pipeline, nullptr);
         pipeline = VK_NULL_HANDLE;
         vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
@@ -1387,12 +1517,14 @@ struct VulkanWindow::Impl {
     bool record_commands(const VkCommandBuffer commands, const std::uint32_t image_index,
                          const float elapsed_seconds, const Scene* scene,
                          const VkBuffer capture_buffer) {
+        const auto region = (overlay ? overlay->scene_viewport() : EditorViewport{}).pixels(
+            swapchain_extent.width, swapchain_extent.height);
         RenderScene render_scene;
-        if (scene && !scene->entities().empty())
+        if (scene)
             render_scene =
                 build_render_scene(*scene, *assets,
-                                   static_cast<float>(swapchain_extent.width) /
-                                       static_cast<float>(std::max(swapchain_extent.height, 1U)));
+                                   static_cast<float>(region.width) / static_cast<float>(region.height),
+                                   overlay != nullptr ? overlay->view_override() : nullptr);
         if (render_scene.deformation_overflow) {
             last_error = "scene exceeds four million deformed vertices per frame";
             return false;
@@ -1464,7 +1596,8 @@ struct VulkanWindow::Impl {
             vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamp_queries, first_query);
         }
         std::array<VkClearValue, 2> clear{};
-        clear[0].color = {{0.012F, 0.018F, 0.045F, 1.0F}};
+        clear[0].color = overlay ? VkClearColorValue{{0.014444F, 0.014444F, 0.014444F, 1.0F}}
+                                 : VkClearColorValue{{0.012F, 0.018F, 0.045F, 1.0F}};
         // Reversed-Z is not in use, so the far plane clears to 1.0 and LESS keeps the nearest write.
         clear[1].depthStencil = {1.0F, 0U};
         VkRenderPassBeginInfo render_info{};
@@ -1475,62 +1608,143 @@ struct VulkanWindow::Impl {
         render_info.clearValueCount = static_cast<std::uint32_t>(clear.size());
         render_info.pClearValues = clear.data();
         vkCmdBeginRenderPass(commands, &render_info, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        VkViewport viewport{};
-        viewport.width = static_cast<float>(swapchain_extent.width);
-        viewport.height = static_cast<float>(swapchain_extent.height);
-        viewport.maxDepth = 1.0F;
-        VkRect2D scissor{};
-        scissor.extent = swapchain_extent;
-        vkCmdSetViewport(commands, 0, 1, &viewport);
-        vkCmdSetScissor(commands, 0, 1, &scissor);
-        const VkDeviceSize vertex_offset = 0U;
-        vkCmdBindVertexBuffers(commands, 0U, 1U, &mesh_vertex_buffer, &vertex_offset);
-        vkCmdBindIndexBuffer(commands, mesh_index_buffer, 0U, VK_INDEX_TYPE_UINT32);
-        vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0U, 1U,
-                                &texture_sets[current_frame], 0U, nullptr);
         latest_draw_calls = 0U;
-        if (scene != nullptr && !scene->entities().empty()) {
-            for (const auto& instance : render_scene.instances) {
-                const auto* mesh = assets->find_mesh(instance.mesh);
-                if (mesh == nullptr) continue;
-                const auto buffer = instance.deformed_vertex_offset >= 0
-                                        ? deformed_buffers[current_frame]
-                                        : mesh_vertex_buffer;
-                vkCmdBindVertexBuffers(commands, 0, 1, &buffer, &vertex_offset);
-                const DrawPushConstants constants{instance.model_view_projection.values,
-                                                  instance.model.values};
+        // The UI invokes this at its viewport draw callback, so overlapping floating windows use
+        // ordinary UI z-order. Captures invoke the same scene draw directly and exclude all chrome.
+        const auto draw_scene = [&] {
+            VkClearAttachment scene_background{};
+            scene_background.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            scene_background.colorAttachment = 0;
+            scene_background.clearValue = clear[0];
+            VkClearRect scene_rect{};
+            scene_rect.rect.offset = {static_cast<std::int32_t>(region.x), static_cast<std::int32_t>(region.y)};
+            scene_rect.rect.extent = {region.width, region.height};
+            scene_rect.layerCount = 1;
+            vkCmdClearAttachments(commands, 1, &scene_background, 1, &scene_rect);
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            VkViewport viewport{};
+            viewport.x = static_cast<float>(region.x);
+            viewport.y = static_cast<float>(region.y);
+            viewport.width = static_cast<float>(region.width);
+            viewport.height = static_cast<float>(region.height);
+            viewport.maxDepth = 1.0F;
+            VkRect2D scissor{};
+            scissor.offset = {static_cast<std::int32_t>(region.x), static_cast<std::int32_t>(region.y)};
+            scissor.extent = {region.width, region.height};
+            vkCmdSetViewport(commands, 0, 1, &viewport);
+            vkCmdSetScissor(commands, 0, 1, &scissor);
+            const VkDeviceSize vertex_offset = 0U;
+            vkCmdBindVertexBuffers(commands, 0U, 1U, &mesh_vertex_buffer, &vertex_offset);
+            vkCmdBindIndexBuffer(commands, mesh_index_buffer, 0U, VK_INDEX_TYPE_UINT32);
+            vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0U, 1U,
+                                    &texture_sets[current_frame], 0U, nullptr);
+            if (scene != nullptr && !scene->entities().empty()) {
+                for (const auto& draw_instance : render_scene.instances) {
+                    const auto* mesh = assets->find_mesh(draw_instance.mesh);
+                    if (mesh == nullptr)
+                        continue;
+                    const auto buffer = draw_instance.deformed_vertex_offset >= 0
+                                            ? deformed_buffers[current_frame]
+                                            : mesh_vertex_buffer;
+                    vkCmdBindVertexBuffers(commands, 0, 1, &buffer, &vertex_offset);
+                    const DrawPushConstants constants{draw_instance.model_view_projection.values,
+                                                      draw_instance.model.values};
+                    vkCmdPushConstants(commands, pipeline_layout,
+                                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                       sizeof(constants), &constants);
+                    vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
+                                     draw_instance.deformed_vertex_offset >= 0
+                                         ? draw_instance.deformed_vertex_offset
+                                         : mesh->vertex_offset,
+                                     draw_instance.material_index);
+                    ++latest_draw_calls;
+                }
+            } else if (scene == nullptr) {
+                const float angle = elapsed_seconds * 0.35F;
+                const float cosine = std::cos(angle);
+                const float sine = std::sin(angle);
+                DrawPushConstants constants{};
+                constants.model_view_projection = {cosine, sine, 0.0F, 0.0F,
+                                                    -sine, cosine, 0.0F, 0.0F,
+                                                    0.0F, 0.0F, 1.0F, 0.0F,
+                                                    0.0F, 0.0F, 0.0F, 1.0F};
+                constants.model = {1.0F, 0.0F, 0.0F, 0.0F,
+                                   0.0F, 1.0F, 0.0F, 0.0F,
+                                   0.0F, 0.0F, 1.0F, 0.0F,
+                                   0.0F, 0.0F, 0.0F, 1.0F};
                 vkCmdPushConstants(commands, pipeline_layout,
                                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                    sizeof(constants), &constants);
-                vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
-                                 instance.deformed_vertex_offset >= 0
-                                     ? instance.deformed_vertex_offset
-                                     : mesh->vertex_offset,
-                                 instance.material_index);
-                ++latest_draw_calls;
+                if (const auto* mesh = assets->find_mesh("builtin.triangle")) {
+                    vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
+                                     mesh->vertex_offset, assets->material_index("builtin.orange"));
+                }
+                latest_draw_calls = 1U;
             }
+            if (overlay && overlay->ground_grid_visible() && capture_buffer == VK_NULL_HANDLE) {
+                DrawPushConstants grid_constants{};
+                grid_constants.model_view_projection = render_scene.camera.view_projection.values;
+                grid_constants.model[0] = static_cast<float>(render_scene.camera_position.x);
+                grid_constants.model[1] = static_cast<float>(render_scene.camera_position.y);
+                grid_constants.model[2] = static_cast<float>(render_scene.camera_position.z);
+                vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, grid_pipeline);
+                vkCmdPushConstants(commands, pipeline_layout,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                   sizeof(grid_constants), &grid_constants);
+                vkCmdDraw(commands, 6, 2, 0, 0);
+                vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            }
+            const Entity selected = overlay && capture_buffer == VK_NULL_HANDLE
+                                        ? overlay->selected_entity() : Entity{};
+            if (selected.valid()) {
+                const auto draw_selection = [&](bool outline) {
+                    vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      outline ? selection_outline_pipeline : selection_mask_pipeline);
+                    for (const auto& draw_instance : render_scene.instances) {
+                        Entity ancestor = draw_instance.entity;
+                        while (ancestor.valid() && ancestor != selected) {
+                            const auto* record = scene ? scene->get(ancestor) : nullptr;
+                            ancestor = record ? record->parent : Entity{};
+                        }
+                        if (ancestor != selected) continue;
+                        const auto* mesh = assets->find_mesh(draw_instance.mesh);
+                        if (!mesh) continue;
+                        const auto buffer = draw_instance.deformed_vertex_offset >= 0
+                                                ? deformed_buffers[current_frame] : mesh_vertex_buffer;
+                        vkCmdBindVertexBuffers(commands, 0, 1, &buffer, &vertex_offset);
+                        DrawPushConstants constants{};
+                        constants.model_view_projection = draw_instance.model_view_projection.values;
+                        if (outline) {
+                            const float scale = SDL_GetWindowDisplayScale(window);
+                            const float pixels = 2.0F * (scale > 0.0F ? scale : 1.0F);
+                            constants.model[0] = 2.0F * pixels / static_cast<float>(region.width);
+                            constants.model[1] = 2.0F * pixels / static_cast<float>(region.height);
+                        }
+                        constants.model[4] = 1.0F;
+                        constants.model[5] = 0.485F;
+                        constants.model[6] = 0.03F;
+                        vkCmdPushConstants(commands, pipeline_layout,
+                                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                           0, sizeof(constants), &constants);
+                        vkCmdDrawIndexed(commands, mesh->index_count, outline ? 8U : 1U,
+                                         mesh->first_index, draw_instance.deformed_vertex_offset >= 0
+                                             ? draw_instance.deformed_vertex_offset : mesh->vertex_offset,
+                                         draw_instance.material_index * 8U);
+                        ++latest_draw_calls;
+                    }
+                };
+                draw_selection(false);
+                draw_selection(true);
+                vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            }
+        };
+        // The overlay is presentation-only. record_commands is shared with the capture and readback
+        // paths, and drawing UI there would change every golden image, so it is skipped whenever a
+        // capture buffer is bound.
+        if (overlay != nullptr && overlay_ready && capture_buffer == VK_NULL_HANDLE) {
+            overlay->record(commands, draw_scene);
         } else {
-            const float angle = elapsed_seconds * 0.35F;
-            const float cosine = std::cos(angle);
-            const float sine = std::sin(angle);
-            DrawPushConstants constants{};
-            constants.model_view_projection = {cosine, sine, 0.0F, 0.0F,
-                                                -sine, cosine, 0.0F, 0.0F,
-                                                0.0F, 0.0F, 1.0F, 0.0F,
-                                                0.0F, 0.0F, 0.0F, 1.0F};
-            constants.model = {1.0F, 0.0F, 0.0F, 0.0F,
-                               0.0F, 1.0F, 0.0F, 0.0F,
-                               0.0F, 0.0F, 1.0F, 0.0F,
-                               0.0F, 0.0F, 0.0F, 1.0F};
-            vkCmdPushConstants(commands, pipeline_layout,
-                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                               sizeof(constants), &constants);
-            if (const auto* mesh = assets->find_mesh("builtin.triangle")) {
-                vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
-                                 mesh->vertex_offset, assets->material_index("builtin.orange"));
-            }
-            latest_draw_calls = 1U;
+            draw_scene();
         }
         vkCmdEndRenderPass(commands);
         if (transfer_source_supported) {
@@ -1572,6 +1786,8 @@ struct VulkanWindow::Impl {
 
     bool draw(const double elapsed, const Scene* scene = nullptr,
               const VkBuffer capture_buffer = VK_NULL_HANDLE) {
+        if (submission_failed) return false;
+        collect_readbacks(false);
         if (!refresh_mesh_assets()) return false;
         if (swapchain == VK_NULL_HANDLE) return recreate_swapchain();
         auto result = vkWaitForFences(device, 1, &frame_fences[current_frame], VK_TRUE,
@@ -1580,6 +1796,7 @@ struct VulkanWindow::Impl {
             last_error = vk_error("vkWaitForFences", result);
             return false;
         }
+        collect_readbacks(false);
         if (timestamp_queries != VK_NULL_HANDLE && timestamp_submitted[current_frame]) {
             std::array<std::uint64_t, 2> timestamps{};
             const auto query_result = vkGetQueryPoolResults(
@@ -1599,10 +1816,35 @@ struct VulkanWindow::Impl {
             last_error = vk_error("vkAcquireNextImageKHR", result);
             return false;
         }
-        vkResetFences(device, 1, &frame_fences[current_frame]);
+        // Build the UI for this frame only when it will actually be presented. A failed overlay is
+        // latched so a broken UI degrades to a plain viewport instead of retrying every frame.
+        if (overlay != nullptr && !overlay_failed && capture_buffer == VK_NULL_HANDLE) {
+            if (!overlay_ready) {
+                OverlayContext context{};
+                context.sdl_window = window;
+                context.api_version = VK_API_VERSION_1_0;
+                context.instance = instance;
+                context.physical_device = physical_device;
+                context.device = device;
+                context.graphics_family = graphics_family;
+                context.graphics_queue = graphics_queue;
+                context.render_pass = render_pass;
+                context.image_count = static_cast<std::uint32_t>(swapchain_images.size());
+                context.frames_in_flight = static_cast<std::uint32_t>(frames_in_flight);
+                std::string overlay_error;
+                if (overlay->initialize(context, overlay_error)) {
+                    overlay_ready = true;
+                } else {
+                    overlay_failed = true;
+                    last_error = "editor overlay unavailable: " + overlay_error;
+                }
+            }
+            if (overlay_ready) overlay->build(swapchain_extent.width, swapchain_extent.height);
+        }
         vkResetCommandBuffer(command_buffers[current_frame], 0);
         if (!record_commands(command_buffers[current_frame], image_index, static_cast<float>(elapsed),
                              scene, capture_buffer)) {
+            submission_failed = true;
             return false;
         }
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1615,8 +1857,10 @@ struct VulkanWindow::Impl {
         submit_info.pCommandBuffers = &command_buffers[current_frame];
         submit_info.signalSemaphoreCount = 1;
         submit_info.pSignalSemaphores = &render_finished[current_frame];
+        vkResetFences(device, 1, &frame_fences[current_frame]);
         result = vkQueueSubmit(graphics_queue, 1, &submit_info, frame_fences[current_frame]);
         if (result != VK_SUCCESS) {
+            submission_failed = true;
             last_error = vk_error("vkQueueSubmit", result);
             return false;
         }
@@ -1699,70 +1943,83 @@ struct VulkanWindow::Impl {
         return true;
     }
 
-    bool write_capture(const std::filesystem::path& path, const void* mapped) {
-        const bool bgra = swapchain_format == VK_FORMAT_B8G8R8A8_SRGB ||
-                          swapchain_format == VK_FORMAT_B8G8R8A8_UNORM;
-        const bool rgba = swapchain_format == VK_FORMAT_R8G8B8A8_SRGB ||
-                          swapchain_format == VK_FORMAT_R8G8B8A8_UNORM;
-        if (!bgra && !rgba) {
-            last_error = "frame capture currently requires an 8-bit BGRA or RGBA swapchain";
-            return false;
+    void collect_readbacks(bool wait) {
+        std::array<std::size_t, frames_in_flight> order{0, 1};
+        std::sort(order.begin(), order.end(), [&](auto a, auto b) { return readbacks[a].serial < readbacks[b].serial; });
+        for (const auto index : order) {
+            auto& slot = readbacks[index];
+            if (!slot.receiver) continue;
+            auto result = wait ? vkWaitForFences(device, 1, &frame_fences[index], VK_TRUE,
+                std::numeric_limits<std::uint64_t>::max()) : vkGetFenceStatus(device, frame_fences[index]);
+            if (result == VK_NOT_READY) break;
+            auto receiver = std::move(slot.receiver);
+            slot.receiver = {};
+            if (result != VK_SUCCESS) { receiver({}, vk_error("readback fence", result)); continue; }
+            const auto size = static_cast<std::size_t>(slot.extent.width) * slot.extent.height * 4U;
+            void* mapped = nullptr;
+            result = vkMapMemory(device, slot.memory, 0, size, 0, &mapped);
+            if (result != VK_SUCCESS) { receiver({}, vk_error("readback mapping", result)); continue; }
+            OwnedFrame frame{slot.extent.width, slot.extent.height, std::vector<std::uint8_t>(size)};
+            std::memcpy(frame.rgba.data(), mapped, size);
+            vkUnmapMemory(device, slot.memory);
+            if (slot.format == VK_FORMAT_B8G8R8A8_SRGB || slot.format == VK_FORMAT_B8G8R8A8_UNORM)
+                for (std::size_t offset = 0; offset < size; offset += 4U) std::swap(frame.rgba[offset], frame.rgba[offset+2U]);
+            receiver(std::move(frame), {});
         }
-        OwnedFrame frame{swapchain_extent.width, swapchain_extent.height,
-                         std::vector<std::uint8_t>(static_cast<std::size_t>(swapchain_extent.width) *
-                                                  swapchain_extent.height * 4U)};
-        const auto* pixels = static_cast<const std::uint8_t*>(mapped);
-        for (std::uint32_t y = 0; y < swapchain_extent.height; ++y) {
-            for (std::uint32_t x = 0; x < swapchain_extent.width; ++x) {
-                const auto offset = (static_cast<std::size_t>(y) * swapchain_extent.width + x) * 4U;
-                frame.rgba[offset] = bgra ? pixels[offset + 2U] : pixels[offset];
-                frame.rgba[offset + 1U] = pixels[offset + 1U];
-                frame.rgba[offset + 2U] = bgra ? pixels[offset] : pixels[offset + 2U];
-                frame.rgba[offset + 3U] = pixels[offset + 3U];
-            }
+    }
+
+    void flush_readbacks() { if (device) collect_readbacks(true); }
+
+    bool readback_async(const Scene* scene, double elapsed, FrameReceiver receiver, std::string& error) {
+        collect_readbacks(false);
+        if (!transfer_source_supported || swapchain == VK_NULL_HANDLE) {
+            error = "Vulkan swapchain readback is unavailable"; return false;
         }
-        return write_frame_image(frame.view(), path, last_error);
+        if (swapchain_format != VK_FORMAT_B8G8R8A8_SRGB && swapchain_format != VK_FORMAT_B8G8R8A8_UNORM &&
+            swapchain_format != VK_FORMAT_R8G8B8A8_SRGB && swapchain_format != VK_FORMAT_R8G8B8A8_UNORM) {
+            error = "readback requires an 8-bit RGBA or BGRA swapchain"; return false;
+        }
+        auto& slot = readbacks[current_frame];
+        if (slot.receiver) { error = "Vulkan readback ring is full"; return false; }
+        // Bound staging memory, even on very large desktop surfaces.
+        if (static_cast<std::uint64_t>(swapchain_extent.width) * swapchain_extent.height * 4U > 64U * 1024U * 1024U) {
+            error = "Vulkan readback exceeds the 64 MiB slot budget"; return false;
+        }
+        if (!slot.buffer || slot.extent.width != swapchain_extent.width || slot.extent.height != swapchain_extent.height) {
+            vkDestroyBuffer(device, slot.buffer, nullptr); vkFreeMemory(device, slot.memory, nullptr);
+            slot.buffer = {}; slot.memory = {};
+            if (!create_capture_buffer(slot.buffer, slot.memory)) { error = last_error; return false; }
+        }
+        slot.extent = swapchain_extent;
+        slot.format = swapchain_format;
+        const auto index = current_frame;
+        if (!draw(elapsed, scene, slot.buffer)) { error = last_error; return false; }
+        // An acquire-time resize can return without submitting a copy.
+        if (current_frame == index) { error = "swapchain changed before readback submission; retry capture"; return false; }
+        slot.serial = ++readback_serial;
+        slot.receiver = std::move(receiver);
+        error.clear();
+        return true;
     }
 
     bool capture_image(const std::filesystem::path& path, const double elapsed, const Scene* scene) {
-        if (!transfer_source_supported) {
-            last_error = "the window surface does not support swapchain transfer-source images";
-            return false;
-        }
-        VkBuffer buffer{};
-        VkDeviceMemory memory{};
-        if (!create_capture_buffer(buffer, memory)) return false;
-        bool captured = draw(elapsed, scene, buffer);
-        if (captured) {
-            const auto wait_result = vkDeviceWaitIdle(device);
-            if (wait_result != VK_SUCCESS) {
-                last_error = vk_error("capture queue wait", wait_result);
-                captured = false;
-            }
-        }
-        void* mapped = nullptr;
-        if (captured) {
-            const auto byte_count = static_cast<VkDeviceSize>(swapchain_extent.width) *
-                                    swapchain_extent.height * 4U;
-            const auto map_result = vkMapMemory(device, memory, 0, byte_count, 0, &mapped);
-            if (map_result != VK_SUCCESS) {
-                last_error = vk_error("capture memory mapping", map_result);
-                captured = false;
-            }
-        }
-        if (captured) captured = write_capture(path, mapped);
-        if (mapped != nullptr) vkUnmapMemory(device, memory);
-        vkDestroyBuffer(device, buffer, nullptr);
-        vkFreeMemory(device, memory, nullptr);
+        bool captured = false;
+        if (!readback_async(scene, elapsed, [&](OwnedFrame frame, std::string failure) {
+            if (!failure.empty()) last_error = std::move(failure);
+            else captured = write_frame_image(frame.view(), path, last_error);
+        }, last_error)) return false;
+        flush_readbacks();
         return captured;
     }
+
 };
 
 VulkanWindow::VulkanWindow(std::string title, const std::uint32_t width,
-                           const std::uint32_t height, const AssetRegistry& assets)
+                           const std::uint32_t height, const AssetRegistry& assets,
+                           const bool editor_window)
     : impl_(std::make_unique<Impl>()) {
     impl_->assets = &assets;
-    impl_->initialize(title, width, height);
+    impl_->initialize(title, width, height, editor_window);
 }
 
 VulkanWindow::~VulkanWindow() = default;
@@ -1785,6 +2042,16 @@ std::string VulkanWindow::device_name() const {
 bool VulkanWindow::poll_quit() {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        // The overlay sees every event first. When it claims one, the event is UI interaction
+        // rather than player input, so it must not reach the deterministic input trace and must not
+        // be interpreted as a quit request.
+        const bool consumed_by_overlay =
+            impl_->overlay != nullptr && impl_->overlay_ready && impl_->overlay->handle_event(&event);
+        if (consumed_by_overlay) {
+            if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) impl_->resized = true;
+            if (event.type == SDL_EVENT_QUIT) return true;
+            continue;
+        }
         if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
             impl_->pending_input_events.push_back(
                 std::string{"key:"} + (event.type == SDL_EVENT_KEY_DOWN ? "down:" : "up:") +
@@ -1812,7 +2079,12 @@ bool VulkanWindow::poll_quit() {
                 std::to_string(event.gbutton.which) + ':' + std::to_string(event.gbutton.button));
         }
         if (event.type == SDL_EVENT_QUIT) return true;
-        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE) return true;
+        // Escape closes the bare demo window, but in the editor it would throw away unsaved work
+        // on a keypress people use to dismiss menus. There, only closing the window quits.
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE &&
+            impl_->overlay == nullptr) {
+            return true;
+        }
         if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) impl_->resized = true;
     }
     return false;
@@ -1832,6 +2104,12 @@ bool VulkanWindow::draw(const double elapsed_seconds) {
 bool VulkanWindow::draw(const Scene& scene, const double elapsed_seconds) {
     return impl_ && impl_->draw(elapsed_seconds, &scene);
 }
+
+bool VulkanWindow::readback_async(const Scene& scene, double elapsed, FrameReceiver receiver, std::string& error) {
+    if (!impl_) { error = "Vulkan window is unavailable"; return false; }
+    return impl_->readback_async(&scene, elapsed, std::move(receiver), error);
+}
+void VulkanWindow::flush_readbacks() { if (impl_) impl_->flush_readbacks(); }
 
 bool VulkanWindow::capture_image(const std::filesystem::path& path, const double elapsed_seconds) {
     return impl_ && impl_->capture_image(path, elapsed_seconds, nullptr);
@@ -1856,7 +2134,7 @@ std::uint32_t VulkanWindow::render_resource_count() const {
     const std::size_t depth_resources = impl_->depth_attachments.size() * 3U;
     return static_cast<std::uint32_t>(impl_->swapchain_images.size() + impl_->image_views.size() +
                                       impl_->framebuffers.size() + impl_->textures.size() * 4U +
-                                      depth_resources + 10U);
+                                      depth_resources + 11U);
 }
 
 std::string VulkanWindow::render_graph_json() const {
@@ -1873,6 +2151,17 @@ void VulkanWindow::resize(const std::uint32_t width, const std::uint32_t height)
     if (!impl_ || impl_->window == nullptr) return;
     SDL_SetWindowSize(impl_->window, static_cast<int>(width), static_cast<int>(height));
     impl_->resized = true;
+}
+
+void VulkanWindow::set_overlay(EditorOverlay* const overlay) {
+    if (!impl_) return;
+    if (impl_->overlay != nullptr && impl_->overlay_ready) {
+        if (impl_->device != VK_NULL_HANDLE) vkDeviceWaitIdle(impl_->device);
+        impl_->overlay->invalidate();
+    }
+    impl_->overlay = overlay;
+    impl_->overlay_ready = false;
+    impl_->overlay_failed = false;
 }
 
 } // namespace relay

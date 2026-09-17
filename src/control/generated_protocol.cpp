@@ -32,7 +32,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_render_capture_status{{
 }};
 
 constexpr std::array<ProtocolFieldSpec, 3> fields_assets_import_model{{
-    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 5U, 128U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.(gltf|glb|fbx|obj|dae|blend)$", ""},
+    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 5U, 128U, "^[A-Za-z0-9][A-Za-z0-9._ /-]*\\.(gltf|glb|fbx|obj|dae|blend)$", ""},
     {"instantiate", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"preset", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "scene|static_mesh"},
 }};
@@ -173,7 +173,68 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_trace_replay{{
     {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.relay-trace\\.jsonl$", ""},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 49> methods{{
+constexpr std::array<ProtocolFieldSpec, 1> fields_scene_copy{{
+    {"entities", ProtocolValueType::string_array, true, false, false, false, 0, 0, 1U, 4096U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_scene_cut{{
+    {"entities", ProtocolValueType::string_array, true, false, false, false, 0, 0, 1U, 4096U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_scene_duplicate_many{{
+    {"entities", ProtocolValueType::string_array, true, false, false, false, 0, 0, 1U, 4096U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_scene_destroy_many{{
+    {"entities", ProtocolValueType::string_array, true, false, false, false, 0, 0, 1U, 4096U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 3> fields_scene_transform_many{{
+    {"entities", ProtocolValueType::string_array, true, false, false, false, 0, 0, 1U, 4096U, "^\\d+:\\d+$", ""},
+    {"delta", ProtocolValueType::number_array, true, false, false, false, 0, 0, 16U, 16U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_scene_paste{{
+    {"parent", ProtocolValueType::string, false, true, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_project_create{{
+    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_project_open{{
+    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_project_add_scene{{
+    {"scene_file", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_project_remove_scene{{
+    {"scene_file", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_project_set_startup{{
+    {"scene_file", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 6> fields_scene_set_animations{{
+    {"entities", ProtocolValueType::string_array, true, false, false, false, 0, 0, 1U, 4096U, "^\\d+:\\d+$", ""},
+    {"playing", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"loop", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"speed", ProtocolValueType::number, false, false, true, true, -100, 100, 0U, 0U, "", ""},
+    {"time_seconds", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_animation_clip{{
+    {"model", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 256U, "", ""},
+    {"clip", ProtocolValueType::integer, true, false, true, true, 0, 255, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolMethodSpec, 66> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current run, pause, frame, simulation time and resolution state.", true, false, false, no_fields},
     {"runtime.pause", "runtime_pause", "Pause Relay runtime", "Pause automatic simulation so the scene can be inspected deterministically.", false, false, true, no_fields},
     {"runtime.resume", "runtime_resume", "Resume Relay runtime", "Resume automatic simulation after an inspection or controlled frame step.", false, false, true, no_fields},
@@ -223,6 +284,23 @@ constexpr std::array<ProtocolMethodSpec, 49> methods{{
     {"trace.stop", "trace_stop", "Stop Relay trace", "Atomically persist the active deterministic trace in Relay's traces directory.", false, false, false, no_fields},
     {"trace.status", "trace_status", "Inspect Relay trace", "Read trace recording state, path and current event count.", true, false, false, no_fields},
     {"trace.replay", "trace_replay", "Replay Relay trace", "Validate and replay a trace against the fixed-step runtime at its recorded frame offsets.", false, false, false, fields_trace_replay},
+    {"scene.copy", "scene_copy", "Copy", "Copy selected subtrees to the session clipboard without changing the scene.", false, false, false, fields_scene_copy},
+    {"scene.cut", "scene_cut", "Cut", "Copy and remove selected subtrees as one undoable edit.", false, true, false, fields_scene_cut},
+    {"scene.duplicate_many", "scene_duplicate_many", "Duplicate Many", "Duplicate selected subtrees beside their originals as one undoable edit.", false, false, false, fields_scene_duplicate_many},
+    {"scene.destroy_many", "scene_destroy_many", "Destroy Many", "Remove selected subtrees as one undoable edit.", false, true, false, fields_scene_destroy_many},
+    {"scene.transform_many", "scene_transform_many", "Transform Many", "Apply a column-major world-space affine delta matrix to selected roots as one undoable gesture.", false, false, false, fields_scene_transform_many},
+    {"scene.paste", "scene_paste", "Paste entities", "Paste the session clipboard as one undoable edit; cameras stay inactive and internal model bindings are remapped.", false, false, false, fields_scene_paste},
+    {"scene.clipboard", "scene_clipboard", "Inspect clipboard", "Read session clipboard root and entity counts.", true, false, false, no_fields},
+    {"project.create", "project_create", "Create project", "Create a folder project (.relayproject) and an empty scene; refuses to overwrite an existing project.", false, false, false, fields_project_create},
+    {"project.open", "project_open", "Open project", "Open a folder project (.relayproject) and load its startup scene atomically, or clear the scene for an empty project.", false, false, false, fields_project_open},
+    {"project.status", "project_status", "Status project", "Inspect the current project, member scene files and startup scene.", true, false, false, no_fields},
+    {"project.list", "project_list", "List project", "List available workspace project files.", true, false, false, no_fields},
+    {"project.add_scene", "project_add_scene", "Add Scene project", "Add an existing valid scene file to the current project; the first scene becomes its startup scene.", false, false, false, fields_project_add_scene},
+    {"project.remove_scene", "project_remove_scene", "Remove Scene project", "Remove scene membership without deleting its file; chooses a remaining startup scene when needed.", false, false, false, fields_project_remove_scene},
+    {"project.set_startup", "project_set_startup", "Set Startup project", "Choose a current project member as the startup scene.", false, false, false, fields_project_set_startup},
+    {"project.close", "project_close", "Close project", "Close project metadata while leaving the current scene intact.", false, false, false, no_fields},
+    {"scene.set_animations", "scene_set_animations", "Control animation tracks", "Seek or configure multiple animation roots in one undoable gesture; time clamps to each clip duration.", false, false, false, fields_scene_set_animations},
+    {"animation.clip", "animation_clip", "Inspect animation timeline", "Read bounded channel key times for an imported animation clip. Key times are read-only; truncated channels report their full key count.", true, false, false, fields_animation_clip},
 }};
 
 } // namespace

@@ -5,6 +5,8 @@
 #include "relay/editor/editor_layout.hpp"
 #include "relay/editor/editor_math.hpp"
 #include "relay/editor/editor_state.hpp"
+#include "relay/editor/editor_selection.hpp"
+#include "relay/editor/editor_timeline.hpp"
 #include "relay/editor/editor_theme.hpp"
 #include "relay/render/scene_render.hpp"
 
@@ -99,31 +101,7 @@ struct EditorUi::Impl {
         return open;
     }
 
-    // Panel chrome. ImGui's own title bars are switched off so headings can use the heading face
-    // and a consistent accent marker instead of the default centred window caption.
-    void panel_header(const char* const title) {
-        const auto& palette = editor_palette();
-        auto* list = ImGui::GetWindowDrawList();
-        const auto origin = ImGui::GetCursorScreenPos();
-        const auto height = ImGui::GetTextLineHeight();
-        // A short accent bar reads as a section marker without adding another border.
-        list->AddRectFilled(ImVec2(origin.x, origin.y + height * 0.12F),
-                            ImVec2(origin.x + 3.0F * ui_scale, origin.y + height * 0.88F),
-                            palette.accent, 1.5F * ui_scale);
-        ImGui::Indent(9.0F * ui_scale);
-        ImGui::PushFont(fonts.heading, fonts.heading_size);
-        ImGui::TextUnformatted(title);
-        ImGui::PopFont();
-        ImGui::Unindent(9.0F * ui_scale);
-        ImGui::Spacing();
-        const auto width = ImGui::GetContentRegionAvail().x;
-        const auto rule = ImGui::GetCursorScreenPos();
-        list->AddLine(ImVec2(rule.x, rule.y), ImVec2(rule.x + width, rule.y), palette.border_soft,
-                      1.0F);
-        ImGui::Dummy(ImVec2(0.0F, 3.0F * ui_scale));
-    }
-
-    enum class ToolIcon { play, pause, step, undo, redo, camera, focus, move, rotate, scale, local, world };
+    enum class ToolIcon { previous, restart, loop, snap, play, pause, step, undo, redo, camera, focus, move, rotate, scale, local, world };
     bool toolbar_button(const char* id, ToolIcon icon, bool active, const char* tooltip) {
         const auto& palette = editor_palette();
         if (active) {
@@ -143,7 +121,30 @@ struct EditorUi::Impl {
         const auto line = [&](float x, float y, float u, float v) {
             draw->AddLine(point(x, y), point(u, v), color, 1.6F * ui_scale);
         };
-        if (icon == ToolIcon::pause) {
+        if (icon == ToolIcon::previous || icon == ToolIcon::restart) {
+            line(8, 7, 8, 21);
+            draw->AddTriangleFilled(point(22, 7), point(22, 21), point(10, 14), color);
+            if (icon == ToolIcon::restart) line(5, 7, 5, 21);
+        } else if (icon == ToolIcon::loop) {
+            // Two opposing arrows, with rounded returns and arrowheads along the path.
+            draw->PathLineTo(point(8, 16));
+            draw->PathLineTo(point(8, 12));
+            draw->PathBezierCubicCurveTo(point(8, 9), point(10, 8), point(13, 8));
+            draw->PathLineTo(point(24, 8));
+            draw->PathStroke(color, 0, 1.6F * ui_scale);
+            line(24, 8, 20, 4);
+            line(24, 8, 20, 12);
+            draw->PathLineTo(point(24, 12));
+            draw->PathLineTo(point(24, 16));
+            draw->PathBezierCubicCurveTo(point(24, 19), point(22, 20), point(19, 20));
+            draw->PathLineTo(point(8, 20));
+            draw->PathStroke(color, 0, 1.6F * ui_scale);
+            line(8, 20, 12, 16);
+            line(8, 20, 12, 24);
+        } else if (icon == ToolIcon::snap) {
+            draw->AddRect(point(9, 6), point(23, 22), color, 2 * ui_scale, 0, 1.6F * ui_scale);
+            line(13, 6, 13, 11); line(19, 17, 23, 17); line(13, 6, 13, 22);
+        } else if (icon == ToolIcon::pause) {
             draw->AddRectFilled(point(11, 7), point(14, 21), color);
             draw->AddRectFilled(point(18, 7), point(21, 21), color);
         } else if (icon == ToolIcon::play || icon == ToolIcon::step) {
@@ -170,7 +171,7 @@ struct EditorUi::Impl {
                     line(x, y, x + (x < 16 ? 5.0F : -5.0F), y);
                     line(x, y, x, y + (y < 14 ? 5.0F : -5.0F));
                 }
-            draw->AddCircle(point(16, 14), 2.0F * ui_scale, color);
+            draw->AddCircleFilled(point(16, 14), 2.0F * ui_scale, color, 16);
         } else if (icon == ToolIcon::move) {
             line(7, 14, 25, 14);
             line(16, 5, 16, 23);
@@ -183,10 +184,11 @@ struct EditorUi::Impl {
             line(16, 23, 12, 19);
             line(16, 23, 20, 19);
         } else if (icon == ToolIcon::rotate) {
-            draw->PathArcTo(point(16, 14), 8.0F * ui_scale, 0.2F, 5.2F, 20);
+            // The arc ends at the top, where its clockwise tangent points right.
+            draw->PathArcTo(point(16, 14), 8.0F * ui_scale, -0.35F, 4.712389F, 32);
             draw->PathStroke(color, 0, 1.6F * ui_scale);
-            line(20, 7, 20, 3);
-            line(20, 7, 25, 7);
+            line(16, 6, 13, 3);
+            line(16, 6, 13, 9);
         } else if (icon == ToolIcon::scale) {
             draw->AddRect(point(8, 15), point(14, 21), color, 0, 0, 1.6F * ui_scale);
             line(14, 15, 24, 5);
@@ -287,6 +289,13 @@ struct EditorUi::Impl {
     std::uint64_t next_request_id{1};
 
     bool imgui_context_created{false};
+    bool headless{false};
+    std::map<std::string, std::array<float, 4>, std::less<>> headless_items;
+    void note_item(const std::string& key) {
+        if (!headless) return;
+        const auto minimum = ImGui::GetItemRectMin(), maximum = ImGui::GetItemRectMax();
+        headless_items[key] = {minimum.x, minimum.y, maximum.x, maximum.y};
+    }
     bool sdl_backend_started{false};
     bool vulkan_backend_started{false};
     bool frame_open{false};
@@ -299,12 +308,19 @@ struct EditorUi::Impl {
     std::vector<std::size_t> roots;
     std::map<std::string, std::size_t, std::less<>> entity_index;
     JsonValue runtime_status;
+    JsonValue project_status;
+    std::vector<std::string> project_files;
+    std::array<char, 129> project_name{"My project"};
+    std::string pending_scene_filename, pending_project_filename;
     std::vector<std::string> mesh_names;
     std::vector<std::string> material_names;
     std::deque<std::string> log_lines;
     std::uint64_t last_log_sequence{0};
 
-    std::string selection;
+    EditorSelection selections;
+    std::string& selection = selections.primary_handle;
+    std::vector<std::string> visible_rows, drawing_rows;
+    bool clipboard_ready{false};
     std::string status_message;
     bool status_is_error{false};
     double seconds_since_refresh{refresh_interval_seconds};
@@ -355,6 +371,13 @@ struct EditorUi::Impl {
     // fold into an earlier, unrelated edit of the same entity.
     std::uint64_t gizmo_gesture{0};
     std::uint64_t animation_gesture{0};
+    std::uint64_t timeline_gesture{0};
+    int timeline_fps{30};
+    bool timeline_snap{false};
+    double timeline_preview_time{};
+    std::vector<std::string> timeline_scrub_targets;
+    std::string timeline_metadata_key;
+    JsonValue timeline_metadata;
     ImGuizmo::OPERATION gizmo_operation{ImGuizmo::TRANSLATE};
     ImGuizmo::MODE gizmo_mode{ImGuizmo::LOCAL};
     // Screen-space bounds of the area left clear for the scene, in the window's pixel coordinates.
@@ -375,14 +398,15 @@ struct EditorUi::Impl {
     std::array<char, 129> create_name{"Entity"};
     std::string renaming;
     std::array<char, 129> rename_buffer{};
-    std::vector<std::string> available_models;
+    std::vector<std::string> available_models, available_files;
+    std::string assets_root = "assets";
     std::vector<std::string> undo_labels, redo_labels;
     int import_preset{0};
-    std::array<bool, 6> panel_open{true, true, true, true, true, true};
-    enum class FileAction { none, open, save_as, import, screenshot, recording };
+    std::array<bool, 8> panel_open{true, true, true, false, true, true, false, false};
+    enum class FileAction { none, open, save_as, import, screenshot, recording, new_project, open_project, add_project_scene };
     FileAction file_action{FileAction::none};
     // What to carry out once the user has answered the unsaved-work prompt.
-    enum class PendingAction { none, new_scene, open_scene, quit };
+    enum class PendingAction { none, new_scene, open_scene, quit, new_project, open_project, project_scene };
     PendingAction pending_action{PendingAction::none};
     bool open_discard_dialog{false};
     bool open_file_dialog{false}, show_help{false}, show_about{false};
@@ -455,6 +479,9 @@ struct EditorUi::Impl {
         const bool periodic = seconds_since_assets >= refresh_interval_seconds;
         if (periodic) seconds_since_assets = 0.0;
         if (auto status = call("runtime.status")) runtime_status = std::move(*status);
+        if (auto project = call("project.status")) project_status = std::move(*project);
+        if (auto clipboard = call("scene.clipboard"); clipboard && clipboard->object())
+            clipboard_ready = number_or(*clipboard->object(), "entities", 0) > 0;
         if (auto list = call("scene.list")) {
             scene_list = std::move(*list);
             rebuild_index();
@@ -464,13 +491,26 @@ struct EditorUi::Impl {
             if (const auto* animator = component(*entity, "animator"))
                 animator_playing = boolean_or(*animator, "playing", false);
         }
+        if (panel_open[6])
+            for (const auto& target : animation_targets())
+                if (const auto* entity = find_entity(target))
+                    if (const auto* animator = component(*entity, "animator"))
+                        animator_playing |= boolean_or(*animator, "playing", false);
         if (auto logs = call("logs.read", "\"after\":" + std::to_string(last_log_sequence))) {
             append_logs(*logs);
         }
         // Assets are refreshed on the same cadence rather than only after a UI-driven import,
         // because an agent sharing this runtime can import a model at any time and the human's
         // mesh and material lists must reflect that.
-        if (periodic || assets_pending) refresh_assets();
+        if (periodic || assets_pending) {
+            refresh_assets();
+            if (auto projects = call("project.list"); projects && projects->object()) {
+                project_files.clear();
+                if (const auto* list = field(*projects->object(), "projects"); list && list->array())
+                    for (const auto& file : *list->array())
+                        if (file.string()) project_files.push_back(*file.string());
+            }
+        }
         if (auto history = call("scene.history")) {
             const auto* object = history->object();
             const auto collect = [&](const std::string_view key, std::vector<std::string>& target) {
@@ -493,7 +533,12 @@ struct EditorUi::Impl {
         if (periodic || assets_pending) {
             if (auto models = call("assets.available")) {
                 available_models.clear();
+                available_files.clear();
                 if (const auto* object = models->object()) {
+                    assets_root = string_or(*object, "root");
+                    if (const auto* files = field(*object, "files"); files && files->array())
+                        for (const auto& item : *files->array())
+                            if (item.string()) available_files.push_back(*item.string());
                     if (const auto* value = field(*object, "models"); value && value->array()) {
                         for (const auto& item : *value->array()) {
                             if (const auto* text = item.string()) available_models.push_back(*text);
@@ -526,7 +571,9 @@ struct EditorUi::Impl {
                 children[parent].push_back(index);
         }
         // A destroyed selection must not keep driving the inspector.
-        if (!selection.empty() && find_entity(selection) == nullptr) select({});
+        const auto previous = selection;
+        selections.prune([&](const auto& handle) { return find_entity(handle) != nullptr; });
+        if (previous != selection) drafts.clear();
     }
 
     [[nodiscard]] const JsonValue::Object* find_entity(const std::string_view handle) const {
@@ -603,7 +650,22 @@ struct EditorUi::Impl {
 
     void select(const std::string& handle) {
         if (selection != handle) drafts.clear();
-        selection = handle;
+        selections.assign(handle);
+    }
+
+    void click_selection(const std::string& handle, bool tree = false) {
+        const auto& io = ImGui::GetIO();
+        selections.click(handle, io.KeyCtrl, tree && io.KeyShift, visible_rows);
+        drafts.clear();
+    }
+
+    std::string selection_fields() const {
+        std::string result = "\"entities\":[";
+        for (std::size_t i = 0; i < selections.handles.size(); ++i) {
+            if (i) result += ',';
+            result += '"' + selections.handles[i] + '"';
+        }
+        return result + "]";
     }
 
     void update_view() {
@@ -688,10 +750,22 @@ struct EditorUi::Impl {
         if (!bounds) return;
         const auto* object = bounds->object();
         if (object == nullptr) return;
-        const auto minimum = editor_vector(*object, "minimum", {{0.0, 0.0, 0.0}});
-        const auto maximum = editor_vector(*object, "maximum", {{0.0, 0.0, 0.0}});
+        auto minimum = editor_vector(*object, "minimum", {{0.0, 0.0, 0.0}});
+        auto maximum = editor_vector(*object, "maximum", {{0.0, 0.0, 0.0}});
         const auto* geometry = field(*object, "has_geometry");
-        const bool has_geometry = geometry && geometry->boolean() && *geometry->boolean();
+        bool has_geometry = geometry && geometry->boolean() && *geometry->boolean();
+        for (const auto& handle : selections.handles) {
+            if (handle == selection) continue;
+            const auto other = call("scene.bounds", entity_field(handle));
+            if (!other || !other->object()) continue;
+            const auto lo = editor_vector(*other->object(), "minimum", {{0, 0, 0}});
+            const auto hi = editor_vector(*other->object(), "maximum", {{0, 0, 0}});
+            for (std::size_t axis = 0; axis < 3; ++axis) {
+                minimum[axis] = std::min(minimum[axis], lo[axis]);
+                maximum[axis] = std::max(maximum[axis], hi[axis]);
+            }
+            has_geometry |= boolean_or(*other->object(), "has_geometry", false);
+        }
         const auto width = viewport_max.x - viewport_min.x;
         const auto height = viewport_max.y - viewport_min.y;
         navigation_camera.frame(
@@ -729,11 +803,11 @@ struct EditorUi::Impl {
         if (object == nullptr) return;
         const auto entity = string_or(*object, "entity");
         if (entity.empty()) {
-            selection.clear();
+            if (!ImGui::GetIO().KeyCtrl) select({});
             set_status("Nothing under the pointer", false);
             return;
         }
-        select(entity);
+        click_selection(entity);
     }
 
     // Local transform of one entity straight from the cached scene listing.
@@ -805,6 +879,7 @@ struct EditorUi::Impl {
         }
         const auto camera_view = editor_view(view.position, view.target);
         EditorMatrix world = editor_multiply(parent, local_of(selection));
+        const auto before_world = world;
         const double depth = -(camera_view[2] * world[12] + camera_view[6] * world[13] +
                                camera_view[10] * world[14] + camera_view[14]);
         // A gizmo at/behind the eye or in the near plane cannot have a finite useful screen size.
@@ -839,7 +914,17 @@ struct EditorUi::Impl {
             else if (gizmo_operation == ImGuizmo::SCALE)
                 fields += vector_fields({scale.x, scale.y, scale.z}, {"sx", "sy", "sz"});
             fields += ",\"gesture\":" + std::to_string(gizmo_gesture);
-            mutate("scene.set_transform", fields, "Gizmo transform");
+            if (selections.handles.size() == 1) mutate("scene.set_transform", fields, "Gizmo transform");
+            else if (const auto inverse = editor_inverse_affine(before_world)) {
+                const auto delta = editor_multiply(world, *inverse);
+                std::string group = selection_fields() + ",\"delta\":[";
+                for (std::size_t i = 0; i < delta.size(); ++i) {
+                    if (i) group += ',';
+                    group += number_text(delta[i]);
+                }
+                group += "],\"gesture\":" + std::to_string(gizmo_gesture);
+                mutate("scene.transform_many", group, "Transformed selection");
+            }
         }
         gizmo_active = using_gizmo;
     }
@@ -855,10 +940,13 @@ struct EditorUi::Impl {
                                    ImGuiTreeNodeFlags_SpanAvailWidth |
                                    ImGuiTreeNodeFlags_DefaultOpen;
         if (!has_children) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-        if (handle == selection) flags |= ImGuiTreeNodeFlags_Selected;
+        drawing_rows.push_back(handle);
+
+        if (selections.contains(handle)) flags |= ImGuiTreeNodeFlags_Selected;
 
         const bool open = ImGui::TreeNodeEx(handle.c_str(), flags, "%s", name.c_str());
-        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) select(handle);
+        note_item("entity:" + handle);
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) click_selection(handle, true);
 
         // Dragging one row onto another reparents it. The drop target rejects its own subtree
         // implicitly: scene.set_parent refuses cycles, and the failure surfaces as a status
@@ -880,7 +968,7 @@ struct EditorUi::Impl {
         }
 
         if (ImGui::BeginPopupContextItem()) {
-            select(handle);
+            if (!selections.contains(handle)) select(handle);
             if (ImGui::MenuItem("Add child")) {
                 mutate("scene.create", "\"name\":\"Entity\",\"parent\":\"" + handle + '"',
                        "Entity created");
@@ -908,6 +996,7 @@ struct EditorUi::Impl {
     }
 
     void draw_hierarchy() {
+        drawing_rows.clear();
         ImGui::SetNextItemWidth(-88.0F * ui_scale);
         ImGui::InputTextWithHint("##createname", "new entity name", create_name.data(),
                                  create_name.size());
@@ -947,6 +1036,7 @@ struct EditorUi::Impl {
                 draw_tree_node(root);
         }
         ImGui::EndChild();
+        visible_rows = drawing_rows;
     }
 
     void draw_transform_section(const JsonValue::Object& entity) {
@@ -1146,7 +1236,7 @@ struct EditorUi::Impl {
         if (duration > 0.0) {
             ImGui::TextColored(editor_color(editor_palette().text_faint), "Length %.3f s", duration);
         }
-        if (drag_scalar("Speed", speed, 0.01F)) {
+        if (drag_scalar("Speed", speed, 0.01F, "%.2fx")) {
             mutate("scene.set_animation",
                    entity_field(selection) + ",\"speed\":" + number_text(speed), "Speed updated");
         }
@@ -1281,6 +1371,177 @@ struct EditorUi::Impl {
         }
     }
 
+    std::vector<std::string> animation_targets() const {
+        std::vector<std::string> result;
+        auto handles = selections.handles;
+        const auto active = std::find(handles.begin(), handles.end(), selection);
+        if (active != handles.end()) std::rotate(handles.begin(), active, active + 1);
+        for (const auto& handle : handles) {
+            const auto* entity = find_entity(handle);
+            if (!entity) continue;
+            auto root = handle;
+            if (!component(*entity, "animator")) {
+                const auto* node = component(*entity, "model_node");
+                root = node ? string_or(*node, "root") : "";
+                entity = find_entity(root);
+            }
+            if (entity && component(*entity, "animator") &&
+                std::find(result.begin(), result.end(), root) == result.end()) result.push_back(root);
+        }
+        if (result.empty())
+            for (const auto* entity : entities)
+                if (component(*entity, "animator")) { result.push_back(string_or(*entity, "entity")); break; }
+        return result;
+    }
+
+    bool timeline_mutate(const std::vector<std::string>& targets, const std::string& fields) {
+        std::string request_fields = "\"entities\":[";
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            if (i) request_fields += ',';
+            request_fields += '\"' + targets[i] + '\"';
+        }
+        return mutate("scene.set_animations", request_fields + "]" + fields, "Animation tracks updated");
+    }
+
+    void draw_timeline() {
+        const auto targets = animation_targets();
+        if (targets.empty()) { ImGui::TextDisabled("Import an animated model to use the timeline."); return; }
+        const auto* root = find_entity(targets.front());
+        const auto* animator = root ? component(*root, "animator") : nullptr;
+        if (!animator) return;
+        const auto model = string_or(*animator, "model");
+        const auto clips = clips_for(model);
+        const auto clip = static_cast<std::size_t>(number_or(*animator, "clip", 0));
+        const auto duration = clip < clips.size() ? clips[clip].duration_seconds : 0.0;
+        const auto time = number_or(*animator, "time_seconds", 0);
+        const bool playing = boolean_or(*animator, "playing", false);
+        const bool loop = boolean_or(*animator, "loop", true);
+        if (toolbar_button("##timeline_restart", ToolIcon::restart, false, "Return to beginning"))
+            timeline_mutate(targets, ",\"time_seconds\":0");
+        if (toolbar_button("##timeline_previous", ToolIcon::previous, false, "Previous frame"))
+            timeline_mutate(targets, ",\"playing\":false,\"time_seconds\":" + number_text(timeline_step(time, duration, timeline_fps, -1)));
+        if (toolbar_button("##timeline_play", playing ? ToolIcon::pause : ToolIcon::play, playing, playing ? "Pause animation" : "Play animation"))
+            timeline_mutate(targets, std::string(",\"playing\":") + (playing ? "false" : "true"));
+        if (toolbar_button("##timeline_next", ToolIcon::step, false, "Next frame"))
+            timeline_mutate(targets, ",\"playing\":false,\"time_seconds\":" + number_text(timeline_step(time, duration, timeline_fps, 1)));
+        if (toolbar_button("##timeline_loop", ToolIcon::loop, loop, "Loop animation"))
+            timeline_mutate(targets, std::string(",\"loop\":") + (loop ? "false" : "true"));
+        if (toolbar_button("##timeline_snap", ToolIcon::snap, timeline_snap, "Snap scrubbing to frames")) timeline_snap = !timeline_snap;
+        ImGui::SetNextItemWidth(72.0F * ui_scale);
+        ImGui::InputInt("FPS", &timeline_fps, 0, 0);
+        timeline_fps = std::clamp(timeline_fps, 1, 240);
+        ImGui::SameLine();
+        double speed = number_or(*animator, "speed", 1);
+        ImGui::SetNextItemWidth(80.0F * ui_scale);
+        if (drag_scalar("Speed", speed, 0.01F, "%.2fx"))
+            timeline_mutate(targets, ",\"speed\":" + number_text(std::clamp(speed, -100.0, 100.0)));
+        ImGui::SetNextItemWidth(220.0F * ui_scale);
+        const auto clip_name = clip < clips.size() ? clips[clip].name : "Unavailable clip";
+        if (ImGui::BeginCombo("Clip", clip_name.c_str())) {
+            for (std::size_t i = 0; i < clips.size(); ++i)
+                if (ImGui::Selectable(clips[i].name.c_str(), i == clip))
+                    mutate("scene.set_animation", entity_field(targets.front()) + ",\"clip\":" + std::to_string(i) + ",\"time_seconds\":0", "Clip selected");
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::Text("%.3f / %.3f s  |  Frame %lld", timeline_scrub_targets.empty() ? time : timeline_preview_time, duration, static_cast<long long>(std::llround(time * timeline_fps)));
+        if (duration <= 0) { ImGui::TextDisabled("Clip duration is unavailable."); return; }
+        const auto metadata_key = model + ":" + std::to_string(clip);
+        if (metadata_key != timeline_metadata_key) {
+            if (auto metadata = call("animation.clip", "\"model\":\"" + json_escape(model) + "\",\"clip\":" + std::to_string(clip))) {
+                timeline_metadata = std::move(*metadata);
+                timeline_metadata_key = metadata_key;
+            }
+        }
+        const auto label_width = std::min(200.0F * ui_scale, ImGui::GetContentRegionAvail().x * 0.35F);
+        ImGui::TextDisabled("Time");
+        ImGui::SameLine(label_width);
+        const auto origin = ImGui::GetCursorScreenPos();
+        const auto width = std::max(1.0F, ImGui::GetContentRegionAvail().x);
+        const auto ruler_height = 35.0F * ui_scale;
+        auto* draw = ImGui::GetWindowDrawList();
+        ImGui::InvisibleButton("##time_ruler", ImVec2(width, ruler_height));
+        note_item("timeline:ruler");
+        if (ImGui::IsItemActivated()) {
+            ++timeline_gesture;
+            timeline_scrub_targets = targets;
+        }
+        if (ImGui::IsItemActive()) {
+            const auto next = timeline_time((ImGui::GetIO().MousePos.x - origin.x) / width,
+                                            duration, timeline_fps, timeline_snap);
+            if (ImGui::IsItemActivated() || next != timeline_preview_time) {
+                timeline_preview_time = next;
+                timeline_mutate(timeline_scrub_targets, ",\"playing\":false,\"time_seconds\":" + number_text(next) +
+                                ",\"gesture\":" + std::to_string(timeline_gesture));
+            }
+        }
+        const auto shown_time = timeline_scrub_targets.empty() ? time : timeline_preview_time;
+        if (ImGui::IsItemDeactivated()) timeline_scrub_targets.clear();
+        const auto& palette = editor_palette();
+        draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + ruler_height), palette.panel);
+        const double desired = std::max(1e-9, duration / std::max(1.0, static_cast<double>(width / (90.0F * ui_scale))));
+        const double magnitude = std::pow(10.0, std::floor(std::log10(desired)));
+        const double ratio = desired / magnitude;
+        const double spacing = magnitude * (ratio <= 1 ? 1 : ratio <= 2 ? 2 : ratio <= 5 ? 5 : 10);
+        const auto tick_label = [&](const double value) {
+            const auto x = origin.x + width * static_cast<float>(value / duration);
+            draw->AddLine(ImVec2(x, origin.y + 18 * ui_scale), ImVec2(x, origin.y + ruler_height), palette.border);
+            char label[48];
+            std::snprintf(label, sizeof(label), "%.2f", value);
+            const auto label_width_px = ImGui::CalcTextSize(label).x;
+            draw->AddText(ImVec2(std::min(x + 3, origin.x + width - label_width_px), origin.y), palette.text_faint, label);
+        };
+        for (double tick = 0; tick < duration - spacing * 0.25; tick += spacing) tick_label(tick);
+        tick_label(duration);
+        const auto playhead = origin.x + width * static_cast<float>(std::clamp(shown_time / duration, 0.0, 1.0));
+        draw->AddLine(ImVec2(playhead, origin.y), ImVec2(playhead, origin.y + ruler_height), palette.accent, 2 * ui_scale);
+        ImGui::Separator();
+        begin_region("##timeline_tracks");
+        draw = ImGui::GetWindowDrawList();
+        for (const auto* entity : entities) {
+            const auto* track = component(*entity, "animator");
+            if (!track) continue;
+            const auto handle = string_or(*entity, "entity");
+            ImGui::PushID(handle.c_str());
+            const auto row_origin = ImGui::GetCursorScreenPos();
+            const auto label = string_or(*entity, "name") + "  |  " + number_text(number_or(*track, "time_seconds", 0)).substr(0, 6) + " s";
+            if (ImGui::Selectable(label.c_str(), std::find(targets.begin(), targets.end(), handle) != targets.end(), 0, ImVec2(label_width - 10 * ui_scale, 0)))
+                click_selection(handle);
+            const auto track_clips = clips_for(string_or(*track, "model"));
+            const auto track_clip = static_cast<std::size_t>(number_or(*track, "clip", 0));
+            const auto track_duration = track_clip < track_clips.size() ? track_clips[track_clip].duration_seconds : 0;
+            const auto bar_end = origin.x + width * static_cast<float>(std::clamp(track_duration / duration, 0.0, 1.0));
+            draw->AddRectFilled(ImVec2(origin.x, row_origin.y + 3 * ui_scale), ImVec2(bar_end, row_origin.y + 15 * ui_scale), palette.accent_soft);
+            const auto track_head = origin.x + width * static_cast<float>(std::clamp(number_or(*track, "time_seconds", 0) / duration, 0.0, 1.0));
+            draw->AddLine(ImVec2(track_head, row_origin.y), ImVec2(track_head, row_origin.y + ImGui::GetTextLineHeightWithSpacing()), palette.accent, 2 * ui_scale);
+            ImGui::PopID();
+        }
+        if (timeline_metadata.object()) {
+            const auto* channels = field(*timeline_metadata.object(), "channels");
+            if (channels && channels->array())
+                for (const auto& channel : *channels->array()) {
+                    if (!channel.object()) continue;
+                    const auto row = ImGui::GetCursorScreenPos();
+                    const auto channel_name = string_or(*channel.object(), "name");
+                    ImGui::PushClipRect(row, ImVec2(origin.x - 8 * ui_scale, row.y + ImGui::GetTextLineHeightWithSpacing()), true);
+                    ImGui::TextDisabled("%s", channel_name.c_str());
+                    ImGui::PopClipRect();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", channel_name.c_str());
+                    const auto* times = field(*channel.object(), "times");
+                    if (times && times->array())
+                        for (const auto& key : *times->array()) {
+                            if (!key.number()) continue;
+                            const auto x = origin.x + width * static_cast<float>(std::clamp(*key.number() / duration, 0.0, 1.0));
+                            draw->AddCircleFilled(ImVec2(x, row.y + 8 * ui_scale), 2.5F * ui_scale, palette.accent);
+                        }
+                    draw->AddLine(ImVec2(playhead, row.y), ImVec2(playhead, row.y + ImGui::GetTextLineHeightWithSpacing()), palette.accent);
+                    if (times && times->array() && number_or(*channel.object(), "key_count", 0) > static_cast<double>(times->array()->size()))
+                        ImGui::TextDisabled("Key markers sampled for display.");
+                }
+        }
+        ImGui::EndChild();
+    }
+
     void draw_inspector() {
         if (selection.empty()) {
             ImGui::Dummy(ImVec2(0.0F, 6.0F * ui_scale));
@@ -1297,6 +1558,11 @@ struct EditorUi::Impl {
             return;
         }
         const auto& palette = editor_palette();
+        if (selections.handles.size() > 1) {
+            ImGui::Text("%zu selected", selections.handles.size());
+            ImGui::TextDisabled("Gizmo transforms all selected objects.");
+            ImGui::TextDisabled("Properties below edit the active object.");
+        }
         ImGui::PushFont(fonts.heading, fonts.heading_size * 1.05F);
         ImGui::TextUnformatted(string_or(*entity, "name", "Entity").c_str());
         ImGui::PopFont();
@@ -1353,8 +1619,85 @@ struct EditorUi::Impl {
             assets_pending = true;
             select({});
         }
+        if (!opening) {
+            if (auto project = call("project.status")) project_status = std::move(*project);
+        }
+        if (!opening && active_project()) {
+            if (!call("project.add_scene", "\"scene_file\":\"" + json_escape(filename) + '\"')) {
+                set_status("Scene saved; project membership could not be updated", true);
+                return false;
+            }
+        }
         set_status((opening ? "Opened " : "Saved ") + filename, false);
         return true;
+    }
+
+    const JsonValue::Object* active_project() const {
+        const auto* object = project_status.object();
+        if (!object) return nullptr;
+        const auto* project = field(*object, "project");
+        return project ? project->object() : nullptr;
+    }
+
+    bool open_or_create_project(bool create, const std::string& filename) {
+        std::string fields = "\"filename\":\"" + json_escape(filename) + '\"';
+        if (create) fields += ",\"name\":\"" + json_escape(project_name.data()) + '\"';
+        const auto result = call(create ? "project.create" : "project.open", fields);
+        if (!result || !result->object()) return false;
+        const auto scene = string_or(*result->object(), "scene_file");
+        scene_has_file = !scene.empty();
+        if (scene_has_file) set_scene_filename(scene);
+        saved_revision = scene_revision;
+        select({});
+        assets_pending = refresh_pending = true;
+        if (auto project = call("project.status")) project_status = std::move(*project);
+        set_status(create ? "Project created" : "Project opened", false);
+        return true;
+    }
+
+    void draw_project() {
+        const auto* project = active_project();
+        if (ImGui::Button("New project")) discarding_action(PendingAction::new_project);
+        ImGui::SameLine();
+        if (ImGui::Button("Open project")) discarding_action(PendingAction::open_project);
+        if (project) {
+            ImGui::Separator();
+            ImGui::TextUnformatted(string_or(*project, "name").c_str());
+            ImGui::TextDisabled("Folder: %s", string_or(*project, "root").c_str());
+            if (ImGui::Button("Add existing scene"))
+                file_dialog(FileAction::add_project_scene, scene_filename.data());
+            ImGui::SameLine();
+            if (ImGui::Button("New scene")) discarding_action(PendingAction::new_scene);
+            ImGui::TextDisabled("Saving a scene adds it to this project.");
+            const auto startup = string_or(*project, "startup_scene");
+            if (const auto* files = field(*project, "scenes"); files && files->array())
+                for (const auto& entry : *files->array()) {
+                    if (!entry.string()) continue;
+                    const auto& file = *entry.string();
+                    const auto label = file + (file == startup ? " (startup)" : "");
+                    const bool selected_scene = ImGui::Selectable(label.c_str(), scene_has_file && file == scene_filename.data());
+                    note_item("project:scene:" + file);
+                    if (selected_scene) {
+                        pending_scene_filename = file;
+                        discarding_action(PendingAction::project_scene);
+                    }
+                    if (ImGui::BeginPopupContextItem()) {
+                        const auto fields = "\"scene_file\":\"" + json_escape(file) + '\"';
+                        if (ImGui::MenuItem("Set as startup scene"))
+                            mutate("project.set_startup", fields, "Startup scene updated");
+                        if (ImGui::MenuItem("Remove from project"))
+                            mutate("project.remove_scene", fields, "Scene removed from project; file kept");
+                        ImGui::EndPopup();
+                    }
+                }
+        } else ImGui::TextDisabled("No project open. Scene files can still be edited.");
+        ImGui::Separator();
+        ImGui::TextDisabled("Available projects");
+        for (const auto& file : project_files)
+            if (ImGui::Selectable(file.c_str())) {
+                pending_project_filename = file;
+                discarding_action(PendingAction::open_project);
+            }
     }
 
     bool save_scene() {
@@ -1369,18 +1712,26 @@ struct EditorUi::Impl {
 
     // Selecting the copy is what makes duplicate useful for laying a scene out: the next drag or
     // inspector edit lands on the new object rather than the one it was made from.
-    void duplicate_selection() {
-        if (selection.empty()) return;
-        const auto result = call("scene.duplicate", entity_field(selection));
+    void group_operation(const char* method, const char* message, bool uses_selection = true) {
+        const auto result = call(method, uses_selection ? selection_fields() : std::string{});
         if (!result) return;
-        set_status("Duplicated entity", false);
+        set_status(message, false);
         refresh_pending = true;
+        if (std::string_view(method) == "scene.copy" || std::string_view(method) == "scene.cut")
+            clipboard_ready = true;
         if (const auto* object = result->object()) {
-            if (auto copy = string_or(*object, "entity"); !copy.empty()) {
-                refresh();
-                select(copy);
+            if (const auto* copied_roots = field(*object, "roots"); copied_roots && copied_roots->array()) {
+                select({});
+                for (const auto& root : *copied_roots->array())
+                    if (root.string()) selections.click(*root.string(), true, false);
             }
         }
+        if (std::string_view(method) == "scene.cut" || std::string_view(method) == "scene.destroy_many")
+            select({});
+    }
+
+    void duplicate_selection() {
+        if (!selection.empty()) group_operation("scene.duplicate_many", "Duplicated selection");
     }
 
     void new_scene() {
@@ -1419,6 +1770,9 @@ struct EditorUi::Impl {
         case PendingAction::new_scene: new_scene(); break;
         case PendingAction::open_scene: file_dialog(FileAction::open, scene_filename.data()); break;
         case PendingAction::quit: mutate("runtime.quit", {}, "Closing editor"); break;
+        case PendingAction::new_project: file_dialog(FileAction::new_project, "projects/my-project/project.relayproject"); break;
+        case PendingAction::open_project: file_dialog(FileAction::open_project, !pending_project_filename.empty() ? pending_project_filename : project_files.empty() ? "projects/my-project/project.relayproject" : project_files.front()); pending_project_filename.clear(); break;
+        case PendingAction::project_scene: (void)open_or_save_scene(true, pending_scene_filename); break;
         }
     }
 
@@ -1432,7 +1786,8 @@ struct EditorUi::Impl {
     void update_window_title() {
         // The window keeps "Relay Editor" as its trailing name so anything matching on it, the
         // desktop harnesses included, still finds the window once the scene name is in front.
-        auto title = scene_title() + " - Relay Editor";
+        const auto* project = active_project();
+        auto title = (project ? string_or(*project, "name") + " / " : std::string{}) + scene_title() + " - Relay Editor";
         if (sdl_window == nullptr || title == window_title) return;
         window_title = std::move(title);
         SDL_SetWindowTitle(sdl_window, window_title.c_str());
@@ -1476,8 +1831,11 @@ struct EditorUi::Impl {
         if (!ImGui::BeginMainMenuBar())
             return;
         if (ImGui::BeginMenu("File")) {
-            future_action("New project...");
-            future_action("Open project...");
+            if (ImGui::MenuItem("New project...")) discarding_action(PendingAction::new_project);
+            if (ImGui::MenuItem("Open project...")) discarding_action(PendingAction::open_project);
+            if (ImGui::MenuItem("Project browser")) panel_open[7] = true;
+            if (ImGui::MenuItem("Close project", nullptr, false, active_project() != nullptr))
+                if (mutate("project.close", {}, "Project closed")) project_status = JsonValue{};
             ImGui::Separator();
             if (ImGui::MenuItem("New scene", "Ctrl+N"))
                 discarding_action(PendingAction::new_scene);
@@ -1502,14 +1860,16 @@ struct EditorUi::Impl {
             if (ImGui::MenuItem("Redo", "Ctrl+Shift+Z", false, !redo_labels.empty()))
                 mutate("scene.redo", {}, "Redone");
             ImGui::Separator();
-            future_action("Cut");
-            future_action("Copy");
-            future_action("Paste");
+            if (ImGui::MenuItem("Cut", "Ctrl+X", false, !selection.empty()))
+                group_operation("scene.cut", "Cut selection");
+            if (ImGui::MenuItem("Copy", "Ctrl+C", false, !selection.empty()))
+                group_operation("scene.copy", "Copied selection");
+            if (ImGui::MenuItem("Paste", "Ctrl+V", false, clipboard_ready))
+                group_operation("scene.paste", "Pasted selection", false);
             if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, !selection.empty()))
                 duplicate_selection();
             if (ImGui::MenuItem("Delete selection", "Delete", false, !selection.empty())) {
-                if (mutate("scene.destroy", entity_field(selection), "Entity destroyed"))
-                    select({});
+                group_operation("scene.destroy_many", "Deleted selection");
             }
             if (ImGui::MenuItem("Clear selection", nullptr, false, !selection.empty()))
                 select({});
@@ -1559,7 +1919,7 @@ struct EditorUi::Impl {
             }
             ImGui::Separator();
             constexpr const char* names[]{"Hierarchy", "Inspector", "Assets",
-                                          "History", "Diagnostics", "Viewport"};
+                                          "History", "Diagnostics", "Viewport", "Timeline", "Project"};
             for (std::size_t i = 0; i < panel_open.size(); ++i)
                 ImGui::MenuItem(names[i], nullptr, &panel_open[i]);
             ImGui::Separator();
@@ -1601,13 +1961,13 @@ struct EditorUi::Impl {
                 refresh_pending = true;
             }
             future_action("Shader editor...");
-            future_action("Animation timeline...");
+            if (ImGui::MenuItem("Animation timeline")) panel_open[6] = true;
             future_action("Agent workspace...");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Layout")) {
             if (ImGui::MenuItem("Reset layout")) {
-                panel_open.fill(true);
+                panel_open = {true, true, true, false, true, true, false, false};
                 layout.reset();
             }
             ImGui::Separator();
@@ -1672,22 +2032,32 @@ struct EditorUi::Impl {
         if (ImGui::BeginPopupModal("Project action", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             const bool scene_action =
                 file_action == FileAction::open || file_action == FileAction::save_as;
-            const char* title = file_action == FileAction::open         ? "Open scene"
+            const bool project_action = file_action == FileAction::new_project || file_action == FileAction::open_project;
+            const char* title = file_action == FileAction::new_project ? "New project"
+                                : file_action == FileAction::open_project ? "Open project"
+                                : file_action == FileAction::add_project_scene ? "Add existing scene to project"
+                                : file_action == FileAction::open         ? "Open scene"
                                 : file_action == FileAction::save_as    ? "Save scene as"
                                 : file_action == FileAction::import     ? "Import model"
                                 : file_action == FileAction::screenshot ? "Capture GPU screenshot"
                                                                         : "Record GPU WebM";
             ImGui::TextUnformatted(title);
-            ImGui::TextDisabled("Project folder: %s", scene_action ? "scenes/"
-                                                      : file_action == FileAction::import
-                                                          ? "assets/"
-                                                          : "captures/");
+            const auto* project = active_project();
+            const auto root = project ? string_or(*project, "root") : std::string{};
+            const auto directory = (scene_action || file_action == FileAction::add_project_scene)
+                ? (root.empty() ? "scenes/" : root + "/scenes/")
+                : project_action ? std::string("workspace (relative path)")
+                : file_action == FileAction::import ? assets_root : std::string("captures/");
+            ImGui::TextDisabled("Folder: %s", directory.c_str());
             ImGui::SetNextItemWidth(360.0F * ui_scale);
             if (ImGui::IsWindowAppearing())
                 ImGui::SetKeyboardFocusHere();
             const bool submitted =
                 ImGui::InputText("Filename", action_filename.data(), action_filename.size(),
                                  ImGuiInputTextFlags_EnterReturnsTrue);
+            if (file_action == FileAction::new_project)
+                ImGui::InputText("Project name", project_name.data(), project_name.size());
+            if (project_action) ImGui::TextDisabled("Use a workspace-relative path, e.g. projects/my-project/project.relayproject.");
             if (file_action == FileAction::screenshot || file_action == FileAction::recording)
                 ImGui::TextDisabled("Source: real Vulkan GPU; editor panels are excluded.");
             if (!dialog_error.empty())
@@ -1701,7 +2071,11 @@ struct EditorUi::Impl {
             if (ImGui::Button("Continue") || submitted) {
                 const auto filename = json_escape(action_filename.data());
                 bool success = false;
-                if (scene_action) {
+                if (project_action) {
+                    success = open_or_create_project(file_action == FileAction::new_project, action_filename.data());
+                } else if (file_action == FileAction::add_project_scene) {
+                    success = mutate("project.add_scene", "\"scene_file\":\"" + filename + '\"', "Scene added to project");
+                } else if (scene_action) {
                     success = open_or_save_scene(file_action == FileAction::open,
                                                  action_filename.data());
                 } else if (file_action == FileAction::import) {
@@ -1734,7 +2108,7 @@ struct EditorUi::Impl {
                     "MMB: orbit | Shift+MMB: pan | Wheel: zoom\nRMB / Shift+F: freelook | WASD/QE: "
                     "fly\nShift: faster | Alt: slower | Escape: leave freelook\nF: frame selection "
                     "| W/E/R: move/rotate/scale\nCtrl+Z: undo | Ctrl+Shift+Z: redo\nCtrl+D: "
-                    "duplicate | Delete: delete selection\nCtrl+N: new scene | Ctrl+O: open | "
+                    "duplicate | Delete: delete selection\nCtrl+A: select all | Ctrl+C/X/V: copy/cut/paste\nCtrl/Shift+click: toggle/range selection\nCtrl+N: new scene | Ctrl+O: open | "
                     "Ctrl+S: save | Ctrl+Shift+S: save as\nDrag panel tabs to dock; Shift-drag "
                     "to float.");
             }
@@ -1817,16 +2191,26 @@ struct EditorUi::Impl {
             discarding_action(PendingAction::new_scene);
         if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false) && !selection.empty())
             duplicate_selection();
-        if (ImGui::IsKeyPressed(ImGuiKey_W, false)) gizmo_operation = ImGuizmo::TRANSLATE;
-        if (ImGui::IsKeyPressed(ImGuiKey_E, false))
+        if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+            select({});
+            for (const auto* entity : entities)
+                selections.click(string_or(*entity, "entity"), true, false);
+        }
+        if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false) && !selection.empty())
+            group_operation("scene.copy", "Copied selection");
+        if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X, false) && !selection.empty())
+            group_operation("scene.cut", "Cut selection");
+        if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false) && clipboard_ready)
+            group_operation("scene.paste", "Pasted selection", false);
+        if (!shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_W, false)) gizmo_operation = ImGuizmo::TRANSLATE;
+        if (!shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_E, false))
             gizmo_operation = ImGuizmo::ROTATE;
-        if (ImGui::IsKeyPressed(ImGuiKey_R, false))
+        if (!shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R, false))
             gizmo_operation = ImGuizmo::SCALE;
-        if (!ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F, false))
+        if (!shortcuts.KeyCtrl && !ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F, false))
             focus_selection();
         if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && !selection.empty()) {
-            mutate("scene.destroy", entity_field(selection), "Entity destroyed");
-            selection.clear();
+            group_operation("scene.destroy_many", "Deleted selection");
         }
         const auto& io = ImGui::GetIO();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
@@ -1849,11 +2233,13 @@ struct EditorUi::Impl {
 
         const float footer = ImGui::GetTextLineHeightWithSpacing();
         if (begin_region("##models", ImVec2(0.0F, -footer))) {
-            if (available_models.empty()) {
+            if (available_files.empty()) {
                 ImGui::TextColored(editor_color(editor_palette().text_faint),
-                                   "No importable models in assets/.");
+                                   "No files in the project folder.");
             }
-            for (const auto& model : available_models) {
+            for (const auto& model : available_files) {
+                const bool importable = std::find(available_models.begin(), available_models.end(), model) != available_models.end();
+                if (!importable) { ImGui::TextDisabled("%s", model.c_str()); continue; }
                 const bool selected = model == std::string(model_filename.data());
                 if (ImGui::Selectable(model.c_str(), selected)) {
                     const auto length = std::min(model.size(), model_filename.size() - 1U);
@@ -1972,7 +2358,30 @@ EditorUi::~EditorUi() {
     }
 }
 
+bool EditorUi::initialize_headless(std::string& error) {
+    if (impl_->headless) return true;
+    if (impl_->imgui_context_created || !impl_->request) {
+        error = "headless editor needs a request handler and no existing window context";
+        return false;
+    }
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    impl_->imgui_context_created = impl_->headless = true;
+    impl_->layout.initialize(".relay/headless-layout.ini");
+    impl_->fonts = load_editor_fonts(1.0F);
+    apply_editor_theme(1.0F);
+    ImGui::GetStyle().FontSizeBase = impl_->fonts.body_size;
+    unsigned char* pixels = nullptr;
+    int width = 0, height = 0;
+    ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    ImGui::GetIO().Fonts->SetTexID(ImTextureID{1});
+    ImGui::GetIO().DeltaTime = 1.0F / 60.0F;
+    error.clear();
+    return true;
+}
+
 bool EditorUi::initialize(const OverlayContext& context, std::string& error) {
+    if (impl_->headless) { error = "headless editor cannot attach a window"; return false; }
     if (impl_->vulkan_backend_started) return true;
     if (!impl_->request) {
         error = "editor UI has no request handler";
@@ -2032,6 +2441,12 @@ void EditorUi::process_actions() {
     for (const auto& action : actions) impl_->mutate(action.method, action.fields, action.success);
 }
 
+void EditorUi::set_panel_visible(const std::string_view name, const bool visible) {
+    constexpr std::array<std::string_view, 8> names{"Hierarchy", "Inspector", "Assets", "History", "Diagnostics", "Viewport", "Timeline", "Project"};
+    for (std::size_t i = 0; i < names.size(); ++i)
+        if (names[i] == name) impl_->panel_open[i] = visible;
+}
+
 void EditorUi::invalidate() {
     if (impl_->frame_open) {
         ImGui::EndFrame();
@@ -2064,6 +2479,7 @@ bool EditorUi::handle_event(const void* const sdl_event) {
         impl_->relative_delta.y += event->motion.yrel;
         return true;
     }
+    if (impl_->headless) return false;
     ImGui_ImplSDL3_ProcessEvent(event);
     const auto& io = ImGui::GetIO();
     switch (event->type) {
@@ -2097,15 +2513,20 @@ bool EditorUi::handle_event(const void* const sdl_event) {
 }
 
 void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
-    if (!impl_->vulkan_backend_started) return;
+    if (!impl_->vulkan_backend_started && !impl_->headless) return;
 
-    ImGui_ImplVulkan_NewFrame();
-    ImGui_ImplSDL3_NewFrame();
+    if (impl_->headless) {
+        impl_->headless_items.clear();
+        ImGui::GetIO().DisplaySize = ImVec2(static_cast<float>(width), static_cast<float>(height));
+    } else {
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+    }
     // SDL's display scale is in physical pixels. ImGui lays out in window coordinates,
     // and its renderer already applies framebuffer density (including fractional Wayland DPI).
     // Use only the remaining content scale here to avoid applying desktop scaling twice.
-    const float density = SDL_GetWindowPixelDensity(impl_->sdl_window);
-    const float display_scale = SDL_GetWindowDisplayScale(impl_->sdl_window);
+    const float density = impl_->headless ? 1.0F : SDL_GetWindowPixelDensity(impl_->sdl_window);
+    const float display_scale = impl_->headless ? 1.0F : SDL_GetWindowDisplayScale(impl_->sdl_window);
     const float scale = density > 0.0F && display_scale > 0.0F
                             ? display_scale / density : 1.0F;
     if (std::abs(scale - impl_->ui_scale) > 0.001F) {
@@ -2146,35 +2567,30 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     };
     if (impl_->panel_open[0]) {
         if (panel("Hierarchy", 0)) {
-            impl_->panel_header("Hierarchy");
             impl_->draw_hierarchy();
         }
         ImGui::End();
     }
     if (impl_->panel_open[1]) {
         if (panel("Inspector", 1)) {
-            impl_->panel_header("Inspector");
             impl_->draw_inspector();
         }
         ImGui::End();
     }
     if (impl_->panel_open[2]) {
         if (panel("Assets", 2)) {
-            impl_->panel_header("Assets");
             impl_->draw_assets();
         }
         ImGui::End();
     }
     if (impl_->panel_open[3]) {
         if (panel("History", 3)) {
-            impl_->panel_header("History");
             impl_->draw_history();
         }
         ImGui::End();
     }
     if (impl_->panel_open[4]) {
         if (panel("Diagnostics", 4)) {
-            impl_->panel_header("Diagnostics");
             impl_->draw_diagnostics();
         }
         ImGui::End();
@@ -2220,6 +2636,15 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         impl_->capture_pointer(false);
         impl_->update_shortcuts();
     }
+    if (impl_->panel_open[6]) {
+        if (panel("Timeline", 6)) impl_->draw_timeline();
+        ImGui::End();
+    }
+    if (!impl_->panel_open[6]) impl_->timeline_scrub_targets.clear();
+    if (impl_->panel_open[7]) {
+        if (panel("Project", 7)) impl_->draw_project();
+        ImGui::End();
+    }
     impl_->draw_dialogs();
 
     ImGui::Render();
@@ -2228,6 +2653,19 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
 
 Entity EditorUi::selected_entity() const {
     return impl_->camera_enabled ? Entity::parse(impl_->selection).value_or(Entity{}) : Entity{};
+}
+
+std::optional<std::array<float, 4>> EditorUi::headless_item_rect(std::string_view key) const {
+    const auto found = impl_->headless_items.find(key);
+    return found == impl_->headless_items.end() ? std::nullopt : std::optional{found->second};
+}
+
+std::vector<Entity> EditorUi::selected_entities() const {
+    std::vector<Entity> result;
+    if (impl_->camera_enabled)
+        for (const auto& handle : impl_->selections.handles)
+            if (const auto entity = Entity::parse(handle)) result.push_back(*entity);
+    return result;
 }
 
 bool EditorUi::ground_grid_visible() const { return impl_->camera_enabled && impl_->grid_enabled; }

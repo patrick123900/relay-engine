@@ -14,7 +14,10 @@ SceneHistory::SceneHistory(Scene& scene, const std::size_t capacity)
 bool SceneHistory::execute(std::string label, const std::function<bool(Scene&)>& operation,
                            const std::uint64_t gesture) {
     auto before = scene_.capture_state();
-    if (!operation(scene_)) return false;
+    if (!operation(scene_)) {
+        scene_.restore_state(std::move(before));
+        return false;
+    }
     // A continuing gesture folds into the transaction it is extending, keeping that transaction's
     // original before-state. Dragging a gizmo therefore stays one undo entry however many updates
     // it sends, instead of filling the bounded history with one entry per frame. The token has to

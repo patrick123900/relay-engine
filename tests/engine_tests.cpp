@@ -1097,7 +1097,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 8U && relay::protocol_methods().size() == 49U,
+    expect(relay::protocol_schema_version == 9U && relay::protocol_methods().size() == 66U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");
@@ -1548,9 +1548,9 @@ int main() {
         expect(listed.find(R"("ok":true)") != std::string::npos &&
                    listed.find("relay-listing-probe.gltf") != std::string::npos,
                "the asset browser lists importable models from the project assets directory");
-        expect(listed.find("relay-listing-probe.txt") == std::string::npos &&
+        expect(listed.find("relay-listing-probe.txt") != std::string::npos &&
                    listed.find(".relay-listing-hidden.gltf") == std::string::npos,
-               "the asset listing exposes only importable models, not other or hidden files");
+               "the asset listing exposes project files and excludes hidden files");
         std::filesystem::remove("assets/relay-listing-probe.gltf");
         std::filesystem::remove("assets/relay-listing-probe.txt");
         std::filesystem::remove("assets/.relay-listing-hidden.gltf");

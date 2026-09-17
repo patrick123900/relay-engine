@@ -1694,19 +1694,19 @@ struct VulkanWindow::Impl {
                 vkCmdDraw(commands, 6, 2, 0, 0);
                 vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             }
-            const Entity selected = overlay && capture_buffer == VK_NULL_HANDLE
-                                        ? overlay->selected_entity() : Entity{};
-            if (selected.valid()) {
+            const auto selected = overlay && capture_buffer == VK_NULL_HANDLE
+                                      ? overlay->selected_entities() : std::vector<Entity>{};
+            if (!selected.empty()) {
                 const auto draw_selection = [&](bool outline) {
                     vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                       outline ? selection_outline_pipeline : selection_mask_pipeline);
                     for (const auto& draw_instance : render_scene.instances) {
                         Entity ancestor = draw_instance.entity;
-                        while (ancestor.valid() && ancestor != selected) {
+                        while (ancestor.valid() && std::find(selected.begin(), selected.end(), ancestor) == selected.end()) {
                             const auto* record = scene ? scene->get(ancestor) : nullptr;
                             ancestor = record ? record->parent : Entity{};
                         }
-                        if (ancestor != selected) continue;
+                        if (!ancestor.valid()) continue;
                         const auto* mesh = assets->find_mesh(draw_instance.mesh);
                         if (!mesh) continue;
                         const auto buffer = draw_instance.deformed_vertex_offset >= 0

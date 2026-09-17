@@ -37,6 +37,8 @@ add_library(relay_engine
     src/render/shader_reflection.cpp
     src/render/vulkan_device.cpp
     src/scene/scene.cpp
+    src/scene/project.cpp
+    src/scene/scene_edit.cpp
     src/scene/scene_history.cpp
     src/scene/scene_io.cpp
 )
@@ -209,7 +211,7 @@ if(RELAY_ENABLE_SDL)
 
             if(RELAY_ENABLE_EDITOR_UI)
                 # Dear ImGui is pinned to a tagged release rather than the untagged docking branch, so
-                # the editor build stays reproducible. The library is linked only into relay_demo:
+                # the editor build stays reproducible. The library is linked into the demo and headless UI tests:
                 # relay_engine must remain free of UI and model-facing dependencies.
                 include(FetchContent)
                 FetchContent_Declare(
@@ -283,4 +285,15 @@ if(RELAY_BUILD_TESTS)
         )
     endif()
     add_test(NAME relay_tests COMMAND relay_tests)
+    add_executable(relay_workflow_tests tests/editor_workflow_tests.cpp)
+    target_link_libraries(relay_workflow_tests PRIVATE Relay::Engine)
+    relay_enable_warnings(relay_workflow_tests)
+    add_test(NAME relay_workflow_tests COMMAND relay_workflow_tests)
+    if(TARGET relay_imgui)
+        add_executable(relay_editor_headless_tests tests/editor_headless_tests.cpp
+            src/editor/editor_ui.cpp src/editor/editor_theme.cpp src/editor/editor_layout.cpp)
+        target_link_libraries(relay_editor_headless_tests PRIVATE Relay::Engine relay_imgui)
+        relay_enable_warnings(relay_editor_headless_tests)
+        add_test(NAME relay_editor_headless_tests COMMAND relay_editor_headless_tests)
+    endif()
 endif()

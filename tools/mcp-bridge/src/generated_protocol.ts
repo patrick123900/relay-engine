@@ -240,7 +240,7 @@ export function registerGeneratedTools(
       title: "Import project model",
       description: "Import a model from the project-local assets directory using a content-addressed identity and optionally instantiate its node hierarchy.",
       inputSchema: z.object({
-        "filename": z.string().min(5).max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._-]*\\.(gltf|glb|fbx|obj|dae|blend)$")).describe("Safe project-local model filename without directory components"),
+        "filename": z.string().min(5).max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._ /-]*\\.(gltf|glb|fbx|obj|dae|blend)$")).describe("Project-relative model path; traversal and symlinks are rejected"),
         "instantiate": z.boolean().default(true).describe("Create the imported model hierarchy in the active scene"),
         "preset": z.enum(["scene", "static_mesh"]).default("scene").describe("Scene preserves conversion-time animation, camera and light data; static_mesh strips those channels")
       }),
@@ -854,6 +854,296 @@ export function registerGeneratedTools(
         const override = overrides["trace_replay"];
         if (override) return override(input as JsonObject);
         return invoke("trace.replay", {"filename": input["filename"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_copy",
+    {
+      title: "Copy",
+      description: "Copy selected subtrees to the session clipboard without changing the scene.",
+      inputSchema: z.object({
+        "entities": z.array(z.string().regex(new RegExp("^\\d+:\\d+$"))).min(1).max(4096)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_copy"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.copy", {"entities": input["entities"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_cut",
+    {
+      title: "Cut",
+      description: "Copy and remove selected subtrees as one undoable edit.",
+      inputSchema: z.object({
+        "entities": z.array(z.string().regex(new RegExp("^\\d+:\\d+$"))).min(1).max(4096)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_cut"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.cut", {"entities": input["entities"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_duplicate_many",
+    {
+      title: "Duplicate Many",
+      description: "Duplicate selected subtrees beside their originals as one undoable edit.",
+      inputSchema: z.object({
+        "entities": z.array(z.string().regex(new RegExp("^\\d+:\\d+$"))).min(1).max(4096)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_duplicate_many"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.duplicate_many", {"entities": input["entities"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_destroy_many",
+    {
+      title: "Destroy Many",
+      description: "Remove selected subtrees as one undoable edit.",
+      inputSchema: z.object({
+        "entities": z.array(z.string().regex(new RegExp("^\\d+:\\d+$"))).min(1).max(4096)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_destroy_many"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.destroy_many", {"entities": input["entities"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_transform_many",
+    {
+      title: "Transform Many",
+      description: "Apply a column-major world-space affine delta matrix to selected roots as one undoable gesture.",
+      inputSchema: z.object({
+        "entities": z.array(z.string().regex(new RegExp("^\\d+:\\d+$"))).min(1).max(4096),
+        "delta": z.array(z.number().finite()).min(16).max(16),
+        "gesture": z.number().int().min(0).max(4294967295).optional()
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_transform_many"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.transform_many", {"entities": input["entities"], "delta": input["delta"], "gesture": input["gesture"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_paste",
+    {
+      title: "Paste entities",
+      description: "Paste the session clipboard as one undoable edit; cameras stay inactive and internal model bindings are remapped.",
+      inputSchema: z.object({
+        "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).nullable().optional()
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_paste"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.paste", {"parent": input["parent"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_clipboard",
+    {
+      title: "Inspect clipboard",
+      description: "Read session clipboard root and entity counts.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["scene_clipboard"];
+        if (override) return override({});
+        return invoke("scene.clipboard", {});
+      },
+  );
+
+  server.registerTool(
+    "project_create",
+    {
+      title: "Create project",
+      description: "Create a folder project (.relayproject) and an empty scene; refuses to overwrite an existing project.",
+      inputSchema: z.object({
+        "filename": z.string().min(1).max(128),
+        "name": z.string().min(1).max(128)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["project_create"];
+        if (override) return override(input as JsonObject);
+        return invoke("project.create", {"filename": input["filename"], "name": input["name"]});
+      },
+  );
+
+  server.registerTool(
+    "project_open",
+    {
+      title: "Open project",
+      description: "Open a folder project (.relayproject) and load its startup scene atomically, or clear the scene for an empty project.",
+      inputSchema: z.object({
+        "filename": z.string().min(1).max(128)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["project_open"];
+        if (override) return override(input as JsonObject);
+        return invoke("project.open", {"filename": input["filename"]});
+      },
+  );
+
+  server.registerTool(
+    "project_status",
+    {
+      title: "Status project",
+      description: "Inspect the current project, member scene files and startup scene.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["project_status"];
+        if (override) return override({});
+        return invoke("project.status", {});
+      },
+  );
+
+  server.registerTool(
+    "project_list",
+    {
+      title: "List project",
+      description: "List available workspace project files.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["project_list"];
+        if (override) return override({});
+        return invoke("project.list", {});
+      },
+  );
+
+  server.registerTool(
+    "project_add_scene",
+    {
+      title: "Add Scene project",
+      description: "Add an existing valid scene file to the current project; the first scene becomes its startup scene.",
+      inputSchema: z.object({
+        "sceneFile": z.string().min(1).max(128)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["project_add_scene"];
+        if (override) return override(input as JsonObject);
+        return invoke("project.add_scene", {"scene_file": input["sceneFile"]});
+      },
+  );
+
+  server.registerTool(
+    "project_remove_scene",
+    {
+      title: "Remove Scene project",
+      description: "Remove scene membership without deleting its file; chooses a remaining startup scene when needed.",
+      inputSchema: z.object({
+        "sceneFile": z.string().min(1).max(128)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["project_remove_scene"];
+        if (override) return override(input as JsonObject);
+        return invoke("project.remove_scene", {"scene_file": input["sceneFile"]});
+      },
+  );
+
+  server.registerTool(
+    "project_set_startup",
+    {
+      title: "Set Startup project",
+      description: "Choose a current project member as the startup scene.",
+      inputSchema: z.object({
+        "sceneFile": z.string().min(1).max(128)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["project_set_startup"];
+        if (override) return override(input as JsonObject);
+        return invoke("project.set_startup", {"scene_file": input["sceneFile"]});
+      },
+  );
+
+  server.registerTool(
+    "project_close",
+    {
+      title: "Close project",
+      description: "Close project metadata while leaving the current scene intact.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["project_close"];
+        if (override) return override({});
+        return invoke("project.close", {});
+      },
+  );
+
+  server.registerTool(
+    "scene_set_animations",
+    {
+      title: "Control animation tracks",
+      description: "Seek or configure multiple animation roots in one undoable gesture; time clamps to each clip duration.",
+      inputSchema: z.object({
+        "entities": z.array(z.string().regex(new RegExp("^\\d+:\\d+$"))).min(1).max(4096),
+        "playing": z.boolean().optional(),
+        "loop": z.boolean().optional(),
+        "speed": z.number().finite().min(-100).max(100).optional(),
+        "timeSeconds": z.number().finite().min(0).max(1000000).optional(),
+        "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one scrub gesture; zero creates a separate undo entry")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_set_animations"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.set_animations", {"entities": input["entities"], "playing": input["playing"], "loop": input["loop"], "speed": input["speed"], "time_seconds": input["timeSeconds"], "gesture": input["gesture"]});
+      },
+  );
+
+  server.registerTool(
+    "animation_clip",
+    {
+      title: "Inspect animation timeline",
+      description: "Read bounded channel key times for an imported animation clip. Key times are read-only; truncated channels report their full key count.",
+      inputSchema: z.object({
+        "model": z.string().min(1).max(256),
+        "clip": z.number().int().min(0).max(255)
+      }),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["animation_clip"];
+        if (override) return override(input as JsonObject);
+        return invoke("animation.clip", {"model": input["model"], "clip": input["clip"]});
       },
   );
 }

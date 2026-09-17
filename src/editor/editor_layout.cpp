@@ -6,17 +6,19 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <utility>
 
 namespace relay {
 
-void EditorLayout::initialize() {
+void EditorLayout::initialize(std::string override_path) {
     auto& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigWindowsMoveFromTitleBarOnly = true;
     // Keep all panels in this SDL/Vulkan surface; native multi-window presentation is a separate
     // backend capability. Docking, floating and resizing within the editor are fully available.
     const auto* configured = std::getenv("RELAY_EDITOR_LAYOUT_PATH");
-    ini_path_ = configured && *configured ? configured : ".relay/editor-layout.ini";
+    ini_path_ = !override_path.empty() ? std::move(override_path)
+                : configured && *configured ? configured : ".relay/editor-layout.ini";
     std::error_code error;
     const auto parent = std::filesystem::path(ini_path_).parent_path();
     if (!parent.empty()) std::filesystem::create_directories(parent, error);
@@ -60,16 +62,26 @@ void EditorLayout::build(const float scale) {
             &main);
         ImGui::DockBuilderSplitNode(main, ImGuiDir_Left, .21F, &left, &main);
         ImGui::DockBuilderSplitNode(main, ImGuiDir_Right, .21F / .79F, &right, &main);
-        ImGuiID assets = 0, history = 0;
+        ImGuiID assets = 0;
         ImGui::DockBuilderSplitNode(bottom, ImGuiDir_Left, .21F, &assets, &bottom);
-        ImGui::DockBuilderSplitNode(bottom, ImGuiDir_Left, .21F / .79F, &history, &bottom);
         ImGui::DockBuilderDockWindow("Hierarchy", left);
         ImGui::DockBuilderDockWindow("Inspector", right);
         ImGui::DockBuilderDockWindow("Assets", assets);
-        ImGui::DockBuilderDockWindow("History", history);
+        ImGui::DockBuilderDockWindow("History", bottom);
+        ImGui::DockBuilderDockWindow("Timeline", bottom);
+        ImGui::DockBuilderDockWindow("Project", assets);
         ImGui::DockBuilderDockWindow("Diagnostics", bottom);
         ImGui::DockBuilderDockWindow("Viewport", main);
         ImGui::DockBuilderFinish(id);
+    }
+    if (!optional_migrated_) {
+        optional_migrated_ = true;
+        for (const auto& pair : {std::pair{"Timeline", "Diagnostics"}, std::pair{"History", "Diagnostics"}, std::pair{"Project", "Assets"}}) {
+            const auto* optional = ImGui::FindWindowSettingsByID(ImHashStr(pair.first));
+            const auto* anchor = ImGui::FindWindowSettingsByID(ImHashStr(pair.second));
+            if ((!optional || !optional->DockId) && anchor && anchor->DockId)
+                ImGui::DockBuilderDockWindow(pair.first, anchor->DockId);
+        }
     }
     ImGui::DockSpaceOverViewport(id, viewport);
 }

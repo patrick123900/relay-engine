@@ -16,18 +16,55 @@ if an important verification gap cannot reasonably be covered without desktop in
 ## Next-session starting point
 
 - Branch: `main`; GitHub: https://github.com/patrick123900/relay-engine (public).
-- Previous published baseline: `4742eff` (Phase D) and `9db0fff` (sandbox documentation).
-  This snapshot includes Phase E, Phase F and the editor follow-ups; use `git log -1` for its commit.
+- Previous published baseline: `c506c8f` (`Polish scene workflows and live animation scrubbing`).
+  The commit containing this handoff includes the usability, project-folder, timeline, icon and
+  grid follow-ups. Use `git log -1` for the latest commit and inspect the working tree before editing.
 - Phases A–D meet their recorded milestone definitions on the tested Linux/Vulkan path, not full
   Godot compatibility or Windows/macOS parity. Deferred work is listed explicitly below.
-- Current on-disk/API versions: scene v4, import manifest v3, protocol v8 with 49 native methods
-  and 49 generated MCP tools.
-- Phase E and the tested Linux/Vulkan Phase F milestone are implemented. The user authorized
-  committing and pushing the accumulated implementation/documentation on 2026-09-17. Later phase
-  labels organize proposed work; they do not claim full editor completion or platform parity.
+- Current on-disk/API versions: scene v4, import manifest v3, project v1, protocol v9 with 66 native
+  methods and 66 generated MCP tools.
+- Phase E and the tested Linux/Vulkan Phase F milestone are implemented. Earlier commit/push
+  authorization was completed for `c506c8f`; the user also authorized committing and pushing all
+  subsequent work, including this documentation, on 2026-09-17.
+  Later phase labels organize proposed work; they do not claim full editor completion or platform parity.
 - The Phase E and Phase F sections below record this session; earlier phase results remain
   historical. The user now prioritizes editor usability before embedded chat; Phase G permissions
   remain a prerequisite for broader agent access.
+
+### Latest state and first follow-up
+
+The three usability priorities are implemented: multi-selection/session clipboard, folder projects,
+and a dockable playback timeline. Project, Timeline and History start hidden; View reopens them.
+Projects use workspace-relative `*.relayproject` paths. Their containing folder supplies recursive
+Assets discovery and model imports, with scene files in its `scenes/` directory. Default Timeline
+shares the wider bottom dock with Diagnostics. Duplicate panel headings are removed. Loop, Rotate
+and Focus icons were redrawn after feedback; those final icon revisions have background verification
+but were not reinspected on the desktop.
+
+**Grid fading verified by the user on 2026-09-17.** After the final correction, the user confirmed
+smooth fading during both upward and downward camera movement. The reported popping is resolved
+in that manual check; no further grid verification is pending. The final implementation retains
+GLSL `smoothstep(0.5, 1.0, fract(height))` in `shaders/editor_grid.vert`, changing only absolute height
+selection and signed plane heights. The native `editor_grid_levels` helper and extra push-constant
+fields were removed. This visual result comes from the user's verification, not the headless suites.
+
+Run background verification first. Prefer an isolated offscreen/virtual-display GPU check if
+practical; it must not affect the user's desktop, mouse or focus. A regular desktop check requires
+fresh explicit approval. The earlier approval covered only the panel/folder review and does not
+carry forward. Next substantive work is Phase G capability grants/audited scopes before chat.
+
+Final recorded verification after the shader correction:
+
+- The user confirmed smooth rendered grid fading in upward and downward motion after the final fix.
+- Development and release builds passed, including grid shader compilation.
+- All three test suites passed in each build: `relay_tests`, `relay_workflow_tests`, and
+  `relay_editor_headless_tests`. These do **not** verify rendered grid crossfading.
+- Generated protocol checks, MCP build/check and the 66-tool headless capture/clipboard smoke
+  passed during the usability work. `git diff --check` passed after the correction.
+- The approved desktop panel/folder review verified default hidden panes, removed headings, nested
+  glTF import and the wider timeline. Its temporary editor and fixture folder were closed/removed.
+- `projects/my-project/testing.relayproject` is the user-created empty test project included in
+  this commit; preserve it unless the user requests otherwise.
 
 ## User’s product goal
 
@@ -857,9 +894,10 @@ Viewport and Controls polish (2026-09-17):
 
 Deferred from this phase, not blocking it:
 
-- [ ] Multi-selection, copy and paste.
-- [ ] Make the interaction harness runnable in CI. It currently needs a desktop session, xdotool and
-      a granted Remote Control permission, so it is a local check rather than part of `ctest`.
+- [x] Multi-selection, copy and paste (implemented in the 2026-09-17 usability follow-up).
+- [x] Add headless editor interaction coverage to `ctest`: selection, clipboard, timeline, close
+      guards and project Save As/browser now run through internal ImGui input with no windows.
+      The older xdotool harnesses remain optional desktop-only checks.
 - [ ] Per-triangle picking; `scene.pick` is bounds-level, which answers "which object" but not
       "where on the surface".
 
@@ -930,13 +968,15 @@ Use this as the next instruction after giving the agent this handoff:
 
 > Read AGENTS.md first: never control mouse/keyboard, change focus or open windows without
 > specific advance user approval for the current task. Inspect HANDOFF.md, README.md and the
-> current branch before changing code. A–F are complete for
-> the tested Linux/Vulkan milestones on `main`, with explicit carry-forward limits, and the daily
-> editing and save workflow above is implemented on top of them. Continue editor usability:
-> multi-selection and cut/copy/paste, a project model above single scene files, and an animation
-> timeline, validated with background/headless checks by default. Real desktop input requires
-> specific user approval first. Keep Phase G permissions ahead of broader agent
-> access and embedded chat. Keep every editor mutation routed through ControlProtocol rather than
+> current branch before changing code. A–F and the three editor usability priorities are implemented
+> on the tested Linux path, with the limits recorded below. Grid fading was visually verified by
+> the user after the final correction; it is no longer pending. Preserve any subsequent local edits and
+> project data. Continue Phase G: explicit session capability grants and audited scopes before
+> chat. Use isolated background GPU verification where practical; get fresh approval before any
+> normal desktop interaction.
+> Keep providers and credentials outside the C++ engine. Validate using background builds, protocol
+> tests and the new headless ImGui input tests; do not request desktop access when these suffice.
+> Keep every editor mutation routed through ControlProtocol rather than
 > touching Scene directly, keep one undo entry per gesture, keep read-only methods untraced, and
 > keep the UI excluded from captures so golden images stay comparable. Keep the unsaved marker a
 > comparison of scene revisions rather than a change count, so undoing back to a saved state still
@@ -1010,7 +1050,7 @@ sections record tests at the layout that existed then, rather than validation of
   lights/cameras/empty nodes. Existing editor-contract and transform/morph fixes remain in place.
 - XZ grid: unit lines, ten-unit major lines, antialiasing/subpixel suppression and distance fade
   35–90 units. Height planes are Y=0,10,20,...: Y=0 holds through camera Y=5, transitions 5–10;
-  Y=10 holds through 15, transitions 15–20, and so on. Below ground retain Y=0. Smoothstep weights
+  Y=10 holds through 15, transitions 15–20, and so on, mirrored below ground through negative levels. Smoothstep weights
   are continuous at boundaries. View > Ground grid toggles it; scene-camera mode suppresses it.
 - Selected editor-camera meshes have a yellow-orange silhouette (approximately `#FFB930`), including
   drawable descendants. A depth-tested stencil mask and eight translated screen-space copies form
@@ -1175,3 +1215,90 @@ MCP build/check and capture smoke passed. The desktop workflow passed all 25 che
 pose changes before slider release and one undo entry throughout the drag. A separate desktop
 check on the final build verified that Alt+F4 leaves an unsaved scene open and intact, and Escape
 cancels the close prompt. Desktop tests required access outside the sandbox to the X11 session.
+
+
+## Three editor usability priorities — implemented 2026-09-17
+
+This section supersedes earlier next-session recommendations to implement selection, projects and
+an animation timeline. These changes follow the published `c506c8f` baseline and are included in this commit.
+
+- Multi-selection: Ctrl-toggle in hierarchy/viewport, Shift-range in visible tree order, Ctrl+A,
+  active-object inspector, group outlines/framing and world-space group gizmos. Complete selected
+  forests are copied/cut/pasted/duplicated/deleted atomically; overlapping ancestor selections do
+  not process children twice. Shared gesture tokens keep a group transform in one undo entry.
+  Singular parents or unrepresentable shear reject the complete edit. `SceneHistory::execute`
+  now restores its before-state when a mutation returns false after partial changes.
+- Session clipboard lives on Engine so protocol instances share it. Copy does not enter scene
+  history; clipboard data survives deletion and scene/project changes. Paste recreates fresh
+  entities, remaps internal parent/model bindings and keeps cameras inactive. Partial imported-node
+  copies drop external model bindings. Forest size remains bounded to 4096 entities.
+- Project v1 `*.relayproject` files in project folders organize up to 128 scene members with a name and startup
+  scene. New/Open project and the Project browser are implemented; Save As/Save add membership.
+  Scene context menus set startup or remove membership while preserving files. Metadata writes
+  atomically; unsafe names, symlinks and invalid/missing startup content are rejected without
+  changing the active scene/project. Each file owns its containing folder: recursive Assets discovery and model imports use that
+  root, scene storage uses its scenes/ directory, and opening projects does not change cwd.
+  Paths are workspace-relative. Metadata edits persist separately from scene undo; export is deferred.
+- Timeline is a dockable panel: model-instance rows, active clip list, seconds ruler, transport,
+  frame stepping, display FPS, frame snapping, speed and loop. The ruler pauses/seeks selected
+  animation roots live, as one undo transaction, with per-clip clamping. Imported-child selection
+  resolves to its animation root; no selected root defaults to the first available animator.
+  Channel key markers are read-only and bounded (256 channels, 256 sampled keys each, full counts
+  reported). Animation authoring/keyframe editing, blending and retargeting remain deferred.
+- Protocol v9 adds forest/clipboard/group-transform methods, `scene.set_animations`, `animation.clip`
+  and eight `project.*` methods (66 total). The generator and native validator now support bounded
+  string/number arrays using the shared strict JSON reader. Generated C++, MCP TS/JS and docs agree.
+
+Background verification architecture:
+
+- `relay_workflow_tests` runs against temporary workspace files and actual ControlProtocol/Engine
+  state: clipboard persistence and bindings, forest deduplication, group undo/rollback, rotated
+  and singular parent transforms, project reopen/startup/failure protection, safe paths and symlinks,
+  bounded channel markers, frame snapping/stepping and synchronized animation seeks.
+- `relay_editor_headless_tests` constructs CPU-only ImGui frames through
+  `EditorUi::initialize_headless`. No SDL initialization, SDL windows, Vulkan device or OS input
+  are used. Internal input events exercise actual hierarchy modifiers, clipboard shortcuts,
+  held-ruler seek/undo, native close guard and project Save As/browser workflows. Widget rectangles
+  are exposed only as read-only observations of headless frames. Layout/files use temporary paths.
+- Both targets are part of `ctest`; the UI target is conditional on editor dependencies. Historical
+  desktop test commands are optional approval-only checks. For background MCP execution set
+  `RELAY_RUNTIME_MODE=headless` so its automatic editor mode cannot open a desktop window.
+
+Next substantive phase: G, capability grants and audited scopes before embedded chat. The user
+verified the grid visual follow-up. Keep the background-first rule in AGENTS.md and CLAUDE.md;
+no desktop interaction is authorized for the next session.
+
+Validation for the three priorities: dev and Release builds completed without warnings. All three
+`ctest` suites passed in both builds (engine, background workflow, headless editor input). Generated
+protocol checks, MCP TypeScript build/check and the 66-tool headless MCP capture/clipboard smoke
+passed. No desktop windows were opened and no OS mouse/keyboard events were sent during this work.
+Windowed GPU visual checks were not rerun; existing selection shaders are unchanged and the new
+selection routing is compiled, with selection and editor behavior checked through headless tests.
+
+
+### Project folders and panel cleanup (2026-09-17)
+
+Project, Timeline and History start hidden and remain available from View. Removed duplicate panel
+headings. Optional panels join existing docks when a layout predates them. Timeline transport uses
+vector icons with tooltips, a compact FPS/speed row and a separate scrolling track area; channel
+labels are clipped to their column. Folder projects use `*.relayproject`, and Assets lists all visible
+files recursively from the project root with nested models selectable for import. Headless coverage
+checks default visibility, explicit reopening, project asset isolation and scene persistence.
+Desktop inspection was specifically approved by the user for this task; future desktop actions
+still require fresh approval under AGENTS.md.
+
+Verification for the panel/folder follow-up: desktop screenshots confirmed hidden optional panes,
+removed duplicate headings, project-folder discovery, actual nested glTF import and the wider
+timeline sharing Diagnostics' bottom dock. The temporary review editor and project folder were
+closed/removed. Ruler labels now use evenly spaced decimal intervals and speed shows two decimals.
+
+Icon follow-up: Loop uses rounded opposing arrows, Rotate uses an arrowhead attached to the
+arc along its tangent, and Focus uses a centered filled dot instead of a tiny outlined ring.
+
+Grid follow-up: retain the original vertex-shader smoothstep crossfade and 128-byte push layout.
+The negative-height correction is limited to absolute camera height for level selection and signed
+plane heights. An initial native calculation/payload change was reverted after the user reported
+popping; do not describe CPU math checks as rendered fade verification.
+
+User verification update (2026-09-17): the final grid fade is visually confirmed smooth during
+both upward and downward camera movement. This closes the earlier pending rendered check.

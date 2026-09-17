@@ -8,6 +8,8 @@
 #include "relay/render/assets.hpp"
 #include "relay/render/renderer.hpp"
 #include "relay/scene/scene.hpp"
+#include "relay/scene/scene_edit.hpp"
+#include "relay/scene/project.hpp"
 #include "relay/scene/scene_history.hpp"
 
 #include <cstdint>
@@ -74,6 +76,9 @@ public:
     [[nodiscard]] Scene& scene();
     [[nodiscard]] const Scene& scene() const;
     [[nodiscard]] SceneHistory& scene_history();
+    [[nodiscard]] SceneClipboard& clipboard() { return clipboard_; }
+    [[nodiscard]] std::optional<Project>& project() { return project_; }
+    [[nodiscard]] const std::optional<Project>& project() const { return project_; }
     [[nodiscard]] AssetRegistry& assets();
     [[nodiscard]] const AssetRegistry& assets() const;
 
@@ -85,6 +90,8 @@ private:
     LogBuffer logs_;
     Scene scene_;
     SceneHistory scene_history_;
+    SceneClipboard clipboard_;
+    std::optional<Project> project_;
     AssetRegistry assets_;
     GpuFrameSource gpu_source_;
     std::function<void()> gpu_flush_;

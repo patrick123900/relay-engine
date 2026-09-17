@@ -49,7 +49,7 @@ def validate_schema(schema: dict) -> None:
         wire_names: set[str] = set()
         input_names: set[str] = set()
         for field in method["params"]:
-            if field.get("type") not in {"string", "integer", "number", "boolean"}:
+            if field.get("type") not in {"string", "integer", "number", "boolean", "string_array", "number_array"}:
                 raise ValueError(f"unsupported field type in {method['method']}")
             input_name = field["name"]
             wire_name = field.get("wire", input_name)
@@ -72,7 +72,7 @@ namespace relay {{
 
 inline constexpr unsigned protocol_schema_version = {schema["version"]}U;
 
-enum class ProtocolValueType {{ string, integer, number, boolean }};
+enum class ProtocolValueType {{ string, integer, number, boolean, string_array, number_array }};
 
 struct ProtocolFieldSpec {{
     std::string_view name;
@@ -112,7 +112,7 @@ struct ProtocolMethodSpec {{
 def generate_cpp(schema: dict) -> str:
     arrays: list[str] = []
     method_rows: list[str] = []
-    type_names = {"string": "string", "integer": "integer", "number": "number", "boolean": "boolean"}
+    type_names = {"string": "string", "integer": "integer", "number": "number", "boolean": "boolean", "string_array": "string_array", "number_array": "number_array"}
     for method in schema["methods"]:
         array_name = f"fields_{symbol(method['method'])}"
         params = method["params"]
@@ -186,7 +186,16 @@ const ProtocolMethodSpec* find_protocol_method(const std::string_view method) {
 
 def zod_expression(field: dict) -> str:
     field_type = field["type"]
-    if field_type == "string":
+    if field_type in {"string_array", "number_array"}:
+        item = "z.string()" if field_type == "string_array" else "z.number().finite()"
+        if field_type == "string_array" and "pattern" in field:
+            item += f".regex(new RegExp({json.dumps(field['pattern'])}))"
+        expression = f"z.array({item})"
+        if "minimumLength" in field:
+            expression += f".min({field['minimumLength']})"
+        if "maximumLength" in field:
+            expression += f".max({field['maximumLength']})"
+    elif field_type == "string":
         expression = "z.string()"
         if "minimumLength" in field:
             expression += f".min({field['minimumLength']})"

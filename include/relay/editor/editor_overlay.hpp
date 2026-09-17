@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <vulkan/vulkan.h>
 
@@ -61,6 +62,10 @@ public:
     [[nodiscard]] virtual const ViewOverride* view_override() const { return nullptr; }
     // Presentation-only selection; never written to scene state or exported captures.
     [[nodiscard]] virtual Entity selected_entity() const { return {}; }
+    [[nodiscard]] virtual std::vector<Entity> selected_entities() const {
+        const auto entity = selected_entity();
+        return entity.valid() ? std::vector<Entity>{entity} : std::vector<Entity>{};
+    }
     [[nodiscard]] virtual bool ground_grid_visible() const { return false; }
 };
 

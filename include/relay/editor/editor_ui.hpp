@@ -11,6 +11,8 @@
 #include "relay/editor/editor_overlay.hpp"
 
 #include <functional>
+#include <array>
+#include <optional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -29,6 +31,11 @@ public:
     EditorUi& operator=(const EditorUi&) = delete;
 
     bool initialize(const OverlayContext& context, std::string& error) override;
+    // CPU-only ImGui frames for background interaction tests. No SDL window, GPU or OS input.
+    bool initialize_headless(std::string& error);
+    [[nodiscard]] std::optional<std::array<float, 4>> headless_item_rect(std::string_view key) const;
+    // Changes editor view state without mutating the scene.
+    void set_panel_visible(std::string_view name, bool visible);
     void invalidate() override;
     // Execute render-related requests only after the current frame has been presented.
     void process_actions();
@@ -38,6 +45,7 @@ public:
     [[nodiscard]] EditorViewport scene_viewport() const override;
     [[nodiscard]] const ViewOverride* view_override() const override;
     [[nodiscard]] Entity selected_entity() const override;
+    [[nodiscard]] std::vector<Entity> selected_entities() const override;
     [[nodiscard]] bool ground_grid_visible() const override;
 
 private:

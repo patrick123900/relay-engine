@@ -2,6 +2,10 @@
 #include "relay/control/generated_protocol.hpp"
 
 #include "relay/core/engine.hpp"
+#include "relay/core/json.hpp"
+#include "relay/editor/editor_math.hpp"
+#include "relay/scene/scene_edit.hpp"
+#include "relay/scene/project.hpp"
 #include "relay/render/vulkan_device.hpp"
 #include "relay/render/asset_manifest.hpp"
 #include "relay/render/assets.hpp"
@@ -19,57 +23,22 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <set>
 #include <utility>
 
 namespace relay {
 namespace {
 
 std::string escape_json(const std::string_view value) {
-    std::string escaped;
-    escaped.reserve(value.size());
-    for (const char character : value) {
-        switch (character) {
-        case '\\': escaped += "\\\\"; break;
-        case '"': escaped += "\\\""; break;
-        case '\n': escaped += "\\n"; break;
-        case '\r': escaped += "\\r"; break;
-        case '\t': escaped += "\\t"; break;
-        default: escaped += character; break;
-        }
-    }
-    return escaped;
+    return json_escape(value);
 }
 
 std::string string_field(const std::string_view json, const std::string_view key) {
-    const std::string marker = "\"" + std::string(key) + "\"";
-    auto position = json.find(marker);
-    if (position == std::string_view::npos) return {};
-    position = json.find(':', position + marker.size());
-    if (position == std::string_view::npos) return {};
-    position = json.find('"', position + 1U);
-    if (position == std::string_view::npos) return {};
-    ++position;
-    std::string result;
-    bool escaping = false;
-    for (; position < json.size(); ++position) {
-        const char character = json[position];
-        if (escaping) {
-            switch (character) {
-            case 'n': result += '\n'; break;
-            case 'r': result += '\r'; break;
-            case 't': result += '\t'; break;
-            default: result += character; break;
-            }
-            escaping = false;
-        } else if (character == '\\') {
-            escaping = true;
-        } else if (character == '"') {
-            return result;
-        } else {
-            result += character;
-        }
-    }
-    return {};
+    JsonParser parser(json);
+    const auto parsed = parser.parse();
+    if (!parsed || !parsed->object()) return {};
+    const auto* value = field(*parsed->object(), key);
+    return value && value->string() ? *value->string() : std::string{};
 }
 
 std::uint64_t unsigned_field(const std::string_view json, const std::string_view key,
@@ -89,36 +58,17 @@ std::uint64_t unsigned_field(const std::string_view json, const std::string_view
 }
 
 std::optional<double> number_field(const std::string_view json, const std::string_view key) {
-    const std::string marker = "\"" + std::string(key) + "\"";
-    auto position = json.find(marker);
-    if (position == std::string_view::npos) return std::nullopt;
-    position = json.find(':', position + marker.size());
-    if (position == std::string_view::npos) return std::nullopt;
-    ++position;
-    while (position < json.size() && (json[position] == ' ' || json[position] == '\t')) ++position;
-    auto end = position;
-    while (end < json.size() && ((json[end] >= '0' && json[end] <= '9') || json[end] == '-' ||
-                                 json[end] == '+' || json[end] == '.' || json[end] == 'e' ||
-                                 json[end] == 'E')) {
-        ++end;
-    }
-    double value = 0.0;
-    const auto result = std::from_chars(json.data() + position, json.data() + end, value);
-    if (result.ec != std::errc{} || result.ptr != json.data() + end) return std::nullopt;
-    return value;
+    JsonParser parser(json);
+    const auto value = parser.parse();
+    const auto* entry = value && value->object() ? field(*value->object(), key) : nullptr;
+    return entry && entry->number() ? std::optional{*entry->number()} : std::nullopt;
 }
 
 bool boolean_field(const std::string_view json, const std::string_view key, const bool fallback) {
-    const std::string marker = "\"" + std::string(key) + "\"";
-    auto position = json.find(marker);
-    if (position == std::string_view::npos) return fallback;
-    position = json.find(':', position + marker.size());
-    if (position == std::string_view::npos) return fallback;
-    ++position;
-    while (position < json.size() && (json[position] == ' ' || json[position] == '\t')) ++position;
-    if (json.substr(position, 4U) == "true") return true;
-    if (json.substr(position, 5U) == "false") return false;
-    return fallback;
+    JsonParser parser(json);
+    const auto value = parser.parse();
+    const auto* entry = value && value->object() ? field(*value->object(), key) : nullptr;
+    return entry && entry->boolean() ? *entry->boolean() : fallback;
 }
 
 std::optional<Entity> entity_field(const std::string_view json, const std::string_view key) {
@@ -144,18 +94,8 @@ std::string error_response(const std::uint64_t id, const std::string_view messag
            ",\"ok\":false,\"error\":\"" + escape_json(message) + "\"}";
 }
 
-std::optional<std::filesystem::path> safe_scene_path(const std::string_view filename) {
-    if (filename.empty() || filename.size() > 128U ||
-        !filename.ends_with(".relay.json")) return std::nullopt;
-    for (const char character : filename) {
-        const bool safe = (character >= 'a' && character <= 'z') ||
-                          (character >= 'A' && character <= 'Z') ||
-                          (character >= '0' && character <= '9') || character == '-' ||
-                          character == '_' || character == '.';
-        if (!safe) return std::nullopt;
-    }
-    if (filename.front() == '.') return std::nullopt;
-    return std::filesystem::path{"scenes"} / filename;
+std::optional<std::filesystem::path> safe_scene_path(const Engine& engine, const std::string_view filename) {
+    return workspace_file(engine.project() ? (engine.project()->root() / "scenes").generic_string() : "scenes", filename, ".relay.json");
 }
 
 std::optional<std::filesystem::path> safe_trace_path(const std::string_view filename) {
@@ -196,15 +136,10 @@ std::optional<std::filesystem::path> safe_capture_path(std::string_view filename
     return std::filesystem::path{directory} / filename;
 }
 
-// Returns the validated top-level name only. The importer joins it against the assets root itself
+// Returns a validated relative path. The importer joins it against the project root itself
 // and sandboxes every dependency the model goes on to reference.
 std::optional<std::string> safe_model_filename(const std::string_view filename) {
-    if (filename.empty() || filename.size() > 128U || filename.front() == '.') return std::nullopt;
-    for (const char character : filename) {
-        if (!((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
-              (character >= '0' && character <= '9') || character == '-' || character == '_' ||
-              character == '.')) return std::nullopt;
-    }
+    if (!workspace_file(".", filename, "")) return {};
     static constexpr std::array extensions{".gltf", ".glb", ".fbx", ".obj", ".dae", ".blend"};
     const auto extension = std::filesystem::path{filename}.extension().string();
     if (std::find(extensions.begin(), extensions.end(), extension) == extensions.end()) {
@@ -232,6 +167,13 @@ ControlProtocol::ControlProtocol(Engine& engine, CaptureHandler capture_handler,
 
 std::string ControlProtocol::handle(const std::string_view request) {
     const auto id = unsigned_field(request, "id", 0);
+    JsonParser request_parser(request);
+    const auto request_value = request_parser.parse();
+    if (!request_value || !request_value->object()) {
+        return error_response(id, request_parser.error().find("duplicate") != std::string::npos
+                                      ? "request contains a duplicate field"
+                                      : "request must be a valid JSON object");
+    }
     const auto method = string_field(request, "method");
     if (method.empty()) {
         return error_response(id, "missing method");
@@ -342,12 +284,14 @@ std::string ControlProtocol::handle(const std::string_view request) {
     if (method == "assets.import_model") {
         const auto filename = string_field(request, "filename");
         const auto safe_name = safe_model_filename(filename);
-        if (!safe_name) return error_response(id, "filename must be a supported model name without directories");
+        if (!safe_name) return error_response(id, "filename must be a safe project-relative model path");
         const bool instantiate = boolean_field(request, "instantiate", true);
         ModelImportSettings settings;
         settings.preset = string_field(request, "preset");
         if (settings.preset.empty()) settings.preset = "scene";
-        const std::filesystem::path assets_root{"assets"};
+        const auto assets_root = engine_.project() ? engine_.project()->root() : std::filesystem::path{"assets"};
+        if (!workspace_file(assets_root.generic_string(), filename, ""))
+            return error_response(id, "model path must stay inside its project without symlinks");
         std::string error;
         ModelImportResult imported;
         if (instantiate) {
@@ -524,22 +468,34 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) + output + '}';
     }
     if (method == "assets.available") {
-        // Only top-level files with an importable extension are listed. This mirrors what
-        // assets.import_model will accept and does not widen the import sandbox.
-        std::vector<std::string> names;
+        std::vector<std::string> names, files;
         std::error_code failure;
-        std::filesystem::directory_iterator item{"assets", failure}, end;
-        for (; !failure && item != end; item.increment(failure)) {
+        const auto root = engine_.project() ? engine_.project()->root() : std::filesystem::path{"assets"};
+        std::filesystem::recursive_directory_iterator item{root, failure}, end;
+        for (; !failure && item != end && files.size() < 4096; item.increment(failure)) {
+            const auto basename = item->path().filename().string();
+            if (item->is_symlink() || basename.starts_with(".")) {
+                if (item->is_directory()) item.disable_recursion_pending();
+                continue;
+            }
             std::error_code status_error;
             if (!item->is_regular_file(status_error)) continue;
-            const auto name = item->path().filename().string();
-            if (safe_model_filename(name).has_value()) names.push_back(name);
+            const auto name = item->path().lexically_relative(root).generic_string();
+            if (!workspace_file(root.generic_string(), name, "")) continue;
+            files.push_back(name);
+            if (safe_model_filename(name)) names.push_back(name);
         }
+        std::sort(files.begin(), files.end());
         std::sort(names.begin(), names.end());
         std::string output = "{\"available\":" + std::string(failure ? "false" : "true") + ",\"models\":[";
         for (std::size_t index = 0; index < names.size(); ++index) {
             if (index != 0) output += ',';
             output += '"' + escape_json(names[index]) + '"';
+        }
+        output += "],\"root\":\"" + escape_json(root.generic_string()) + "\",\"files\":[";
+        for (std::size_t i = 0; i < files.size(); ++i) {
+            if (i) output += ',';
+            output += '\"' + escape_json(files[i]) + '\"';
         }
         return response_prefix(id) + output + "]}}";
     }
@@ -614,6 +570,247 @@ std::string ControlProtocol::handle(const std::string_view request) {
         engine_.logs().write(LogLevel::info, "Destroyed entity " + entity->to_string());
         return response_prefix(id) + "{\"destroyed\":\"" + entity->to_string() +
                "\",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "project.status") {
+        return response_prefix(id) + "{\"project\":" +
+               (engine_.project() ? engine_.project()->json() : "null") + "}}";
+    }
+    if (method == "project.list") {
+        std::string files = "[";
+        for (const auto& file : available_projects()) {
+            if (files.size() > 1) files += ',';
+            files += '\"' + escape_json(file) + '\"';
+        }
+        return response_prefix(id) + "{\"projects\":" + files + "]}}";
+    }
+    if (method == "project.close") {
+        engine_.project().reset();
+        return response_prefix(id) + "{\"project\":null}}";
+    }
+    if (method == "project.create" || method == "project.open") {
+        std::string error;
+        const auto filename = string_field(request, "filename");
+        auto project = method == "project.open" ? load_project(filename, error)
+                                                : std::optional{Project{filename, string_field(request, "name"), {}, {}}};
+        if (!project) return error_response(id, error);
+        SceneState state;
+        if (!project->startup_scene.empty()) {
+            const auto path = workspace_file((project->root() / "scenes").generic_string(), project->startup_scene, ".relay.json");
+            if (!path) return error_response(id, "unsafe project startup scene");
+            auto loaded = load_scene_file(*path);
+            if (!loaded) return error_response(id, "startup scene: " + loaded.error);
+            state = std::move(*loaded.state);
+        }
+        if (method == "project.create" && !save_project(*project, error, true))
+            return error_response(id, error);
+        // Validate disk content before changing either the scene or active project.
+        auto reload = reload_imported_assets(project->root(), engine_.assets());
+        if (!engine_.scene_history().execute("Open project " + project->name, [&](Scene& scene) {
+                if (project->startup_scene.empty()) scene.clear();
+                else scene.restore_state(state);
+                (void)reload.rebind_scene(scene);
+                return true;
+            })) return error_response(id, "cannot apply project scene");
+        engine_.project() = std::move(project);
+        return response_prefix(id) + "{\"project\":" + engine_.project()->json() +
+               ",\"scene_file\":\"" + escape_json(engine_.project()->startup_scene) +
+               "\",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "project.add_scene" || method == "project.remove_scene" || method == "project.set_startup") {
+        if (!engine_.project()) return error_response(id, "no project is open");
+        auto project = *engine_.project();
+        const auto filename = string_field(request, "scene_file");
+        const auto path = safe_scene_path(engine_, filename);
+        if (!path) return error_response(id, "unsafe scene filename");
+        auto found = std::find(project.scenes.begin(), project.scenes.end(), filename);
+        if (method == "project.add_scene") {
+            auto loaded = load_scene_file(*path);
+            if (!loaded) return error_response(id, "cannot add scene: " + loaded.error);
+            if (found == project.scenes.end()) project.scenes.push_back(filename);
+            if (project.startup_scene.empty()) project.startup_scene = filename;
+        } else {
+            if (found == project.scenes.end()) return error_response(id, "scene is not a project member");
+            if (method == "project.set_startup") project.startup_scene = filename;
+            else {
+                project.scenes.erase(found);
+                if (project.startup_scene == filename)
+                    project.startup_scene = project.scenes.empty() ? "" : project.scenes.front();
+            }
+        }
+        std::string error;
+        if (!save_project(project, error)) return error_response(id, error);
+        engine_.project() = std::move(project);
+        return response_prefix(id) + "{\"project\":" + engine_.project()->json() + "}}";
+    }
+    if (method == "animation.clip") {
+        const auto* model = engine_.assets().find_model(string_field(request, "model"));
+        const auto index = unsigned_field(request, "clip", 0);
+        if (!model || index >= model->clips.size()) return error_response(id, "clip is unavailable");
+        const auto& clip = model->clips[static_cast<std::size_t>(index)];
+        std::ostringstream channels;
+        channels << std::setprecision(17) << '[';
+        std::size_t count = 0;
+        const auto channel = [&](const std::string& name, const auto& keys) {
+            if (keys.empty() || count >= 256) return;
+            if (count++) channels << ',';
+            channels << "{\"name\":\"" << json_escape(name) << "\",\"key_count\":" << keys.size()
+                     << ",\"times\":[";
+            const auto size = std::min<std::size_t>(keys.size(), 256);
+            for (std::size_t i = 0; i < size; ++i) {
+                if (i) channels << ',';
+                // Sample the whole channel when bounded, retaining both endpoints.
+                const auto key = keys.size() <= size ? i : i * (keys.size() - 1) / (size - 1);
+                channels << keys[key].time;
+            }
+            channels << "]}";
+        };
+        std::size_t total_channels = 0;
+        for (const auto& track : clip.tracks) {
+            const auto node = track.node < model->nodes.size() ? model->nodes[track.node] : "Node " + std::to_string(track.node);
+            channel(node + " / Position", track.positions);
+            channel(node + " / Rotation", track.rotations);
+            channel(node + " / Scale", track.scales);
+            total_channels += !track.positions.empty() + !track.rotations.empty() + !track.scales.empty();
+        }
+        for (const auto& track : clip.morph_tracks) {
+            channel("Mesh " + std::to_string(track.mesh) + " / Morph", track.keys);
+            total_channels += !track.keys.empty();
+        }
+        channels << ']';
+        return response_prefix(id) + "{\"name\":\"" + json_escape(clip.name) +
+               "\",\"channel_count\":" + std::to_string(total_channels) +
+               ",\"channels\":" + channels.str() + "}}";
+    }
+    if (method == "scene.set_animations") {
+        JsonParser parser(request);
+        const auto parsed = parser.parse();
+        const auto& object = *parsed->object();
+        std::vector<std::pair<Entity, Animator>> updates;
+        std::set<Entity> seen;
+        for (const auto& value : *field(object, "entities")->array()) {
+            const auto parsed_entity = Entity::parse(*value.string());
+            if (!parsed_entity) return error_response(id, "invalid animation entity handle");
+            const auto entity = *parsed_entity;
+            if (!seen.insert(entity).second) continue;
+            const auto* record = engine_.scene().get(entity);
+            if (!record || !record->animator) return error_response(id, "animation root is stale or invalid");
+            auto animator = *record->animator;
+            const auto* model = engine_.assets().find_model(animator.model);
+            if (!model || animator.clip >= model->clips.size()) return error_response(id, "clip is unavailable");
+            animator.playing = boolean_field(request, "playing", animator.playing);
+            animator.loop = boolean_field(request, "loop", animator.loop);
+            if (const auto speed = number_field(request, "speed")) animator.speed = *speed;
+            if (const auto time = number_field(request, "time_seconds"))
+                animator.time_seconds = std::min(*time, model->clips[animator.clip].duration_seconds);
+            updates.emplace_back(entity, animator);
+        }
+        const auto label = "Configure animation tracks " + json_stringify(*field(object, "entities"));
+        if (!engine_.scene_history().execute(label, [&](Scene& scene) {
+                for (const auto& [entity, animator] : updates)
+                    if (!scene.set_animator(entity, animator)) return false;
+                return true;
+            }, unsigned_field(request, "gesture", 0))) return error_response(id, "invalid animation configuration");
+        return response_prefix(id) + "{\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.clipboard") {
+        return response_prefix(id) + "{\"roots\":" + std::to_string(engine_.clipboard().roots.size()) +
+               ",\"entities\":" + std::to_string(engine_.clipboard().nodes.size()) + "}}";
+    }
+    if (method == "scene.copy" || method == "scene.cut" || method == "scene.duplicate_many" ||
+        method == "scene.destroy_many" || method == "scene.transform_many" || method == "scene.paste") {
+        JsonParser parser(request);
+        const auto input = parser.parse();
+        const auto& object = *input->object();
+        std::vector<Entity> selected;
+        if (const auto* values = field(object, "entities"))
+            for (const auto& value : *values->array()) {
+                const auto entity = Entity::parse(*value.string());
+                if (!entity) return error_response(id, "selection contains an invalid entity handle");
+                selected.push_back(*entity);
+            }
+        auto roots = method == "scene.paste" ? std::optional{std::vector<Entity>{}}
+                                            : selection_roots(engine_.scene(), selected);
+        if (!roots) return error_response(id, "selection contains a stale or invalid entity");
+        std::optional<SceneClipboard> copied;
+        if (method == "scene.copy" || method == "scene.cut" || method == "scene.duplicate_many") {
+            copied = copy_selection(engine_.scene(), selected);
+            if (!copied) return error_response(id, "selected subtrees exceed the clipboard limit");
+        }
+        if (method == "scene.copy") {
+            engine_.clipboard() = std::move(*copied);
+            return response_prefix(id) + "{\"copied\":" +
+                   std::to_string(engine_.clipboard().nodes.size()) + "}}";
+        }
+        std::vector<Entity> result_roots;
+        const auto parent = method == "scene.paste" ? entity_field(request, "parent") : std::optional{Entity{}};
+        if (!parent || (parent->valid() && !engine_.scene().contains(*parent)))
+            return error_response(id, "paste parent is stale or invalid");
+        std::vector<std::pair<Entity, Transform>> transforms;
+        if (method == "scene.transform_many") {
+            EditorMatrix delta{};
+            const auto& values = *field(object, "delta")->array();
+            for (std::size_t i = 0; i < 16; ++i) {
+                delta[i] = static_cast<float>(*values[i].number());
+                if (!std::isfinite(delta[i])) return error_response(id, "delta is not representable");
+            }
+            if (delta[3] != 0 || delta[7] != 0 || delta[11] != 0 || delta[15] != 1)
+                return error_response(id, "delta must be affine");
+            const auto world_of = [&](Entity entity) {
+                std::vector<Entity> chain;
+                while (engine_.scene().contains(entity)) {
+                    chain.push_back(entity);
+                    entity = engine_.scene().get(entity)->parent;
+                }
+                auto world = editor_identity();
+                for (auto i = chain.rbegin(); i != chain.rend(); ++i) {
+                    const auto& t = engine_.scene().get(*i)->transform;
+                    world = editor_multiply(world, editor_compose(t.position, t.rotation_degrees, t.scale));
+                }
+                return world;
+            };
+            for (const auto entity : *roots) {
+                const auto inverse = editor_inverse_affine(world_of(engine_.scene().get(entity)->parent));
+                if (!inverse) return error_response(id, "selected entity has a singular parent");
+                const auto local = editor_multiply(*inverse, editor_multiply(delta, world_of(entity)));
+                Transform t;
+                editor_decompose(local, t.position, t.rotation_degrees, t.scale);
+                // Relay stores TRS, so refuse a delta that would require shear instead of losing it.
+                const auto recomposed = editor_compose(t.position, t.rotation_degrees, t.scale);
+                for (std::size_t i = 0; i < 16; ++i)
+                    if (!std::isfinite(local[i]) || !std::isfinite(recomposed[i]) ||
+                        std::abs(local[i] - recomposed[i]) > 0.001F * std::max(1.0F, std::abs(local[i])))
+                        return error_response(id, "group transform cannot be represented without shear");
+                transforms.emplace_back(entity, t);
+            }
+        }
+        const auto label = method == "scene.transform_many"
+                               ? "Transform selection " + json_stringify(*field(object, "entities"))
+                           : method == "scene.paste" ? std::string{"Paste selection"}
+                           : method == "scene.cut" ? std::string{"Cut selection"}
+                           : method == "scene.duplicate_many" ? std::string{"Duplicate selection"}
+                           : std::string{"Delete selection"};
+        const bool changed = engine_.scene_history().execute(label, [&](Scene& scene) {
+            if (method == "scene.paste" || method == "scene.duplicate_many") {
+                const auto& clipboard = method == "scene.paste" ? engine_.clipboard() : *copied;
+                result_roots = paste_selection(scene, clipboard, *parent, method == "scene.duplicate_many");
+                return !result_roots.empty();
+            }
+            if (method == "scene.transform_many") {
+                for (const auto& [entity, transform] : transforms)
+                    if (!scene.set_transform(entity, transform)) return false;
+                result_roots = *roots;
+            } else for (const auto entity : *roots) if (!scene.destroy(entity)) return false;
+            return true;
+        }, method == "scene.transform_many" ? unsigned_field(request, "gesture", 0) : 0);
+        if (!changed) return error_response(id, "group operation failed or clipboard is empty");
+        if (method == "scene.cut") engine_.clipboard() = std::move(*copied);
+        std::string handles = "[";
+        for (const auto entity : result_roots) {
+            if (handles.size() > 1) handles += ',';
+            handles += "\"" + entity.to_string() + "\"";
+        }
+        return response_prefix(id) + "{\"roots\":" + handles + "],\"history\":" +
+               history_json(engine_.scene_history()) + "}}";
     }
     if (method == "scene.duplicate") {
         const auto entity = entity_field(request, "entity");
@@ -843,7 +1040,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
     }
     if (method == "scene.save") {
         const auto filename = string_field(request, "filename");
-        const auto path = safe_scene_path(filename);
+        const auto path = safe_scene_path(engine_, filename);
         if (!path) return error_response(id, "filename must be a safe .relay.json name without directories");
         std::string error;
         if (!save_scene_file_atomic(engine_.scene(), *path, error)) return error_response(id, error);
@@ -857,14 +1054,14 @@ std::string ControlProtocol::handle(const std::string_view request) {
     }
     if (method == "scene.load") {
         const auto filename = string_field(request, "filename");
-        const auto path = safe_scene_path(filename);
+        const auto path = safe_scene_path(engine_, filename);
         if (!path) return error_response(id, "filename must be a safe .relay.json name without directories");
         auto loaded = load_scene_file(*path);
         if (!loaded) return error_response(id, loaded.error);
         const auto state = std::move(*loaded.state);
         // Imported assets live outside the scene file, so restore them before the scene that
         // references them by id.
-        auto reload = reload_imported_assets(std::filesystem::path{"assets"}, engine_.assets());
+        auto reload = reload_imported_assets(engine_.project() ? engine_.project()->root() : std::filesystem::path{"assets"}, engine_.assets());
         if (!engine_.scene_history().execute("Load " + filename, [&](Scene& scene) {
                 scene.restore_state(state);
                 (void)reload.rebind_scene(scene);

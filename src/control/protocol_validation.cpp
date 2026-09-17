@@ -1,4 +1,6 @@
 #include "relay/control/generated_protocol.hpp"
+#include "relay/core/json.hpp"
+#include <algorithm>
 
 #include <charconv>
 #include <cmath>
@@ -9,139 +11,6 @@
 
 namespace relay {
 namespace {
-
-struct Scalar {
-    std::variant<std::monostate, bool, double, std::string> value;
-};
-
-class ObjectParser {
-public:
-    explicit ObjectParser(const std::string_view text) : text_(text) {}
-
-    [[nodiscard]] bool parse(std::map<std::string, Scalar, std::less<>>& fields,
-                             std::string& error) {
-        skip_space();
-        if (!take('{')) return fail(error, "request must be a JSON object");
-        skip_space();
-        if (take('}')) return finish(error);
-        while (position_ < text_.size()) {
-            auto key = parse_string(error);
-            if (!key) return false;
-            skip_space();
-            if (!take(':')) return fail(error, "expected ':' after request field");
-            skip_space();
-            auto value = parse_scalar(error);
-            if (!value) return false;
-            if (!fields.emplace(std::move(*key), std::move(*value)).second) {
-                return fail(error, "request contains a duplicate field");
-            }
-            skip_space();
-            if (take('}')) return finish(error);
-            if (!take(',')) return fail(error, "expected ',' between request fields");
-            skip_space();
-        }
-        return fail(error, "unterminated request object");
-    }
-
-private:
-    void skip_space() {
-        while (position_ < text_.size() && (text_[position_] == ' ' || text_[position_] == '\t' ||
-                                            text_[position_] == '\r' || text_[position_] == '\n')) {
-            ++position_;
-        }
-    }
-
-    bool take(const char expected) {
-        if (position_ >= text_.size() || text_[position_] != expected) return false;
-        ++position_;
-        return true;
-    }
-
-    bool finish(std::string& error) {
-        skip_space();
-        return position_ == text_.size() || fail(error, "unexpected content after request object");
-    }
-
-    bool fail(std::string& error, const std::string_view message) const {
-        error = std::string(message) + " at byte " + std::to_string(position_);
-        return false;
-    }
-
-    [[nodiscard]] std::optional<std::string> parse_string(std::string& error) {
-        if (!take('"')) {
-            fail(error, "expected a JSON string");
-            return std::nullopt;
-        }
-        std::string result;
-        while (position_ < text_.size()) {
-            const auto character = static_cast<unsigned char>(text_[position_++]);
-            if (character == '"') return result;
-            if (character < 0x20U) {
-                fail(error, "unescaped control character in string");
-                return std::nullopt;
-            }
-            if (character != '\\') {
-                result += static_cast<char>(character);
-                continue;
-            }
-            if (position_ >= text_.size()) {
-                fail(error, "incomplete string escape");
-                return std::nullopt;
-            }
-            switch (text_[position_++]) {
-            case '"': result += '"'; break;
-            case '\\': result += '\\'; break;
-            case '/': result += '/'; break;
-            case 'b': result += '\b'; break;
-            case 'f': result += '\f'; break;
-            case 'n': result += '\n'; break;
-            case 'r': result += '\r'; break;
-            case 't': result += '\t'; break;
-            default:
-                fail(error, "unsupported string escape in control request");
-                return std::nullopt;
-            }
-        }
-        fail(error, "unterminated string");
-        return std::nullopt;
-    }
-
-    [[nodiscard]] std::optional<Scalar> parse_scalar(std::string& error) {
-        if (position_ >= text_.size()) {
-            fail(error, "missing request value");
-            return std::nullopt;
-        }
-        if (text_[position_] == '"') {
-            auto string = parse_string(error);
-            return string ? std::optional{Scalar{std::move(*string)}} : std::nullopt;
-        }
-        for (const auto& literal : {std::pair{"true", Scalar{true}},
-                                    std::pair{"false", Scalar{false}},
-                                    std::pair{"null", Scalar{}}}) {
-            const std::string_view name = literal.first;
-            if (text_.substr(position_, name.size()) == name) {
-                position_ += name.size();
-                return literal.second;
-            }
-        }
-        const auto start = position_;
-        while (position_ < text_.size() && ((text_[position_] >= '0' && text_[position_] <= '9') ||
-                                             text_[position_] == '-' || text_[position_] == '+' ||
-                                             text_[position_] == '.' || text_[position_] == 'e' ||
-                                             text_[position_] == 'E')) ++position_;
-        double number = 0.0;
-        const auto converted = std::from_chars(text_.data() + start, text_.data() + position_, number);
-        if (start == position_ || converted.ec != std::errc{} ||
-            converted.ptr != text_.data() + position_ || !std::isfinite(number)) {
-            fail(error, "request value must be a finite scalar");
-            return std::nullopt;
-        }
-        return Scalar{number};
-    }
-
-    std::string_view text_;
-    std::size_t position_{};
-};
 
 bool enum_contains(const std::string_view values, const std::string_view candidate) {
     if (values.empty()) return true;
@@ -157,14 +26,36 @@ bool enum_contains(const std::string_view values, const std::string_view candida
     return false;
 }
 
-bool validate_field(const ProtocolFieldSpec& spec, const Scalar& scalar, std::string& error) {
-    if (std::holds_alternative<std::monostate>(scalar.value)) {
+bool validate_field(const ProtocolFieldSpec& spec, const JsonValue& scalar, std::string& error) {
+    if (scalar.is_null()) {
         if (spec.nullable) return true;
         error = "field '" + std::string(spec.name) + "' cannot be null";
         return false;
     }
+    if (spec.type == ProtocolValueType::string_array || spec.type == ProtocolValueType::number_array) {
+        const auto* values = scalar.array();
+        if (!values || values->size() < spec.minimum_length ||
+            (spec.maximum_length && values->size() > spec.maximum_length)) {
+            error = "field '" + std::string(spec.name) + "' must be an array of valid length";
+            return false;
+        }
+        for (const auto& value : *values) {
+            if (spec.type == ProtocolValueType::number_array) {
+                if (!value.number() || !std::isfinite(*value.number())) {
+                    error = "array entries must be finite numbers";
+                    return false;
+                }
+            } else if (!value.string() || value.string()->size() > 32U ||
+                       (!spec.pattern.empty() &&
+                        !std::regex_match(*value.string(), std::regex(std::string(spec.pattern))))) {
+                error = "array entries must be valid entity handles";
+                return false;
+            }
+        }
+        return true;
+    }
     if (spec.type == ProtocolValueType::string) {
-        const auto* value = std::get_if<std::string>(&scalar.value);
+        const auto* value = scalar.string();
         if (value == nullptr) {
             error = "field '" + std::string(spec.name) + "' must be a string";
             return false;
@@ -185,13 +76,13 @@ bool validate_field(const ProtocolFieldSpec& spec, const Scalar& scalar, std::st
         return true;
     }
     if (spec.type == ProtocolValueType::boolean) {
-        if (!std::holds_alternative<bool>(scalar.value)) {
+        if (scalar.boolean() == nullptr) {
             error = "field '" + std::string(spec.name) + "' must be boolean";
             return false;
         }
         return true;
     }
-    const auto* value = std::get_if<double>(&scalar.value);
+    const auto* value = scalar.number();
     if (value == nullptr || (spec.type == ProtocolValueType::integer && std::floor(*value) != *value)) {
         error = "field '" + std::string(spec.name) + "' must be " +
                 (spec.type == ProtocolValueType::integer ? "integer" : "number");
@@ -213,19 +104,25 @@ bool validate_protocol_request(const std::string_view request, const std::string
         error = "unknown method: " + std::string(method);
         return false;
     }
-    std::map<std::string, Scalar, std::less<>> fields;
-    ObjectParser parser(request);
-    if (!parser.parse(fields, error)) return false;
+    JsonParser parser(request);
+    const auto parsed = parser.parse();
+    if (!parsed || !parsed->object()) {
+        error = parser.error().find("duplicate") != std::string::npos
+                    ? "request contains a duplicate field"
+                    : "request must be a valid JSON object: " + parser.error();
+        return false;
+    }
+    const auto& fields = *parsed->object();
     const auto id = fields.find("id");
-    if (id == fields.end() || std::get_if<double>(&id->second.value) == nullptr ||
-        std::floor(*std::get_if<double>(&id->second.value)) != *std::get_if<double>(&id->second.value) ||
-        *std::get_if<double>(&id->second.value) < 0.0) {
+    if (id == fields.end() || id->second.number() == nullptr ||
+        std::floor(*id->second.number()) != *id->second.number() ||
+        *id->second.number() < 0.0) {
         error = "request id must be a non-negative integer";
         return false;
     }
     const auto method_field = fields.find("method");
-    if (method_field == fields.end() || std::get_if<std::string>(&method_field->second.value) == nullptr ||
-        *std::get_if<std::string>(&method_field->second.value) != method) {
+    if (method_field == fields.end() || method_field->second.string() == nullptr ||
+        *method_field->second.string() != method) {
         error = "request method is invalid";
         return false;
     }

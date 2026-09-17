@@ -41,8 +41,18 @@ try:
     process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
     process.stdin.flush()
     names = {tool["name"] for tool in call("tools/list", {})["tools"]}
-    assert len(names) == 49 and "render_capture_cancel" in names and "scene_pick" in names
-    assert {"scene_duplicate", "scene_clear"} <= names
+    assert len(names) == 66 and "render_capture_cancel" in names and "scene_pick" in names
+    assert {"scene_duplicate", "scene_clear", "scene_copy", "scene_cut", "scene_paste",
+            "scene_transform_many", "project_create", "project_open", "animation_clip",
+            "scene_set_animations"} <= names
+    _, created = tool("scene_create", {"name": "MCP clipboard probe"})
+    probe = created["entity"]
+    _, copied = tool("scene_copy", {"entities": [probe]})
+    assert copied["copied"] == 1, copied
+    _, pasted = tool("scene_paste", {})
+    assert len(pasted["roots"]) == 1 and pasted["roots"][0] != probe, pasted
+    _, deleted = tool("scene_destroy_many", {"entities": [probe, pasted["roots"][0]]})
+    assert "history" in deleted, deleted
     _, captured = tool("render_capture_async", {"filename": "mcp-phase-e.png", "source": "deterministic"})
     assert captured["source"] == "deterministic", captured
     for _ in range(100):

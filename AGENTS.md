@@ -28,3 +28,6 @@ Keep all work in the background.
   commands in the documentation are reproduction notes, not permission to run intrusive checks.
 
 These instructions apply to every agent working on this project, including Codex and Claude.
+
+Keep repository content professional and suitable for public distribution. Do not record personal
+activities or private user context in tracked files, commit messages, or repository comments.

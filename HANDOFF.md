@@ -4,7 +4,8 @@ Last updated: 2026-09-17
 
 ## Desktop interaction rule — read first
 
-Follow [AGENTS.md](AGENTS.md). Never control the user's mouse or keyboard, change focus, or open/show/activate/move/resize
+Follow [AGENTS.md](AGENTS.md).
+Never control the user's mouse or keyboard, change focus, or open/show/activate/move/resize
 windows without specific advance approval for those actions in the current task. Work in the
 background using builds, headless tests and protocol checks. Desktop and windowed GPU tests are
 optional, approval-only checks; record them as pending when approval has not been given.
@@ -16,7 +17,7 @@ if an important verification gap cannot reasonably be covered without desktop in
 ## Next-session starting point
 
 - Branch: `main`; GitHub: https://github.com/patrick123900/relay-engine (public).
-- Previous published baseline: `c506c8f` (`Polish scene workflows and live animation scrubbing`).
+- Previous published baseline: `4c3d16e` (`Polish scene workflows and live animation scrubbing`).
   The commit containing this handoff includes the usability, project-folder, timeline, icon and
   grid follow-ups. Use `git log -1` for the latest commit and inspect the working tree before editing.
 - Phases A–D meet their recorded milestone definitions on the tested Linux/Vulkan path, not full
@@ -24,7 +25,7 @@ if an important verification gap cannot reasonably be covered without desktop in
 - Current on-disk/API versions: scene v4, import manifest v3, project v1, protocol v9 with 66 native
   methods and 66 generated MCP tools.
 - Phase E and the tested Linux/Vulkan Phase F milestone are implemented. Earlier commit/push
-  authorization was completed for `c506c8f`; the user also authorized committing and pushing all
+  authorization was completed for `4c3d16e`; the user also authorized committing and pushing all
   subsequent work, including this documentation, on 2026-09-17.
   Later phase labels organize proposed work; they do not claim full editor completion or platform parity.
 - The Phase E and Phase F sections below record this session; earlier phase results remain
@@ -1220,7 +1221,7 @@ cancels the close prompt. Desktop tests required access outside the sandbox to t
 ## Three editor usability priorities — implemented 2026-09-17
 
 This section supersedes earlier next-session recommendations to implement selection, projects and
-an animation timeline. These changes follow the published `c506c8f` baseline and are included in this commit.
+an animation timeline. These changes follow the published `4c3d16e` baseline and are included in this commit.
 
 - Multi-selection: Ctrl-toggle in hierarchy/viewport, Shift-range in visible tree order, Ctrl+A,
   active-object inspector, group outlines/framing and world-space group gizmos. Complete selected

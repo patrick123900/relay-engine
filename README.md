@@ -1,6 +1,7 @@
 # Relay Engine
 
-Agent desktop policy: follow [AGENTS.md](AGENTS.md). Never control mouse/keyboard, change focus, or open/show/activate/move/resize windows
+Agent desktop policy: follow [AGENTS.md](AGENTS.md). Never control mouse/keyboard, change focus,
+or open/show/activate/move/resize windows
 without specific advance user approval for the current task. Use background/headless checks by
 default. Desktop and windowed GPU tests below are optional, approval-only reproduction commands.
 Agents must first run relevant background/headless builds and tests autonomously. Do not skip

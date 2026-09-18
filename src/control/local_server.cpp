@@ -1,11 +1,15 @@
 #include "relay/control/local_server.hpp"
 
 #include "relay/control/control_protocol.hpp"
+#include "relay/control/session_auth.hpp"
+#include "relay/core/json.hpp"
 #include "relay/core/engine.hpp"
 
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
+#include <chrono>
 #include <string>
 #include <string_view>
 
@@ -54,6 +58,12 @@ bool send_all(const Socket socket, const std::string_view payload) {
 } // namespace
 
 bool serve_local_control(Engine& engine, const std::uint16_t port, std::string& error) {
+    const auto* configured_token = std::getenv("RELAY_AGENT_TOKEN");
+    const std::string token = configured_token ? configured_token : "";
+    if (!session_token_matches(token, token)) {
+        error = "loopback control requires a host-provisioned RELAY_AGENT_TOKEN (32–128 characters)";
+        return false;
+    }
 #ifdef _WIN32
     WSADATA winsock_data{};
     if (WSAStartup(MAKEWORD(2, 2), &winsock_data) != 0) {
@@ -92,16 +102,27 @@ bool serve_local_control(Engine& engine, const std::uint16_t port, std::string& 
     engine.pause();
     engine.logs().write(LogLevel::info,
                         "Local control listening on 127.0.0.1:" + std::to_string(port));
-    ControlProtocol protocol(engine);
     while (engine.status().running) {
         const Socket client = accept(listener, nullptr, nullptr);
         if (client == invalid_socket) {
             error = socket_error();
             break;
         }
+        ControlProtocol protocol(engine);
+        protocol.configure_agent_from_environment();
+        bool authenticated = false;
+        const auto authentication_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+#ifdef _WIN32
+        DWORD timeout = 5000;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+        timeval timeout{5, 0};
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
         std::string pending;
         std::array<char, 4096> bytes{};
         while (engine.status().running) {
+            if (!authenticated && std::chrono::steady_clock::now() >= authentication_deadline) break;
 #ifdef _WIN32
             const auto received = recv(client, bytes.data(), static_cast<int>(bytes.size()), 0);
 #else
@@ -109,16 +130,49 @@ bool serve_local_control(Engine& engine, const std::uint16_t port, std::string& 
 #endif
             if (received <= 0) break;
             pending.append(bytes.data(), static_cast<std::size_t>(received));
+            if (pending.size() > (authenticated ? 1048576U : 2048U)) break;
             std::size_t newline = 0;
             while ((newline = pending.find('\n')) != std::string::npos) {
                 auto request = pending.substr(0, newline);
                 pending.erase(0, newline + 1U);
                 if (!request.empty() && request.back() == '\r') request.pop_back();
                 if (request.empty()) continue;
-                auto response = protocol.handle(request);
+                if (!authenticated) {
+                    JsonParser parser(request);
+                    const auto value = parser.parse();
+                    const auto* object = value ? value->object() : nullptr;
+                    const auto* method = object ? field(*object, "method") : nullptr;
+                    const auto* supplied = object ? field(*object, "token") : nullptr;
+                    const auto* id = object ? field(*object, "id") : nullptr;
+                    const bool authorized = object && object->size() == 3 && method && method->string() &&
+                        *method->string() == "session.authenticate" && supplied && supplied->string() &&
+                        id && id->number() && *id->number() >= 0 && std::floor(*id->number()) == *id->number() &&
+                        session_token_matches(token, *supplied->string());
+                    if (!authorized) {
+                        engine.logs().write(LogLevel::warning, "Local control session authentication denied");
+                        (void)send_all(client, "{\"id\":0,\"ok\":false,\"error\":\"session authentication required\"}\n");
+                        pending.clear();
+                        break;
+                    }
+                    const auto response = json_stringify(JsonValue{JsonValue::Object{
+                        {"id", *id}, {"ok", JsonValue{true}},
+                        {"result", JsonValue{JsonValue::Object{{"authenticated", JsonValue{true}}}}}}}) + '\n';
+                    if (!send_all(client, response)) break;
+                    authenticated = true;
+#ifdef _WIN32
+                    timeout = 60000;
+                    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+                    timeout.tv_sec = 60;
+                    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
+                    continue;
+                }
+                auto response = protocol.handle_agent(request);
                 response.push_back('\n');
                 if (!send_all(client, response)) break;
             }
+            if (!authenticated && pending.empty()) break;
         }
         close_socket(client);
     }

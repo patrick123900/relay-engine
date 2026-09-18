@@ -246,7 +246,7 @@ Background verification is available through the normal `ctest --preset dev` com
   when editor dependencies are available and uses temporary files and its own layout.
 
 These tests do not move the OS pointer or send OS keyboard input. For background MCP work, set
-`RELAY_RUNTIME_MODE=headless`; the bridge's automatic live-editor mode can open a desktop window.
+`RELAY_RUNTIME_MODE=headless` (also the default); explicitly selecting editor mode opens a desktop window.
 
 The desktop suites below open windows, change focus and control the real mouse and keyboard.
 Their isolated layout does not isolate desktop input. Agents must obtain specific user approval
@@ -363,12 +363,12 @@ compatible saved mesh/material references by import index.
 For a long-lived local connection, run Relay on an IPv4 loopback port:
 
 ```sh
-./build/dev/relay_demo --agent-port 7777
+RELAY_AGENT_TOKEN="$(openssl rand -hex 32)" RELAY_AGENT_GRANTS=runtime.status ./build/dev/relay_demo --agent-port 7777
 ```
 
 The wire format is the same newline-delimited JSON used by `--agent-stdio`. The listener never binds
-to a LAN or public interface. A future security milestone will add per-session capability grants
-before any transport is allowed to perform filesystem or editor mutations.
+to a LAN or public interface. Agent connections enforce explicit per-session method grants before dispatch; see the grant configuration below.
+Loopback binding and grants do not authenticate local clients.
 
 Probe the graphics device directly:
 
@@ -392,7 +392,7 @@ Capture the actual Vulkan swapchain through a synchronized GPU-to-CPU transfer:
 ## MCP bridge
 
 The official MCP TypeScript SDK powers Relay's first model-facing bridge. It launches and owns a
-headless runtime, then exposes sixty-six narrowly scoped tools with JSON Schema validation and safety
+headless runtime, then exposes sixty-nine narrowly scoped tools with JSON Schema validation and safety
 annotations. Engine messages stay on a private child-process channel so MCP's standard output is
 never polluted by runtime logs.
 
@@ -407,14 +407,177 @@ MCP hosts should launch `node tools/mcp-bridge/dist/index.js` from the repositor
 `RELAY_ENGINE_BINARY` only when the runtime lives somewhere other than `build/dev/relay_demo`.
 The `render_capture` MCP tool uses synchronized Vulkan swapchain readback by default and offers a
 `deterministic` source for display-free testing.
-When a desktop is present, the bridge owns one live Vulkan editor process: scene operations,
+The bridge defaults to headless operation. With an explicitly configured `RELAY_RUNTIME_MODE=editor`,
+it owns one live Vulkan editor process: scene operations,
 simulation stepping, human presentation and GPU capture all address that same runtime. Set
 `RELAY_RUNTIME_MODE=headless` for CI and servers without a display.
 
+## Session capability grants and chat
+
+Every agent connection starts without action grants. `session.status`, `session.audit` and
+`session.request` are available for inspection and access requests; omit them from grant lists.
+The host can supply exact native method names through `RELAY_AGENT_GRANTS`, for example:
+
+```sh
+RELAY_AGENT_GRANTS=runtime.status,scene.list RELAY_RUNTIME_MODE=headless node tools/mcp-bridge/dist/index.js
+```
+
+The dockable **View > Agent** panel has Chat, Account, Access and Activity tabs. Access shows pending requests,
+their method effects and project context, with explicit Allow/Deny buttons and revocation controls.
+The host can also grant a whole method, one entity or one source/output filename. Requesting access
+never executes an action. After a decision, send a chat follow-up to continue; denied actions
+cannot mutate scene state, write files, call capture handlers or enter deterministic traces.
+
+**Auto approval (all actions)** in Access grants every public engine action for the current
+session, including destructive actions and replay, without individual prompts or resource scopes. It
+stays enabled across project changes. Turning it off restores limited grants; Revoke all disables it
+and clears grants/requests. The switch defaults off on each launch, is controlled only by the human
+host, and its changes/actions are audited. Native input/path validation and fail-closed import
+sandboxes still apply. This setting controls the Relay agent's engine tools.
+
+Whole-method grants permit that method's normal effects across the current project. Entity grants
+support `scene.inspect`, `scene.bounds`, `scene.set_transform`, `scene.set_morph`, `scene.set_light`,
+`scene.set_renderer` and `scene.rename`; transforms/bounds retain their normal descendant effects.
+File grants support scene save/load, model import, synchronous/asynchronous capture, video start
+and trace start. They match the exact source/output name, retaining normal effects such as scene
+replacement, import dependencies and manifest restoration. A capture target is the bare filename,
+even when the request contains `captures/`. Unsupported resource/method combinations fail closed;
+project-wide methods, cameras, undo/redo and compound replay cannot be disguised as entity grants.
+
+Limited grants are bound to the active project. Project open/create/close attempts revoke them, even
+if the operation fails. Scene load/clear and undo/redo attempts revoke entity grants so restored
+allocator handles cannot inherit approval. Pending requests from another project cannot be
+approved. Agent tools cannot approve requests, replace grants, export audits or submit human chat.
+Generated `hostOnly`/`bridgeOnly` annotations enforce this distinction and omit those tools from MCP.
+Native validation, path checks and import sandboxes always apply after authorization. Unknown
+method names, wildcards, whitespace and empty entries invalidate environment policy and grant
+nothing. Agent `trace.replay` requires full Auto approval; nested commands retain agent enforcement and auditing, and recursive replay is refused.
+
+The host API `ControlProtocol::set_agent_grants` replaces/revokes policy; an empty list revokes all
+limited access. Trusted editor actions use `ControlProtocol::handle`, sharing scene mutations and undo
+history with permissioned `handle_agent`. Environment policy is snapshotted at startup/per socket
+connection, and cannot be changed over the wire. A loopback listener applies its configured policy
+to each authenticated client; it does not provide separate user accounts or simultaneous clients.
+
+Socket control requires a host-provisioned `RELAY_AGENT_TOKEN` of 32–128 characters; use a random
+secret. The client must first send the socket-only handshake below using that secret. Failed or
+missing authentication closes the connection before any control request is dispatched. The initial
+receive timeout is five seconds and unauthenticated buffering is bounded. Stdio uses private
+owned-process pipes and needs no socket handshake. Tokens are never returned, traced or logged.
+
+```json
+{"id":1,"method":"session.authenticate","token":"<host-provisioned-secret>"}
+```
+
+`session.audit` reports the latest 256 decisions/outcomes, exact method scopes, approved resource
+metadata, request IDs, project context and read-only/destructive annotations. Host grants, requests,
+approvals, denials and revocations are included. Sequence bounds and `after` expose incremental
+reads/eviction. Successful audit/status polling neither traces nor audits itself. Raw request
+parameters, credentials and conversation text are excluded. Activity > Export audit atomically
+publishes a JSONL snapshot under `.relay/audits/`, refusing symlink ancestors and existing files.
+These exports persist across restarts; live audit history otherwise ends with its connection.
+They are snapshots, not a tamper-proof continuous journal or a complete history after eviction.
+
+The editor opens the Agent panel by default. On fresh layouts it shares the full-height Inspector
+dock; **Tools > Agent workspace** or **Ctrl+Shift+A** opens a wider workspace inside the same window.
+Chat has distinct conversation cards, code formatting and streaming responses. Neither user nor
+agent messages have Copy buttons.
+Enter sends; Ctrl+Enter adds a newline. The rounded composer contains one send/stop icon and a shared
+model menu with a supported-level reasoning slider. The compact model/reasoning label and send icon
+share a right-aligned row without composer scrolling; tabs replace the extra workspace header.
+Follow is automatic at the bottom; scrolling
+up pauses it and shows a down arrow that returns to the latest reply and resumes follow.
+Access contains permissions, while Activity shows expandable tool results and native audit decisions.
+The UI remains excluded from engine captures.
+
+### Agent inspection camera and images
+
+`editor_camera_status`, `editor_camera_set` and `editor_camera_frame` control the live editor's
+inspection viewpoint for visual confirmation. Set target coordinates, yaw/pitch in radians and
+orbit distance, or frame an entity's descendant bounds. `mode: "scene"` restores scene-camera
+rendering. These view-only controls require session approval, change no scene/selection/undo state,
+and fail closed without a live editor. Read-only status is excluded from traces.
+
+After positioning the view, use `render_capture` with a PNG output and `source: "vulkan"`. The
+OpenAI adapter returns the capture as image content to the model, not just a filename, using the
+[App Server dynamic-tool response contract](https://developers.openai.com/codex/app-server).
+Image reads are bounded and refuse unsafe paths/symlinks. Deterministic CPU captures retain their
+existing scene-camera source and provenance; editor UI remains excluded from captures.
+Composer soft wrapping is display-only and preserves submitted Unicode, whitespace and hard newlines.
+
+### OpenAI sign-in and models
+
+In **Agent > Account**, choose **OpenAI / ChatGPT**, then **Sign in with ChatGPT**. The panel displays
+a device code and an Open sign-in page button. Complete that code on the OpenAI page; account status
+updates automatically. Cancel sign-in, reconnect, sign out and Refresh account and models are
+available in the same panel. Device authentication may need enabling in your ChatGPT security
+settings. Model and reasoning options come from the supported model catalogue, including the
+account's default model; model identifiers are not hardcoded. Choices are saved privately.
+
+Install a current Codex CLI with App Server support (tested with 0.154.0), plus Node.js 24 or later.
+The external bridge uses the supported
+[Codex App Server authentication/model APIs](https://developers.openai.com/codex/app-server).
+`RELAY_CODEX_EXECUTABLE` can select a Codex executable. OAuth credentials and automatic token refresh
+are owned by that external process, in an isolated `.relay/openai` home. Existing desktop/CLI Codex
+logins and settings are untouched. The home has mode 0700, credential files are private, symlink
+configuration paths are refused, and all files/logs are gitignored. Tokens are never read back into
+the bridge projection, C++ engine, model arguments, traces or audits. Only account display metadata
+and the temporary device code reach the host-only editor display.
+
+OpenAI conversations are ephemeral App Server threads with streamed messages and Relay dynamic
+tools. The stable Codex tool host is enabled to deliver these dynamic tools at inference time;
+general code-mode features remain disabled. Every Relay tool call crosses native session authorization; models cannot invoke host or
+bridge administration. Shell, computer/browser, apps and delegation capabilities are disabled;
+the dedicated empty workspace is read-only. Editor mutations remain exclusively native protocol
+operations. Pending access requests interrupt the turn for review. Full Auto approval permits all
+public engine actions until completion or Stop; native format/path/import checks remain in force.
+Stop interrupts work without rolling back completed actions. The host-only `chat.control`
+`new_chat` action releases the old thread; there is currently no New chat header button.
+Account/model changes are disabled during an active turn.
+
+### Current Phase G status
+
+Phase G remains in progress. Device sign-in, model selection, automatic editor bridge startup,
+agent tool use and the chat/camera controls are implemented. The built-in OpenAI agent receives
+Relay tools through App Server dynamic tools; launching the editor does not expose an attachable
+standalone MCP endpoint.
+
+Intermittent ChatGPT/App Server disconnections have been reported after several minutes of agent
+work. The cause and recovery behavior still need investigation; long-running reliability is not
+validated. Background protocol/headless tests and the recorded live tool check do not establish
+sustained provider stability. Desktop verification of the latest composer/camera controls and a
+live image-based review remain pending. See [HANDOFF.md](HANDOFF.md) for the next-session checklist.
+
+### Other providers
+
+**Account > Compatible API (advanced)** retains the full endpoint/model setup and bearer/API-key or
+custom-header authentication. Save provider writes `.relay/agent-provider.json` in the external
+bridge with owner-only permissions and atomic replacement. Blank credentials retain the current
+secret; Remove saved credential clears it. Saved settings override `RELAY_CHAT_ENDPOINT`,
+`RELAY_CHAT_MODEL` and optional `RELAY_CHAT_API_KEY` environment fallback. Existing configured
+providers are preserved when upgrading. HTTPS is required except for loopback HTTP providers;
+credential-bearing URLs and redirects are refused. No chat generation occurs before a human message.
+
+The entire `.relay` directory, including provider files, OpenAI auth/state/logs, harness preferences,
+backups and temporary files, is gitignored. Authentication is absent from scene/project files,
+audits and deterministic traces. Providers, credentials and canonical history remain external;
+the engine holds only a bounded mailbox and display projection. Compatible-provider credentials
+pass transiently through the trusted editor mailbox, are cleared on submission/consumption, and
+are never returned. Runtime children receive no provider credential/configuration variables.
+
+Build the bridge (`npm --prefix tools/mcp-bridge run build`) and use
+`./build/dev/relay_demo --editor`; it starts the bridge automatically with the selected engine
+binary. `npm run editor` in `tools/mcp-bridge` is also supported. These commands open a desktop
+window; agents require specific current-task desktop approval. MCP defaults to headless, with
+`RELAY_RUNTIME_MODE=editor` as the explicit windowed mode. Background mock-provider and real
+App Server metadata tests require no SDL windows or model-generation requests. Normal desktop
+visual verification is separate from completing a live account sign-in/provider turn.
+
 ## Architecture direction
 
-Relay's runtime remains model-agnostic. MCP, chat history, permissions and model providers belong in
-an out-of-process Agent Bridge. The engine exposes one versioned control API shared by the editor,
+Relay's runtime remains model-agnostic. MCP, canonical chat history and model providers belong in
+an out-of-process Agent Bridge. Native session authorization and the human approval interface stay
+at the control/editor boundary. The engine exposes one versioned control API shared by the editor,
 tests, command-line tools and agents.
 
 The windowed demo now uses Vulkan on Windows and Linux when SDL3, a Vulkan loader and `glslc` are
@@ -436,8 +599,8 @@ Both CMake builds and `npm run check` reject stale generated C++, TypeScript or 
 
 Near-term milestones, in the order they should be taken:
 
-1. Phase G: add per-session capability grants and auditable action scopes before broader agent
-   access, then embedded chat.
+1. Extend Phase G beyond its tested local workflow: provider-specific adapters, live-provider
+   verification, multi-client identities and optional continuous audit retention.
 2. Phase H: expand import presets and replace whole-registry refresh with asynchronous resource uploads.
 3. Continue editor authoring beyond the implemented playback timeline and folder project model:
    editable keyframes, external project folders/export and multi-object property editing.
@@ -465,7 +628,7 @@ active jobs. Full queues/rings report capture failures or recording drops. Cance
 at a different resolution after resize count as drops. Start a new recording to use the new size.
 Odd dimensions are padded for VP9. Shutdown drains readbacks and joins the workers.
 
-Protocol v9 has 66 native methods and generated MCP tools. Project files use version 1. Scene v4 and manifest v3 are unchanged.
+Protocol v14 has 85 native methods and 72 generated MCP tools; host and bridge administration are excluded from MCP. Project files use version 1. Scene v4 and manifest v3 are unchanged.
 Linux/RADV is the verified platform; no Windows/macOS parity is claimed.
 
 ```sh

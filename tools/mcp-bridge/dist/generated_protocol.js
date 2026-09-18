@@ -57,6 +57,49 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             return override({});
         return invoke("runtime.quit", {});
     });
+    server.registerTool("editor_camera_status", {
+        title: "Inspect editor camera",
+        description: "Read the live editor inspection viewpoint used by Vulkan captures. Unavailable without an editor. Does not modify scene cameras.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["editor_camera_status"];
+        if (override)
+            return override({});
+        return invoke("editor.camera.status", {});
+    });
+    server.registerTool("editor_camera_set", {
+        title: "Position editor inspection camera",
+        description: "Set the live inspector camera target, orbit angles in radians and distance for visual confirmation using render_capture source vulkan. View-only: no scene or undo changes.",
+        inputSchema: z.object({
+            "target_x": z.number().finite().min(-1000000).max(1000000).optional(),
+            "target_y": z.number().finite().min(-1000000).max(1000000).optional(),
+            "target_z": z.number().finite().min(-1000000).max(1000000).optional(),
+            "yaw": z.number().finite().min(-1000).max(1000).optional(),
+            "pitch": z.number().finite().min(-1.55).max(1.55).optional(),
+            "distance": z.number().finite().min(0.25).max(5000).optional(),
+            "mode": z.enum(["inspector", "scene"]).default("inspector")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["editor_camera_set"];
+        if (override)
+            return override(input);
+        return invoke("editor.camera.set", { "target_x": input["target_x"], "target_y": input["target_y"], "target_z": input["target_z"], "yaw": input["yaw"], "pitch": input["pitch"], "distance": input["distance"], "mode": input["mode"] });
+    });
+    server.registerTool("editor_camera_frame", {
+        title: "Frame entity in inspection camera",
+        description: "Frame an entity and its descendant bounds in the live inspection view before Vulkan capture. Does not change selection, scene cameras or undo history.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["editor_camera_frame"];
+        if (override)
+            return override(input);
+        return invoke("editor.camera.frame", { "entity": input["entity"] });
+    });
     server.registerTool("render_capture", {
         title: "Capture Relay frame",
         description: "Save the current rendered frame in Relay's captures directory for visual inspection.",
@@ -870,6 +913,45 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override(input);
         return invoke("animation.clip", { "model": input["model"], "clip": input["clip"] });
+    });
+    server.registerTool("session_status", {
+        title: "Inspect session grants",
+        description: "Inspect exact native method grants for this connection. Grants are approved only by the host; no tool can expand them.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["session_status"];
+        if (override)
+            return override({});
+        return invoke("session.status", {});
+    });
+    server.registerTool("session_audit", {
+        title: "Inspect session audit",
+        description: "Read bounded session action decisions and outcomes. Scope is the exact native method. Oldest sequence exposes eviction; parameters are not retained.",
+        inputSchema: z.object({
+            "after": z.number().int().min(0).default(0)
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["session_audit"];
+        if (override)
+            return override(input);
+        return invoke("session.audit", { "after": input["after"] });
+    });
+    server.registerTool("session_request", {
+        title: "Session request",
+        description: "Request host approval for an exact method and optional entity/file target. This never grants access or executes an action.",
+        inputSchema: z.object({
+            "scope": z.string().max(64),
+            "kind": z.enum(["method", "entity", "file"]).default("method"),
+            "target": z.string().max(128).default("")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["session_request"];
+        if (override)
+            return override(input);
+        return invoke("session.request", { "scope": input["scope"], "kind": input["kind"], "target": input["target"] });
     });
 }
 //# sourceMappingURL=generated_protocol.js.map

@@ -1,7 +1,9 @@
 #include "relay/editor/editor_ui.hpp"
 
 #include "relay/core/json.hpp"
+#include "relay/control/generated_protocol.hpp"
 #include "relay/editor/editor_camera.hpp"
+#include "relay/editor/wrapped_input.hpp"
 #include "relay/editor/editor_layout.hpp"
 #include "relay/editor/editor_math.hpp"
 #include "relay/editor/editor_state.hpp"
@@ -343,7 +345,7 @@ struct EditorUi::Impl {
     std::map<std::string, std::vector<ClipInfo>, std::less<>> model_clips;
 
     // Editor viewpoint. This is view state, not scene state: it creates no entity, is never saved,
-    // never enters the undo history and is never sent over the protocol, so navigating the viewport
+    // never enters the undo history. Protocol camera controls share this view-only state; navigating the viewport
     // at mouse rate produces no trace entries.
     bool camera_enabled{true};
     bool grid_enabled{true};
@@ -402,7 +404,22 @@ struct EditorUi::Impl {
     std::string assets_root = "assets";
     std::vector<std::string> undo_labels, redo_labels;
     int import_preset{0};
-    std::array<bool, 8> panel_open{true, true, true, false, true, true, false, false};
+    std::array<bool, 9> panel_open{true, true, true, false, true, true, false, false, false};
+    JsonValue agent_review, agent_audit, chat_status;
+    std::array<char, 4001> chat_message{};
+    std::array<char, 8003> chat_display{};
+    WrappedInput wrapped_chat;
+    std::array<char, 129> grant_target{}, audit_filename{"session-audit.jsonl"};
+    int grant_method{}, grant_kind{};
+    std::array<char, 2049> provider_endpoint{};
+    std::array<char, 257> provider_model{};
+    std::array<char, 129> provider_header{};
+    std::array<char, 4097> provider_credential{};
+    int provider_auth{};
+    bool provider_loaded{}, provider_clear{}, agent_expand_pending{}, chat_follow{true};
+    bool agent_account_pending{}, chat_jump_pending{};
+    int agent_reasoning_index{};
+    std::string agent_reasoning_model, agent_reasoning_effort;
     enum class FileAction { none, open, save_as, import, screenshot, recording, new_project, open_project, add_project_scene };
     FileAction file_action{FileAction::none};
     // What to carry out once the user has answered the unsaved-work prompt.
@@ -464,6 +481,437 @@ struct EditorUi::Impl {
         return true;
     }
 
+    void draw_agent() {
+        const auto* review = agent_review.object();
+        const auto* session = review ? field(*review, "session") : nullptr;
+        const auto* session_object = session ? session->object() : nullptr;
+        const auto& colors = editor_palette();
+        const auto* status = chat_status.object();
+        const bool connected = status && boolean_or(*status, "connected", false);
+        const auto* projection = status ? field(*status, "view") : nullptr;
+        const auto* object = projection ? projection->object() : nullptr;
+        const auto* provider_value = object ? field(*object, "provider") : nullptr;
+        const auto* provider_settings = provider_value ? provider_value->object() : nullptr;
+        const bool is_openai = !provider_settings || string_or(*provider_settings, "selected", "openai") == "openai";
+        const auto* openai_value = object ? field(*object, "openai") : nullptr;
+        const auto* openai = openai_value ? openai_value->object() : nullptr;
+        const bool busy = object && boolean_or(*object, "busy", false);
+        const auto control = [&](const std::string& action, const std::string& extra = "") {
+            (void)call("chat.control", "\"action\":\"" + action + "\"" + (extra.empty() ? "" : "," + extra));
+            refresh_pending = true;
+        };
+        if (!ImGui::BeginTabBar("AgentTabs")) return;
+        const bool chat_tab = ImGui::BeginTabItem("Chat");
+        note_item("agent:chat-tab");
+        if (chat_tab) {
+            ImGui::TextColored(editor_color(session_object && boolean_or(*session_object, "auto_approval", false) ? colors.success : colors.warning), "%s",
+                session_object && boolean_or(*session_object, "auto_approval", false) ? "Auto approval  /  All engine actions" : "Reviewed access  /  Approvals in Access");
+            const auto* messages_value = object ? field(*object, "messages") : nullptr;
+            const auto* messages = messages_value ? messages_value->array() : nullptr;
+            const auto full_status = object ? string_or(*object, "status", "Connecting...") : "Waiting for bridge...";
+            const bool show_status = !busy && full_status != "Ready" && !full_status.empty();
+            const float transcript_height = std::max(80 * ui_scale, ImGui::GetContentRegionAvail().y - 155 * ui_scale - (show_status ? 36 * ui_scale : 0));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, editor_color(colors.window));
+            if (ImGui::BeginChild("Conversation", ImVec2(0, transcript_height), ImGuiChildFlags_Borders)) {
+                chat_follow = chat_jump_pending || ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 2 * ui_scale;
+                chat_jump_pending = false;
+                if (!messages || messages->empty()) {
+                    ImGui::Spacing(); ImGui::Spacing();
+                    ImGui::PushFont(fonts.heading);
+                    ImGui::TextWrapped("What would you like to build?");
+                    ImGui::PopFont();
+                    ImGui::TextWrapped("Inspect your scene, make changes, and follow every action here.");
+                    ImGui::Spacing();
+                    if (ImGui::Button("Inspect this scene", ImVec2(-1, 0))) { chat_message.fill('\0');
+                        std::copy_n("Inspect this scene and suggest improvements.", 44, chat_message.data()); }
+                    if (ImGui::Button("Add a light", ImVec2(-1, 0))) { chat_message.fill('\0');
+                        std::copy_n("Add a light that suits this scene.", 34, chat_message.data()); }
+                    if (is_openai && (!openai || !field(*openai, "account") || !field(*openai, "account")->object())) {
+                        ImGui::Spacing(); ImGui::TextWrapped("Sign in with ChatGPT to get started.");
+                        if (ImGui::Button("Connect OpenAI", ImVec2(-1, 0))) agent_account_pending = true;
+                    }
+                }
+                if (messages) for (std::size_t index = 0; index < messages->size(); ++index) if (const auto* entry = (*messages)[index].object()) {
+                    const auto role = string_or(*entry, "role", "assistant");
+                    const auto content = string_or(*entry, "content", "");
+                    ImGui::PushID(static_cast<int>(index));
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, editor_color(role == "user" ? colors.accent_soft : colors.panel));
+                    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * ui_scale, 10 * ui_scale));
+                    if (ImGui::BeginChild("Message", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize)) {
+                        ImGui::TextColored(editor_color(role == "user" ? colors.text : colors.text_dim), "%s", role == "user" ? "YOU" : role == "assistant" ? "RELAY" : "NOTICE");
+                        ImGui::Spacing();
+                        std::istringstream lines(content); std::string line; bool code = false;
+                        while (std::getline(lines, line)) {
+                            if (line.starts_with("```")) { code = !code; ImGui::Spacing(); continue; }
+                            if (code) { ImGui::PushFont(fonts.monospace); ImGui::TextWrapped("%s", line.c_str()); ImGui::PopFont(); }
+                            else if (line.starts_with("#")) { const auto first = line.find_first_not_of("# "); ImGui::PushFont(fonts.heading); ImGui::TextWrapped("%s", first == std::string::npos ? "" : line.substr(first).c_str()); ImGui::PopFont(); }
+                            else ImGui::TextWrapped("%s", line.c_str());
+                        }
+                    }
+                    ImGui::EndChild(); ImGui::PopStyleVar(); ImGui::PopStyleColor(); ImGui::PopID(); ImGui::Spacing();
+                }
+                if (busy) ImGui::TextDisabled("Relay is working...");
+                if (chat_follow) ImGui::SetScrollHereY(1.0F);
+                if (!chat_follow) {
+                    const auto position = ImGui::GetWindowPos();
+                    const auto size = ImGui::GetWindowSize();
+                    ImGui::SetCursorScreenPos(ImVec2(position.x + size.x * .5F - 16 * ui_scale, position.y + size.y - 44 * ui_scale));
+                    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+                    ImGui::BeginChild("JumpBottom", ImVec2(32 * ui_scale, 32 * ui_scale), 0, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                    if (ImGui::InvisibleButton("##JumpToBottom", ImVec2(32 * ui_scale, 32 * ui_scale))) { chat_jump_pending = true; chat_follow = true; }
+                    auto* arrow_draw = ImGui::GetWindowDrawList();
+                    const auto arrow_center = ImVec2(position.x + size.x * .5F, position.y + size.y - 28 * ui_scale);
+                    arrow_draw->AddCircleFilled(arrow_center, 16 * ui_scale, colors.panel);
+                    arrow_draw->AddCircle(arrow_center, 16 * ui_scale, colors.text_dim);
+                    arrow_draw->AddLine(ImVec2(arrow_center.x, arrow_center.y - 7 * ui_scale), ImVec2(arrow_center.x, arrow_center.y + 7 * ui_scale), colors.text, 2 * ui_scale);
+                    arrow_draw->AddLine(ImVec2(arrow_center.x - 6 * ui_scale, arrow_center.y + 1 * ui_scale), ImVec2(arrow_center.x, arrow_center.y + 7 * ui_scale), colors.text, 2 * ui_scale);
+                    arrow_draw->AddLine(ImVec2(arrow_center.x + 6 * ui_scale, arrow_center.y + 1 * ui_scale), ImVec2(arrow_center.x, arrow_center.y + 7 * ui_scale), colors.text, 2 * ui_scale);
+                    note_item("agent:jump-bottom");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jump to latest message");
+                    ImGui::EndChild(); ImGui::PopStyleVar();
+                }
+            }
+            ImGui::EndChild(); ImGui::PopStyleColor();
+            ImGui::Spacing();
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 16 * ui_scale);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * ui_scale, 10 * ui_scale));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, editor_color(colors.panel));
+            bool send = false;
+            if (ImGui::BeginChild("Composer", ImVec2(0, 135 * ui_scale), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+                const float action_size = 32 * ui_scale;
+                const float input_height = std::max(ImGui::GetTextLineHeight() * 2, ImGui::GetContentRegionAvail().y - action_size - ImGui::GetStyle().ItemSpacing.y - 2 * ui_scale);
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+                wrapped_chat.width = ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x * 2 - ImGui::GetStyle().ScrollbarSize;
+                if (wrapped_chat.raw != chat_message.data()) { wrapped_chat.raw = chat_message.data(); wrapped_chat.wrap(); }
+                if (ImGui::GetActiveID() != ImGui::GetID("##ChatMessage")) wrapped_chat.wrap();
+                std::copy(wrapped_chat.display.begin(), wrapped_chat.display.end(), chat_display.begin()); chat_display[wrapped_chat.display.size()] = '\0';
+                send = ImGui::InputTextMultiline("##ChatMessage", chat_display.data(), chat_display.size(), ImVec2(ImGui::GetContentRegionAvail().x, input_height),
+                    ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CtrlEnterForNewLine | ImGuiInputTextFlags_CallbackAlways,
+                    WrappedInput::callback, &wrapped_chat);
+                wrapped_chat.edit(chat_display.data());
+                std::copy(wrapped_chat.raw.begin(), wrapped_chat.raw.end(), chat_message.begin()); chat_message[wrapped_chat.raw.size()] = '\0';
+                note_item("agent:message");
+                if (!chat_message[0] && !ImGui::IsItemActive()) {
+                    const auto origin = ImGui::GetItemRectMin();
+                    const auto padding = ImGui::GetStyle().FramePadding;
+                    ImGui::GetWindowDrawList()->AddText(ImVec2(origin.x + padding.x, origin.y + padding.y), colors.text_faint, "Message Relay...");
+                }
+                ImGui::PopStyleColor();
+                const auto model = openai ? string_or(*openai, "model", "") : "";
+                const auto effort = openai ? string_or(*openai, "effort", "") : "";
+                const auto* models_value = openai ? field(*openai, "models") : nullptr;
+                const auto* models = models_value ? models_value->array() : nullptr;
+                const JsonValue::Object* selected = nullptr;
+                if (models) for (const auto& entry : *models) if (entry.object() && string_or(*entry.object(), "model", "") == model) selected = entry.object();
+                const auto model_label = is_openai ? (selected ? string_or(*selected, "displayName", "Model") : "Model") :
+                    (provider_settings ? string_or(*provider_settings, "model", "Model") : "Model");
+                const float gap = ImGui::GetStyle().ItemSpacing.x;
+                const float label_gap = effort.empty() || !is_openai ? 0 : 8 * ui_scale;
+                const float model_text_width = ImGui::CalcTextSize(model_label.c_str()).x;
+                const float effort_text_width = is_openai ? ImGui::CalcTextSize(effort.c_str()).x : 0;
+                const float row_width = ImGui::GetContentRegionAvail().x;
+                const float options_width = std::min(model_text_width + label_gap + effort_text_width + 36 * ui_scale,
+                    std::max(32 * ui_scale, row_width - action_size - gap));
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0F, row_width - options_width - gap - action_size));
+                ImGui::BeginDisabled(busy || !is_openai || !models || models->empty());
+                if (ImGui::InvisibleButton("##AgentOptions", ImVec2(options_width, action_size))) ImGui::OpenPopup("AgentOptions");
+                note_item("agent:options");
+                const auto options_position = ImGui::GetItemRectMin();
+                const auto options_max = ImGui::GetItemRectMax();
+                auto* options_draw = ImGui::GetWindowDrawList();
+                options_draw->AddRectFilled(options_position, options_max, colors.panel, 8 * ui_scale);
+                const float text_y = options_position.y + (action_size - ImGui::GetTextLineHeight()) * .5F;
+                options_draw->PushClipRect(options_position, ImVec2(options_max.x - 24 * ui_scale, options_max.y), true);
+                options_draw->AddText(ImVec2(options_position.x + 8 * ui_scale, text_y), colors.text, model_label.c_str());
+                if (is_openai && !effort.empty()) options_draw->AddText(ImVec2(options_position.x + 8 * ui_scale + model_text_width + label_gap, text_y), colors.text_dim, effort.c_str());
+                options_draw->PopClipRect();
+                const auto chevron = ImVec2(options_max.x - 12 * ui_scale, options_position.y + action_size * .5F);
+                options_draw->AddLine(ImVec2(chevron.x - 4 * ui_scale, chevron.y + 2 * ui_scale), ImVec2(chevron.x, chevron.y - 2 * ui_scale), colors.text_dim, 1.5F * ui_scale);
+                options_draw->AddLine(ImVec2(chevron.x, chevron.y - 2 * ui_scale), ImVec2(chevron.x + 4 * ui_scale, chevron.y + 2 * ui_scale), colors.text_dim, 1.5F * ui_scale);
+                ImGui::EndDisabled();
+                ImGui::SetNextWindowPos(ImVec2(options_max.x, options_position.y - 8 * ui_scale), ImGuiCond_Always, ImVec2(1, 1));
+                ImGui::SetNextWindowSize(ImVec2(std::min(340 * ui_scale, ImGui::GetWindowWidth() - 24 * ui_scale), 0));
+                if (ImGui::BeginPopup("AgentOptions")) {
+                    ImGui::BeginDisabled(busy);
+                    ImGui::TextDisabled("Model");
+                    ImGui::SetNextItemWidth(-1);
+                    if (ImGui::BeginCombo("##AgentModel", model_label.c_str())) {
+                        if (models) for (const auto& entry : *models) if (const auto* candidate = entry.object()) {
+                            const auto id = string_or(*candidate, "model", "");
+                            if (ImGui::Selectable(string_or(*candidate, "displayName", id).c_str(), id == model))
+                                control("select", "\"model\":\"" + json_escape(id) + "\"");
+                            note_item("agent:model-option:" + id);
+                        }
+                        ImGui::EndCombo();
+                    }
+                    note_item("agent:model-picker");
+                    const auto* efforts_value = selected ? field(*selected, "supportedReasoningEfforts") : nullptr;
+                    const auto* efforts = efforts_value ? efforts_value->array() : nullptr;
+                    if (efforts && !efforts->empty()) {
+                        if (agent_reasoning_model != model || agent_reasoning_effort != effort) {
+                            agent_reasoning_model = model; agent_reasoning_effort = effort; agent_reasoning_index = 0;
+                            for (std::size_t i = 0; i < efforts->size(); ++i) if ((*efforts)[i].object() && string_or(*(*efforts)[i].object(), "reasoningEffort", "") == effort) agent_reasoning_index = static_cast<int>(i);
+                        }
+                        agent_reasoning_index = std::clamp(agent_reasoning_index, 0, static_cast<int>(efforts->size()) - 1);
+                        const auto* choice = (*efforts)[static_cast<std::size_t>(agent_reasoning_index)].object();
+                        const auto level = choice ? string_or(*choice, "reasoningEffort", "Default") : "Default";
+                        ImGui::Separator(); ImGui::TextDisabled("Reasoning");
+                        ImGui::SetNextItemWidth(-1);
+                        ImGui::SliderInt("##AgentReasoning", &agent_reasoning_index, 0, static_cast<int>(efforts->size()) - 1, level.c_str(), ImGuiSliderFlags_NoInput);
+                        note_item("agent:reasoning-slider");
+                        if (ImGui::IsItemDeactivatedAfterEdit()) {
+                            const auto* chosen = (*efforts)[static_cast<std::size_t>(agent_reasoning_index)].object();
+                            if (chosen) control("select", "\"model\":\"" + json_escape(model) + "\",\"effort\":\"" + json_escape(string_or(*chosen, "reasoningEffort", "")) + "\"");
+                        }
+                    }
+                    ImGui::EndDisabled(); ImGui::EndPopup();
+                }
+                ImGui::SameLine(0, gap);
+                ImGui::BeginDisabled(!connected || (!busy && !chat_message[0]));
+                const bool activated = ImGui::InvisibleButton("##ChatAction", ImVec2(32 * ui_scale, 32 * ui_scale));
+                note_item(busy ? "agent:stop" : "agent:send");
+                const auto center = ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * .5F, (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * .5F);
+                auto* draw = ImGui::GetWindowDrawList();
+                draw->AddCircleFilled(center, 16 * ui_scale, colors.accent);
+                if (busy) draw->AddRectFilled(ImVec2(center.x - 5 * ui_scale, center.y - 5 * ui_scale), ImVec2(center.x + 5 * ui_scale, center.y + 5 * ui_scale), colors.text, 1 * ui_scale);
+                else {
+                    draw->AddLine(ImVec2(center.x, center.y + 7 * ui_scale), ImVec2(center.x, center.y - 7 * ui_scale), colors.text, 2 * ui_scale);
+                    draw->AddLine(ImVec2(center.x - 6 * ui_scale, center.y - 1 * ui_scale), ImVec2(center.x, center.y - 7 * ui_scale), colors.text, 2 * ui_scale);
+                    draw->AddLine(ImVec2(center.x + 6 * ui_scale, center.y - 1 * ui_scale), ImVec2(center.x, center.y - 7 * ui_scale), colors.text, 2 * ui_scale);
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", busy ? "Stop" : "Send message");
+                if (activated && busy) (void)call("chat.cancel");
+                if (activated && !busy) send = true;
+                ImGui::EndDisabled();
+            }
+            ImGui::EndChild(); ImGui::PopStyleColor(); ImGui::PopStyleVar(2);
+            if (send && connected && !busy && chat_message[0]) {
+                if (call("chat.submit", "\"message\":\"" + json_escape(chat_message.data()) + "\"")) { chat_message.fill('\0'); refresh_pending = true; }
+            }
+            if (show_status) { ImGui::TextWrapped("%s", full_status.substr(0, 120).c_str()); if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", full_status.c_str()); }
+            ImGui::EndTabItem();
+        }
+        const bool setup_tab = ImGui::BeginTabItem("Account", nullptr, agent_account_pending ? ImGuiTabItemFlags_SetSelected : 0);
+        agent_account_pending = false;
+        note_item("agent:setup-tab");
+        if (setup_tab) {
+            int provider_index = is_openai ? 0 : 1;
+            ImGui::BeginDisabled(busy);
+            if (ImGui::Combo("Provider", &provider_index, "OpenAI / ChatGPT\0Compatible API (advanced)\0"))
+                control("provider", std::string("\"provider\":\"") + (provider_index == 0 ? "openai" : "compatible") + "\"");
+            note_item("agent:provider-picker");
+            ImGui::EndDisabled();
+            if (is_openai) {
+                ImGui::SeparatorText("OpenAI connection");
+                const auto* account_value = openai ? field(*openai, "account") : nullptr;
+                const auto* account = account_value ? account_value->object() : nullptr;
+                const auto* login_value = openai ? field(*openai, "login") : nullptr;
+                const auto* login = login_value ? login_value->object() : nullptr;
+                if (account) {
+                    ImGui::TextColored(editor_color(colors.success), "Connected to ChatGPT");
+                    ImGui::TextWrapped("%s", string_or(*account, "email", "").c_str());
+                    ImGui::TextDisabled("Plan: %s", string_or(*account, "plan", "").c_str());
+                } else ImGui::TextWrapped("Use your ChatGPT account. No endpoint or API key is needed.");
+                ImGui::BeginDisabled(busy || !connected);
+                if (login) {
+                    const auto code = string_or(*login, "userCode", "");
+                    ImGui::TextDisabled("YOUR DEVICE CODE"); ImGui::PushFont(fonts.monospace, ImGui::GetFontSize() * 1.5F); ImGui::TextUnformatted(code.c_str()); ImGui::PopFont();
+                    if (ImGui::Button("Copy code")) ImGui::SetClipboardText(code.c_str());
+                    note_item("agent:copy-device-code");
+                    if (ImGui::Button("Open sign-in page")) {
+                        const auto url = string_or(*login, "verificationUrl", "");
+                        if (!headless && url == "https://auth.openai.com/codex/device") (void)SDL_OpenURL(url.c_str());
+                    }
+                    note_item("agent:open-signin");
+                    ImGui::TextWrapped("Enter the code on the OpenAI sign-in page. This panel updates when sign-in completes.");
+                    if (ImGui::Button("Cancel sign-in")) control("cancel_signin");
+                    note_item("agent:cancel-signin");
+                } else {
+                    if (ImGui::Button(account ? "Reconnect OpenAI" : "Sign in with ChatGPT", ImVec2(-1, 0))) control("signin");
+                    note_item("agent:signin");
+                }
+                if (account) { if (ImGui::Button("Sign out")) control("signout"); note_item("agent:signout"); }
+                if (ImGui::Button("Refresh account and models", ImVec2(-1, 0))) control("refresh");
+                note_item("agent:refresh-models");
+                ImGui::EndDisabled();
+                ImGui::Spacing();
+                ImGui::TextWrapped("%s", object ? string_or(*object, "status", "").c_str() : "Connecting...");
+                ImGui::Separator();
+                ImGui::TextDisabled("Private on this device  /  Excluded from Git");
+                ImGui::TextWrapped("Relay keeps its own sign-in. Your other Codex apps keep their existing logins.");
+            } else {
+            const auto* settings = provider_settings;
+            if (!provider_loaded && settings) {
+                const auto copy = [](auto& buffer, const std::string& text) {
+                    const auto count = std::min(buffer.size() - 1, text.size());
+                    std::copy_n(text.data(), count, buffer.data()); buffer[count] = '\0';
+                };
+                copy(provider_endpoint, string_or(*settings, "endpoint", ""));
+                copy(provider_model, string_or(*settings, "model", ""));
+                copy(provider_header, string_or(*settings, "header", ""));
+                const auto auth = string_or(*settings, "auth", "bearer");
+                provider_auth = auth == "none" ? 2 : auth == "header" ? 1 : 0;
+                provider_loaded = true;
+            }
+            ImGui::TextWrapped("Compatible chat completion endpoint. Authentication is stored privately in .relay/agent-provider.json by the external bridge.");
+            ImGui::InputText("Endpoint", provider_endpoint.data(), provider_endpoint.size()); note_item("agent:endpoint");
+            ImGui::InputText("Model", provider_model.data(), provider_model.size()); note_item("agent:model");
+            ImGui::Combo("Authentication", &provider_auth, "Bearer token / API key\0Custom header\0None (local provider)\0");
+            if (provider_auth == 1) ImGui::InputText("Header", provider_header.data(), provider_header.size());
+            if (provider_auth != 2) {
+                ImGui::InputText("Credential", provider_credential.data(), provider_credential.size(), ImGuiInputTextFlags_Password);
+                note_item("agent:credential");
+                ImGui::TextWrapped(settings && boolean_or(*settings, "authenticated", false) ? "Authentication configured. Leave blank to keep it." : "Enter an API key or authentication token.");
+                ImGui::Checkbox("Remove saved credential", &provider_clear);
+            }
+            ImGui::BeginDisabled(!connected || busy);
+            if (ImGui::Button("Save provider")) {
+                const auto payload = "\"endpoint\":\"" + json_escape(provider_endpoint.data()) + "\",\"model\":\"" + json_escape(provider_model.data()) +
+                    "\",\"auth\":\"" + (provider_auth == 2 ? std::string("none") : provider_auth == 1 ? std::string("header") : std::string("bearer")) +
+                    "\",\"header\":\"" + json_escape(provider_header.data()) + "\",\"credential\":\"" + json_escape(provider_credential.data()) +
+                    "\",\"clear\":" + (provider_clear ? "true" : "false");
+                if (call("chat.configure", payload)) { provider_clear = false; refresh_pending = true; }
+                provider_credential.fill('\0');
+            }
+            note_item("agent:save-provider");
+            ImGui::EndDisabled();
+            if (object) ImGui::TextWrapped("%s", string_or(*object, "setup_status", "").c_str());
+            }
+            ImGui::EndTabItem();
+        }
+        const bool access_tab = ImGui::BeginTabItem("Access");
+        note_item("agent:access-tab");
+        if (access_tab) {
+            bool automatic = session_object && boolean_or(*session_object, "auto_approval", false);
+            if (ImGui::Checkbox("Auto approval (all actions)", &automatic))
+                (void)mutate("session.auto_approval", std::string("\"enabled\":") + (automatic ? "true" : "false"), automatic ? "Auto approval enabled" : "Auto approval disabled");
+            note_item("agent:auto-approval");
+            ImGui::TextDisabled("Project: %s", session_object ? string_or(*session_object, "project", "").c_str() : "");
+            if (ImGui::Button("Revoke all", ImVec2(120 * ui_scale, 0)))
+                (void)mutate("session.revoke", {}, "All agent access revoked");
+            note_item("agent:revoke");
+            if (const auto* pending = review ? field(*review, "pending") : nullptr; pending && pending->array()) {
+                for (const auto& item : *pending->array()) if (const auto* entry = item.object()) {
+                    const auto id = static_cast<std::uint64_t>(number_or(*entry, "request", 0));
+                    ImGui::PushID(static_cast<int>(id));
+                    const auto scope = string_or(*entry, "scope", "");
+                    const auto* specification = find_protocol_method(scope);
+                    ImGui::TextWrapped("%s: %s (%s) %s", specification && specification->destructive ? "Destructive request" : "Request",
+                        scope.c_str(), string_or(*entry, "kind", "").c_str(), string_or(*entry, "target", "").c_str());
+                    const auto decision = [&](bool allow) {
+                        (void)mutate("session.decide", "\"request\":" + std::to_string(id) + ",\"allow\":" + (allow ? "true" : "false"), allow ? "Access approved" : "Access denied");
+                    };
+                    if (ImGui::Button("Allow", ImVec2(90 * ui_scale, 0))) decision(true);
+                    note_item("agent:allow:" + std::to_string(id));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Deny", ImVec2(90 * ui_scale, 0))) decision(false);
+                    note_item("agent:deny:" + std::to_string(id));
+                    if (specification) ImGui::TextWrapped("%s", std::string(specification->description).c_str());
+                    ImGui::TextDisabled("Project: %s", string_or(*entry, "project", "").c_str());
+                    ImGui::PopID();
+                }
+            }
+            ImGui::SeparatorText("Grant limited access");
+            const auto* methods_value = review ? field(*review, "methods") : nullptr;
+            const auto* methods = methods_value ? methods_value->array() : nullptr;
+            if (methods && !methods->empty()) {
+                grant_method = std::clamp(grant_method, 0, static_cast<int>(methods->size()) - 1);
+                const auto* chosen = (*methods)[static_cast<std::size_t>(grant_method)].object();
+                const auto chosen_scope = string_or(*chosen, "scope", "");
+                if (ImGui::BeginCombo("Action", chosen_scope.c_str())) {
+                    for (std::size_t i = 0; i < methods->size(); ++i) {
+                        const auto* option = (*methods)[i].object();
+                        if (ImGui::Selectable(string_or(*option, "scope", "").c_str(), static_cast<int>(i) == grant_method)) {
+                            grant_method = static_cast<int>(i);
+                            grant_kind = 0;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::TextWrapped("%s", string_or(*chosen, "description", "").c_str());
+                if (boolean_or(*chosen, "destructive", false)) ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(editor_palette().warning), "This action is destructive.");
+                const char* kinds[]{"Whole method", "Exact entity", "Exact file"};
+                if (ImGui::BeginCombo("Scope", kinds[grant_kind])) {
+                    for (int i = 0; i < 3; ++i) {
+                        const bool supported = i == 0 || boolean_or(*chosen, i == 1 ? "entity_scope" : "file_scope", false);
+                        ImGui::BeginDisabled(!supported);
+                        if (ImGui::Selectable(kinds[i], grant_kind == i)) grant_kind = i;
+                        ImGui::EndDisabled();
+                    }
+                    ImGui::EndCombo();
+                }
+                if (grant_kind) {
+                    ImGui::InputText("Target", grant_target.data(), grant_target.size());
+                    if (grant_kind == 2) ImGui::TextWrapped("Restricts the source/output filename. Loads and imports may also restore dependencies and change the scene.");
+                    if (grant_kind == 1 && !selection.empty() && ImGui::Button("Use selected entity"))
+                        std::snprintf(grant_target.data(), grant_target.size(), "%s", selection.c_str());
+                } else ImGui::TextWrapped("Applies across the current project. File actions retain their native dependency and scene effects.");
+                if (ImGui::Button("Grant", ImVec2(90 * ui_scale, 0))) {
+                    constexpr const char* keys[]{"method", "entity", "file"};
+                    (void)mutate("session.grant", "\"scope\":\"" + json_escape(chosen_scope) + "\",\"kind\":\"" + keys[grant_kind] +
+                        "\",\"target\":\"" + json_escape(grant_kind ? grant_target.data() : "") + "\"", "Access granted");
+                }
+                note_item("agent:grant");
+            }
+            ImGui::SeparatorText("Active grants");
+            if (session_object) {
+                const auto revoke = [&](const std::string& scope) {
+                    (void)mutate("session.revoke", "\"scope\":\"" + json_escape(scope) + "\"", "Access revoked");
+                };
+                if (const auto* grants = field(*session_object, "grants"); grants && grants->array())
+                    for (const auto& grant : *grants->array()) if (grant.string()) {
+                        ImGui::PushID(grant.string()->c_str());
+                        ImGui::TextUnformatted(grant.string()->c_str()); ImGui::SameLine();
+                        if (ImGui::SmallButton("Revoke")) revoke(*grant.string());
+                        ImGui::PopID();
+                    }
+                if (const auto* grants = field(*session_object, "scoped_grants"); grants && grants->array()) {
+                    int row_id = 0;
+                    for (const auto& grant : *grants->array()) if (const auto* entry = grant.object()) {
+                        ImGui::PushID(++row_id);
+                        const auto scope = string_or(*entry, "scope", "");
+                        ImGui::TextWrapped("%s: %s %s", scope.c_str(), string_or(*entry, "kind", "").c_str(), string_or(*entry, "target", "").c_str());
+                        if (ImGui::SmallButton("Revoke method")) revoke(scope);
+                        ImGui::PopID();
+                    }
+                }
+            }
+            ImGui::EndTabItem();
+        }
+        const bool actions_tab = ImGui::BeginTabItem("Activity");
+        note_item("agent:actions-tab");
+        if (actions_tab) {
+            ImGui::InputText("Audit file", audit_filename.data(), audit_filename.size());
+            if (ImGui::Button("Export audit"))
+                (void)mutate("session.export_audit", "\"filename\":\"" + json_escape(audit_filename.data()) + "\"", "Audit exported under .relay/audits");
+            note_item("agent:export");
+            ImGui::TextDisabled("Latest 256 decisions. Exports preserve existing files.");
+            ImGui::SeparatorText("Tool activity");
+            if (object) if (const auto* results = field(*object, "results"); results && results->array()) {
+                for (std::size_t index = 0; index < results->array()->size(); ++index) if (const auto* entry = (*results->array())[index].object()) {
+                    const bool succeeded = boolean_or(*entry, "succeeded", false);
+                    ImGui::PushID(static_cast<int>(index));
+                    ImGui::PushStyleColor(ImGuiCol_Text, editor_color(succeeded ? colors.success : colors.danger));
+                    const auto label = std::string(succeeded ? "Succeeded  /  " : "Failed  /  ") + string_or(*entry, "scope", "");
+                    const bool details = ImGui::CollapsingHeader(label.c_str());
+                    ImGui::PopStyleColor();
+                    if (details) { ImGui::PushFont(fonts.monospace); ImGui::TextWrapped("%s", string_or(*entry, "summary", "").c_str()); ImGui::PopFont(); }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::SeparatorText("Session audit");
+            if (const auto* audit_object = agent_audit.object()) {
+                if (const auto* entries = field(*audit_object, "entries"); entries && entries->array())
+                    for (auto it = entries->array()->rbegin(); it != entries->array()->rend(); ++it) if (const auto* entry = it->object()) {
+                        const char* state = !boolean_or(*entry, "allowed", false) ? "Denied" : boolean_or(*entry, "succeeded", false) ? "Succeeded" : "Failed";
+                        ImGui::TextWrapped("%.0f  %s  %s", number_or(*entry, "sequence", 0), state, string_or(*entry, "scope", "").c_str());
+                    }
+            }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
     void set_status(std::string message, const bool error) {
         status_message = std::move(message);
         status_is_error = error;
@@ -478,6 +926,11 @@ struct EditorUi::Impl {
         seconds_since_refresh = 0.0;
         const bool periodic = seconds_since_assets >= refresh_interval_seconds;
         if (periodic) seconds_since_assets = 0.0;
+        if (panel_open[8]) {
+            if (auto result = call("session.review")) agent_review = std::move(*result);
+            if (auto result = call("session.audit")) agent_audit = std::move(*result);
+            if (auto result = call("chat.status")) chat_status = std::move(*result);
+        }
         if (auto status = call("runtime.status")) runtime_status = std::move(*status);
         if (auto project = call("project.status")) project_status = std::move(*project);
         if (auto clipboard = call("scene.clipboard"); clipboard && clipboard->object())
@@ -1919,7 +2372,7 @@ struct EditorUi::Impl {
             }
             ImGui::Separator();
             constexpr const char* names[]{"Hierarchy", "Inspector", "Assets",
-                                          "History", "Diagnostics", "Viewport", "Timeline", "Project"};
+                                          "History", "Diagnostics", "Viewport", "Timeline", "Project", "Agent"};
             for (std::size_t i = 0; i < panel_open.size(); ++i)
                 ImGui::MenuItem(names[i], nullptr, &panel_open[i]);
             ImGui::Separator();
@@ -1962,12 +2415,12 @@ struct EditorUi::Impl {
             }
             future_action("Shader editor...");
             if (ImGui::MenuItem("Animation timeline")) panel_open[6] = true;
-            future_action("Agent workspace...");
+            if (ImGui::MenuItem("Agent workspace...", "Ctrl+Shift+A")) { panel_open[8] = true; agent_expand_pending = true; }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Layout")) {
             if (ImGui::MenuItem("Reset layout")) {
-                panel_open = {true, true, true, false, true, true, false, false};
+                panel_open = {true, true, true, false, true, true, false, false, false};
                 layout.reset();
             }
             ImGui::Separator();
@@ -2181,6 +2634,9 @@ struct EditorUi::Impl {
             ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
             return;
         const auto& shortcuts = ImGui::GetIO();
+        if (shortcuts.KeyCtrl && shortcuts.KeyShift && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+            panel_open[8] = true; agent_expand_pending = true; return;
+        }
         if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
             if (shortcuts.KeyShift) file_dialog(FileAction::save_as, scene_filename.data());
             else (void)save_scene();
@@ -2442,7 +2898,7 @@ void EditorUi::process_actions() {
 }
 
 void EditorUi::set_panel_visible(const std::string_view name, const bool visible) {
-    constexpr std::array<std::string_view, 8> names{"Hierarchy", "Inspector", "Assets", "History", "Diagnostics", "Viewport", "Timeline", "Project"};
+    constexpr std::array<std::string_view, 9> names{"Hierarchy", "Inspector", "Assets", "History", "Diagnostics", "Viewport", "Timeline", "Project", "Agent"};
     for (std::size_t i = 0; i < names.size(); ++i)
         if (names[i] == name) impl_->panel_open[i] = visible;
 }
@@ -2645,10 +3101,55 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         if (panel("Project", 7)) impl_->draw_project();
         ImGui::End();
     }
+    if (impl_->panel_open[8]) {
+        if (impl_->agent_expand_pending) {
+            impl_->agent_expand_pending = false;
+            const auto* viewport = ImGui::GetMainViewport();
+            ImGui::SetNextWindowDockID(0);
+            const auto size = ImVec2(std::min(580 * impl_->ui_scale, viewport->WorkSize.x * .8F), viewport->WorkSize.y * .92F);
+            ImGui::SetNextWindowSize(size);
+            ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - size.x - 16 * impl_->ui_scale, viewport->WorkPos.y + 16 * impl_->ui_scale));
+        }
+        if (panel("Agent", 8)) impl_->draw_agent();
+        ImGui::End();
+    }
     impl_->draw_dialogs();
 
     ImGui::Render();
     impl_->frame_open = false;
+}
+
+std::string EditorUi::handle_camera_request(std::string_view request) {
+    JsonParser parser(request); const auto parsed = parser.parse();
+    if (!parsed || !parsed->object()) return "{\"id\":0,\"ok\":false,\"error\":\"invalid camera request\"}";
+    const auto& fields = *parsed->object();
+    const auto id = number_or(fields, "id", 0);
+    const auto prefix = "{\"id\":" + number_text(id);
+    const auto method = string_or(fields, "method", "");
+    if (method == "editor.camera.set") {
+        auto& camera = impl_->navigation_camera;
+        camera.target.x = number_or(fields, "target_x", camera.target.x);
+        camera.target.y = number_or(fields, "target_y", camera.target.y);
+        camera.target.z = number_or(fields, "target_z", camera.target.z);
+        camera.yaw = number_or(fields, "yaw", camera.yaw); camera.pitch = number_or(fields, "pitch", camera.pitch);
+        camera.distance = number_or(fields, "distance", camera.distance);
+        impl_->camera_enabled = string_or(fields, "mode", "inspector") == "inspector";
+        impl_->freelook_latched = false;
+    } else if (method == "editor.camera.frame") {
+        const auto bounds = impl_->call("scene.bounds", Impl::entity_field(string_or(fields, "entity", "")));
+        if (!bounds || !bounds->object()) return prefix + ",\"ok\":false,\"error\":\"cannot frame invalid entity\"}";
+        const auto lo = editor_vector(*bounds->object(), "minimum", {{0, 0, 0}}), hi = editor_vector(*bounds->object(), "maximum", {{0, 0, 0}});
+        const double viewport_width = impl_->viewport_max.x - impl_->viewport_min.x, viewport_height = impl_->viewport_max.y - impl_->viewport_min.y;
+        impl_->navigation_camera.frame({lo[0], lo[1], lo[2]}, {hi[0], hi[1], hi[2]}, boolean_or(*bounds->object(), "has_geometry", false), 60,
+            viewport_height > 0 ? viewport_width / viewport_height : 1);
+        impl_->camera_enabled = true; impl_->freelook_latched = false;
+    }
+    impl_->update_view();
+    const auto& camera = impl_->navigation_camera; const auto eye = camera.position();
+    return prefix + ",\"ok\":true,\"result\":{\"mode\":\"" + (impl_->camera_enabled ? "inspector" : "scene") +
+        "\",\"target\":{\"x\":" + number_text(camera.target.x) + ",\"y\":" + number_text(camera.target.y) + ",\"z\":" + number_text(camera.target.z) +
+        "},\"position\":{\"x\":" + number_text(eye.x) + ",\"y\":" + number_text(eye.y) + ",\"z\":" + number_text(eye.z) +
+        "},\"yaw\":" + number_text(camera.yaw) + ",\"pitch\":" + number_text(camera.pitch) + ",\"distance\":" + number_text(camera.distance) + ",\"capture_source\":\"vulkan\"}}";
 }
 
 Entity EditorUi::selected_entity() const {

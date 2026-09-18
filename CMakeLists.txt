@@ -17,6 +17,7 @@ add_custom_target(relay_protocol_codegen_check ALL
 
 add_library(relay_engine
     src/control/control_protocol.cpp
+    src/control/agent_session.cpp
     src/control/generated_protocol.cpp
     src/control/local_server.cpp
     src/control/protocol_validation.cpp
@@ -123,6 +124,7 @@ if(WIN32)
 endif()
 
 add_executable(relay_demo apps/relay_demo/main.cpp)
+target_compile_definitions(relay_demo PRIVATE RELAY_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(relay_demo PRIVATE Relay::Engine)
 relay_enable_warnings(relay_demo)
 
@@ -289,6 +291,13 @@ if(RELAY_BUILD_TESTS)
     target_link_libraries(relay_workflow_tests PRIVATE Relay::Engine)
     relay_enable_warnings(relay_workflow_tests)
     add_test(NAME relay_workflow_tests COMMAND relay_workflow_tests)
+    add_executable(relay_session_test_host tests/session_test_host.cpp)
+    target_link_libraries(relay_session_test_host PRIVATE Relay::Engine)
+    relay_enable_warnings(relay_session_test_host)
+    add_test(NAME relay_session_protocol_tests
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/session_protocol_tests.py"
+                "$<TARGET_FILE:relay_demo>")
+    set_tests_properties(relay_session_protocol_tests PROPERTIES TIMEOUT 30)
     if(TARGET relay_imgui)
         add_executable(relay_editor_headless_tests tests/editor_headless_tests.cpp
             src/editor/editor_ui.cpp src/editor/editor_theme.cpp src/editor/editor_layout.cpp)

@@ -14,6 +14,12 @@
 #include "relay/editor/editor_ui.hpp"
 #endif
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <chrono>
 #include <cstdlib>
 #include <atomic>
@@ -35,13 +41,14 @@ int run_agent_mode() {
     relay::Engine engine;
     engine.pause();
     relay::ControlProtocol protocol(engine);
+    protocol.configure_agent_from_environment();
 
     std::cout << "{\"event\":\"relay.ready\",\"protocol\":"
               << relay::protocol_schema_version << '}' << std::endl;
     std::string request;
     while (engine.status().running && std::getline(std::cin, request)) {
         if (!request.empty()) {
-            std::cout << protocol.handle(request) << std::endl;
+            std::cout << protocol.handle_agent(request) << std::endl;
         }
     }
     return 0;
@@ -274,13 +281,16 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
             return std::string{};
         });
 
+    protocol.configure_agent_from_environment();
+
 #ifdef RELAY_HAS_EDITOR_UI
-    // The editor is handed the very same protocol object the agent transport uses, so a human drag
-    // and an agent request are literally the same native operation and share one undo history.
+    // Trusted UI dispatch and permissioned agent dispatch share native operations and history.
     std::unique_ptr<relay::EditorUi> editor;
     if (with_ui) {
         editor = std::make_unique<relay::EditorUi>(
             [&protocol](const std::string_view request) { return protocol.handle(request); });
+        protocol.set_editor_camera_handler([&editor](std::string_view request) { return editor->handle_camera_request(request); });
+        editor->set_panel_visible("Agent", true);
         window.set_overlay(editor.get());
     }
 #else
@@ -321,7 +331,7 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
             requests.swap(input_state->requests);
         }
         for (const auto& request : requests) {
-            std::cout << protocol.handle(request) << std::endl;
+            std::cout << protocol.handle_agent(request) << std::endl;
         }
         if (!engine.status().running || window_closed) break;
 
@@ -402,6 +412,26 @@ int run_windowed() {
 
 } // namespace
 
+// The public editor entry point starts the external provider bridge before any window initialization.
+int run_editor_bridge(const char* executable) {
+    const auto binary = std::filesystem::absolute(executable).string();
+    const auto entry = (std::filesystem::path(RELAY_SOURCE_ROOT) / "tools/mcp-bridge/dist/index.js").string();
+    if (!std::filesystem::is_regular_file(entry)) {
+        std::cerr << "Build the external agent bridge before starting the editor\n";
+        return 1;
+    }
+    const char* node = std::getenv("RELAY_NODE_EXECUTABLE");
+    if (!node || !*node) node = "node";
+#ifdef _WIN32
+    const auto result = _spawnlp(_P_WAIT, node, node, entry.c_str(), "--editor", "--engine-binary", binary.c_str(), nullptr);
+    return result < 0 ? 1 : static_cast<int>(result);
+#else
+    execlp(node, node, entry.c_str(), "--editor", "--engine-binary", binary.c_str(), static_cast<char*>(nullptr));
+    std::cerr << "Could not start Node.js for the editor agent bridge\n";
+    return 1;
+#endif
+}
+
 int main(const int argument_count, char** arguments) {
     const std::string_view mode = argument_count > 1 ? arguments[1] : "";
     if (mode == "--agent-stdio") return run_agent_mode();
@@ -421,7 +451,7 @@ int main(const int argument_count, char** arguments) {
                                                      : std::string_view{});
     }
     if (mode == "--editor-stdio") return run_live_editor(false, true);
-    if (mode == "--editor") return run_live_editor(true, false);
+    if (mode == "--editor") return run_editor_bridge(arguments[0]);
     if (mode == "--editor-ui-stdio") return run_live_editor(true, true);
 #else
     if (mode == "--editor-stdio" || mode == "--editor" || mode == "--editor-ui-stdio") {

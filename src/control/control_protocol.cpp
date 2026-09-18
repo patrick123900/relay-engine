@@ -182,6 +182,19 @@ std::string ControlProtocol::handle(const std::string_view request) {
     if (!validate_protocol_request(request, method, validation_error)) {
         return error_response(id, validation_error);
     }
+    if (method.starts_with("session.") || method.starts_with("chat.") || method.starts_with("bridge."))
+        return session_dispatch(request);
+    if (method == "project.open" || method == "project.create" || method == "project.close") {
+        agent_grants_.clear();
+        scoped_grants_.clear();
+        policy_audit("session.project_revoked", true);
+    }
+    // Entity grants cannot survive scene replacement or history restoration to another allocation.
+    if (method == "scene.load" || method == "scene.clear" || method == "scene.undo" || method == "scene.redo") {
+        const auto size = scoped_grants_.size();
+        std::erase_if(scoped_grants_, [](const ScopedGrant& grant) { return grant.kind == "entity"; });
+        if (scoped_grants_.size() != size) policy_audit("session.entity_revoked", true);
+    }
     // Traces exist to reproduce state changes, so read-only queries are not recorded. The editor
     // polls scene.list, logs.read and friends continuously; tracing those would bury the operations
     // that actually changed the scene and make trace files grow with idle time rather than work.
@@ -189,6 +202,11 @@ std::string ControlProtocol::handle(const std::string_view request) {
     const bool read_only = specification != nullptr && specification->read_only;
     if (!method.starts_with("trace.") && !read_only) {
         engine_.record_trace_event("command", std::string(request));
+    }
+
+    if (method.starts_with("editor.camera.")) {
+        if (!editor_camera_handler_) return error_response(id, "editor inspection camera requires a live editor");
+        return editor_camera_handler_(request);
     }
 
     if (method == "runtime.status") {
@@ -1105,6 +1123,9 @@ std::string ControlProtocol::handle(const std::string_view request) {
                escape_json(engine_.trace().path().string()) + "\"}}";
     }
     if (method == "trace.replay") {
+        if (replay_active_) return error_response(id, "recursive trace replay is unavailable");
+        struct ReplayContext { bool& active; ~ReplayContext() { active = false; } } replay_context{replay_active_};
+        replay_active_ = true;
         if (engine_.trace().active()) return error_response(id, "stop the active trace before replaying");
         const auto filename = string_field(request, "filename");
         const auto path = safe_trace_path(filename);
@@ -1125,7 +1146,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
             const auto current = engine_.status().frame_index;
             if (target > current) engine_.step(static_cast<std::uint32_t>(target - current));
             if (event.kind == "command") {
-                (void)handle(event.payload);
+                if (agent_dispatch_) (void)handle_agent(event.payload);
+                else (void)handle(event.payload);
                 ++command_count;
             } else {
                 engine_.apply_input_event(event.payload);

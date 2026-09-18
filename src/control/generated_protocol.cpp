@@ -13,6 +13,20 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_runtime_step{{
     {"frames", ProtocolValueType::integer, false, false, true, true, 1, 10000, 0U, 0U, "", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 7> fields_editor_camera_set{{
+    {"target_x", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"target_y", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"target_z", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"yaw", ProtocolValueType::number, false, false, true, true, -1000, 1000, 0U, 0U, "", ""},
+    {"pitch", ProtocolValueType::number, false, false, true, true, -1.55, 1.55, 0U, 0U, "", ""},
+    {"distance", ProtocolValueType::number, false, false, true, true, 0.25, 5000, 0U, 0U, "", ""},
+    {"mode", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "inspector|scene"},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_editor_camera_frame{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 2> fields_render_capture{{
     {"path", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^(captures/)?[A-Za-z0-9][A-Za-z0-9._-]*\\.(bmp|png)$", ""},
     {"source", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "vulkan|deterministic"},
@@ -234,73 +248,149 @@ constexpr std::array<ProtocolFieldSpec, 2> fields_animation_clip{{
     {"clip", ProtocolValueType::integer, true, false, true, true, 0, 255, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 66> methods{{
-    {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current run, pause, frame, simulation time and resolution state.", true, false, false, no_fields},
-    {"runtime.pause", "runtime_pause", "Pause Relay runtime", "Pause automatic simulation so the scene can be inspected deterministically.", false, false, true, no_fields},
-    {"runtime.resume", "runtime_resume", "Resume Relay runtime", "Resume automatic simulation after an inspection or controlled frame step.", false, false, true, no_fields},
-    {"runtime.step", "runtime_step", "Step Relay frames", "Advance an exact number of deterministic simulation frames, including while paused.", false, false, false, fields_runtime_step},
-    {"runtime.quit", "runtime_shutdown", "Shut down Relay runtime", "Request an orderly shutdown of the runtime owned by this MCP bridge.", false, false, true, no_fields},
-    {"render.capture", "render_capture", "Capture Relay frame", "Save the current rendered frame in Relay's captures directory for visual inspection.", false, false, false, fields_render_capture},
-    {"render.capture_async", "render_capture_async", "Queue Relay frame capture", "Capture real Vulkan or deterministic CPU frames through bounded background image workers.", false, false, false, fields_render_capture_async},
-    {"render.capture_cancel", "render_capture_cancel", "Cancel pending capture", "Cancel a queued image or GPU readback job; writing and completed jobs cannot be cancelled. GPU slots remain alive until their fence completes.", false, false, false, fields_render_capture_cancel},
-    {"render.capture_status", "render_capture_status", "Inspect capture job", "Check whether an asynchronous capture is queued, writing, complete or failed.", true, false, false, fields_render_capture_status},
-    {"render.capabilities", "render_capabilities", "Inspect graphics capabilities", "Create a temporary Vulkan device and report adapter and modern rendering support.", true, false, false, no_fields},
-    {"render.graph", "render_graph", "Inspect render graph", "Read compiled render passes, resources, dependencies and access transitions.", true, false, false, no_fields},
-    {"render.shader_interfaces", "render_shader_interfaces", "Inspect shader interfaces", "Read SPIR-V-reflected stages, locations, descriptor bindings and push-constant sizes from the live Vulkan pipeline.", true, false, false, no_fields},
-    {"render.assets", "render_assets", "Inspect render assets", "List built-in and imported meshes, materials and textures currently available to scene renderer components.", true, false, false, no_fields},
-    {"assets.formats", "asset_import_formats", "Inspect model import formats", "Report model formats and feature coverage available in this Relay build, including Godot-compatible interchange paths.", true, false, false, no_fields},
-    {"assets.import_model", "asset_import_model", "Import project model", "Import a model from the project-local assets directory using a content-addressed identity and optionally instantiate its node hierarchy.", false, false, false, fields_assets_import_model},
-    {"logs.read", "logs_read", "Read Relay logs", "Read structured engine log entries newer than a sequence number.", true, false, false, fields_logs_read},
-    {"performance.read", "performance_read", "Read Relay performance", "Read bounded per-frame CPU/GPU timing, draw/resource counts, entities and process memory.", true, false, false, fields_performance_read},
-    {"input.recent", "input_recent", "Read recent Relay input", "Read the bounded normalized keyboard, mouse and gamepad input event history.", true, false, false, no_fields},
-    {"video.start", "video_start", "Start Relay video", "Record real Vulkan or deterministic CPU frames to WebM with explicit frame drops.", false, false, false, fields_video_start},
-    {"video.capabilities", "video_capabilities", "Inspect video capabilities", "Report whether this Relay build found the FFmpeg WebM encoder.", true, false, false, no_fields},
-    {"video.stop", "video_stop", "Stop Relay video", "Drain pending readbacks and start background WebM finalization; poll video.status for completion and errors.", false, false, false, no_fields},
-    {"video.status", "video_status", "Inspect Relay video", "Read recording state, submitted frames and explicitly reported frame drops.", true, false, false, no_fields},
-    {"scene.list", "scene_list", "List scene entities", "List every live entity with its name, parent and local transform.", true, false, false, no_fields},
-    {"scene.inspect", "scene_inspect", "Inspect scene entity", "Inspect one entity using its stable generation-checked handle.", true, false, false, fields_scene_inspect},
-    {"scene.create", "scene_create", "Create scene entity", "Create a named entity, optionally parented to another live entity.", false, false, false, fields_scene_create},
-    {"scene.destroy", "scene_destroy", "Destroy scene entity", "Destroy an entity and its descendants as one undoable transaction.", false, true, false, fields_scene_destroy},
-    {"scene.duplicate", "scene_duplicate", "Duplicate scene entity", "Copy an entity and its descendants beside the original as one undoable transaction. Components are preserved, a copied camera is never the active one, and a copy of a whole imported model drives its own animation.", false, false, false, fields_scene_duplicate},
-    {"scene.clear", "scene_clear", "Clear the scene", "Destroy every entity as one undoable transaction, leaving an empty scene to start new work in.", false, true, false, no_fields},
-    {"scene.set_transform", "scene_set_transform", "Set entity transform", "Update selected local position, Euler rotation or scale fields in one transaction.", false, false, false, fields_scene_set_transform},
-    {"scene.set_camera", "scene_set_camera", "Configure entity camera", "Add, update or remove a perspective or orthographic camera; activating one deactivates the previous camera.", false, false, false, fields_scene_set_camera},
-    {"scene.set_renderer", "scene_set_renderer", "Configure entity renderer", "Attach a registered built-in or imported mesh and material to an entity, or remove its renderer component.", false, false, false, fields_scene_set_renderer},
-    {"scene.set_parent", "scene_set_parent", "Set entity parent", "Reparent an entity safely; use null to move it to the scene root.", false, false, false, fields_scene_set_parent},
-    {"scene.undo", "scene_undo", "Undo scene change", "Undo the most recent scene transaction and restore exact entity generations.", false, false, false, no_fields},
-    {"scene.redo", "scene_redo", "Redo scene change", "Reapply the most recently undone scene transaction.", false, false, false, no_fields},
-    {"scene.set_animation", "scene_set_animation", "Control imported animation", "Configure clip, playback, looping, speed and seek time on an imported model root.", false, false, false, fields_scene_set_animation},
-    {"scene.set_morph", "scene_set_morph", "Set imported morph weight", "Override a mesh morph weight, or reset all overrides to imported defaults and animation.", false, false, false, fields_scene_set_morph},
-    {"scene.set_light", "scene_set_light", "Configure scene light", "Add, update or remove a directional, point or spot light.", false, false, false, fields_scene_set_light},
-    {"scene.rename", "scene_rename", "Rename scene entity", "Change an entity's display name as one undoable transaction.", false, false, false, fields_scene_rename},
-    {"scene.history", "scene_history", "Inspect undo history", "Read the labels currently on the undo and redo stacks, newest first.", true, false, false, no_fields},
-    {"assets.available", "asset_available_models", "List importable models", "List model files present in the project assets directory that this build can import. Top-level files only; the import sandbox is unchanged.", true, false, false, no_fields},
-    {"scene.pick", "scene_pick", "Pick scene entity", "Find the nearest drawable entity a world-space ray enters. Bounds-level precision, not per-triangle. Stateless: the caller supplies the ray, so the engine stores no viewpoint.", true, false, false, fields_scene_pick},
-    {"scene.bounds", "scene_bounds", "Inspect entity bounds", "Read the world-space axis-aligned bounds and origin of an entity and its descendants, for framing a selection or locating an object.", true, false, false, fields_scene_bounds},
-    {"scene.snapshot", "scene_snapshot", "Snapshot Relay scene", "Return deterministic scene JSON plus reflected component field metadata.", true, false, false, no_fields},
-    {"scene.save", "scene_save", "Save Relay scene", "Atomically save the current scene in Relay's project-local scenes directory.", false, true, true, fields_scene_save},
-    {"scene.load", "scene_load", "Load Relay scene", "Validate, migrate and load a project scene as one undoable transaction.", false, false, false, fields_scene_load},
-    {"trace.start", "trace_start", "Start Relay trace", "Record frame-stamped agent commands and normalized human input events.", false, false, false, fields_trace_start},
-    {"trace.stop", "trace_stop", "Stop Relay trace", "Atomically persist the active deterministic trace in Relay's traces directory.", false, false, false, no_fields},
-    {"trace.status", "trace_status", "Inspect Relay trace", "Read trace recording state, path and current event count.", true, false, false, no_fields},
-    {"trace.replay", "trace_replay", "Replay Relay trace", "Validate and replay a trace against the fixed-step runtime at its recorded frame offsets.", false, false, false, fields_trace_replay},
-    {"scene.copy", "scene_copy", "Copy", "Copy selected subtrees to the session clipboard without changing the scene.", false, false, false, fields_scene_copy},
-    {"scene.cut", "scene_cut", "Cut", "Copy and remove selected subtrees as one undoable edit.", false, true, false, fields_scene_cut},
-    {"scene.duplicate_many", "scene_duplicate_many", "Duplicate Many", "Duplicate selected subtrees beside their originals as one undoable edit.", false, false, false, fields_scene_duplicate_many},
-    {"scene.destroy_many", "scene_destroy_many", "Destroy Many", "Remove selected subtrees as one undoable edit.", false, true, false, fields_scene_destroy_many},
-    {"scene.transform_many", "scene_transform_many", "Transform Many", "Apply a column-major world-space affine delta matrix to selected roots as one undoable gesture.", false, false, false, fields_scene_transform_many},
-    {"scene.paste", "scene_paste", "Paste entities", "Paste the session clipboard as one undoable edit; cameras stay inactive and internal model bindings are remapped.", false, false, false, fields_scene_paste},
-    {"scene.clipboard", "scene_clipboard", "Inspect clipboard", "Read session clipboard root and entity counts.", true, false, false, no_fields},
-    {"project.create", "project_create", "Create project", "Create a folder project (.relayproject) and an empty scene; refuses to overwrite an existing project.", false, false, false, fields_project_create},
-    {"project.open", "project_open", "Open project", "Open a folder project (.relayproject) and load its startup scene atomically, or clear the scene for an empty project.", false, false, false, fields_project_open},
-    {"project.status", "project_status", "Status project", "Inspect the current project, member scene files and startup scene.", true, false, false, no_fields},
-    {"project.list", "project_list", "List project", "List available workspace project files.", true, false, false, no_fields},
-    {"project.add_scene", "project_add_scene", "Add Scene project", "Add an existing valid scene file to the current project; the first scene becomes its startup scene.", false, false, false, fields_project_add_scene},
-    {"project.remove_scene", "project_remove_scene", "Remove Scene project", "Remove scene membership without deleting its file; chooses a remaining startup scene when needed.", false, false, false, fields_project_remove_scene},
-    {"project.set_startup", "project_set_startup", "Set Startup project", "Choose a current project member as the startup scene.", false, false, false, fields_project_set_startup},
-    {"project.close", "project_close", "Close project", "Close project metadata while leaving the current scene intact.", false, false, false, no_fields},
-    {"scene.set_animations", "scene_set_animations", "Control animation tracks", "Seek or configure multiple animation roots in one undoable gesture; time clamps to each clip duration.", false, false, false, fields_scene_set_animations},
-    {"animation.clip", "animation_clip", "Inspect animation timeline", "Read bounded channel key times for an imported animation clip. Key times are read-only; truncated channels report their full key count.", true, false, false, fields_animation_clip},
+constexpr std::array<ProtocolFieldSpec, 1> fields_session_audit{{
+    {"after", ProtocolValueType::integer, false, false, true, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 3> fields_session_request{{
+    {"scope", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 64U, "", ""},
+    {"kind", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "", "method|entity|file"},
+    {"target", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 3> fields_session_grant{{
+    {"scope", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 64U, "", ""},
+    {"kind", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "", "method|entity|file"},
+    {"target", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_session_decide{{
+    {"request", ProtocolValueType::integer, true, false, true, false, 0, 0, 0U, 0U, "", ""},
+    {"allow", ProtocolValueType::boolean, true, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_session_revoke{{
+    {"scope", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 64U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_session_export_audit{{
+    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.jsonl$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_chat_submit{{
+    {"message", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 4000U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_bridge_publish{{
+    {"view", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 65536U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_session_auto_approval{{
+    {"enabled", ProtocolValueType::boolean, true, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 6> fields_chat_configure{{
+    {"endpoint", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 2048U, "", ""},
+    {"model", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 256U, "", ""},
+    {"auth", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "bearer|header|none"},
+    {"header", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "", ""},
+    {"credential", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 4096U, "", ""},
+    {"clear", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 4> fields_chat_control{{
+    {"action", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "signin|cancel_signin|signout|refresh|select|new_chat|provider"},
+    {"model", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 256U, "", ""},
+    {"effort", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 32U, "", ""},
+    {"provider", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "openai|compatible"},
+}};
+
+constexpr std::array<ProtocolMethodSpec, 85> methods{{
+    {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current run, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
+    {"runtime.pause", "runtime_pause", "Pause Relay runtime", "Pause automatic simulation so the scene can be inspected deterministically.", false, false, true, false, false, no_fields},
+    {"runtime.resume", "runtime_resume", "Resume Relay runtime", "Resume automatic simulation after an inspection or controlled frame step.", false, false, true, false, false, no_fields},
+    {"runtime.step", "runtime_step", "Step Relay frames", "Advance an exact number of deterministic simulation frames, including while paused.", false, false, false, false, false, fields_runtime_step},
+    {"runtime.quit", "runtime_shutdown", "Shut down Relay runtime", "Request an orderly shutdown of the runtime owned by this MCP bridge.", false, false, true, false, false, no_fields},
+    {"editor.camera.status", "editor_camera_status", "Inspect editor camera", "Read the live editor inspection viewpoint used by Vulkan captures. Unavailable without an editor. Does not modify scene cameras.", true, false, false, false, false, no_fields},
+    {"editor.camera.set", "editor_camera_set", "Position editor inspection camera", "Set the live inspector camera target, orbit angles in radians and distance for visual confirmation using render_capture source vulkan. View-only: no scene or undo changes.", false, false, false, false, false, fields_editor_camera_set},
+    {"editor.camera.frame", "editor_camera_frame", "Frame entity in inspection camera", "Frame an entity and its descendant bounds in the live inspection view before Vulkan capture. Does not change selection, scene cameras or undo history.", false, false, false, false, false, fields_editor_camera_frame},
+    {"render.capture", "render_capture", "Capture Relay frame", "Save the current rendered frame in Relay's captures directory for visual inspection.", false, false, false, false, false, fields_render_capture},
+    {"render.capture_async", "render_capture_async", "Queue Relay frame capture", "Capture real Vulkan or deterministic CPU frames through bounded background image workers.", false, false, false, false, false, fields_render_capture_async},
+    {"render.capture_cancel", "render_capture_cancel", "Cancel pending capture", "Cancel a queued image or GPU readback job; writing and completed jobs cannot be cancelled. GPU slots remain alive until their fence completes.", false, false, false, false, false, fields_render_capture_cancel},
+    {"render.capture_status", "render_capture_status", "Inspect capture job", "Check whether an asynchronous capture is queued, writing, complete or failed.", true, false, false, false, false, fields_render_capture_status},
+    {"render.capabilities", "render_capabilities", "Inspect graphics capabilities", "Create a temporary Vulkan device and report adapter and modern rendering support.", true, false, false, false, false, no_fields},
+    {"render.graph", "render_graph", "Inspect render graph", "Read compiled render passes, resources, dependencies and access transitions.", true, false, false, false, false, no_fields},
+    {"render.shader_interfaces", "render_shader_interfaces", "Inspect shader interfaces", "Read SPIR-V-reflected stages, locations, descriptor bindings and push-constant sizes from the live Vulkan pipeline.", true, false, false, false, false, no_fields},
+    {"render.assets", "render_assets", "Inspect render assets", "List built-in and imported meshes, materials and textures currently available to scene renderer components.", true, false, false, false, false, no_fields},
+    {"assets.formats", "asset_import_formats", "Inspect model import formats", "Report model formats and feature coverage available in this Relay build, including Godot-compatible interchange paths.", true, false, false, false, false, no_fields},
+    {"assets.import_model", "asset_import_model", "Import project model", "Import a model from the project-local assets directory using a content-addressed identity and optionally instantiate its node hierarchy.", false, false, false, false, false, fields_assets_import_model},
+    {"logs.read", "logs_read", "Read Relay logs", "Read structured engine log entries newer than a sequence number.", true, false, false, false, false, fields_logs_read},
+    {"performance.read", "performance_read", "Read Relay performance", "Read bounded per-frame CPU/GPU timing, draw/resource counts, entities and process memory.", true, false, false, false, false, fields_performance_read},
+    {"input.recent", "input_recent", "Read recent Relay input", "Read the bounded normalized keyboard, mouse and gamepad input event history.", true, false, false, false, false, no_fields},
+    {"video.start", "video_start", "Start Relay video", "Record real Vulkan or deterministic CPU frames to WebM with explicit frame drops.", false, false, false, false, false, fields_video_start},
+    {"video.capabilities", "video_capabilities", "Inspect video capabilities", "Report whether this Relay build found the FFmpeg WebM encoder.", true, false, false, false, false, no_fields},
+    {"video.stop", "video_stop", "Stop Relay video", "Drain pending readbacks and start background WebM finalization; poll video.status for completion and errors.", false, false, false, false, false, no_fields},
+    {"video.status", "video_status", "Inspect Relay video", "Read recording state, submitted frames and explicitly reported frame drops.", true, false, false, false, false, no_fields},
+    {"scene.list", "scene_list", "List scene entities", "List every live entity with its name, parent and local transform.", true, false, false, false, false, no_fields},
+    {"scene.inspect", "scene_inspect", "Inspect scene entity", "Inspect one entity using its stable generation-checked handle.", true, false, false, false, false, fields_scene_inspect},
+    {"scene.create", "scene_create", "Create scene entity", "Create a named entity, optionally parented to another live entity.", false, false, false, false, false, fields_scene_create},
+    {"scene.destroy", "scene_destroy", "Destroy scene entity", "Destroy an entity and its descendants as one undoable transaction.", false, true, false, false, false, fields_scene_destroy},
+    {"scene.duplicate", "scene_duplicate", "Duplicate scene entity", "Copy an entity and its descendants beside the original as one undoable transaction. Components are preserved, a copied camera is never the active one, and a copy of a whole imported model drives its own animation.", false, false, false, false, false, fields_scene_duplicate},
+    {"scene.clear", "scene_clear", "Clear the scene", "Destroy every entity as one undoable transaction, leaving an empty scene to start new work in.", false, true, false, false, false, no_fields},
+    {"scene.set_transform", "scene_set_transform", "Set entity transform", "Update selected local position, Euler rotation or scale fields in one transaction.", false, false, false, false, false, fields_scene_set_transform},
+    {"scene.set_camera", "scene_set_camera", "Configure entity camera", "Add, update or remove a perspective or orthographic camera; activating one deactivates the previous camera.", false, false, false, false, false, fields_scene_set_camera},
+    {"scene.set_renderer", "scene_set_renderer", "Configure entity renderer", "Attach a registered built-in or imported mesh and material to an entity, or remove its renderer component.", false, false, false, false, false, fields_scene_set_renderer},
+    {"scene.set_parent", "scene_set_parent", "Set entity parent", "Reparent an entity safely; use null to move it to the scene root.", false, false, false, false, false, fields_scene_set_parent},
+    {"scene.undo", "scene_undo", "Undo scene change", "Undo the most recent scene transaction and restore exact entity generations.", false, false, false, false, false, no_fields},
+    {"scene.redo", "scene_redo", "Redo scene change", "Reapply the most recently undone scene transaction.", false, false, false, false, false, no_fields},
+    {"scene.set_animation", "scene_set_animation", "Control imported animation", "Configure clip, playback, looping, speed and seek time on an imported model root.", false, false, false, false, false, fields_scene_set_animation},
+    {"scene.set_morph", "scene_set_morph", "Set imported morph weight", "Override a mesh morph weight, or reset all overrides to imported defaults and animation.", false, false, false, false, false, fields_scene_set_morph},
+    {"scene.set_light", "scene_set_light", "Configure scene light", "Add, update or remove a directional, point or spot light.", false, false, false, false, false, fields_scene_set_light},
+    {"scene.rename", "scene_rename", "Rename scene entity", "Change an entity's display name as one undoable transaction.", false, false, false, false, false, fields_scene_rename},
+    {"scene.history", "scene_history", "Inspect undo history", "Read the labels currently on the undo and redo stacks, newest first.", true, false, false, false, false, no_fields},
+    {"assets.available", "asset_available_models", "List importable models", "List model files present in the project assets directory that this build can import. Top-level files only; the import sandbox is unchanged.", true, false, false, false, false, no_fields},
+    {"scene.pick", "scene_pick", "Pick scene entity", "Find the nearest drawable entity a world-space ray enters. Bounds-level precision, not per-triangle. Stateless: the caller supplies the ray, so the engine stores no viewpoint.", true, false, false, false, false, fields_scene_pick},
+    {"scene.bounds", "scene_bounds", "Inspect entity bounds", "Read the world-space axis-aligned bounds and origin of an entity and its descendants, for framing a selection or locating an object.", true, false, false, false, false, fields_scene_bounds},
+    {"scene.snapshot", "scene_snapshot", "Snapshot Relay scene", "Return deterministic scene JSON plus reflected component field metadata.", true, false, false, false, false, no_fields},
+    {"scene.save", "scene_save", "Save Relay scene", "Atomically save the current scene in Relay's project-local scenes directory.", false, true, true, false, false, fields_scene_save},
+    {"scene.load", "scene_load", "Load Relay scene", "Validate, migrate and load a project scene as one undoable transaction.", false, false, false, false, false, fields_scene_load},
+    {"trace.start", "trace_start", "Start Relay trace", "Record frame-stamped agent commands and normalized human input events.", false, false, false, false, false, fields_trace_start},
+    {"trace.stop", "trace_stop", "Stop Relay trace", "Atomically persist the active deterministic trace in Relay's traces directory.", false, false, false, false, false, no_fields},
+    {"trace.status", "trace_status", "Inspect Relay trace", "Read trace recording state, path and current event count.", true, false, false, false, false, no_fields},
+    {"trace.replay", "trace_replay", "Replay Relay trace", "Validate and replay a trace against the fixed-step runtime at its recorded frame offsets.", false, false, false, false, false, fields_trace_replay},
+    {"scene.copy", "scene_copy", "Copy", "Copy selected subtrees to the session clipboard without changing the scene.", false, false, false, false, false, fields_scene_copy},
+    {"scene.cut", "scene_cut", "Cut", "Copy and remove selected subtrees as one undoable edit.", false, true, false, false, false, fields_scene_cut},
+    {"scene.duplicate_many", "scene_duplicate_many", "Duplicate Many", "Duplicate selected subtrees beside their originals as one undoable edit.", false, false, false, false, false, fields_scene_duplicate_many},
+    {"scene.destroy_many", "scene_destroy_many", "Destroy Many", "Remove selected subtrees as one undoable edit.", false, true, false, false, false, fields_scene_destroy_many},
+    {"scene.transform_many", "scene_transform_many", "Transform Many", "Apply a column-major world-space affine delta matrix to selected roots as one undoable gesture.", false, false, false, false, false, fields_scene_transform_many},
+    {"scene.paste", "scene_paste", "Paste entities", "Paste the session clipboard as one undoable edit; cameras stay inactive and internal model bindings are remapped.", false, false, false, false, false, fields_scene_paste},
+    {"scene.clipboard", "scene_clipboard", "Inspect clipboard", "Read session clipboard root and entity counts.", true, false, false, false, false, no_fields},
+    {"project.create", "project_create", "Create project", "Create a folder project (.relayproject) and an empty scene; refuses to overwrite an existing project.", false, false, false, false, false, fields_project_create},
+    {"project.open", "project_open", "Open project", "Open a folder project (.relayproject) and load its startup scene atomically, or clear the scene for an empty project.", false, false, false, false, false, fields_project_open},
+    {"project.status", "project_status", "Status project", "Inspect the current project, member scene files and startup scene.", true, false, false, false, false, no_fields},
+    {"project.list", "project_list", "List project", "List available workspace project files.", true, false, false, false, false, no_fields},
+    {"project.add_scene", "project_add_scene", "Add Scene project", "Add an existing valid scene file to the current project; the first scene becomes its startup scene.", false, false, false, false, false, fields_project_add_scene},
+    {"project.remove_scene", "project_remove_scene", "Remove Scene project", "Remove scene membership without deleting its file; chooses a remaining startup scene when needed.", false, false, false, false, false, fields_project_remove_scene},
+    {"project.set_startup", "project_set_startup", "Set Startup project", "Choose a current project member as the startup scene.", false, false, false, false, false, fields_project_set_startup},
+    {"project.close", "project_close", "Close project", "Close project metadata while leaving the current scene intact.", false, false, false, false, false, no_fields},
+    {"scene.set_animations", "scene_set_animations", "Control animation tracks", "Seek or configure multiple animation roots in one undoable gesture; time clamps to each clip duration.", false, false, false, false, false, fields_scene_set_animations},
+    {"animation.clip", "animation_clip", "Inspect animation timeline", "Read bounded channel key times for an imported animation clip. Key times are read-only; truncated channels report their full key count.", true, false, false, false, false, fields_animation_clip},
+    {"session.status", "session_status", "Inspect session grants", "Inspect exact native method grants for this connection. Grants are approved only by the host; no tool can expand them.", true, false, false, false, false, no_fields},
+    {"session.audit", "session_audit", "Inspect session audit", "Read bounded session action decisions and outcomes. Scope is the exact native method. Oldest sequence exposes eviction; parameters are not retained.", true, false, false, false, false, fields_session_audit},
+    {"session.request", "session_request", "Session request", "Request host approval for an exact method and optional entity/file target. This never grants access or executes an action.", false, false, false, false, false, fields_session_request},
+    {"session.review", "session_review", "Session review", "Inspect pending requests, active scoped grants and native action descriptions.", true, false, false, true, false, no_fields},
+    {"session.grant", "session_grant", "Session grant", "Host approval of an exact method scope bound to the current project.", false, false, false, true, false, fields_session_grant},
+    {"session.decide", "session_decide", "Session decide", "Host approval or denial of a pending request. Stale project requests cannot be approved.", false, false, false, true, false, fields_session_decide},
+    {"session.revoke", "session_revoke", "Session revoke", "Host revocation of all grants or one exact method.", false, false, false, true, false, fields_session_revoke},
+    {"session.export_audit", "session_export_audit", "Session export_audit", "Export a bounded audit snapshot atomically under .relay/audits without overwriting existing records.", false, false, false, true, false, fields_session_export_audit},
+    {"chat.submit", "chat_submit", "Chat submit", "Submit a user message to the external bridge. Providers and canonical conversation history remain outside the engine.", false, false, false, true, false, fields_chat_submit},
+    {"chat.status", "chat_status", "Chat status", "Inspect the bounded external bridge display and pending user-message count.", true, false, false, true, false, no_fields},
+    {"bridge.poll", "bridge_poll", "Bridge poll", "Consume bounded user-message submissions for the authenticated external bridge.", false, false, false, false, true, no_fields},
+    {"bridge.publish", "bridge_publish", "Bridge publish", "Publish a bounded display snapshot from the authenticated external bridge.", false, false, false, false, true, fields_bridge_publish},
+    {"chat.cancel", "chat_cancel", "Stop chat work", "Cancel pending chat submissions and ask the external bridge to abort its active turn. Completed native actions remain undoable.", false, false, false, true, false, no_fields},
+    {"session.auto_approval", "session_auto_approval", "Auto approval", "Set full session access to every public engine action without approval prompts. Trusted host only.", false, false, false, true, false, fields_session_auto_approval},
+    {"chat.configure", "chat_configure", "Configure chat provider", "Pass transient provider settings to the external bridge for private storage. Never traced or exposed to agent tools.", false, false, false, true, false, fields_chat_configure},
+    {"chat.control", "chat_control", "Control agent harness", "Host-only OpenAI sign-in, account, model, reasoning and conversation controls, processed by the external bridge.", false, false, false, true, false, fields_chat_control},
 }};
 
 } // namespace

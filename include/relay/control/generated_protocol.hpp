@@ -8,7 +8,7 @@
 
 namespace relay {
 
-inline constexpr unsigned protocol_schema_version = 9U;
+inline constexpr unsigned protocol_schema_version = 14U;
 
 enum class ProtocolValueType { string, integer, number, boolean, string_array, number_array };
 
@@ -35,6 +35,8 @@ struct ProtocolMethodSpec {
     bool read_only;
     bool destructive;
     bool idempotent;
+    bool host_only;
+    bool bridge_only;
     std::span<const ProtocolFieldSpec> fields;
 };
 

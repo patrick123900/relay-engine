@@ -24,6 +24,7 @@ npm-debug.log*
 !/captures/pbr-golden.png
 
 # Editor and operating-system noise
+# Private bridge provider authentication, editor settings, audits and temporary/backup files
 /.relay/
 .DS_Store
 *.swp

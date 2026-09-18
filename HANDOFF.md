@@ -1,6 +1,6 @@
 # Relay Engine — Session Handoff
 
-Last updated: 2026-09-17
+Last updated: 2026-09-18
 
 ## Desktop interaction rule — read first
 
@@ -17,22 +17,45 @@ if an important verification gap cannot reasonably be covered without desktop in
 ## Next-session starting point
 
 - Branch: `main`; GitHub: https://github.com/patrick123900/relay-engine (public).
-- Previous published baseline: `4c3d16e` (`Polish scene workflows and live animation scrubbing`).
+- Previous published baseline: `bf9a566` (`Keep repository documentation and agent policies professional`).
   The commit containing this handoff includes the usability, project-folder, timeline, icon and
   grid follow-ups. Use `git log -1` for the latest commit and inspect the working tree before editing.
 - Phases A–D meet their recorded milestone definitions on the tested Linux/Vulkan path, not full
   Godot compatibility or Windows/macOS parity. Deferred work is listed explicitly below.
-- Current on-disk/API versions: scene v4, import manifest v3, project v1, protocol v9 with 66 native
-  methods and 66 generated MCP tools.
+- Current on-disk/API versions: scene v4, import manifest v3, project v1, protocol v14 with 85 native
+  methods and 72 generated MCP tools.
 - Phase E and the tested Linux/Vulkan Phase F milestone are implemented. Earlier commit/push
   authorization was completed for `4c3d16e`; the user also authorized committing and pushing all
   subsequent work, including this documentation, on 2026-09-17.
   Later phase labels organize proposed work; they do not claim full editor completion or platform parity.
 - The Phase E and Phase F sections below record this session; earlier phase results remain
-  historical. The user now prioritizes editor usability before embedded chat; Phase G permissions
-  remain a prerequisite for broader agent access.
+  historical. Phase G permissions and embedded chat are implemented on this branch, but
+  Phase G remains unfinished: long-running provider reliability and final UI/visual checks need work.
 
 ### Latest state and first follow-up
+
+**Phase G is in progress, not complete.** Current chat uses OpenAI device authentication, discovered
+models/reasoning and external Codex App Server dynamic tools. `relay_demo --editor` automatically
+starts the bridge; standalone attachable MCP service is a separate integration. Keep the stable
+`features.code_mode_host` enabled or registered tools cannot reach inference. Credentials, logs
+and preferences stay in ignored `.relay/`, outside the C++ engine.
+
+Current Agent UI has Chat/Account/Access/Activity tabs and no workspace heading, extra
+New chat/Account/Expand header buttons, or per-message Copy buttons (user or agent). The composer
+soft-wraps without changing submitted text. Enter sends; Ctrl+Enter adds a newline. A single
+right-aligned icon sends or stops; a compact neutral model/reasoning label with a drawn chevron
+opens the shared model menu and supported-level reasoning slider, without a description below.
+Follow is automatic at the transcript bottom; scrolling up pauses it and shows a jump-down arrow.
+Standard/narrow headless layout checks verify zero outer composer scrolling.
+
+First follow-up: investigate intermittent service disconnections after several minutes of agent
+work. This symptom is reported; the cause and a reproducible trigger are not established. Use
+sanitized transport/process lifecycle diagnostics and sustained background fixtures to distinguish
+service exit, RPC/stream failures and bridge shutdown/cancellation. Protect completed native actions,
+avoid duplicate mutations on recovery, and keep credentials/conversation data out of tracked logs.
+Do not label the adapter reliable or Phase G complete until the issue is reproduced and corrected.
+
+
 
 The three usability priorities are implemented: multi-selection/session clipboard, folder projects,
 and a dockable playback timeline. Project, Timeline and History start hidden; View reopens them.
@@ -52,7 +75,13 @@ fields were removed. This visual result comes from the user's verification, not 
 Run background verification first. Prefer an isolated offscreen/virtual-display GPU check if
 practical; it must not affect the user's desktop, mouse or focus. A regular desktop check requires
 fresh explicit approval. The earlier approval covered only the panel/folder review and does not
-carry forward. Next substantive work is Phase G capability grants/audited scopes before chat.
+carry forward. Phase G local grants, host approval, authentication and external-bridge chat are
+implemented with background verification. Treat the local-workflow completion records below as
+historical implementation checkpoints, not completion of Phase G. Live tool use has been verified
+in a temporary scene and confirmed working in editor testing. Intermittent ChatGPT/App Server
+disconnections after several minutes of agent work remain unresolved. Continue Phase G reliability
+and interface refinement before moving to Phase H; newer camera/image/composer desktop checks
+and a live image-based model review remain pending.
 
 Final recorded verification after the shader correction:
 
@@ -378,10 +407,13 @@ are observable through `video.status`. Cancellation retains GPU storage until fe
 
 - The editor covers scene tree, inspector, viewport camera, gizmos, asset browser and undo history,
   verified with driven mouse and keyboard input. See Phase F.
-- There is no built-in chat panel yet.
-- Model-provider and conversation state integration has not been built.
-- There are no per-session capability grants or authentication. The socket is loopback-only, but
-  mutating tools still need a formal permission model before broader exposure.
+- A dockable Agent panel supports external-bridge chat, explicit access review and action inspection.
+- The initial text/function-call provider adapter is OpenAI-compatible. Canonical conversation state
+  and provider credentials stay in the TypeScript bridge; live-provider verification is pending.
+- Native project-bound grants, supported entity/file scopes, host approval and bounded audits with
+  snapshot export are implemented. Loopback control requires a host-provisioned bearer token; each
+  local client shares the configured listener policy. Multi-user accounts, simultaneous clients and
+  continuous/tamper-proof audit retention are outside this local milestone.
 - There is no plugin/project packaging system yet.
 
 ## What to build next
@@ -1101,7 +1133,10 @@ Carry forward:
 - [ ] Recalibrate the five older pixel-coordinate desktop suites for maximized startup, 17-unit
   fonts and the fixed toolbar. They last passed before these layout changes; do not claim a fresh
   pass from those historical results. The current visuals suite remains runnable independently.
-- [ ] Phase G capability grants before broader agent access / embedded chat.
+- [x] Phase G native session capability grants and bounded action audits.
+- [x] Phase G local host approval interface, token authentication, supported entity/file scopes and
+      external-bridge chat integration, verified in background tests with a mock provider.
+- [ ] Phase G live-provider and normal desktop verification; expanded adapters/multi-client identities.
 - [ ] Preserve the earlier A–D importer/resource-lifecycle checklist and platform sandbox TODOs.
 
 ## Daily editing and save workflow — 2026-09-17
@@ -1303,3 +1338,354 @@ popping; do not describe CPU math checks as rendered fade verification.
 
 User verification update (2026-09-17): the final grid fade is visually confirmed smooth during
 both upward and downward camera movement. This closes the earlier pending rendered check.
+
+
+## Phase G continuation — native capability boundary (2026-09-18)
+
+Historical initial-boundary record; superseded by the completed local-workflow record below.
+At this stage the native permission prerequisite was implemented and the rest of Phase G remained incomplete.
+Protocol v10 has 68 native methods/MCP tools. Scene v4, manifest v3 and project v1 are unchanged.
+
+- Agent stdio, editor-stdio and each accepted loopback connection dispatch through
+  `ControlProtocol::handle_agent`. Default access is limited to `session.status` and
+  `session.audit`; every action/inspection method needs its own explicit host grant.
+- The host supplies exact comma-separated native names through `RELAY_AGENT_GRANTS`, or uses
+  `set_agent_grants` on the render/control thread for replacement/revocation. Invalid grant lists
+  revoke all access; wildcards and agent self-grant tools are unsupported. Environment policy is
+  snapshotted at startup/per accepted connection and cannot be changed through the wire.
+- Trusted human editor requests still use `ControlProtocol::handle`; agent restrictions do not
+  disable human editing or introduce a separate Scene mutation path/undo history.
+- A bounded 256-entry connection-local audit records host grant changes, validation failures,
+  denied actions and allowed outcomes. Entries expose exact method scopes, request IDs,
+  read-only/destructive flags and host policy snapshots, without request parameters. Sequence
+  bounds expose eviction; successful status/audit reads neither trace nor audit themselves.
+- Denials run before native dispatch and trace recording. Generated validation, native path
+  checks and import sandboxes remain enforced after grants. Read-only operations stay untraced.
+- Agent `trace.replay` remains ungrantable: nested commands, frame advancement and input effects
+  need a full authorization preflight before replay can safely execute.
+- MCP defaults to headless operation; a desktop runtime requires explicit `RELAY_RUNTIME_MODE=editor`.
+  The old headless synchronous Vulkan capture subprocess fallback was removed because it escaped
+  the owned session's permission boundary. Vulkan requests now fail without a live renderer.
+- Provider SDKs, credentials, conversation history and orchestration remain outside C++.
+
+Verification:
+
+- Development and release builds passed with no compiler warnings.
+- All four background CTest suites passed: native, workflow, session stdio/loopback and headless
+  ImGui input tests. Loopback tests required reviewed sandbox access for local sockets; they do
+  not initialize SDL/Vulkan or interact with the desktop.
+- Generated protocol consistency, MCP type check/build, 68-tool deterministic capture smoke and
+  default-ungranted MCP startup/capture regression passed. `git diff --check` passed.
+- An isolated Xvfb GPU smoke was attempted with desktop display variables disabled. RADV could
+  not present because this private X server lacks DRI3; no software Vulkan ICD is installed.
+  Rendered GPU verification is therefore pending, as are unrun normal desktop checks. Background
+  permission/protocol verification is complete and does not require desktop interaction.
+- No normal desktop windows, OS input or focus controls were used. The previously user-verified
+  grid fade remains resolved; this phase changes no shaders, captures or scene serialization.
+
+Remaining boundaries: grants currently cover exact methods across the active project, not files
+or entities; local clients share the listener's configured policy without authentication; audit
+history is in memory and ends with its connection. Build a human grant/revocation review interface,
+resource-specific scopes, authenticated connection identity and optional durable audit export
+before broader exposure. Embedded chat remains pending and must use the out-of-process bridge.
+
+
+## Phase G — completed local permission/chat workflow (2026-09-18)
+
+The Phase G local milestone is implemented on the tested Linux path: a human can grant limited
+access, collaborate through the external bridge and inspect actions. Native denial/path boundaries
+are verified through real protocol dispatch and headless ImGui input. This does not claim live
+provider/rendered desktop verification, broad transport exposure or Windows/macOS parity.
+
+Current protocol: v11, 79 native methods and 69 MCP tools. Scene v4, manifest v3 and project v1
+remain unchanged. Generated host-only and authenticated-bridge-only methods are excluded from MCP
+and from the provider tool list; agent tools cannot self-approve or publish bridge messages.
+
+Implemented:
+
+- **View > Agent** is hidden by default and dockable beside Diagnostics. Chat, Access and Actions
+  show bridge messages, request effects/project context, Allow/Deny, manual method/entity/file
+  grants, per-method/all-access revocation, bounded tool summaries and audit export. Approval
+  controls precede longer descriptions so they remain reachable in the default bottom dock.
+- `session.request` queues at most 32 deduplicated access requests without approving or executing
+  them. Host `session.grant`, `session.decide`, `session.revoke` and `session.export_audit` dispatch
+  through ControlProtocol and do not alter scene undo or deterministic traces.
+- Exact-method grants and supported entity/file scopes are bound to the active project. Project
+  open/create/close attempts revoke all grants. Scene load/clear and undo/redo attempts revoke
+  entity grants to prevent restored allocator handles from inheriting access. Stale project
+  requests cannot be approved. Unsupported resource/method combinations fail closed.
+- Entity scopes support inspect/bounds/transform/morph/light/renderer/name methods. File scopes
+  cover scene save/load, model imports, capture, video start and trace start. Filename bounds
+  restrict a method's source/output, not all its normal effects: imports/loads can restore
+  dependencies/manifests and replace the scene; entity transforms/bounds retain descendant
+  effects. Cameras, project operations, whole-scene history and replay have no entity scope.
+- Loopback startup requires `RELAY_AGENT_TOKEN` (32–128 characters). A socket-only
+  `session.authenticate` handshake must succeed before dispatch; bad/missing tokens close the
+  client without mutation. Initial receive timeout/buffering are bounded. Authentication failure
+  diagnostics contain no tokens. Stdio remains an owned-process private pipe.
+- Audit records include decisions/outcomes, host-approved scope metadata, project context and
+  request IDs. Export publishes a bounded JSONL snapshot under `.relay/audits/` atomically without
+  overwriting files or following symlink ancestors. Exports are optional persistent snapshots,
+  not continuous or tamper-proof journals; eviction and connection-lifetime limits remain explicit.
+- The TypeScript bridge owns an OpenAI-compatible text/function-call adapter, bounded canonical
+  conversation turns and HTTP/tool orchestration. Endpoint/model/key are configured only in its
+  environment. Runtime children receive no provider credential/configuration variables. A fresh
+  private bridge token authorizes bounded mailbox/display projection calls, never native actions.
+- Chat checks native grants for every tool, stops for access review and resumes only on a human
+  follow-up. Stop aborts active provider work/future calls, preserving completed native actions.
+  Round/tool/time/response bounds, redirect refusal, credential redaction and rejection of
+  credential-bearing tool arguments are covered by tests. No provider request occurs without a
+  submitted human message; unconfigured chat reports its configuration state.
+- A human can build the bridge and run `npm run editor` from `tools/mcp-bridge` to launch the editor
+  with chat, or explicitly select editor mode through MCP. These commands open desktop windows;
+  agents still need fresh task-specific desktop approval. Default MCP mode remains headless.
+- MCP scene-save results now resolve their absolute path from the native response, preserving
+  active project scene roots. Captures retain native authorization and source provenance.
+
+Final background verification:
+
+- Development and release builds passed without compiler warnings.
+- All four CTest suites passed in both builds: native engine, editor workflows, authenticated
+  stdio/loopback transport and headless ImGui input. Headless approval/denial/revocation/export
+  tests run at the default dock size, without SDL, desktop windows, OS input or focus changes.
+  Chat Send/Stop also run through actual ImGui input and the authenticated bridge mailbox, without
+  provider calls or scene-revision/undo changes.
+- Three bridge tests passed using mocked fetch and the real native session test host: environment
+  separation, approval pause/resume and actual scoped tool dispatch/denial, bridge authentication,
+  provider failure/redaction, credential-bearing argument refusal and cancellation/response bounds.
+- Generated protocol consistency, MCP type check/build, 69-tool deterministic capture and default
+  ungranted/headless startup regressions passed. `git diff --check` passed.
+- Normal desktop and live-provider verification are pending. The earlier isolated Xvfb attempt
+  lacked DRI3 presentation support; it was not rerun against the normal desktop. No shader/capture
+  or scene serialization changes were made. User-verified grid fading remains resolved.
+
+Boundaries/follow-ups: the initial provider adapter is non-streaming text/function calling; live
+endpoint/model access requires external host configuration and has not been exercised. There are
+no multi-user accounts or simultaneous socket clients, transport remains loopback-only, and the
+private bridge owns its runtime rather than attaching to an unrelated editor. Audit exports are
+manual snapshots. Agent trace replay remains unavailable pending authorization preflight of every
+nested command/frame/input effect. Broader provider APIs, attachments, live-provider verification,
+multi-client policy identities and continuous audit retention remain enhancements. Phase H can
+proceed independently of optional desktop/provider verification.
+
+
+## Phase G — full Auto approval and private editor provider setup (2026-09-18)
+
+Protocol v12 has 81 native methods and 69 MCP tools. New host-only `session.auto_approval`
+and `chat.configure` remain absent from generated MCP/provider tools.
+
+- Agent panel header: Auto approval (all actions), default off each session. Allows every public
+  engine method without individual approval/scopes, including destructive operations and replay.
+  Persists across project changes; disabling restores limited grants and Revoke all clears access.
+  Permission changes and automatic actions include the mode in bounded audit records. Agent tools
+  cannot enable the switch. Replay dispatches nested commands through agent enforcement/auditing;
+  host/bridge administration and recursive replay remain unavailable through imported traces.
+- Setup tab: endpoint/model, bearer token/API key, custom authentication header or no authentication.
+  Credentials are transient in the trusted UI/mailbox, cleared after submission/consumption, never
+  returned in projections, and excluded from scenes/projects/traces/audits. Canonical authentication
+  remains in the external TypeScript bridge, in `.relay/agent-provider.json`. The whole `.relay`
+  directory (including temp/backup files) is gitignored. File mode 0600, atomic replacement, symlink
+  path refusal, bounded loading and sanitized configuration errors protect private storage.
+  Blank credential keeps the current secret; explicit removal clears it. Saved setup overrides
+  environment fallback. Initial adapter remains compatible Chat Completions, not an OAuth browser flow.
+- Public `relay_demo --editor` delegates to the bridge before initializing any window, which starts
+  the same selected binary with `--editor-ui-stdio`. Build bridge assets first. No normal desktop
+  launch was performed by agents. A fake Node executable verifies delegation entirely in background.
+- Full Auto approval chat has no scoped-mode round/tool-count/total-work budget; it continues until
+  provider completion or Stop. Response size and individual network timeouts remain bounded.
+  Native schema/path validation, import bounds and fail-closed Blender sandbox policy are unchanged.
+
+Final background verification:
+
+- Development and release builds passed without compiler warnings.
+- All four CTest suites passed in both builds: native engine, workflow, stdio/loopback authorization
+  and headless editor input, including Auto approval/revocation and provider setup controls.
+- Six bridge tests passed against development and release fixtures: private credential persistence,
+  restrictive file permissions, gitignore coverage, symlink refusal, sanitized errors, custom-header
+  authentication, more than 8 rounds/16 automatic calls, and window-free editor launch delegation.
+- Headless MCP capture/default-policy smoke, generated protocol consistency, TypeScript checks and
+  whitespace checks passed. No scene/project/asset/shader data was modified.
+- Live-provider and normal desktop/GPU verification remain pending; grid fading remains
+  user-verified, not pending. No normal desktop interaction was performed.
+
+
+## Phase G — OpenAI device sign-in and agent workspace (2026-09-18)
+
+Protocol v13: 82 native methods and 69 MCP tools. `chat.control` is a new host-only mailbox method
+for provider, sign-in/cancel/sign-out/refresh, model/reasoning and New chat controls. All previous
+local edits, scene/project/assets and compatible-provider settings are preserved.
+
+- External `openai.ts` uses the official Codex App Server device-code flow, login completion,
+  account metadata and model catalogue. Tokens/refresh remain in Codex; only sanitized display
+  metadata/device code reach the host-only UI. Dedicated `.relay/openai` home isolates Relay from
+  existing host Codex authentication and configuration. Directory mode 0700, restrictive process
+  creation mask, private files and symlink/hardlink refusal protect storage. `.relay` remains
+  entirely gitignored, including auth, state, logs, provider/harness preferences and backups.
+- OpenAI is the default for new configurations. Existing compatible providers are retained. Account
+  switches providers and exposes device sign-in/cancel/reconnect/sign-out/refresh; advanced manual
+  endpoints remain available for other providers. Model/reasoning options are discovered, validated
+  and stored privately, with no hardcoded model list. Codex CLI 0.154.0 and Node.js 26 are tested.
+- OpenAI threads are ephemeral, with streaming message projections and generated dynamic tools.
+  Every action uses native agent dispatch; host/bridge controls are absent from model tools.
+  Pending access requests interrupt the turn. Stop preserves completed actions; New chat releases
+  the old thread. Shell/exec, computer/browser, apps/delegation and code-mode capabilities are
+  disabled; the isolated empty workspace is read-only. Full Auto approval still permits every
+  public engine method, retaining schema/path/import/sandbox safeguards and nested replay auditing.
+- Agent opens by default in native editor launch; fresh layouts share the full-height Inspector
+  dock. Tools > Agent workspace / Ctrl+Shift+A expands it inside the same native surface. Compact
+  saved layouts expose Open workspace rather than clipping controls. Chat has separate message
+  cards, basic heading/code formatting, copy, model/reasoning, composer/send shortcut, Follow,
+  streaming/busy status, Stop/New chat; Account/Access/Activity separate the supporting controls.
+  Activity results are expandable. UI stays excluded from captures.
+- Background tests cover mock device login/cancel/logout, token-free account projection, model
+  persistence, real native actions, host-tool refusal, pending-review/cancellation, private paths
+  and all account/model controls through headless ImGui. An installed-Codex test registers all
+  69 dynamic tools and checks signed-out metadata/ephemeral startup without model generation.
+  The runtime schema uses `sandbox: "read-only"`, verified against the installed CLI.
+
+The user specifically approved desktop visual verification for this task. A separate temporary-layout
+Relay window was used with fixture provider/account data; no existing account/authentication was
+accessed and no project or saved layout was modified. Conversation and device-code screens were
+visually inspected. Footer spacing/contrast/device-code size were corrected after inspection.
+This is not reusable desktop approval for future tasks. Final background/visual results follow below;
+completing real account authentication and a live provider turn remain separate pending checks.
+
+
+Final verification for the OpenAI harness:
+
+- Development and release builds passed without compiler warnings. All four CTest suites passed
+  in both builds, including native authorization/socket checks and headless ImGui account/model
+  controls. Stop preserves queued private provider settings as well as completed scene actions.
+- All 11 bridge tests passed against development and release binaries. The installed Codex runtime
+  accepted isolated signed-out account/model metadata and ephemeral registration of all 69 Relay
+  dynamic tools, without requesting authentication or running a model turn.
+- Generated protocol consistency, TypeScript checks, headless MCP capture/default-deny smoke and
+  whitespace checks passed. No scene, project, asset or shader data was modified.
+- Task-authorized desktop inspection checked the corrected conversation footer, message contrast,
+  expanded workspace and enlarged device code using fixture data in a separate temporary-layout
+  Relay window. The verification window was closed afterward and prior focus restored.
+- Real Vulkan captures before and after replacing the chat contents were byte-identical, confirming
+  UI exclusion (SHA-256 9c192b20f0785bb67c1c486e798226c42859a358786b590044c9c761655b0cdc).
+  Only those temporary capture files were removed. Grid fading remains user-verified.
+- Real account device-code completion and a live OpenAI conversation remain pending. Fixture
+  authentication tests and installed-runtime metadata/tool registration do not claim live sign-in
+  or provider generation. Broader optional desktop smoke suites were not run.
+
+
+## Phase G — dynamic tool delivery correction (2026-09-18)
+
+A live model turn reproduced tool-unavailable replies with Auto approval enabled: no dynamic calls
+were emitted and the temporary scene remained empty. `features.code_mode_host=false` disabled the
+stable inference tool host despite successful `thread/start` dynamic-tool registration. The bridge
+now explicitly enables that stable host; general code mode, shell/exec, browser/computer and apps
+remain disabled. This supersedes the earlier blanket code-host-disabled record above.
+
+A subsequent live OpenAI turn in a disposable headless scene successfully called `scene.create`
+and `scene.set_light`, creating one point light. No desktop interaction or user project mutation
+was performed. The installed-Codex regression checks the effective tool-host and disabled-tool
+settings through `config/read`; credentials remain external and gitignored. Existing editor
+processes must be restarted to load the rebuilt bridge and replacement Codex service.
+
+Verification: rebuilt TypeScript assets, generated-protocol/TypeScript checks, all 11 bridge tests,
+headless MCP capture/default-deny smoke and whitespace checks passed. No native engine code changed.
+
+
+## Phase G — chat composer and automatic follow (2026-09-18)
+
+- Enter sends and Ctrl+Enter inserts a newline. The rounded input composer contains a single
+  arrow send icon that becomes a square Stop action during generation. Separate Send/Stop/Follow
+  buttons and the shortcut/Ready footer were removed; actionable connection/error status remains.
+- Model and reasoning controls are hidden in one composer dropup. The model list remains discovered
+  from Codex; the slider maps only to that model's supported reasoning levels and commits on release.
+  Controls remain disabled during generation and use host-only ControlProtocol mailbox actions.
+- Follow is enabled at the transcript bottom. Scrolling up pauses it; a circular down arrow returns
+  to the latest reply and restores follow. The overlay has its own ImGui click surface so message
+  cards cannot intercept clicks. Manual scrolling back to the bottom also resumes follow.
+- Headless regression exercises both keyboard shortcuts, send/stop replacement, hidden menu/model
+  choices, slider submission, follow on new replies, paused follow, jump click and manual resumption.
+  Chat controls leave scene revision/undo unchanged. No provider/authentication settings were changed.
+- Development and release builds, all four CTest suites in each build, all 11 bridge tests, generated
+  protocol/TypeScript checks, headless MCP capture/default-deny smoke and whitespace checks passed.
+  Scene/project/asset/shader data was preserved. Desktop visual verification of this new composer
+  remains pending; no desktop interaction was performed or requested for this task.
+
+
+## Phase G — compact composer alignment (2026-09-18)
+
+Removed the workspace heading and extra New chat/Account/Expand header buttons. Account remains
+available as a tab; Tools > Agent workspace and Ctrl+Shift+A remain available for expansion.
+The composer uses its actual available height to size the text input above the action row, with
+no outer scrolling. The send/stop icon is aligned to the right edge. A text-sized neutral model
+control sits beside it, displaying the configured reasoning level in dimmer text and a drawn
+chevron instead of a caret character. The description below the reasoning slider is removed.
+
+Headless input/layout checks passed at standard and narrow panel widths, including zero composer
+scroll extents, containment/right alignment and preserved model/reasoning/send/stop/follow behavior.
+Development and release builds and all four CTest suites passed. Concurrent native suites initially
+conflicted through their shared temporary import fixture; the development suite passed on an
+isolated rerun. Run those native build suites sequentially in future. All 11 bridge tests, generated
+protocol/TypeScript checks, background MCP smoke and whitespace checks passed. No scene/project,
+asset/shader or authentication data was changed. Desktop visual verification remains pending;
+no desktop interaction was performed for this task.
+
+
+## Phase G — wrapped composer and inspection camera tools (2026-09-18)
+
+Protocol v14 has 85 native methods and 72 generated MCP tools. Existing credentials/provider
+settings, project data, deterministic capture source/provenance and import sandbox policies remain
+unchanged. The composer now soft-wraps at font/viewport width, including long words and Unicode,
+while preserving original submitted whitespace/hard newlines. Display-only breaks are mapped away
+from submitted text; editing/resizing retains cursor/selection mapping and Delete/Backspace cross
+soft boundaries. Enter/Ctrl+Enter behavior and outer composer containment remain intact.
+
+New `editor.camera.status/set/frame` tools use the live editor's view-only camera seam after native
+validation and agent authorization. Set configures target, yaw/pitch (radians), distance and
+inspector/scene mode. Frame fits entity/descendant bounds through native scene.bounds, without
+changing human selection. Status is read-only/untraced. No view control enters scene undo/revisions,
+project persistence or deterministic CPU capture; missing editors fail closed. The editor updates
+its capture viewpoint immediately. The external OpenAI instructions describe this visual workflow.
+
+Successful PNG render.capture replies now attach App Server inputImage content to the model.
+Only bounded regular PNG files under the capture directory are read; unsafe paths/symlinks and
+invalid data are refused. Images stay outside native bridge display projections/audits. Existing
+Vulkan capture UI exclusion and provenance are preserved; asynchronous capture remains unchanged.
+
+Development/release builds passed without warnings. All four CTest suites passed sequentially in
+both builds. All 13 bridge tests passed against development and release fixtures, including actual
+image-reply dispatch and installed-Codex registration of all 72 tools without live generation.
+Headless tests cover wrapped editing/submission/Unicode/hard blank lines/soft-boundary Delete,
+authorization, camera validation/framing/immediate view override/scene mode and revision stability.
+Generated protocol/TypeScript checks, 72-tool MCP smoke (including headless camera refusal), default
+policy/provenance and whitespace checks passed. No scene/project/asset/shader data was modified.
+
+Desktop visual/GPU verification of the new controls and a live image-based model review remain
+pending. Only Radeon Vulkan is installed; the previously documented private-Xvfb DRI3 presentation
+limitation still makes isolated GPU checks impractical here. No desktop interaction was performed
+or requested for this task. Prior grid fading verification remains resolved.
+
+
+## Documentation checkpoint — Phase G remains unfinished (2026-09-18)
+
+Recorded the current composer, automatic follow, compact icons/model controls, soft wrapping,
+inspection-camera tools and image replies, plus removal of Copy from both message roles. The Copy
+removal was rebuilt in development and passed existing headless editor tests; release verification
+for that final cosmetic edit was not rerun. Earlier full development/release verification records
+apply to the wrapped composer/camera checkpoint, not later untested edits.
+
+Intermittent ChatGPT/App Server service disconnections during multi-minute agent work are an open
+reliability issue. No cause, fix or successful long-duration verification is claimed. Retain all
+existing edits/project/authentication data and continue Phase G troubleshooting/refinement later.
+This checkpoint changes documentation only; no provider request, build or desktop check was run.
+
+
+## Publication checkpoint (2026-09-18)
+
+The current feature/protocol documentation is synchronized with the Phase G implementation;
+earlier entries remain historical. The final Copy-button removal has now also been rebuilt in
+release. Development/release builds and all four CTest suites in each build passed, alongside all
+13 bridge tests, generated protocol/TypeScript checks, 72-tool headless MCP smoke and whitespace
+checks. Credential/authentication/settings/log paths under `.relay` are ignored and untracked.
+
+Phase G remains unfinished: intermittent multi-minute ChatGPT/App Server disconnections, latest
+composer/camera desktop verification and live image-based review still require follow-up. This
+publication checkpoint does not claim those issues resolved or authorize future desktop access.

@@ -48,6 +48,142 @@ std::vector<relay::Entity> roots(const relay::JsonValue& value) {
     return result;
 }
 
+void auto_approval() {
+    relay::Engine engine;
+    relay::ControlProtocol protocol(engine);
+    const auto invoke = [&](const std::string& request) { return protocol.handle_agent(request); };
+    check(invoke(R"({"id":1,"method":"session.auto_approval","enabled":true})").find("\"ok\":false") != std::string::npos, "agent cannot enable Auto approval");
+    (void)request(protocol, "session.auto_approval", "\"enabled\":true");
+    check(invoke(R"({"id":2,"method":"scene.create","name":"Automatic"})").find("\"ok\":true") != std::string::npos, "Auto approval permits mutation without grant");
+    check(invoke(R"({"id":3,"method":"session.request","scope":"trace.replay"})").find("\"pending\":false") != std::string::npos, "automatic access requests do not wait");
+    check(invoke(R"({"id":4,"method":"project.create","filename":"projects/automatic/project.relayproject","name":"Automatic"})").find("\"ok\":true") != std::string::npos, "Auto approval permits project switch");
+    check(invoke(R"({"id":5,"method":"scene.clear"})").find("\"ok\":true") != std::string::npos, "Auto approval persists across project switch");
+    check(invoke(R"({"id":6,"method":"scene.save","filename":"../escape.relayscene"})").find("\"ok\":false") != std::string::npos, "automatic permissions retain native path validation");
+    check(invoke(R"({"id":7,"method":"session.audit"})").find("\"auto_approval\":true") != std::string::npos, "audit records automatic scope");
+    std::filesystem::create_directories("traces");
+    relay::TraceRecorder trace;
+    std::string error;
+    check(trace.start("traces/automatic.relay-trace.jsonl", engine.status().frame_index,
+                      engine.fixed_delta_seconds(), engine.random_seed(), error), "create replay fixture");
+    trace.record(engine.status().frame_index, "command", R"({"id":9,"method":"session.auto_approval","enabled":false})");
+    trace.record(engine.status().frame_index, "command", R"({"id":10,"method":"scene.create","name":"Replayed"})");
+    trace.record(engine.status().frame_index, "command", R"({"id":11,"method":"trace.replay","filename":"automatic.relay-trace.jsonl"})");
+    check(trace.stop(error), "persist replay fixture");
+    check(invoke(R"({"id":12,"method":"trace.replay","filename":"automatic.relay-trace.jsonl"})").find("\"ok\":true") != std::string::npos, "Auto approval permits bounded replay");
+    check(engine.scene().entities().size() == 1, "replay executes public command and rejects recursive replay");
+    check(invoke(R"({"id":13,"method":"session.status"})").find("\"auto_approval\":true") != std::string::npos, "replay cannot invoke host permission administration");
+    check(invoke(R"({"id":14,"method":"session.audit"})").find("scene.create") != std::string::npos, "nested replay commands are audited");
+    (void)request(protocol, "session.revoke");
+    check(invoke(R"({"id":8,"method":"scene.clear"})").find("\"ok\":false") != std::string::npos, "revoke disables automatic access");
+}
+
+void session_capabilities() {
+    relay::Engine engine;
+    relay::ControlProtocol protocol(engine);
+    const auto revision = engine.scene_history().revision();
+    auto agent = [&](const std::string& method, const std::string& fields = {}) {
+        return protocol.handle_agent("{\"id\":7,\"method\":\"" + method + "\"" +
+            (fields.empty() ? "" : "," + fields) + "}");
+    };
+    auto succeeds = [](const std::string& response) {
+        relay::JsonParser parser(response);
+        const auto value = parser.parse();
+        check(value && value->object(), "agent response JSON");
+        return *relay::field(*value->object(), "ok")->boolean();
+    };
+    check(!succeeds(agent("scene.create")), "default deny mutations");
+    check(!succeeds(agent("scene.list")), "inspection also requires explicit grant");
+    check(succeeds(agent("session.status")), "bootstrap grant inspection");
+    check(engine.scene_history().revision() == revision, "denial cannot change revision");
+    std::string error;
+    check(protocol.set_agent_grants({"scene.create", "scene.list", "scene.save"}, error), "host grants exact methods");
+    check(succeeds(agent("scene.create")), "approved mutation succeeds");
+    check(!succeeds(agent("scene.clear")), "destructive method needs its own grant");
+    check(!succeeds(agent("scene.save", "\"filename\":\"../escape.relay.json\"")), "grants cannot bypass path validation");
+    check(!std::filesystem::exists("escape.relay.json"), "invalid save cannot write");
+    check(!protocol.set_agent_grants({"scene.create", "*"}, error), "wildcards fail closed");
+    check(!succeeds(agent("scene.create")), "invalid configuration revokes all grants");
+    check(!protocol.set_agent_grants({"trace.replay"}, error), "compound replay not grantable");
+    check(!succeeds(agent("trace.replay", "\"filename\":\"agent.relay-trace.jsonl\"")), "replay denied before effects");
+    check(protocol.set_agent_grants({"scene.list"}, error), "read only scope granted");
+    (void)request(protocol, "trace.start", "\"filename\":\"session.relay-trace.jsonl\"");
+    check(succeeds(agent("scene.list")), "approved read succeeds");
+    check(!succeeds(agent("scene.create")), "denied mutation under active trace");
+    check(engine.trace().event_count() == 0, "reads and denials stay untraced");
+    (void)request(protocol, "trace.stop");
+    for (int i = 0; i < 270; ++i) (void)agent("scene.clear");
+    const auto audit_text = agent("session.audit");
+    relay::JsonParser parser(audit_text);
+    const auto audit = parser.parse();
+    const auto* result = relay::field(*audit->object(), "result");
+    const auto* entries = relay::field(*result->object(), "entries")->array();
+    check(entries->size() == 256, "audit is bounded");
+    check(*relay::field(*result->object(), "oldest_sequence")->number() > 1, "eviction visible");
+    check(!*relay::field(*entries->back().object(), "allowed")->boolean(), "denied action audited");
+    check(succeeds(protocol.handle("{\"id\":1,\"method\":\"scene.create\"}")), "trusted UI retains protocol dispatch");
+    relay::ControlProtocol another_session(engine);
+    check(!succeeds(another_session.handle_agent("{\"id\":1,\"method\":\"scene.list\"}")), "grants never leak to another session");
+}
+
+void scoped_session_workflows() {
+    relay::Engine engine;
+    relay::ControlProtocol protocol(engine);
+    const auto first = engine.scene().create("Scoped first");
+    const auto second = engine.scene().create("Scoped second");
+    auto agent = [&](const std::string& method, const std::string& fields, bool ok) {
+        const auto response = protocol.handle_agent("{\"id\":8,\"method\":\"" + method + "\"" + (fields.empty() ? "" : "," + fields) + "}");
+        relay::JsonParser parser(response);
+        const auto result = parser.parse();
+        check(result && result->object(), "agent workflow JSON");
+        if (*relay::field(*result->object(), "ok")->boolean() != ok) throw std::runtime_error(response);
+        return ok ? *relay::field(*result->object(), "result") : *result;
+    };
+    const auto fields = "\"scope\":\"scene.set_transform\",\"kind\":\"entity\",\"target\":\"" + first.to_string() + "\"";
+    const auto pending = agent("session.request", fields, true);
+    const auto number = static_cast<unsigned>(*relay::field(*pending.object(), "request")->number());
+    (void)agent("scene.set_transform", "\"entity\":\"" + first.to_string() + "\",\"px\":5", false);
+    (void)agent("session.decide", "\"request\":" + std::to_string(number) + ",\"allow\":true", false);
+    (void)request(protocol, "session.decide", "\"request\":" + std::to_string(number) + ",\"allow\":true");
+    const auto depth = engine.scene_history().undo_depth();
+    (void)agent("scene.set_transform", "\"entity\":\"" + first.to_string() + "\",\"px\":5,\"gesture\":77", true);
+    (void)agent("scene.set_transform", "\"entity\":\"" + first.to_string() + "\",\"px\":7,\"gesture\":77", true);
+    check(engine.scene_history().undo_depth() == depth + 1, "scoped agent gestures preserve one undo entry");
+    (void)agent("scene.set_transform", "\"entity\":\"" + second.to_string() + "\",\"px\":9", false);
+    (void)agent("scene.clear", {}, false);
+    (void)request(protocol, "session.revoke", "\"scope\":\"scene.set_transform\"");
+    (void)agent("scene.set_transform", "\"entity\":\"" + first.to_string() + "\",\"px\":8", false);
+    (void)request(protocol, "session.grant", fields);
+    (void)request(protocol, "scene.undo");
+    (void)agent("scene.set_transform", "\"entity\":\"" + first.to_string() + "\",\"px\":8", false);
+    (void)request(protocol, "session.grant", "\"scope\":\"scene.save\",\"kind\":\"file\",\"target\":\"scoped.relay.json\"");
+    (void)agent("scene.save", "\"filename\":\"scoped.relay.json\"", true);
+    (void)agent("scene.save", "\"filename\":\"other.relay.json\"", false);
+    check(!std::filesystem::exists("scenes/other.relay.json"), "file scope cannot write another filename");
+    (void)request(protocol, "session.grant", "\"scope\":\"runtime.step\",\"kind\":\"entity\",\"target\":\"" + first.to_string() + "\"", false);
+    const auto stale = agent("session.request", "\"scope\":\"scene.create\"", true);
+    (void)request(protocol, "project.create", "\"filename\":\"projects/scoped/project.relayproject\",\"name\":\"Scoped project\"");
+    (void)agent("scene.save", "\"filename\":\"scoped.relay.json\"", false);
+    (void)request(protocol, "session.decide", "\"request\":" + std::to_string(static_cast<unsigned>(*relay::field(*stale.object(), "request")->number())) + ",\"allow\":true", false);
+    (void)request(protocol, "session.decide", "\"request\":" + std::to_string(static_cast<unsigned>(*relay::field(*stale.object(), "request")->number())) + ",\"allow\":false");
+    (void)request(protocol, "session.export_audit", "\"filename\":\"scoped-audit.jsonl\"");
+    check(std::filesystem::file_size(".relay/audits/scoped-audit.jsonl") > 0, "audit exported in bounded native directory");
+    const auto bytes = std::filesystem::file_size(".relay/audits/scoped-audit.jsonl");
+    (void)request(protocol, "session.export_audit", "\"filename\":\"scoped-audit.jsonl\"", false);
+    check(std::filesystem::file_size(".relay/audits/scoped-audit.jsonl") == bytes, "existing audit cannot be overwritten");
+    (void)agent("session.export_audit", "\"filename\":\"agent-audit.jsonl\"", false);
+    (void)request(protocol, "session.export_audit", "\"filename\":\"../escape.jsonl\"", false);
+    std::filesystem::create_directory("outside-audit");
+    std::filesystem::rename(".relay/audits", ".relay/audits-backup");
+    std::filesystem::create_directory_symlink(std::filesystem::absolute("outside-audit"), ".relay/audits");
+    (void)request(protocol, "session.export_audit", "\"filename\":\"escape.jsonl\"", false);
+    check(!std::filesystem::exists("outside-audit/escape.jsonl"), "audit export refuses symlink ancestors");
+    std::filesystem::remove(".relay/audits");
+    std::filesystem::rename(".relay/audits-backup", ".relay/audits");
+    (void)agent("bridge.poll", {}, false);
+    (void)agent("chat.submit", "\"message\":\"Hello\"", false);
+    (void)request(protocol, "chat.submit", "\"message\":\"Hello\"", false);
+}
+
 void clipboard_and_groups() {
     relay::Engine engine;
     relay::ControlProtocol protocol(engine);
@@ -279,6 +415,9 @@ int main() {
     std::filesystem::current_path(temporary);
     int result = 0;
     try {
+        auto_approval();
+        session_capabilities();
+        scoped_session_workflows();
         clipboard_and_groups();
         selections_and_timeline();
         projects();

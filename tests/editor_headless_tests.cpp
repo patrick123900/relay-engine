@@ -1,11 +1,14 @@
 #include "relay/control/control_protocol.hpp"
 #include "relay/core/engine.hpp"
 #include "relay/editor/editor_ui.hpp"
+#include "relay/editor/wrapped_input.hpp"
+#include "relay/render/scene_render.hpp"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <SDL3/SDL.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -164,6 +167,229 @@ void project_ui() {
           "project browser opens saved scene through guarded protocol workflow");
     std::cout << "Headless project save/browser tests passed\n";
 }
+void agent_ui() {
+    relay::Engine engine;
+    relay::ControlProtocol protocol(engine);
+    const auto target = engine.scene().create("Approved target");
+    const auto other = engine.scene().create("Denied target");
+    const auto request_text = "{\"id\":1,\"method\":\"session.request\",\"scope\":\"scene.set_transform\",\"kind\":\"entity\",\"target\":\"" + target.to_string() + "\"}";
+    check(protocol.handle_agent(request_text).find("\"ok\":true") != std::string::npos, "agent requests limited access");
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize approval UI without windows");
+    ui.set_panel_visible("Agent", true);
+    frame(ui, 5);
+    // ImGui-only focus/input queues; never sends OS input or changes desktop focus.
+    ImGui::SetWindowFocus("Agent");
+    frame(ui, 3);
+    auto press = [&](const std::string& name) {
+        auto rect = ui.headless_item_rect(name);
+        check(rect.has_value(), ("agent control visible: " + name).c_str());
+        const float center = ((*rect)[0] + (*rect)[2]) / 2;
+        (*rect)[0] = center - 60;
+        click(ui, *rect);
+    };
+    press("agent:access-tab");
+    frame(ui, 3);
+    const auto depth = engine.scene_history().undo_depth();
+    press("agent:allow:1");
+    check(engine.scene_history().undo_depth() == depth, "approval does not enter scene undo");
+    auto transform = [&](relay::Entity entity) {
+        return protocol.handle_agent("{\"id\":2,\"method\":\"scene.set_transform\",\"entity\":\"" + entity.to_string() + "\",\"px\":4}");
+    };
+    check(transform(target).find("\"ok\":true") != std::string::npos, "UI approval permits scoped native mutation");
+    check(transform(other).find("\"ok\":false") != std::string::npos, "UI grant cannot edit another entity");
+    press("agent:revoke");
+    check(transform(target).find("\"ok\":false") != std::string::npos, "UI revocation denies subsequent actions");
+    check(protocol.handle_agent("{\"id\":3,\"method\":\"session.request\",\"scope\":\"scene.clear\"}").find("\"ok\":true") != std::string::npos, "destructive request queues");
+    frame(ui, 40);
+    press("agent:deny:2");
+    check(protocol.handle_agent("{\"id\":4,\"method\":\"scene.clear\"}").find("\"ok\":false") != std::string::npos, "UI denial leaves destructive action forbidden");
+    press("agent:auto-approval");
+    check(transform(other).find("\"ok\":true") != std::string::npos, "UI Auto approval permits previously denied entity");
+    press("agent:revoke");
+    check(transform(other).find("\"ok\":false") != std::string::npos, "Revoke all disables Auto approval");
+    press("agent:actions-tab");
+    frame(ui, 3);
+    press("agent:export");
+    check(std::filesystem::exists(".relay/audits/session-audit.jsonl"), "UI audit export routes through protocol");
+    std::cout << "Headless agent approval/revocation/audit tests passed\n";
+}
+
+void chat_ui() {
+    relay::Engine engine;
+    relay::ControlProtocol protocol(engine);
+    const auto revision = engine.scene_history().revision();
+    const auto* configured = std::getenv("RELAY_BRIDGE_TOKEN");
+    const auto previous = configured ? std::optional<std::string>{configured} : std::nullopt;
+    const std::string token(64, 'c');
+#ifdef _WIN32
+    _putenv_s("RELAY_BRIDGE_TOKEN", token.c_str());
+#else
+    setenv("RELAY_BRIDGE_TOKEN", token.c_str(), 1);
+#endif
+    protocol.configure_agent_from_environment();
+#ifdef _WIN32
+    _putenv_s("RELAY_BRIDGE_TOKEN", previous ? previous->c_str() : "");
+#else
+    if (previous) setenv("RELAY_BRIDGE_TOKEN", previous->c_str(), 1);
+    else unsetenv("RELAY_BRIDGE_TOKEN");
+#endif
+    const auto published = protocol.handle_agent("{\"id\":1,\"method\":\"bridge.publish\",\"bridge_token\":\"" + token +
+        "\",\"view\":\"" + relay::json_escape(R"({"status":"Fixture bridge ready","busy":false,"messages":[],"provider":{"selected":"compatible"}})") + "\"}");
+    check(published.find("\"ok\":true") != std::string::npos, "fixture bridge authenticates display projection");
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "chat input initializes without desktop");
+    ui.set_panel_visible("Agent", true);
+    frame(ui, 5);
+    ImGui::SetWindowFocus("Agent");
+    frame(ui, 3);
+    const auto press = [&](const std::string& name) {
+        auto rect = ui.headless_item_rect(name);
+        check(rect.has_value(), ("chat control visible: " + name).c_str());
+        auto* window = ImGui::FindWindowByName("Agent");
+        if ((*rect)[1] < window->InnerClipRect.Min.y || (*rect)[3] > window->InnerClipRect.Max.y) {
+            const auto desired = window->Scroll.y + ((*rect)[1] + (*rect)[3]) / 2 -
+                (window->InnerClipRect.Min.y + window->InnerClipRect.Max.y) / 2;
+            ImGui::SetScrollY(window, desired);
+            frame(ui, 3);
+            rect = ui.headless_item_rect(name);
+            check(rect.has_value(), "chat control remains visible after ImGui-only scrolling");
+        }
+        (*rect)[0] = ((*rect)[0] + (*rect)[2]) / 2 - 60;
+        click(ui, *rect);
+    };
+    const auto publish = [&](const std::string& fixture) {
+        check(protocol.handle_agent("{\"id\":7,\"method\":\"bridge.publish\",\"bridge_token\":\"" + token + "\",\"view\":\"" + relay::json_escape(fixture) + "\"}").find("\"ok\":true") != std::string::npos, "OpenAI fixture projection accepted");
+        frame(ui, 40);
+    };
+    const auto consume = [&]() { return protocol.handle_agent("{\"id\":8,\"method\":\"bridge.poll\",\"bridge_token\":\"" + token + "\"}"); };
+    press("agent:message");
+    ImGui::GetIO().AddInputCharactersUTF8("Hello bridge");
+    frame(ui, 3);
+    press("agent:send");
+    const auto submissions_text = protocol.handle_agent("{\"id\":2,\"method\":\"bridge.poll\",\"bridge_token\":\"" + token + "\"}");
+    relay::JsonParser parser(submissions_text);
+    const auto submissions = parser.parse();
+    const auto* result = relay::field(*submissions->object(), "result");
+    const auto* entries = relay::field(*result->object(), "submissions")->array();
+    check(entries->size() == 1 && *relay::field(*entries->front().object(), "message")->string() == "Hello bridge",
+          "headless chat Send reaches only external bridge mailbox through protocol");
+    publish(R"({"status":"Working","busy":true,"messages":[],"provider":{"selected":"compatible"}})");
+    check(!ui.headless_item_rect("agent:send"), "busy composer replaces Send with Stop");
+    press("agent:stop");
+    const auto cancellation = protocol.handle_agent("{\"id\":3,\"method\":\"bridge.poll\",\"bridge_token\":\"" + token + "\"}");
+    check(cancellation.find("\"cancel\":true") != std::string::npos, "headless Stop queues bridge cancellation");
+    publish(R"({"status":"Ready","busy":false,"messages":[],"provider":{"selected":"compatible"}})");
+    press("agent:message"); ImGui::GetIO().AddInputCharactersUTF8("First line"); frame(ui, 3);
+    key(ui, ImGuiKey_Enter);
+    check(consume().find("First line") == std::string::npos, "Ctrl+Enter inserts a newline without submitting");
+    ImGui::GetIO().AddInputCharactersUTF8("Second line"); frame(ui, 3);
+    key(ui, ImGuiKey_Enter, false);
+    check(consume().find("First line\\nSecond line") != std::string::npos, "Enter sends the multiline composer text");
+    press("agent:setup-tab"); frame(ui, 3);
+    press("agent:endpoint"); ImGui::GetIO().AddInputCharactersUTF8("http://localhost:1234/v1/chat/completions"); frame(ui, 3);
+    press("agent:model"); ImGui::GetIO().AddInputCharactersUTF8("fixture-model"); frame(ui, 3);
+    press("agent:credential"); ImGui::GetIO().AddInputCharactersUTF8("fixture-ui-secret"); frame(ui, 3);
+    press("agent:save-provider");
+    (void)protocol.handle(R"({"id":12,"method":"chat.cancel"})");
+    const auto settings = protocol.handle_agent("{\"id\":4,\"method\":\"bridge.poll\",\"bridge_token\":\"" + token + "\"}");
+    check(settings.find("fixture-ui-secret") != std::string::npos && settings.find("fixture-model") != std::string::npos, "Stop preserves queued transient provider settings for authenticated bridge");
+    const auto consumed = protocol.handle_agent("{\"id\":5,\"method\":\"bridge.poll\",\"bridge_token\":\"" + token + "\"}");
+    check(consumed.find("fixture-ui-secret") == std::string::npos, "consumed credentials are absent from mailbox");
+    check(protocol.handle_agent(R"({"id":6,"method":"session.audit"})").find("fixture-ui-secret") == std::string::npos, "provider credentials never enter audit");
+    const std::string catalog = R"("models":[{"model":"fixture-a","displayName":"Fixture A","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast"},{"reasoningEffort":"high","description":"Careful"}]},{"model":"fixture-b","displayName":"Fixture B","supportedReasoningEfforts":[]}],"model":"fixture-a","effort":"low")";
+    publish(R"({"status":"Sign in with ChatGPT","busy":false,"provider":{"selected":"openai"},"openai":{"account":null,"login":null,)" + catalog + "}}");
+    press("agent:signin");
+    check(consume().find("\"action\":\"signin\"") != std::string::npos, "Sign in button queues supported device authentication control");
+    publish(R"({"status":"Finish sign-in","busy":false,"provider":{"selected":"openai"},"openai":{"account":null,"login":{"userCode":"FIXT-1234","verificationUrl":"https://auth.openai.com/codex/device"},)" + catalog + "}}");
+    check(ui.headless_item_rect("agent:copy-device-code").has_value() && ui.headless_item_rect("agent:open-signin").has_value(), "device code controls rendered without browser interaction");
+    press("agent:cancel-signin");
+    check(consume().find("cancel_signin") != std::string::npos, "Cancel sign-in queues bridge control");
+    press("agent:chat-tab"); frame(ui, 3);
+    check(!ui.headless_item_rect("agent:model-picker") && !ui.headless_item_rect("agent:reasoning-slider"), "model and reasoning stay hidden until the common menu opens");
+    press("agent:options"); frame(ui, 3);
+    press("agent:model-picker"); frame(ui, 3);
+    press("agent:model-option:fixture-b");
+    check(consume().find("fixture-b") != std::string::npos, "model picker submits discovered model");
+    auto slider = ui.headless_item_rect("agent:reasoning-slider");
+    check(slider.has_value(), "common menu renders reasoning slider");
+    (*slider)[0] = (*slider)[2] - 62; click(ui, *slider);
+    check(consume().find("\"effort\":\"high\"") != std::string::npos, "reasoning picker submits supported effort");
+    key(ui, ImGuiKey_Escape, false);
+    key(ui, ImGuiKey_Escape, false);
+    ImGui::SetWindowFocus("Agent"); frame(ui, 3);
+    check(!ui.headless_item_rect("agent:new-chat") && !ui.headless_item_rect("agent:expand"), "chat header actions removed");
+    auto* composer = static_cast<ImGuiWindow*>(nullptr);
+    for (auto* window : ImGui::GetCurrentContext()->Windows) if (std::string(window->Name).starts_with("Agent/Composer_") && window->ParentWindow == ImGui::FindWindowByName("Agent")) composer = window;
+    check(composer && composer->ScrollMax.y == 0 && composer->ScrollMax.x == 0, "composer contents fit without internal overflow");
+    const auto send_rect = ui.headless_item_rect("agent:send");
+    const auto options_rect = ui.headless_item_rect("agent:options");
+    check(send_rect && options_rect && std::abs((*send_rect)[2] - composer->WorkRect.Max.x) < 2, "send icon aligned to composer right edge");
+    check((*options_rect)[2] < (*send_rect)[0] && std::abs((*options_rect)[1] - (*send_rect)[1]) < 1, "compact model and send controls share a right-aligned row");
+    check((*options_rect)[2] - (*options_rect)[0] < composer->WorkRect.GetWidth() - 50, "model selector sizes to its label instead of filling row");
+    std::string long_messages;
+    for (int i = 0; i < 24; ++i) { if (i) long_messages += ","; long_messages += R"({"role":"assistant","content":"A long reply with multiple lines.\nMore details to fill the transcript.\nAnother line of details."})"; }
+    publish(R"({"status":"Ready","busy":false,"provider":{"selected":"openai"},"messages":[)" + long_messages + "],\"openai\":{" + catalog + "}}");
+    auto* conversation = ImGui::FindWindowByName("Agent/Conversation");
+    if (!conversation) for (auto* window : ImGui::GetCurrentContext()->Windows) if (std::string(window->Name).starts_with("Agent/Conversation_") && window->ParentWindow == ImGui::FindWindowByName("Agent")) conversation = window;
+    check(conversation && conversation->ScrollMax.y > 100, "long conversation overflows transcript");
+    check(conversation->Scroll.y >= conversation->ScrollMax.y - 2, "new replies follow when already at bottom");
+    ImGui::SetScrollY(conversation, 0); frame(ui, 4);
+    check(ui.headless_item_rect("agent:jump-bottom").has_value(), "scrolling away from bottom reveals jump arrow");
+    long_messages += R"(,{"role":"assistant","content":"A new streamed reply while reading earlier messages."})";
+    publish(R"({"status":"Ready","busy":false,"provider":{"selected":"openai"},"messages":[)" + long_messages + "],\"openai\":{" + catalog + "}}");
+    check(conversation->Scroll.y < 2 && ui.headless_item_rect("agent:jump-bottom"), "new replies do not pull a reader away from earlier messages");
+    auto jump = ui.headless_item_rect("agent:jump-bottom"); (*jump)[0] = ((*jump)[0] + (*jump)[2]) / 2 - 60; click(ui, *jump); frame(ui, 5);
+    check(conversation->Scroll.y >= conversation->ScrollMax.y - 2 && !ui.headless_item_rect("agent:jump-bottom"), "jump arrow returns to bottom and restores follow");
+    ImGui::SetScrollY(conversation, 0); frame(ui, 3);
+    ImGui::SetScrollY(conversation, conversation->ScrollMax.y); frame(ui, 3);
+    check(!ui.headless_item_rect("agent:jump-bottom"), "manually scrolling to bottom restores follow");
+    long_messages += R"(,{"role":"assistant","content":"A final reply after follow resumes."})";
+    publish(R"({"status":"Ready","busy":false,"provider":{"selected":"openai"},"messages":[)" + long_messages + "],\"openai\":{" + catalog + "}}");
+    check(conversation->Scroll.y >= conversation->ScrollMax.y - 2, "resumed follow tracks subsequent replies");
+    key(ui, ImGuiKey_A, true, true); frame(ui, 3);
+    check(ImGui::FindWindowByName("Agent")->DockId == 0 && ImGui::FindWindowByName("Agent")->Size.y > 600, "agent shortcut opens a full in-editor workspace without native windows");
+    ImGui::SetWindowSize("Agent", ImVec2(320, 780)); frame(ui, 5);
+    const auto narrow_send = ui.headless_item_rect("agent:send");
+    const auto narrow_options = ui.headless_item_rect("agent:options");
+    check(composer->ScrollMax.y == 0 && composer->ScrollMax.x == 0 && narrow_send && narrow_options, "narrow composer fits without internal scrolling");
+    check((*narrow_options)[0] >= composer->WorkRect.Min.x && (*narrow_send)[2] <= composer->WorkRect.Max.x + 1, "narrow composer controls remain within bounding box");
+    press("agent:message");
+    const std::string long_input = "A long input that should wrap at word boundaries without changing its submitted text. UTF-8: café 日本語. More words to make multiple display lines.";
+    ImGui::GetIO().AddInputCharactersUTF8(long_input.c_str()); frame(ui, 4);
+    auto* input_state = ImGui::GetInputTextState(ImGui::GetActiveID());
+    check(input_state && std::string(input_state->TextA.Data).find('\n') != std::string::npos, "composer soft-wraps a long input while editing");
+    key(ui, ImGuiKey_Enter, false);
+    check(consume().find(relay::json_escape(long_input)) != std::string::npos, "soft wrapping preserves submitted text and Unicode");
+    press("agent:message"); ImGui::GetIO().AddInputCharactersUTF8(long_input.c_str()); frame(ui, 4);
+    input_state = ImGui::GetInputTextState(ImGui::GetActiveID());
+    const auto first_break = std::string(input_state->TextA.Data).find('\n');
+    key(ui, ImGuiKey_Home); key(ui, ImGuiKey_End, false); key(ui, ImGuiKey_Delete, false);
+    auto edited_input = long_input; edited_input.erase(first_break, 1);
+    key(ui, ImGuiKey_Enter, false);
+    check(consume().find(relay::json_escape(edited_input)) != std::string::npos, "Delete crosses a soft line boundary without getting stuck");
+    relay::WrappedInput wrapped; wrapped.width = 80; wrapped.raw = "abc\n\n日本語 café and a long unbrokenwordwithoutspaces"; wrapped.wrap();
+    const auto original_text = wrapped.raw; wrapped.edit(wrapped.display);
+    check(wrapped.raw == original_text, "soft wrapping preserves hard blank lines and Unicode");
+    const auto camera_revision = engine.scene_history().revision();
+    protocol.set_editor_camera_handler([&](std::string_view request) { return ui.handle_camera_request(request); });
+    check(protocol.handle_agent(R"({"id":90,"method":"editor.camera.set","distance":12})").find("capability denied") != std::string::npos, "camera controls require agent approval");
+    (void)protocol.handle(R"({"id":91,"method":"session.auto_approval","enabled":true})");
+    check(protocol.handle_agent(R"({"id":92,"method":"editor.camera.set","target_x":2,"target_y":3,"target_z":4,"yaw":0,"pitch":0,"distance":12})").find("\"ok\":true") != std::string::npos, "approved camera control reaches editor view");
+    check(ui.view_override() && ui.view_override()->position.z == 16 && ui.view_override()->target.x == 2, "camera tool updates captured viewpoint immediately");
+    const auto camera_entity = engine.scene().create("Camera frame fixture");
+    const auto frame_request = "{\"id\":93,\"method\":\"editor.camera.frame\",\"entity\":\"" + camera_entity.to_string() + "\"}";
+    check(protocol.handle_agent(frame_request).find("\"ok\":true") != std::string::npos, "camera frame uses native entity bounds");
+    check(ui.selected_entities().empty(), "agent framing does not change human selection");
+    check(protocol.handle_agent(R"({"id":94,"method":"editor.camera.set","pitch":2})").find("\"ok\":false") != std::string::npos, "camera tool rejects invalid angles");
+    check(protocol.handle_agent(R"({"id":95,"method":"editor.camera.set","mode":"scene"})").find("\"ok\":true") != std::string::npos && !ui.view_override(), "camera tool can restore scene camera rendering");
+    check(engine.scene_history().revision() == camera_revision, "inspection camera controls stay out of scene revision and undo");
+    check(engine.scene_history().revision() == revision, "chat does not modify scene revision or undo");
+    std::cout << "Headless chat send/stop tests passed without provider calls\n";
+}
+
 } // namespace
 
 int main() {
@@ -173,7 +399,7 @@ int main() {
     std::filesystem::create_directory(temporary);
     std::filesystem::current_path(temporary);
     int result = 0;
-    try { run(); project_ui(); }
+    try { run(); project_ui(); agent_ui(); chat_ui(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
     std::filesystem::current_path(original);
     std::filesystem::remove_all(temporary);

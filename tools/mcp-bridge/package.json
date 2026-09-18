@@ -8,7 +8,9 @@
     "generate:check": "python ../../tools/generate_protocol.py --check",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "check": "npm run generate:check && tsc -p tsconfig.json --noEmit"
+    "check": "npm run generate:check && tsc -p tsconfig.json --noEmit",
+    "test": "node --test --test-isolation=none tests/*.test.mjs",
+    "editor": "node dist/index.js --editor"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",

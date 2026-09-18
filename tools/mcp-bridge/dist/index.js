@@ -4,20 +4,30 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import readline from "node:readline";
+import { randomBytes } from "node:crypto";
+import { ChatWorkflow, engineEnvironment } from "./chat.js";
+import { ProviderStore } from "./provider.js";
+import { HarnessPreferences, OpenAiHarness } from "./openai.js";
 import { registerGeneratedTools, } from "./generated_protocol.js";
+const editorOnly = process.argv.includes("--editor");
 class RelayClient {
     #child;
     #pending = new Map();
     #nextId = 1;
+    #bridgeToken = randomBytes(32).toString("hex");
     constructor(engineBinary, projectRoot, runtimeArgument) {
         this.#child = spawn(engineBinary, [runtimeArgument], {
             cwd: projectRoot,
+            env: engineEnvironment(process.env, this.#bridgeToken),
             stdio: ["pipe", "pipe", "pipe"],
         });
         this.#child.stderr.on("data", (chunk) => process.stderr.write(`[relay] ${chunk}`));
-        this.#child.once("error", (error) => this.#rejectAll(error));
+        this.#child.once("error", (error) => { this.#rejectAll(error); if (editorOnly)
+            void shutdown(); });
         this.#child.once("exit", (code, signal) => {
             this.#rejectAll(new Error(`Relay runtime exited (${code ?? signal ?? "unknown"})`));
+            if (editorOnly)
+                void shutdown();
         });
         const lines = readline.createInterface({ input: this.#child.stdout });
         lines.on("line", (line) => {
@@ -49,13 +59,16 @@ class RelayClient {
         const id = this.#nextId++;
         return new Promise((resolve, reject) => {
             this.#pending.set(id, { resolve, reject });
-            this.#child.stdin.write(`${JSON.stringify({ id, method, ...parameters })}\n`, (error) => {
+            this.#child.stdin.write(`${JSON.stringify({ ...parameters, id, method })}\n`, (error) => {
                 if (error) {
                     this.#pending.delete(id);
                     reject(error);
                 }
             });
         });
+    }
+    bridge(method, parameters = {}) {
+        return this.call(method, { ...parameters, bridge_token: this.#bridgeToken });
     }
     get pendingCount() {
         return this.#pending.size;
@@ -75,65 +88,116 @@ class RelayClient {
 const bridgeDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(bridgeDirectory, "../../..");
 const defaultBinary = path.join(projectRoot, "build", "dev", "relay_demo");
-const engineBinary = process.env.RELAY_ENGINE_BINARY ?? defaultBinary;
-const desktopAvailable = process.platform === "win32" ||
-    process.platform === "darwin" ||
-    Boolean(process.env.WAYLAND_DISPLAY || process.env.DISPLAY);
+const binaryArgument = process.argv.indexOf("--engine-binary");
+const engineBinary = (binaryArgument >= 0 ? process.argv[binaryArgument + 1] : undefined) ?? process.env.RELAY_ENGINE_BINARY ?? defaultBinary;
 const requestedRuntimeMode = process.env.RELAY_RUNTIME_MODE;
 if (requestedRuntimeMode && requestedRuntimeMode !== "editor" && requestedRuntimeMode !== "headless") {
     throw new Error("RELAY_RUNTIME_MODE must be 'editor' or 'headless'");
 }
-const runtimeMode = requestedRuntimeMode ?? (desktopAvailable ? "editor" : "headless");
-const runtimeArgument = runtimeMode === "editor" ? "--editor-stdio" : "--agent-stdio";
+const runtimeMode = editorOnly ? "editor" : requestedRuntimeMode ?? "headless";
+const runtimeArgument = runtimeMode === "editor" ? "--editor-ui-stdio" : "--agent-stdio";
+const provider = new ProviderStore(projectRoot, process.env);
+const configuration = provider.current();
 const relay = new RelayClient(engineBinary, projectRoot, runtimeArgument);
-let activeGpuCaptures = 0;
-function captureVulkanFrame(filename) {
-    const relativePath = path.join("captures", filename);
-    const absolutePath = path.join(projectRoot, relativePath);
-    return new Promise((resolve, reject) => {
-        activeGpuCaptures += 1;
-        let finished = false;
-        const markFinished = () => {
-            if (finished)
-                return;
-            finished = true;
-            activeGpuCaptures -= 1;
-        };
-        const child = spawn(engineBinary, ["--vulkan-capture", relativePath], {
-            cwd: projectRoot,
-            stdio: ["ignore", "pipe", "pipe"],
-        });
-        let standardOutput = "";
-        let standardError = "";
-        child.stdout.on("data", (chunk) => {
-            if (standardOutput.length < 16_384)
-                standardOutput += chunk.toString();
-        });
-        child.stderr.on("data", (chunk) => {
-            if (standardError.length < 16_384)
-                standardError += chunk.toString();
-        });
-        const timeout = setTimeout(() => {
-            child.kill("SIGTERM");
-            markFinished();
-            reject(new Error("Vulkan frame capture timed out after 30 seconds"));
-        }, 30_000);
-        child.once("error", (error) => {
-            clearTimeout(timeout);
-            markFinished();
-            reject(error);
-        });
-        child.once("exit", (code, signal) => {
-            clearTimeout(timeout);
-            markFinished();
-            if (code === 0)
-                resolve({ path: relativePath, absolutePath, source: "vulkan" });
-            else {
-                reject(new Error(`Vulkan capture exited with ${code ?? signal ?? "unknown"}: ${standardError || standardOutput}`));
+let chat = new ChatWorkflow(projectRoot, (method, parameters) => relay.call(method, parameters), configuration);
+const preferences = new HarnessPreferences(projectRoot, !!configuration);
+const openai = new OpenAiHarness(projectRoot, (method, parameters) => relay.call(method, parameters), preferences);
+const workflow = () => preferences.value.provider === "openai" ? openai : chat;
+let openaiStartup = false;
+let polling = false;
+let acceptingChat = true;
+let setupStatus = "";
+const publishChat = async () => { await relay.bridge("bridge.publish", { view: JSON.stringify({ ...workflow().view(), provider: { ...provider.view(), selected: preferences.value.provider }, setup_status: setupStatus }) }); };
+const submissions = [];
+let runningChat = false;
+const runChat = async () => {
+    if (runningChat)
+        return;
+    runningChat = true;
+    try {
+        while (acceptingChat && submissions.length)
+            await workflow().submit(submissions.shift(), publishChat);
+    }
+    finally {
+        runningChat = false;
+    }
+};
+const chatPoll = setInterval(() => {
+    if (polling || !acceptingChat)
+        return;
+    polling = true;
+    void (async () => {
+        if (editorOnly && preferences.value.provider === "openai" && !openaiStartup) {
+            openaiStartup = true;
+            void openai.control({ action: "refresh" });
+        }
+        await publishChat();
+        const response = await relay.bridge("bridge.poll");
+        for (const submission of (response.submissions ?? [])) {
+            if (submission.control) {
+                const control = submission.control;
+                if (runningChat) {
+                    setupStatus = "Stop the active turn before changing harness settings.";
+                    continue;
+                }
+                if (control.action === "provider") {
+                    chat.cancel();
+                    openai.cancel();
+                    submissions.length = 0;
+                    preferences.value.provider = control.provider === "compatible" ? "compatible" : "openai";
+                    try {
+                        preferences.save();
+                        setupStatus = "";
+                    }
+                    catch {
+                        setupStatus = "Could not save harness preferences.";
+                    }
+                    if (preferences.value.provider === "openai")
+                        void openai.control({ action: "refresh" });
+                }
+                else if (preferences.value.provider === "openai") {
+                    if (control.action === "new_chat") {
+                        submissions.length = 0;
+                        await openai.control(control);
+                    }
+                    else
+                        void openai.control(control).then(publishChat).catch(() => { });
+                }
+                else if (control.action === "new_chat") {
+                    submissions.length = 0;
+                    chat.close();
+                    chat = new ChatWorkflow(projectRoot, (method, parameters) => relay.call(method, parameters), provider.current());
+                }
             }
-        });
-    });
-}
+            else if (submission.configure) {
+                if (runningChat) {
+                    submission.configure.credential = "";
+                    setupStatus = "Stop active chat before changing provider settings.";
+                    continue;
+                }
+                try {
+                    provider.save(submission.configure);
+                    chat.close();
+                    submissions.length = 0;
+                    chat = new ChatWorkflow(projectRoot, (method, parameters) => relay.call(method, parameters), provider.current());
+                    setupStatus = "Provider settings saved privately.";
+                }
+                catch {
+                    setupStatus = "Provider settings could not be saved. Check endpoint, model, authentication and private file permissions.";
+                }
+                submission.configure.credential = "";
+            }
+            else if (submission.cancel) {
+                submissions.length = 0;
+                workflow().cancel();
+            }
+            else if (typeof submission.message === "string" && submissions.length < 8)
+                submissions.push(submission.message);
+        }
+        void runChat().catch(() => { });
+    })().catch(() => { })
+        .finally(() => { polling = false; });
+}, 500);
 function toolResult(value) {
     return {
         content: [{ type: "text", text: JSON.stringify(value) }],
@@ -146,9 +210,6 @@ function createServer() {
         render_capture: async (input) => {
             const filename = input.filename;
             const source = input.source;
-            if (source === "vulkan" && runtimeMode !== "editor") {
-                return toolResult(await captureVulkanFrame(filename));
-            }
             const result = await relay.call("render.capture", {
                 path: `captures/${filename}`,
                 source,
@@ -168,16 +229,14 @@ function createServer() {
         },
         scene_save: async (input) => {
             const filename = input.filename;
-            return toolResult({
-                ...(await relay.call("scene.save", { filename })),
-                absolutePath: path.join(projectRoot, "scenes", filename),
-            });
+            const result = await relay.call("scene.save", { filename });
+            return toolResult({ ...result, absolutePath: path.resolve(projectRoot, result.path) });
         },
     };
     registerGeneratedTools(server, async (method, parameters) => toolResult(await relay.call(method, parameters)), overrides);
     return server;
 }
-const handle = serveStdio(createServer, {
+const handle = editorOnly ? { close: async () => { } } : serveStdio(createServer, {
     onerror: (error) => process.stderr.write(`[mcp] ${error.stack ?? error.message}\n`),
 });
 let shuttingDown = false;
@@ -185,19 +244,26 @@ async function shutdown() {
     if (shuttingDown)
         return;
     shuttingDown = true;
+    acceptingChat = false;
+    clearInterval(chatPoll);
+    chat.close();
+    openai.close();
     relay.close();
     await handle.close();
 }
 process.once("SIGINT", () => void shutdown());
 process.once("SIGTERM", () => void shutdown());
-process.stdin.once("end", () => {
-    setTimeout(() => {
-        const drain = setInterval(() => {
-            if (activeGpuCaptures === 0 && relay.pendingCount === 0) {
-                clearInterval(drain);
-                void shutdown();
-            }
-        }, 50);
-    }, 250);
-});
+if (!editorOnly)
+    process.stdin.once("end", () => {
+        acceptingChat = false;
+        clearInterval(chatPoll);
+        setTimeout(() => {
+            const drain = setInterval(() => {
+                if (relay.pendingCount === 0) {
+                    clearInterval(drain);
+                    void shutdown();
+                }
+            }, 50);
+        }, 250);
+    });
 //# sourceMappingURL=index.js.map

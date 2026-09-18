@@ -36,6 +36,8 @@ public:
     [[nodiscard]] std::optional<std::array<float, 4>> headless_item_rect(std::string_view key) const;
     // Changes editor view state without mutating the scene.
     void set_panel_visible(std::string_view name, bool visible);
+    // Host seam: invoked only after native protocol validation and agent authorization.
+    [[nodiscard]] std::string handle_camera_request(std::string_view request);
     void invalidate() override;
     // Execute render-related requests only after the current frame has been presented.
     void process_actions();

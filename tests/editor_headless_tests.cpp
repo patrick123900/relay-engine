@@ -1,6 +1,7 @@
 #include "relay/control/control_protocol.hpp"
 #include "relay/core/engine.hpp"
 #include "relay/editor/editor_ui.hpp"
+#include "relay/editor/chat_media.hpp"
 #include "relay/editor/wrapped_input.hpp"
 #include "relay/render/scene_render.hpp"
 #include <imgui.h>
@@ -12,6 +13,7 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 void check(bool condition, const char* message) {
@@ -76,6 +78,8 @@ void run() {
     click(ui, row(first));
     click(ui, row(third), false, true);
     check(ui.selected_entities().size() == 3, "Shift-click selects visible hierarchy range");
+    check(std::abs(row(first)[3] - row(second)[1]) < .01F && std::abs(row(second)[3] - row(third)[1]) < .01F,
+          "adjacent selected hierarchy rows have no vertical highlight gap");
     click(ui, row(third), true);
     check(ui.selected_entities().size() == 2, "Ctrl-click toggles selection without losing others");
     key(ui, ImGuiKey_C);
@@ -173,10 +177,12 @@ void agent_ui() {
     const auto target = engine.scene().create("Approved target");
     const auto other = engine.scene().create("Denied target");
     const auto request_text = "{\"id\":1,\"method\":\"session.request\",\"scope\":\"scene.set_transform\",\"kind\":\"entity\",\"target\":\"" + target.to_string() + "\"}";
-    check(protocol.handle_agent(request_text).find("\"ok\":true") != std::string::npos, "agent requests limited access");
     relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
     std::string error;
     check(ui.initialize_headless(error), "initialize approval UI without windows");
+    check(protocol.handle(R"({"id":10,"method":"session.status"})").find("\"auto_approval\":true") != std::string::npos, "editor allows all actions by default");
+    (void)protocol.handle(R"({"id":11,"method":"session.auto_approval","enabled":false})");
+    check(protocol.handle_agent(request_text).find("\"ok\":true") != std::string::npos, "agent requests limited access");
     ui.set_panel_visible("Agent", true);
     frame(ui, 5);
     // ImGui-only focus/input queues; never sends OS input or changes desktop focus.
@@ -265,6 +271,21 @@ void chat_ui() {
         frame(ui, 40);
     };
     const auto consume = [&]() { return protocol.handle_agent("{\"id\":8,\"method\":\"bridge.poll\",\"bridge_token\":\"" + token + "\"}"); };
+    ui.set_attachment_picker([](auto complete) { complete({"/tmp/attachment one.txt", "/tmp/image.png"}); });
+    press("agent:attach"); frame(ui, 3);
+    check(ui.headless_item_rect("agent:attachment").has_value(), "picker results become removable chips without opening an OS dialog");
+    press("agent:send");
+    const auto attached_submission = consume();
+    check(attached_submission.find("attachment one.txt") != std::string::npos && attached_submission.find("image.png") != std::string::npos, "attachment-only send carries selected paths through host mailbox");
+    const auto drop_rect = ui.headless_item_rect("agent:message");
+    SDL_Event drop{}; drop.type = SDL_EVENT_DROP_POSITION;
+    drop.drop.x = ((*drop_rect)[0] + (*drop_rect)[2]) * .5F; drop.drop.y = ((*drop_rect)[1] + (*drop_rect)[3]) * .5F;
+    check(ui.handle_event(&drop), "drop position inside composer accepted");
+    drop.type = SDL_EVENT_DROP_FILE; drop.drop.data = "/tmp/dropped.txt"; ui.handle_event(&drop);
+    drop.type = SDL_EVENT_DROP_COMPLETE; ui.handle_event(&drop); frame(ui, 3);
+    press("agent:send"); check(consume().find("dropped.txt") != std::string::npos, "synthetic SDL file drop reaches bridge without desktop input");
+    drop.type = SDL_EVENT_DROP_FILE; drop.drop.x = -500; drop.drop.data = "/tmp/rejected.txt"; ui.handle_event(&drop); frame(ui, 3);
+    check(!ui.headless_item_rect("agent:attachment"), "file drop outside composer ignored");
     press("agent:message");
     ImGui::GetIO().AddInputCharactersUTF8("Hello bridge");
     frame(ui, 3);
@@ -329,6 +350,25 @@ void chat_ui() {
     check(send_rect && options_rect && std::abs((*send_rect)[2] - composer->WorkRect.Max.x) < 2, "send icon aligned to composer right edge");
     check((*options_rect)[2] < (*send_rect)[0] && std::abs((*options_rect)[1] - (*send_rect)[1]) < 1, "compact model and send controls share a right-aligned row");
     check((*options_rect)[2] - (*options_rect)[0] < composer->WorkRect.GetWidth() - 50, "model selector sizes to its label instead of filling row");
+    const auto usage_fixture = [&](int five_hour, int weekly) {
+        publish("{\"status\":\"Ready\",\"busy\":false,\"provider\":{\"selected\":\"openai\"},\"openai\":{\"usage\":{\"fiveHour\":" + std::to_string(five_hour) + ",\"weekly\":" + std::to_string(weekly) + "}," + catalog + "}}");
+    };
+    const auto has_fill = [&](ImU32 color) {
+        for (const auto& vertex : ImGui::FindWindowByName("Agent")->DrawList->VtxBuffer) if (vertex.col == color) return true;
+        return false;
+    };
+    usage_fixture(80, 90);
+    check(has_fill(IM_COL32(195, 201, 211, 255)) && has_fill(IM_COL32(246, 199, 65, 255)), "usage fill stays grey at 80 and yellow at 90");
+    usage_fixture(81, 91);
+    check(has_fill(IM_COL32(246, 199, 65, 255)) && has_fill(IM_COL32(242, 86, 86, 255)), "usage fill turns yellow above 80 and red above 90");
+    const auto five_meter = ui.headless_item_rect("agent:usage:fiveHour"), weekly_meter = ui.headless_item_rect("agent:usage:weekly"), attach_button = ui.headless_item_rect("agent:attach"), model_menu = ui.headless_item_rect("agent:options");
+    check(five_meter && weekly_meter && attach_button && model_menu && (*five_meter)[1] > (*attach_button)[3] && std::abs((*five_meter)[1] - (*weekly_meter)[1]) < .01F && (*five_meter)[2] < (*weekly_meter)[0] && std::abs(((*five_meter)[2] - (*five_meter)[0]) - ((*weekly_meter)[2] - (*weekly_meter)[0])) < .01F && std::abs((*five_meter)[0] - (composer->Pos.x + 4)) < 2 && std::abs((*weekly_meter)[2] - (composer->Pos.x + composer->Size.x - 4)) < 2 && (*five_meter)[1] >= composer->Pos.y + composer->Size.y, "both usage meters fill an equal-width row below composer controls");
+    const std::string selectable_reply = "Selectable reply with café 日本語 and enough words to wrap across several visual lines while preserving copied text. More words for a longer paragraph.\nA second paragraph.";
+    publish("{\"status\":\"Ready\",\"busy\":false,\"messages\":[{\"role\":\"assistant\",\"content\":\"" + relay::json_escape(selectable_reply) + "\"}],\"provider\":{\"selected\":\"compatible\"}}");
+    press("agent:history-text"); key(ui, ImGuiKey_A); key(ui, ImGuiKey_C);
+    check(std::string(ImGui::GetClipboardText()) == selectable_reply, "history selection copies original Unicode and real line breaks without soft wrapping");
+    ImGui::GetIO().AddInputCharactersUTF8("cannot edit"); frame(ui, 3); key(ui, ImGuiKey_C);
+    check(std::string(ImGui::GetClipboardText()) == selectable_reply, "selected history text remains read-only");
     std::string long_messages;
     for (int i = 0; i < 24; ++i) { if (i) long_messages += ","; long_messages += R"({"role":"assistant","content":"A long reply with multiple lines.\nMore details to fill the transcript.\nAnother line of details."})"; }
     publish(R"({"status":"Ready","busy":false,"provider":{"selected":"openai"},"messages":[)" + long_messages + "],\"openai\":{" + catalog + "}}");
@@ -355,6 +395,9 @@ void chat_ui() {
     const auto narrow_send = ui.headless_item_rect("agent:send");
     const auto narrow_options = ui.headless_item_rect("agent:options");
     check(composer->ScrollMax.y == 0 && composer->ScrollMax.x == 0 && narrow_send && narrow_options, "narrow composer fits without internal scrolling");
+    const auto narrow_five = ui.headless_item_rect("agent:usage:fiveHour"), narrow_weekly = ui.headless_item_rect("agent:usage:weekly");
+    check(narrow_five && narrow_weekly && (*narrow_five)[2] < (*narrow_weekly)[0] && std::abs((*narrow_five)[1] - (*narrow_weekly)[1]) < .01F && std::abs((*narrow_five)[3] - (*narrow_five)[1] - 18) < .01F,
+          "narrow usage pills stay side by side at slimmer readable height");
     check((*narrow_options)[0] >= composer->WorkRect.Min.x && (*narrow_send)[2] <= composer->WorkRect.Max.x + 1, "narrow composer controls remain within bounding box");
     press("agent:message");
     const std::string long_input = "A long input that should wrap at word boundaries without changing its submitted text. UTF-8: café 日本語. More words to make multiple display lines.";
@@ -371,8 +414,13 @@ void chat_ui() {
     key(ui, ImGuiKey_Enter, false);
     check(consume().find(relay::json_escape(edited_input)) != std::string::npos, "Delete crosses a soft line boundary without getting stuck");
     relay::WrappedInput wrapped; wrapped.width = 80; wrapped.raw = "abc\n\n日本語 café and a long unbrokenwordwithoutspaces"; wrapped.wrap();
+    for (int offset : wrapped.breaks)
+        check(wrapped.display[static_cast<std::size_t>(offset + 1)] != ' ' && wrapped.display[static_cast<std::size_t>(offset + 1)] != '\t', "wrapped words do not start with separating blanks");
+    for (int position = 0; position <= static_cast<int>(wrapped.raw.size()); ++position)
+        check(wrapped.raw_position(wrapped.display_position(position)) == position, "wrapped cursor positions round-trip");
     const auto original_text = wrapped.raw; wrapped.edit(wrapped.display);
     check(wrapped.raw == original_text, "soft wrapping preserves hard blank lines and Unicode");
+    (void)protocol.handle(R"({"id":89,"method":"session.auto_approval","enabled":false})");
     const auto camera_revision = engine.scene_history().revision();
     protocol.set_editor_camera_handler([&](std::string_view request) { return ui.handle_camera_request(request); });
     check(protocol.handle_agent(R"({"id":90,"method":"editor.camera.set","distance":12})").find("capability denied") != std::string::npos, "camera controls require agent approval");
@@ -390,6 +438,103 @@ void chat_ui() {
     std::cout << "Headless chat send/stop tests passed without provider calls\n";
 }
 
+void media_ui(const std::filesystem::path& fixture) {
+    std::filesystem::create_directories("captures");
+    std::filesystem::copy_file(fixture / "image.png", "captures/chat-image.png");
+    std::filesystem::copy_file(fixture / "clip.webm", "captures/chat-video.webm");
+    relay::EditorUi ui([](std::string_view) { return std::string("{}"); });
+    std::string error; check(ui.initialize_headless(error), "media headless context initializes");
+    relay::ChatMedia media;
+    ImRect last_media_item;
+    auto draw = [&](std::string_view message) {
+        auto& io = ImGui::GetIO(); io.DisplaySize = ImVec2(800, 600);
+        ImGui::NewFrame(); ImGui::SetNextWindowPos(ImVec2(0, 0)); ImGui::SetNextWindowSize(ImVec2(700, 590)); ImGui::Begin("Media fixture");
+        const bool handled = media.draw(message, true);
+        last_media_item = ImGui::GetCurrentContext()->LastItemData.Rect;
+        ImGui::End(); media.draw_viewer(true); ImGui::Render(); return handled;
+    };
+    check(draw("![unsafe](/etc/passwd)"), "out-of-scope media is rejected as unavailable");
+    check(ImGui::GetCurrentContext()->UserTextures.empty(), "unsafe media does not load a texture");
+    for (int i = 0; i < 500 && ImGui::GetCurrentContext()->UserTextures.Size == 0; ++i) {
+        draw("![image](captures/chat-image.png)"); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    check(ImGui::GetCurrentContext()->UserTextures.Size == 1, "PNG is decoded asynchronously into an inline image texture");
+    auto& viewer_io = ImGui::GetIO();
+    const auto image_message = "![image](captures/chat-image.png)";
+    viewer_io.AddMousePosEvent(100, 100); draw(image_message);
+    viewer_io.AddMouseButtonEvent(0, true); draw(image_message);
+    viewer_io.AddMouseButtonEvent(0, false); draw(image_message); draw(image_message);
+    check(media.viewer_open(), "thumbnail click opens large media viewer");
+    auto image_bounds = [&]() {
+        auto* window = ImGui::FindWindowByName("Chat media viewer");
+        check(window && window->Active, "large viewer is an active modal");
+        for (const auto& command : window->DrawList->CmdBuffer) {
+            if (command.TexRef._TexData != ImGui::GetCurrentContext()->UserTextures.front() || command.ElemCount < 6) continue;
+            const auto& vertices = window->DrawList->VtxBuffer;
+            const auto& indices = window->DrawList->IdxBuffer;
+            const auto minimum = vertices[static_cast<int>(command.VtxOffset + indices[static_cast<int>(command.IdxOffset)])].pos;
+            const auto maximum = vertices[static_cast<int>(command.VtxOffset + indices[static_cast<int>(command.IdxOffset + 2)])].pos;
+            return ImRect(minimum, maximum);
+        }
+        throw std::runtime_error("large viewer has no image draw command");
+    };
+    const auto fitted = image_bounds();
+    viewer_io.AddMousePosEvent(400, 268); draw(image_message);
+    viewer_io.AddMouseWheelEvent(0, 1); draw(image_message);
+    check(image_bounds().GetWidth() > fitted.GetWidth(), "scroll wheel zooms the large picture");
+    const auto zoomed = image_bounds();
+    viewer_io.AddMouseButtonEvent(0, true); draw(image_message);
+    viewer_io.AddMousePosEvent(430, 288); draw(image_message); draw(image_message);
+    viewer_io.AddMouseButtonEvent(0, false); draw(image_message);
+    check(image_bounds().Min.x > zoomed.Min.x + 20, "dragging pans the large picture");
+    viewer_io.AddKeyEvent(ImGuiKey_Escape, true); draw(image_message);
+    check(!media.viewer_open(), "Escape closes the large viewer");
+    viewer_io.AddKeyEvent(ImGuiKey_Escape, false); draw(image_message); draw(image_message);
+    viewer_io.AddMousePosEvent(100, 100); draw(image_message);
+    viewer_io.AddMouseButtonEvent(0, true); draw(image_message);
+    viewer_io.AddMouseButtonEvent(0, false); draw(image_message); draw(image_message);
+    viewer_io.AddMousePosEvent(5, 5); draw(image_message);
+    viewer_io.AddMouseButtonEvent(0, true); draw(image_message);
+    check(!media.viewer_open(), "clicking the dark backdrop closes the large viewer");
+    viewer_io.AddMouseButtonEvent(0, false); draw(image_message);
+
+#ifdef RELAY_CHAT_VIDEO
+    for (int i = 0; i < 500 && ImGui::GetCurrentContext()->UserTextures.Size < 2; ++i) {
+        draw("![video](captures/chat-video.webm)"); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    check(ImGui::GetCurrentContext()->UserTextures.Size == 2, "WebM poster is decoded into inline video texture");
+    draw("![video](captures/chat-video.webm)");
+    const auto slider_rect = last_media_item;
+    auto* poster = ImGui::GetCurrentContext()->UserTextures.back();
+    auto& io = ImGui::GetIO();
+    io.AddMousePosEvent(slider_rect.Max.x - 15, (slider_rect.Min.y + slider_rect.Max.y) * .5F);
+    draw("![video](captures/chat-video.webm)");
+    io.AddMouseButtonEvent(0, true); draw("![video](captures/chat-video.webm)");
+    io.AddMouseButtonEvent(0, false); draw("![video](captures/chat-video.webm)");
+    for (int i = 0; i < 500 && ImGui::GetCurrentContext()->UserTextures.back() == poster; ++i) {
+        draw("![video](captures/chat-video.webm)"); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    check(ImGui::GetCurrentContext()->UserTextures.back() != poster, "headless video seeking decodes a new frame");
+    viewer_io.AddMousePosEvent(100, 100); draw("![video](captures/chat-video.webm)");
+    viewer_io.AddMouseButtonEvent(0, true); draw("![video](captures/chat-video.webm)");
+    viewer_io.AddMouseButtonEvent(0, false); draw("![video](captures/chat-video.webm)"); draw("![video](captures/chat-video.webm)");
+    check(media.viewer_open(), "video thumbnail opens large media mode");
+    auto* video_frame = ImGui::GetCurrentContext()->UserTextures.back();
+    viewer_io.AddMousePosEvent(40, 554); draw("");
+    viewer_io.AddMouseButtonEvent(0, true); draw("");
+    viewer_io.AddMouseButtonEvent(0, false); draw("");
+    for (int i = 0; i < 500 && ImGui::GetCurrentContext()->UserTextures.back() == video_frame; ++i) {
+        draw(""); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    check(ImGui::GetCurrentContext()->UserTextures.back() != video_frame, "large video plays even when the chat thumbnail is not drawn");
+    viewer_io.AddKeyEvent(ImGuiKey_Escape, true); draw("");
+    check(!media.viewer_open(), "Escape also closes large video mode");
+    viewer_io.AddKeyEvent(ImGuiKey_Escape, false); draw("");
+
+#endif
+    media.clear(); check(ImGui::GetCurrentContext()->UserTextures.empty(), "media textures unregister on cleanup");
+}
+
 } // namespace
 
 int main() {
@@ -399,7 +544,7 @@ int main() {
     std::filesystem::create_directory(temporary);
     std::filesystem::current_path(temporary);
     int result = 0;
-    try { run(); project_ui(); agent_ui(); chat_ui(); }
+    try { run(); project_ui(); agent_ui(); chat_ui(); media_ui(RELAY_CHAT_MEDIA_FIXTURES); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
     std::filesystem::current_path(original);
     std::filesystem::remove_all(temporary);

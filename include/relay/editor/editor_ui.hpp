@@ -24,7 +24,10 @@ public:
     // Handles one request line and returns one response line, matching ControlProtocol::handle.
     using RequestHandler = std::function<std::string(std::string_view)>;
 
+    using AttachmentPicker = std::function<void(std::function<void(std::vector<std::string>)>)>;
     explicit EditorUi(RequestHandler request);
+    // Background test seam; the normal picker is opened only by a human button press.
+    void set_attachment_picker(AttachmentPicker picker);
     ~EditorUi() override;
 
     EditorUi(const EditorUi&) = delete;

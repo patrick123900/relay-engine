@@ -44,6 +44,9 @@ struct WrappedInput {
             if (line_end <= cursor) { line_end = cursor + 1; while (line_end < newline && (static_cast<unsigned char>(*line_end) & 0xc0) == 0x80) ++line_end; }
             display.append(cursor, line_end);
             cursor = line_end;
+            // Keep separating blanks on the preceding visual line, preserving raw text
+            // and the one-byte soft-break mapping without indenting wrapped words.
+            while (cursor < newline && (*cursor == ' ' || *cursor == '\t')) display += *cursor++;
             if (cursor < newline) { breaks.push_back(static_cast<int>(display.size())); display += '\n'; }
             else if (cursor < end && *cursor == '\n') { display += '\n'; ++cursor; }
         }

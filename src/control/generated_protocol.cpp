@@ -277,8 +277,9 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_session_export_audit{{
     {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.jsonl$", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 1> fields_chat_submit{{
-    {"message", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 4000U, "", ""},
+constexpr std::array<ProtocolFieldSpec, 2> fields_chat_submit{{
+    {"message", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 4000U, "", ""},
+    {"attachments", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 8U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_bridge_publish{{

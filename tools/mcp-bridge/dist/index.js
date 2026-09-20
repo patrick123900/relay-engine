@@ -115,8 +115,10 @@ const runChat = async () => {
         return;
     runningChat = true;
     try {
-        while (acceptingChat && submissions.length)
-            await workflow().submit(submissions.shift(), publishChat);
+        while (acceptingChat && submissions.length) {
+            const submission = submissions.shift();
+            await workflow().submit(submission.message, publishChat, submission.attachments);
+        }
     }
     finally {
         runningChat = false;
@@ -131,6 +133,7 @@ const chatPoll = setInterval(() => {
             openaiStartup = true;
             void openai.control({ action: "refresh" });
         }
+        void openai.refreshUsage();
         await publishChat();
         const response = await relay.bridge("bridge.poll");
         for (const submission of (response.submissions ?? [])) {
@@ -192,7 +195,7 @@ const chatPoll = setInterval(() => {
                 workflow().cancel();
             }
             else if (typeof submission.message === "string" && submissions.length < 8)
-                submissions.push(submission.message);
+                submissions.push({ message: submission.message, ...(submission.attachments ? { attachments: submission.attachments } : {}) });
         }
         void runChat().catch(() => { });
     })().catch(() => { })

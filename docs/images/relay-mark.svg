@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Relay Engine</title>
+  <desc id="desc">A faceted triangular relay mark</desc>
+  <defs>
+    <linearGradient id="a" x1="18" y1="18" x2="108" y2="112" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#74d7ff"/>
+      <stop offset="1" stop-color="#7568ff"/>
+    </linearGradient>
+    <linearGradient id="b" x1="72" y1="20" x2="84" y2="108" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#e7b8ff"/>
+      <stop offset="1" stop-color="#9b6cff"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#171a20"/>
+  <path d="M22 96 59 24l13 26-21 46H22Z" fill="url(#b)"/>
+  <path d="m59 24 47 72H51l21-46-13-26Z" fill="url(#a)"/>
+  <path d="m72 50 34 46H51l21-46Z" fill="#263b70" fill-opacity=".46"/>
+  <path d="M22 96h84" stroke="#d6e7ff" stroke-opacity=".7" stroke-width="3" stroke-linecap="round"/>
+</svg>

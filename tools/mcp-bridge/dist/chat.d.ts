@@ -11,6 +11,7 @@ export interface Method {
     description: string;
     hostOnly?: boolean;
     bridgeOnly?: boolean;
+    readOnly?: boolean;
     params: Parameter[];
 }
 export interface Configuration {
@@ -30,6 +31,6 @@ export declare class ChatWorkflow {
     view(): JsonObject;
     cancel(): void;
     close(): void;
-    submit(message: string, publish: () => Promise<void>): Promise<void>;
+    submit(message: string, publish: () => Promise<void>, attachmentPaths?: string[]): Promise<void>;
 }
 export {};

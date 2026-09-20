@@ -1,4 +1,5 @@
 #include "relay/editor/editor_ui.hpp"
+#include "relay/editor/chat_media.hpp"
 
 #include "relay/core/json.hpp"
 #include "relay/control/generated_protocol.hpp"
@@ -33,6 +34,8 @@
 #include <span>
 #include <sstream>
 #include <vector>
+#include <mutex>
+#include <filesystem>
 
 namespace relay {
 namespace {
@@ -408,7 +411,38 @@ struct EditorUi::Impl {
     JsonValue agent_review, agent_audit, chat_status;
     std::array<char, 4001> chat_message{};
     std::array<char, 8003> chat_display{};
+    ChatMedia chat_media;
     WrappedInput wrapped_chat;
+    struct AttachmentInbox { std::mutex mutex; std::vector<std::string> paths; };
+    std::shared_ptr<AttachmentInbox> attachment_inbox{std::make_shared<AttachmentInbox>()};
+    AttachmentPicker attachment_picker;
+    std::vector<std::string> attachments;
+    bool chat_busy{};
+    std::optional<std::array<float, 4>> composer_rect;
+    bool drop_hover{};
+    void receive_attachments() {
+        std::lock_guard lock(attachment_inbox->mutex);
+        for (auto& filename : attachment_inbox->paths) {
+            if (attachments.size() >= 8) break;
+            if (std::find(attachments.begin(), attachments.end(), filename) == attachments.end()) attachments.push_back(std::move(filename));
+        }
+        attachment_inbox->paths.clear();
+    }
+    void pick_attachments() {
+        if (attachment_picker) {
+            auto inbox = attachment_inbox;
+            attachment_picker([inbox](std::vector<std::string> paths) { std::lock_guard lock(inbox->mutex); inbox->paths = std::move(paths); });
+            return;
+        }
+        if (headless) return;
+        auto* state = new std::shared_ptr<AttachmentInbox>(attachment_inbox);
+        SDL_ShowOpenFileDialog([](void* userdata, const char* const* files, int) {
+            std::unique_ptr<std::shared_ptr<AttachmentInbox>> inbox(static_cast<std::shared_ptr<AttachmentInbox>*>(userdata));
+            if (!files) return;
+            std::lock_guard lock((*inbox)->mutex);
+            for (std::size_t i = 0; files[i] && i < 8; ++i) (*inbox)->paths.emplace_back(files[i]);
+        }, state, sdl_window, nullptr, 0, nullptr, true);
+    }
     std::array<char, 129> grant_target{}, audit_filename{"session-audit.jsonl"};
     int grant_method{}, grant_kind{};
     std::array<char, 2049> provider_endpoint{};
@@ -496,6 +530,7 @@ struct EditorUi::Impl {
         const auto* openai_value = object ? field(*object, "openai") : nullptr;
         const auto* openai = openai_value ? openai_value->object() : nullptr;
         const bool busy = object && boolean_or(*object, "busy", false);
+        chat_busy = busy;
         const auto control = [&](const std::string& action, const std::string& extra = "") {
             (void)call("chat.control", "\"action\":\"" + action + "\"" + (extra.empty() ? "" : "," + extra));
             refresh_pending = true;
@@ -504,14 +539,15 @@ struct EditorUi::Impl {
         const bool chat_tab = ImGui::BeginTabItem("Chat");
         note_item("agent:chat-tab");
         if (chat_tab) {
-            ImGui::TextColored(editor_color(session_object && boolean_or(*session_object, "auto_approval", false) ? colors.success : colors.warning), "%s",
-                session_object && boolean_or(*session_object, "auto_approval", false) ? "Auto approval  /  All engine actions" : "Reviewed access  /  Approvals in Access");
+            receive_attachments();
             const auto* messages_value = object ? field(*object, "messages") : nullptr;
             const auto* messages = messages_value ? messages_value->array() : nullptr;
             const auto full_status = object ? string_or(*object, "status", "Connecting...") : "Waiting for bridge...";
             const bool show_status = !busy && full_status != "Ready" && !full_status.empty();
-            const float transcript_height = std::max(80 * ui_scale, ImGui::GetContentRegionAvail().y - 155 * ui_scale - (show_status ? 36 * ui_scale : 0));
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, editor_color(colors.window));
+            const float usage_font_size = 13 * ui_scale;
+            const float extra_usage_height = 18 * ui_scale + ImGui::GetStyle().ItemSpacing.y;
+            const float transcript_height = std::max(80 * ui_scale, ImGui::GetContentRegionAvail().y - (attachments.empty() ? 155 : 190) * ui_scale - extra_usage_height - (show_status ? 36 * ui_scale : 0));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, editor_color(colors.panel));
             if (ImGui::BeginChild("Conversation", ImVec2(0, transcript_height), ImGuiChildFlags_Borders)) {
                 chat_follow = chat_jump_pending || ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 2 * ui_scale;
                 chat_jump_pending = false;
@@ -538,15 +574,25 @@ struct EditorUi::Impl {
                     ImGui::PushStyleColor(ImGuiCol_ChildBg, editor_color(role == "user" ? colors.accent_soft : colors.panel));
                     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * ui_scale, 10 * ui_scale));
                     if (ImGui::BeginChild("Message", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize)) {
-                        ImGui::TextColored(editor_color(role == "user" ? colors.text : colors.text_dim), "%s", role == "user" ? "YOU" : role == "assistant" ? "RELAY" : "NOTICE");
-                        ImGui::Spacing();
-                        std::istringstream lines(content); std::string line; bool code = false;
+                        std::istringstream lines(content); std::string line, text; bool code = false; int block = 0;
+                        const auto flush = [&]() {
+                            if (code) ImGui::PushFont(fonts.monospace);
+                            selectable_chat_text(text, block++);
+                            if (code) ImGui::PopFont();
+                            text.clear();
+                        };
                         while (std::getline(lines, line)) {
-                            if (line.starts_with("```")) { code = !code; ImGui::Spacing(); continue; }
-                            if (code) { ImGui::PushFont(fonts.monospace); ImGui::TextWrapped("%s", line.c_str()); ImGui::PopFont(); }
-                            else if (line.starts_with("#")) { const auto first = line.find_first_not_of("# "); ImGui::PushFont(fonts.heading); ImGui::TextWrapped("%s", first == std::string::npos ? "" : line.substr(first).c_str()); ImGui::PopFont(); }
-                            else ImGui::TextWrapped("%s", line.c_str());
+                            if (line.starts_with("```")) { flush(); code = !code; ImGui::Spacing(); continue; }
+                            if (!code && line.starts_with("#")) {
+                                flush(); const auto first = line.find_first_not_of("# ");
+                                ImGui::PushFont(fonts.heading);
+                                selectable_chat_text(first == std::string::npos ? "" : line.substr(first), block++);
+                                ImGui::PopFont();
+                            } else if (!code && line.find("![") != std::string::npos) {
+                                flush(); if (!chat_media.draw(line, headless, [&](std::string_view value) { selectable_chat_text(std::string(value), block++); })) selectable_chat_text(line, block++);
+                            } else { if (!text.empty()) text += '\n'; text += line; }
                         }
+                        flush();
                     }
                     ImGui::EndChild(); ImGui::PopStyleVar(); ImGui::PopStyleColor(); ImGui::PopID(); ImGui::Spacing();
                 }
@@ -577,7 +623,18 @@ struct EditorUi::Impl {
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * ui_scale, 10 * ui_scale));
             ImGui::PushStyleColor(ImGuiCol_ChildBg, editor_color(colors.panel));
             bool send = false;
-            if (ImGui::BeginChild("Composer", ImVec2(0, 135 * ui_scale), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+            if (ImGui::BeginChild("Composer", ImVec2(0, (attachments.empty() ? 135 : 170) * ui_scale), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+                receive_attachments();
+                const bool had_attachments = !attachments.empty();
+                if (had_attachments) ImGui::BeginChild("Attachments", ImVec2(0, 40 * ui_scale), 0, ImGuiWindowFlags_HorizontalScrollbar);
+                for (std::size_t i = 0; i < attachments.size();) {
+                    ImGui::PushID(static_cast<int>(i));
+                    const auto label = std::filesystem::path(attachments[i]).filename().string() + "  x";
+                    if (ImGui::SmallButton(label.c_str())) attachments.erase(attachments.begin() + static_cast<std::ptrdiff_t>(i)); else ++i;
+                    note_item("agent:attachment"); ImGui::PopID();
+                    if (i < attachments.size()) ImGui::SameLine();
+                }
+                if (had_attachments) ImGui::EndChild();
                 const float action_size = 32 * ui_scale;
                 const float input_height = std::max(ImGui::GetTextLineHeight() * 2, ImGui::GetContentRegionAvail().y - action_size - ImGui::GetStyle().ItemSpacing.y - 2 * ui_scale);
                 ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
@@ -591,7 +648,17 @@ struct EditorUi::Impl {
                 wrapped_chat.edit(chat_display.data());
                 std::copy(wrapped_chat.raw.begin(), wrapped_chat.raw.end(), chat_message.begin()); chat_message[wrapped_chat.raw.size()] = '\0';
                 note_item("agent:message");
-                if (!chat_message[0] && !ImGui::IsItemActive()) {
+                const auto input_min = ImGui::GetItemRectMin(), input_max = ImGui::GetItemRectMax();
+                composer_rect = std::array<float, 4>{input_min.x, input_min.y, input_max.x, input_max.y};
+                if (drop_hover) {
+                    auto* drop_draw = ImGui::GetWindowDrawList();
+                    drop_draw->AddRectFilled(input_min, input_max, colors.panel, 8 * ui_scale);
+                    drop_draw->AddRect(input_min, input_max, colors.accent, 8 * ui_scale, 0, 2 * ui_scale);
+                    const char* hint = "Drop to attach file(s)";
+                    const auto size = ImGui::CalcTextSize(hint);
+                    drop_draw->AddText(ImVec2((input_min.x + input_max.x - size.x) * .5F, (input_min.y + input_max.y - size.y) * .5F), colors.text, hint);
+                }
+                if (!drop_hover && !chat_message[0] && !ImGui::IsItemActive()) {
                     const auto origin = ImGui::GetItemRectMin();
                     const auto padding = ImGui::GetStyle().FramePadding;
                     ImGui::GetWindowDrawList()->AddText(ImVec2(origin.x + padding.x, origin.y + padding.y), colors.text_faint, "Message Relay...");
@@ -611,8 +678,19 @@ struct EditorUi::Impl {
                 const float effort_text_width = is_openai ? ImGui::CalcTextSize(effort.c_str()).x : 0;
                 const float row_width = ImGui::GetContentRegionAvail().x;
                 const float options_width = std::min(model_text_width + label_gap + effort_text_width + 36 * ui_scale,
-                    std::max(32 * ui_scale, row_width - action_size - gap));
-                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0F, row_width - options_width - gap - action_size));
+                    std::max(32 * ui_scale, row_width - action_size * 2 - gap * 2));
+                const float row_start = ImGui::GetCursorPosX();
+                ImGui::BeginDisabled(busy || attachments.size() >= 8);
+                if (ImGui::InvisibleButton("##Attach", ImVec2(action_size, action_size))) pick_attachments();
+                note_item("agent:attach");
+                const auto attach_min = ImGui::GetItemRectMin();
+                auto* attach_draw = ImGui::GetWindowDrawList();
+                const ImVec2 attach_center(attach_min.x + action_size * .5F, attach_min.y + action_size * .5F);
+                attach_draw->AddLine(ImVec2(attach_center.x - 7 * ui_scale, attach_center.y), ImVec2(attach_center.x + 7 * ui_scale, attach_center.y), colors.text_dim, 2 * ui_scale);
+                attach_draw->AddLine(ImVec2(attach_center.x, attach_center.y - 7 * ui_scale), ImVec2(attach_center.x, attach_center.y + 7 * ui_scale), colors.text_dim, 2 * ui_scale);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Attach files");
+                ImGui::EndDisabled(); ImGui::SameLine();
+                ImGui::SetCursorPosX(row_start + std::max(action_size + gap, row_width - options_width - gap - action_size));
                 ImGui::BeginDisabled(busy || !is_openai || !models || models->empty());
                 if (ImGui::InvisibleButton("##AgentOptions", ImVec2(options_width, action_size))) ImGui::OpenPopup("AgentOptions");
                 note_item("agent:options");
@@ -667,7 +745,7 @@ struct EditorUi::Impl {
                     ImGui::EndDisabled(); ImGui::EndPopup();
                 }
                 ImGui::SameLine(0, gap);
-                ImGui::BeginDisabled(!connected || (!busy && !chat_message[0]));
+                ImGui::BeginDisabled(!connected || (!busy && !chat_message[0] && attachments.empty()));
                 const bool activated = ImGui::InvisibleButton("##ChatAction", ImVec2(32 * ui_scale, 32 * ui_scale));
                 note_item(busy ? "agent:stop" : "agent:send");
                 const auto center = ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * .5F, (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * .5F);
@@ -685,8 +763,53 @@ struct EditorUi::Impl {
                 ImGui::EndDisabled();
             }
             ImGui::EndChild(); ImGui::PopStyleColor(); ImGui::PopStyleVar(2);
-            if (send && connected && !busy && chat_message[0]) {
-                if (call("chat.submit", "\"message\":\"" + json_escape(chat_message.data()) + "\"")) { chat_message.fill('\0'); refresh_pending = true; }
+            const float usage_gap = ImGui::GetStyle().ItemSpacing.x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 4 * ui_scale);
+            const float usage_row_width = std::max(1.0F, ImGui::GetContentRegionAvail().x - 4 * ui_scale);
+                const auto* usage_value = openai ? field(*openai, "usage") : nullptr;
+                const auto* usage = is_openai && usage_value ? usage_value->object() : nullptr;
+                for (const auto& [key, label] : {std::pair{"fiveHour", "5-Hourly"}, std::pair{"weekly", "Weekly"}}) {
+                    const auto* value = usage ? field(*usage, key) : nullptr;
+                    const bool known = value && value->number();
+                    const float percent = known ? std::clamp(static_cast<float>(*value->number()), 0.0F, 100.0F) : 0;
+                    const float width = (usage_row_width - usage_gap) * .5F;
+                    const float height = 18 * ui_scale;
+                    ImGui::PushID(key);
+                    ImGui::InvisibleButton("##Usage", ImVec2(width, height));
+                    note_item(std::string("agent:usage:") + key);
+                    const auto minimum = ImGui::GetItemRectMin(), maximum = ImGui::GetItemRectMax();
+                    auto* meter_draw = ImGui::GetWindowDrawList();
+                    const ImU32 fill = percent > 90 ? IM_COL32(242, 86, 86, 255) : percent > 80 ? IM_COL32(246, 199, 65, 255) : IM_COL32(195, 201, 211, 255);
+                    meter_draw->AddRectFilled(minimum, maximum, colors.panel, height * .5F);
+                    const float boundary = minimum.x + width * percent / 100;
+                    if (known && percent > 0) {
+                        meter_draw->PushClipRect(minimum, ImVec2(boundary, maximum.y), true);
+                        meter_draw->AddRectFilled(minimum, maximum, fill, height * .5F); meter_draw->PopClipRect();
+                    }
+                    const std::string text = std::string(label) + ": " + (known ? std::to_string(static_cast<int>(std::round(percent))) + "%" : "--");
+                    const float font_size = usage_font_size;
+                    const auto size = ImGui::GetFont()->CalcTextSizeA(font_size, std::numeric_limits<float>::max(), 0, text.c_str());
+                    const ImVec2 position(minimum.x + (width - size.x) * .5F, minimum.y + (height - size.y) * .5F);
+                    meter_draw->PushClipRect(minimum, maximum, true);
+                    meter_draw->PushClipRect(ImVec2(known ? boundary : minimum.x, minimum.y), maximum, true);
+                    meter_draw->AddText(ImGui::GetFont(), font_size, position, IM_COL32(238, 241, 246, 255), text.c_str());
+                    meter_draw->PopClipRect();
+                    if (known && percent > 0) {
+                        meter_draw->PushClipRect(minimum, ImVec2(boundary, maximum.y), true);
+                        meter_draw->AddText(ImGui::GetFont(), font_size, position, IM_COL32(0, 0, 0, 255), text.c_str()); meter_draw->PopClipRect();
+                    }
+                    meter_draw->PopClipRect();
+                    meter_draw->AddRect(minimum, maximum, ImGui::GetColorU32(ImGuiCol_Border), height * .5F, 0, ui_scale);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", known ? "Account usage consumed in this window" : "Account usage is unavailable");
+                    ImGui::PopID();
+                    if (std::string_view(key) == "fiveHour") ImGui::SameLine(0, usage_gap);
+                }
+
+            if (send && connected && !busy && (chat_message[0] || !attachments.empty())) {
+                std::string files = "[";
+                for (const auto& filename : attachments) { if (files.size() > 1) files += ","; files += "\"" + json_escape(filename) + "\""; }
+                files += "]";
+                if (call("chat.submit", "\"message\":\"" + json_escape(chat_message.data()) + "\",\"attachments\":" + files)) { chat_message.fill('\0'); attachments.clear(); refresh_pending = true; }
             }
             if (show_status) { ImGui::TextWrapped("%s", full_status.substr(0, 120).c_str()); if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", full_status.c_str()); }
             ImGui::EndTabItem();
@@ -783,8 +906,8 @@ struct EditorUi::Impl {
         note_item("agent:access-tab");
         if (access_tab) {
             bool automatic = session_object && boolean_or(*session_object, "auto_approval", false);
-            if (ImGui::Checkbox("Auto approval (all actions)", &automatic))
-                (void)mutate("session.auto_approval", std::string("\"enabled\":") + (automatic ? "true" : "false"), automatic ? "Auto approval enabled" : "Auto approval disabled");
+            if (ImGui::Checkbox("Allow all actions", &automatic))
+                (void)mutate("session.auto_approval", std::string("\"enabled\":") + (automatic ? "true" : "false"), automatic ? "All actions allowed" : "Action approvals required");
             note_item("agent:auto-approval");
             ImGui::TextDisabled("Project: %s", session_object ? string_or(*session_object, "project", "").c_str() : "");
             if (ImGui::Button("Revoke all", ImVec2(120 * ui_scale, 0)))
@@ -898,6 +1021,12 @@ struct EditorUi::Impl {
                     if (details) { ImGui::PushFont(fonts.monospace); ImGui::TextWrapped("%s", string_or(*entry, "summary", "").c_str()); ImGui::PopFont(); }
                     ImGui::PopID();
                 }
+            }
+            if (is_openai && openai && ImGui::CollapsingHeader("Connection diagnostics")) {
+                if (const auto* transport = field(*openai, "transport"); transport && transport->object())
+                    ImGui::TextWrapped("%s", json_stringify(*transport).c_str());
+                if (const auto* entries = field(*openai, "diagnostics"); entries && entries->array())
+                    for (const auto& entry : *entries->array()) ImGui::TextWrapped("%s", json_stringify(entry).c_str());
             }
             ImGui::SeparatorText("Session audit");
             if (const auto* audit_object = agent_audit.object()) {
@@ -1397,7 +1526,10 @@ struct EditorUi::Impl {
 
         if (selections.contains(handle)) flags |= ImGuiTreeNodeFlags_Selected;
 
+        // Hierarchy highlights meet edge-to-edge; other controls keep normal spacing.
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0F));
         const bool open = ImGui::TreeNodeEx(handle.c_str(), flags, "%s", name.c_str());
+        ImGui::PopStyleVar();
         note_item("entity:" + handle);
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) click_selection(handle, true);
 
@@ -1446,6 +1578,33 @@ struct EditorUi::Impl {
                 draw_tree_node(child);
             ImGui::TreePop();
         }
+    }
+
+    void selectable_chat_text(const std::string& text, int block) {
+        if (text.empty()) return;
+        WrappedInput wrapped;
+        wrapped.raw = text; wrapped.width = std::max(1.0F, ImGui::GetContentRegionAvail().x - 2);
+        wrapped.wrap();
+        std::vector<char> buffer(wrapped.display.begin(), wrapped.display.end()); buffer.push_back('\0');
+        const auto lines = 1 + std::count(wrapped.display.begin(), wrapped.display.end(), '\n');
+        ImGui::PushID(block);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 0);
+        ImGui::InputTextMultiline("##HistoryText", buffer.data(), buffer.size(),
+            ImVec2(-1, static_cast<float>(lines) * ImGui::GetTextLineHeight() + 2),
+            ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoHorizontalScroll);
+        note_item("agent:history-text");
+        // Copy the original text, excluding newlines inserted only for visual wrapping.
+        if (ImGui::IsItemActive() && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+            if (const auto* state = ImGui::GetInputTextState(ImGui::GetItemID())) {
+                const auto begin = wrapped.raw_position(std::min(state->GetSelectionStart(), state->GetSelectionEnd()));
+                const auto end = wrapped.raw_position(std::max(state->GetSelectionStart(), state->GetSelectionEnd()));
+                if (end > begin) ImGui::SetClipboardText(text.substr(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)).c_str());
+            }
+        }
+        ImGui::PopStyleVar(3); ImGui::PopStyleColor(); ImGui::PopID();
     }
 
     void draw_hierarchy() {
@@ -2630,7 +2789,7 @@ struct EditorUi::Impl {
     // Keyboard shortcuts, ignored whenever a text field has focus so typing a name never switches
     // the gizmo or deletes the selection.
     void update_shortcuts() {
-        if (ImGui::GetIO().WantTextInput || navigating ||
+        if (ImGui::GetIO().WantTextInput || (ImGui::GetActiveID() != 0 && ImGui::GetInputTextState(ImGui::GetActiveID())) || navigating ||
             ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
             return;
         const auto& shortcuts = ImGui::GetIO();
@@ -2797,7 +2956,11 @@ struct EditorUi::Impl {
     }
 };
 
-EditorUi::EditorUi(RequestHandler request) : impl_(std::make_unique<Impl>(std::move(request))) {}
+EditorUi::EditorUi(RequestHandler request) : impl_(std::make_unique<Impl>(std::move(request))) {
+    (void)impl_->call("session.auto_approval", "\"enabled\":true");
+}
+
+void EditorUi::set_attachment_picker(AttachmentPicker picker) { impl_->attachment_picker = std::move(picker); }
 
 EditorUi::~EditorUi() {
     // Swapchain recreation preserves the ImGui context and layout; destruction retires them.
@@ -2809,6 +2972,7 @@ EditorUi::~EditorUi() {
     }
     if (impl_->imgui_context_created) {
         impl_->layout.save();
+        impl_->chat_media.clear();
         ImGui::DestroyContext();
         impl_->imgui_context_created = false;
     }
@@ -2880,7 +3044,7 @@ bool EditorUi::initialize(const OverlayContext& context, std::string& error) {
     info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     // Letting the backend own a small descriptor pool keeps UI allocations out of the engine's
     // fixed bindless texture table.
-    info.DescriptorPoolSize = 16U;
+    info.DescriptorPoolSize = 256U;
     if (!ImGui_ImplVulkan_Init(&info)) {
         error = "could not start the Vulkan ImGui backend";
         return false;
@@ -2934,6 +3098,20 @@ bool EditorUi::handle_event(const void* const sdl_event) {
         impl_->relative_delta.x += event->motion.xrel;
         impl_->relative_delta.y += event->motion.yrel;
         return true;
+    }
+    if (event->type >= SDL_EVENT_DROP_FILE && event->type <= SDL_EVENT_DROP_POSITION) {
+        if (event->type == SDL_EVENT_DROP_POSITION || event->type == SDL_EVENT_DROP_FILE) {
+            const auto& rect = impl_->composer_rect;
+            const auto origin = ImGui::GetMainViewport()->Pos;
+            const float x = event->drop.x + origin.x, y = event->drop.y + origin.y;
+            impl_->drop_hover = !impl_->chat_busy && !impl_->chat_media.viewer_open() && rect && x >= (*rect)[0] && y >= (*rect)[1] && x <= (*rect)[2] && y <= (*rect)[3];
+            if (event->type == SDL_EVENT_DROP_FILE && impl_->drop_hover && event->drop.data) {
+                std::lock_guard lock(impl_->attachment_inbox->mutex);
+                impl_->attachment_inbox->paths.emplace_back(event->drop.data);
+            }
+        }
+        if (event->type == SDL_EVENT_DROP_COMPLETE) impl_->drop_hover = false;
+        return impl_->drop_hover;
     }
     if (impl_->headless) return false;
     ImGui_ImplSDL3_ProcessEvent(event);
@@ -2991,6 +3169,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         ImGui::GetStyle().FontSizeBase = impl_->fonts.body_size;
         ImGui::GetStyle().FontScaleDpi = scale;
     }
+    impl_->composer_rect.reset();
     ImGui::NewFrame();
     ImGuizmo::BeginFrame();
     impl_->frame_open = true;
@@ -3080,7 +3259,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
             }
         }
         impl_->update_camera_input();
-        impl_->update_shortcuts();
+        if (!impl_->chat_media.viewer_open()) impl_->update_shortcuts();
         impl_->update_view();
         impl_->draw_gizmo();
         impl_->update_selection_input();
@@ -3090,7 +3269,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         impl_->viewport_hovered = false;
         impl_->freelook_latched = false;
         impl_->capture_pointer(false);
-        impl_->update_shortcuts();
+        if (!impl_->chat_media.viewer_open()) impl_->update_shortcuts();
     }
     if (impl_->panel_open[6]) {
         if (panel("Timeline", 6)) impl_->draw_timeline();
@@ -3115,6 +3294,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     }
     impl_->draw_dialogs();
 
+    impl_->chat_media.draw_viewer(impl_->headless);
     ImGui::Render();
     impl_->frame_open = false;
 }

@@ -1,33 +1,20 @@
-# Project instructions for agents
+# Agent instructions
 
-Keep all work in the background.
+Work in the background and keep the repository suitable for public distribution.
 
-- Never move, capture, or control the user's mouse; send keyboard input; change window focus;
-  or open, show, activate, move, or resize any window unless the user specifically approves
-  those desktop actions in advance for the current task.
-- A coding request, a request to test or verify a change, past desktop-test approval, saved tool
-  permissions, or documentation listing a desktop test does not authorize desktop interaction.
-- First priority is to complete relevant verification in the background without interrupting the
-  user's computer use. Run appropriate builds, headless tests and protocol/API checks autonomously;
-  no user permission is needed for these non-interrupting checks. Do not skip them, replace them
-  with a desktop-test permission request, or stop at proposing tests.
-- Prefer existing headless coverage or a meaningful background regression test for the change.
-  Where practical, use a genuinely isolated offscreen or virtual display that cannot affect the
-  user's desktop, input or focus. Do not assume an isolated layout provides that isolation.
-- Use background builds, headless tests, protocol/API checks, and file inspection by default.
-  Check how a test or tool runs before launching it: it must not open windows or touch the user's
-  input or focus. This applies to editor, GPU, browser, screenshot, and desktop automation tools,
-  including `xdotool` and the `tests/editor_*_smoke.py` suites.
-- Only consider asking for desktop-test approval after completing relevant background checks and
-  determining that an important verification gap cannot reasonably be covered without desktop
-  interaction. Explain that remaining gap and which windows or input the proposed check affects.
-  Do not routinely ask for desktop access on every coding task. If background checks are sufficient,
-  finish the task and report their results. Otherwise report the specific desktop check as pending;
-  continue all independent background work and do not interrupt the desktop while awaiting approval.
-- An isolated editor layout is not an isolated desktop. Earlier verification records and test
-  commands in the documentation are reproduction notes, not permission to run intrusive checks.
+- Do not move or control the user's mouse, send keyboard input, change focus, or open, show, move,
+  resize, or activate windows without the user's specific advance approval for those desktop actions
+  in the current task. Coding or test requests, old approvals, saved permissions, and documented
+  commands do not grant desktop access.
+- Complete relevant background verification autonomously: builds, headless tests, protocol/API
+  checks, and file inspection need no permission. Prefer meaningful headless regression coverage.
+- Before running any editor, browser, GPU, screenshot, or automation test, confirm it cannot affect
+  the user's desktop. An isolated editor layout is not an isolated desktop. The
+  `tests/editor_*_smoke.py` suites use the real desktop and require explicit approval.
+- Ask about desktop verification only after background checks are complete and a material gap cannot
+  be covered safely. Continue all independent work while approval is pending.
+- Preserve unrelated working-tree changes. Do not put personal activity, private user context, or
+  credentials in tracked files, commits, or repository comments.
 
-These instructions apply to every agent working on this project, including Codex and Claude.
-
-Keep repository content professional and suitable for public distribution. Do not record personal
-activities or private user context in tracked files, commit messages, or repository comments.
+Use [`HANDOFF.md`](HANDOFF.md) for current engineering state and [`docs/protocol.md`](docs/protocol.md)
+for the generated control-protocol reference.

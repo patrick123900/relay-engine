@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "format": "relay.protocol",
-  "version": 14,
+  "version": 15,
   "methods": [
     {"method":"runtime.status","tool":"runtime_status","title":"Inspect Relay runtime","description":"Read the current run, pause, frame, simulation time and resolution state.","readOnly":true,"params":[]},
     {"method":"runtime.pause","tool":"runtime_pause","title":"Pause Relay runtime","description":"Pause automatic simulation so the scene can be inspected deterministically.","idempotent":true,"params":[]},
@@ -86,7 +86,7 @@
     {"method":"session.decide","tool":"session_decide","title":"Session decide","description":"Host approval or denial of a pending request. Stale project requests cannot be approved.","params":[{"name":"request","type":"integer","minimum":0,"required":true},{"name":"allow","type":"boolean","required":true}],"hostOnly":true},
     {"method":"session.revoke","tool":"session_revoke","title":"Session revoke","description":"Host revocation of all grants or one exact method.","params":[{"name":"scope","type":"string","maximumLength":64,"required":false,"default":""}],"hostOnly":true},
     {"method":"session.export_audit","tool":"session_export_audit","title":"Session export_audit","description":"Export a bounded audit snapshot atomically under .relay/audits without overwriting existing records.","params":[{"name":"filename","type":"string","maximumLength":128,"required":true,"pattern":"^[A-Za-z0-9][A-Za-z0-9._-]*\\.jsonl$"}],"hostOnly":true},
-    {"method":"chat.submit","tool":"chat_submit","title":"Chat submit","description":"Submit a user message to the external bridge. Providers and canonical conversation history remain outside the engine.","params":[{"name":"message","type":"string","maximumLength":4000,"required":true,"minimumLength":1}],"hostOnly":true},
+    {"method":"chat.submit","tool":"chat_submit","title":"Chat submit","description":"Submit a user message to the external bridge. Providers and canonical conversation history remain outside the engine.","params":[{"name":"message","type":"string","maximumLength":4000,"required":true,"minimumLength":0},{"name":"attachments","type":"string_array","maximumLength":8,"required":false}],"hostOnly":true},
     {"method":"chat.status","tool":"chat_status","title":"Chat status","description":"Inspect the bounded external bridge display and pending user-message count.","params":[],"readOnly":true,"hostOnly":true},
     {"method":"bridge.poll","tool":"bridge_poll","title":"Bridge poll","description":"Consume bounded user-message submissions for the authenticated external bridge.","params":[],"bridgeOnly":true},
     {"method":"bridge.publish","tool":"bridge_publish","title":"Bridge publish","description":"Publish a bounded display snapshot from the authenticated external bridge.","params":[{"name":"view","type":"string","maximumLength":65536,"required":true}],"bridgeOnly":true},

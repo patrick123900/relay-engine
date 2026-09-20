@@ -125,13 +125,16 @@ let polling = false;
 let acceptingChat = true;
 let setupStatus = "";
 const publishChat = async () => { await relay.bridge("bridge.publish", { view: JSON.stringify({ ...workflow().view(), provider: { ...provider.view(), selected: preferences.value.provider }, setup_status: setupStatus }) }); };
-const submissions: string[] = [];
+const submissions: { message: string; attachments?: string[] }[] = [];
 let runningChat = false;
 const runChat = async () => {
   if (runningChat) return;
   runningChat = true;
   try {
-    while (acceptingChat && submissions.length) await workflow().submit(submissions.shift()!, publishChat);
+    while (acceptingChat && submissions.length) {
+      const submission = submissions.shift()!;
+      await workflow().submit(submission.message, publishChat, submission.attachments);
+    }
   } finally { runningChat = false; }
 };
 const chatPoll = setInterval(() => {
@@ -141,9 +144,10 @@ const chatPoll = setInterval(() => {
     if (editorOnly && preferences.value.provider === "openai" && !openaiStartup) {
       openaiStartup = true; void openai.control({ action: "refresh" });
     }
+    void openai.refreshUsage();
     await publishChat();
     const response = await relay.bridge("bridge.poll");
-    for (const submission of (response.submissions ?? []) as { message?: string; cancel?: boolean; configure?: ProviderSettings; control?: { action: string; model?: string; effort?: string; provider?: string } }[]) {
+    for (const submission of (response.submissions ?? []) as { message?: string; attachments?: string[]; cancel?: boolean; configure?: ProviderSettings; control?: { action: string; model?: string; effort?: string; provider?: string } }[]) {
       if (submission.control) {
         const control = submission.control;
         if (runningChat) { setupStatus = "Stop the active turn before changing harness settings."; continue; }
@@ -171,7 +175,7 @@ const chatPoll = setInterval(() => {
         submission.configure.credential = "";
       }
       else if (submission.cancel) { submissions.length = 0; workflow().cancel(); }
-      else if (typeof submission.message === "string" && submissions.length < 8) submissions.push(submission.message);
+      else if (typeof submission.message === "string" && submissions.length < 8) submissions.push({ message: submission.message, ...(submission.attachments ? { attachments: submission.attachments } : {}) });
     }
     void runChat().catch(() => {});
   })().catch(() => { /* Disconnected bridge or runtime shutdown. */ })

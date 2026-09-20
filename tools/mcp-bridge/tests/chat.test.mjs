@@ -148,3 +148,27 @@ test('provider errors are bounded and redacted, cancellation aborts requests', a
     assert.ok(workflow.view().messages.every(message => message.content.isWellFormed()));
   } finally { workflow.close(); globalThis.fetch = originalFetch; }
 });
+
+
+test('compatible-provider follow-ups retain completed native results after later transport failure', async () => {
+  const originalFetch = globalThis.fetch; let rounds = 0, creations = 0;
+  const workflow = new ChatWorkflow(root, async method => {
+    if (method === 'session.status') return {auto_approval: true};
+    ++creations; return {entity: '0:1', details: 'x'.repeat(6000), tail: 'preserved'};
+  }, config);
+  try {
+    globalThis.fetch = async (_url, options) => {
+      const body = JSON.parse(options.body); ++rounds;
+      if (rounds === 1) return answer(null, [tool('scene_create', {name: 'Retained object'})]);
+      const result = body.messages.find(message => message.role === 'tool');
+      assert.equal(JSON.parse(result.content).tail, 'preserved');
+      assert.ok(result.content.length > 4000);
+      if (rounds === 2) throw new Error('Later transport failure');
+      return answer('Existing entity inspected; completed creation was retained.');
+    };
+    await workflow.submit('Create an object', async () => {});
+    await workflow.submit('Continue without recreating', async () => {});
+    assert.equal(creations, 1);
+    assert.equal(workflow.view().status, 'Ready');
+  } finally {workflow.close(); globalThis.fetch = originalFetch;}
+});

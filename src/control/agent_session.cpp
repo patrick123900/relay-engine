@@ -346,7 +346,15 @@ std::string ControlProtocol::session_dispatch(std::string_view request) {
             if (const auto* busy = field(*object, "busy"); busy && busy->boolean() && *busy->boolean())
                 return failure(id, "chat is busy; stop it before submitting another message");
         if (chat_submissions_.size() >= 8) return failure(id, "chat submission queue is full");
-        chat_submissions_.push_back(J{O{{"id", number(++chat_sequence_)}, {"message", J{text(fields, "message")}}}});
+        O submission{{"id", number(++chat_sequence_)}, {"message", J{text(fields, "message")}}};
+        const auto* attachments = field(fields, "attachments");
+        if (attachments && attachments->array()) {
+            for (const auto& attachment : *attachments->array())
+                if (!attachment.string() || attachment.string()->size() > 4096) return failure(id, "invalid attachment path");
+            submission.emplace("attachments", *attachments);
+        }
+        if (text(fields, "message").empty() && (!attachments || !attachments->array() || attachments->array()->empty())) return failure(id, "message or attachment required");
+        chat_submissions_.push_back(J{std::move(submission)});
         return reply(id, J{O{{"submission", number(chat_sequence_)}}});
     }
     if (method == "chat.cancel") {

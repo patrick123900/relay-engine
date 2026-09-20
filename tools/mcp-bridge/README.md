@@ -73,7 +73,7 @@ Enter sends, Ctrl+Enter inserts a newline; one send/stop icon and a shared model
 reasoning in dimmer text and shares a compact right-aligned row with the send icon. Extra header
 actions and the slider description are omitted. Follow is automatic at the bottom; a
 down arrow resumes it after scrolling up. Account contains provider sign-in;
-Access contains scoped grants and full Auto approval; Activity contains tool results/audit exports.
+Access contains scoped grants and Allow all actions (enabled by default in the human editor); Activity contains tool results/audit exports.
 
 ### OpenAI / ChatGPT
 
@@ -91,7 +91,8 @@ including auth, database, logs, preferences and backups. Do not track or share t
 OAuth tokens are managed/refreshed by Codex, never read into the bridge or native display/trace/audit.
 `RELAY_CODEX_EXECUTABLE` selects another Codex executable if needed.
 
-Ephemeral threads register the generated public native methods as experimental dynamic tools.
+Private persisted threads under `.relay/openai` register the generated public native methods as
+experimental dynamic tools and can resume after an App Server restart.
 Each invocation goes through the same native authorization as MCP. Host/bridge administration is
 not registered. The isolated empty workspace is read-only, with shell/exec, browser/computer,
 apps, delegation and general code mode disabled. The stable code-mode tool host stays enabled
@@ -113,22 +114,35 @@ No credential is forwarded in the native child environment or returned in provid
 editor submissions are transient in the mailbox and excluded from scenes/projects/traces/audits.
 
 Limited-access compatible chat bounds rounds (8), calls (16) and total HTTP work (90 seconds).
-Auto approval continues until completion or Stop. Individual HTTP requests (30 seconds) and response
+Auto approval continues until completion or Stop. Individual HTTP requests (120 seconds with Allow all actions, otherwise 30 seconds) and response
 size (256 KiB) remain bounded; redirects/credential-bearing endpoint URLs are refused. Provider
 failure bodies are not echoed; configured keys are redacted and refused in tool arguments.
 
 ## Open reliability work
 
 Phase G is not complete. Intermittent ChatGPT/App Server disconnections have been reported during
-multi-minute agent work; no root cause or reliable recovery is established. Future work should
-reproduce this with sustained background fixtures and sanitized process/RPC lifecycle diagnostics,
-then verify that recovery preserves completed actions and does not repeat scene mutations.
+multi-minute agent work; the original live-provider root cause is not yet established. The
+implemented recovery resumes the original private thread, waits for in-flight native actions,
+reconciles the current scene/checkpoint and continues remaining work. Stable call IDs deduplicate
+mutations, including lost replies; stale transport/turn events cannot run new actions. Three
+consecutive unsuccessful recoveries stop safely; successful tool progress resets the retry budget.
+Stop cancels reconnect backoff, and project switches pause the task. Recovery does not restart a
+failed native editor or a restarted bridge process, and never substitutes a fresh conversation
+when original-thread resume fails. Account/usage failures require user action.
+
+Full tool JSON reaches inference; UI summaries stay bounded. Shared instructions cover local
+geometry, degrees versus camera radians, preserving human work and repeated PNG visual review.
+Activity > Connection diagnostics exposes only bounded lifecycle/error-category metadata; no raw
+provider stderr or private messages. RPC acknowledgements allow 120 seconds. Active reasoning has
+no task deadline; 30-second completion checks read metadata and the latest turn summary (not complete capture history) to reconcile missing terminal notifications, and three
+failed completion checks retire an unresponsive service. Mutation deduplication storage is bounded
+to 64 MiB per submission; PNG payloads are not retained in that ledger.
 Never store credentials or private conversation data in tracked diagnostics.
 
 Normal `relay_demo --editor` starts the bridge automatically and registers tools with the built-in
 OpenAI agent as dynamic tools. This is separate from the standalone MCP transport for external
 hosts; the editor does not expose an attachable MCP endpoint. Existing background tests validate
-bounded protocol/workflow cases, not long-duration live-provider reliability. New composer/camera
+protocol/workflow recovery and sustained native work, not long-duration live-provider reliability. New composer/camera
 desktop checks and live image-based review remain pending; the earlier live native-tool check passed.
 
 ## Background verification
@@ -136,8 +150,14 @@ desktop checks and live image-based review remain pending; the earlier live nati
 `npm test` uses mock service/fetch and the real `relay_session_test_host` native fixture, covering
 authentication projection, sign-in/cancel/logout, model/reasoning persistence, streamed messages,
 tool authorization, pending approval and Stop. The installed-runtime test creates a fresh temporary
-Codex home, reads signed-out account/model metadata and registers all tools in an ephemeral thread;
-it never starts a model turn or opens a browser/window. It skips only if Codex is unavailable.
+Codex home, reads signed-out account/model metadata and registers all tools in a private persisted thread;
+it never starts a model turn or opens a browser/window. It skips only if Codex is unavailable. `app-server.test.mjs` runs the real App Server against a
+private loopback Responses fixture, verifies a completed dynamic tool result, then restarts and
+resumes the persisted conversation/tools. It needs local socket access but no OpenAI account.
+Run `RELAY_SUSTAINED_TEST_MS=130000 node --test tests/sustained.test.mjs` for the opt-in wall-clock
+native editing/PNG fixture with two injected service disconnects. It uses deterministic CPU
+captures and makes no desktop or OpenAI requests. Native development/release suites should run
+sequentially because they share import fixtures.
 `RELAY_SESSION_TEST_HOST` and `RELAY_ENGINE_BINARY` select release targets. Native headless ImGui
 coverage verifies the same account/model controls without OS input. Desktop visual checks and live
 account authentication/generation are separate verification scopes.
@@ -153,3 +173,50 @@ permissions, without modifying scene cameras or undo. Set uses target coordinate
 `render_capture` PNG replies include image content for visual review. Only bounded PNG files
 under the safe capture directory are read; no image payload enters native UI projections/audits.
 Deterministic CPU capture behavior is unchanged. Camera tools fail closed in headless mode.
+
+### Human file attachments and local media
+
+Host-only `chat.submit` accepts an optional array of eight selected file paths and permits empty
+message text when files are present. The picker is opened by a human attach-button press; drop
+handling uses SDL drop events over the composer. The editor displays removable attachment chips.
+The external bridge reads only those human-selected regular files, refuses final symlinks and
+bounds each file to 16 MiB, each message to 32 MiB and conversation memory to 128 MiB. Copies live
+in ignored `.relay/chat-files` with private permissions. Images become native provider image parts;
+small UTF-8 files receive explicitly untrusted text previews. `chat_attachment_read` is an extra
+bridge tool that accepts opaque attachment IDs and bounded byte ranges, never arbitrary paths.
+Binary data and chunks split inside a UTF-8 character are returned losslessly as base64. This does
+not add a filesystem tool to the engine MCP catalog, which remains 72 tools. Binary documents
+are not automatically extracted. Attachment-read capabilities clear on new chat or sign-out.
+
+Assistant Markdown media embeds display local PNG/JPEG images and silent WebM/MP4/MOV video with
+play/pause and seeking in the editor. Decoders use background workers; video containers are read
+from memory, with external protocols disabled. Rendering accepts only paths confined to captures
+and chat attachments. No remote fetching or desktop application launching occurs. Optional FFmpeg
+libraries enable video playback; missing support is shown explicitly. CPU-only headless coverage
+checks picker/drop/submission, provider image parts, file-read boundaries, PNG/WebM decoding and
+texture cleanup. The native GPU presentation and real system picker are not exercised by these
+background tests.
+
+Clicking a human or assistant media thumbnail opens a modal viewer covering the main editor viewport
+with a dark translucent backdrop. Pictures fit initially, zoom around the cursor with the wheel,
+and pan with left-button drag. Escape and backdrop clicks dismiss it, including the footer outside
+video controls. Videos retain play/pause/seeking, even when the chat thumbnail is not visible.
+The viewer blocks editor shortcuts and composer drop targets. Large image decoding is limited to
+4096 pixels per side on workers, and closed images return to ordinary preview resolution. Human
+attachment display projections now include confined Markdown media references with no image bytes.
+Headless interaction tests cover picture opening, zoom, pan, both dismissal paths, video opening,
+and playback while the inline thumbnail is not drawn.
+
+### Composer account usage meters
+
+The OpenAI adapter reads `account/rateLimits/read` and merges sparse `account/rateLimits/updated`
+notifications, following the [App Server protocol](https://developers.openai.com/codex/app-server).
+The Codex bucket is preferred over the legacy single-bucket response. Five-hour and weekly windows
+are identified by explicit 300/10080-minute durations, regardless of primary/secondary ordering.
+Only bounded consumed percentages enter the editor projection. Telemetry reads run without blocking
+submission polling, refresh at most once a minute, and cannot interrupt editing on failure.
+Account changes and sign-out clear prior values; unknown windows are not inferred as zero usage.
+The UI displays "5-Hourly: N%" and "Weekly: N%" below and outside the rounded input container,
+with grey fill through 80%, yellow above 80%, and red above 90%. Contrast changes at the fill
+boundary, and the two outlined pills share an equal-width row. Compatible providers and missing
+data display `--`.

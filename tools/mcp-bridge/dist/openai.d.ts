@@ -11,6 +11,7 @@ export interface RpcTransport {
     reply(id: string | number, result: JsonObject): void;
     onMessage: (method: string, params: JsonObject, id?: string | number) => void;
     close(): void;
+    diagnostics?(): JsonObject;
 }
 export declare function captureImage(root: string, result: JsonObject): JsonObject | undefined;
 export declare class HarnessPreferences {
@@ -26,18 +27,20 @@ export declare class HarnessPreferences {
 export declare class CodexTransport implements RpcTransport {
     #private;
     onMessage: RpcTransport["onMessage"];
-    constructor(root: string, executable?: string);
+    constructor(root: string, executable?: string, configurationOverrides?: string[]);
     request(method: string, params?: JsonObject): Promise<JsonObject>;
     reply(id: string | number, result: JsonObject): void;
     notify(method: string): void;
+    diagnostics(): JsonObject;
     close(): void;
 }
 export declare class OpenAiHarness {
     #private;
-    constructor(root: string, invoke: Invoke, preferences: HarnessPreferences, factory?: () => RpcTransport);
+    refreshUsage(force?: boolean): Promise<void>;
+    constructor(root: string, invoke: Invoke, preferences: HarnessPreferences, factory?: () => RpcTransport, pollMilliseconds?: number);
     view(): JsonObject;
     control(control: Control): Promise<void>;
-    submit(message: string, publish: () => Promise<void>): Promise<void>;
+    submit(message: string, publish: () => Promise<void>, attachmentPaths?: string[]): Promise<void>;
     cancel(): void;
     close(): void;
 }

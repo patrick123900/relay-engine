@@ -82,6 +82,9 @@ struct VulkanWindow::Impl {
     VkDeviceMemory mesh_index_memory{};
     VkBuffer material_buffer{};
     VkDeviceMemory material_memory{};
+    VkDeviceSize mesh_vertex_capacity{}, mesh_index_capacity{}, material_capacity{};
+    std::size_t uploaded_vertex_count{}, uploaded_index_count{};
+    std::size_t uploaded_material_count{}, uploaded_texture_count{};
     struct GpuTexture {
         VkImage image{};
         VkDeviceMemory memory{};
@@ -93,9 +96,24 @@ struct VulkanWindow::Impl {
     VkDescriptorSetLayout texture_layout{};
     VkDescriptorPool texture_pool{};
     std::array<VkDescriptorSet, frames_in_flight> texture_sets{};
+    struct AssetResources {
+        VkBuffer vertex_buffer{}, index_buffer{}, material_buffer{};
+        VkDeviceMemory vertex_memory{}, index_memory{}, material_memory{};
+        std::vector<GpuTexture> textures;
+        VkDescriptorPool descriptor_pool{};
+        std::array<VkDescriptorSet, frames_in_flight> descriptor_sets{};
+        VkDeviceSize vertex_capacity{}, index_capacity{}, material_capacity{};
+        std::size_t vertex_count{}, index_count{}, material_count{}, texture_count{};
+        std::uint64_t revision{};
+    };
+    std::optional<AssetResources> retired_assets;
     std::array<VkBuffer, frames_in_flight> deformed_buffers{}, lighting_buffers{};
     std::array<VkDeviceMemory, frames_in_flight> deformed_memories{}, lighting_memories{};
     std::array<VkDeviceSize, frames_in_flight> deformed_capacities{};
+    VkCommandBuffer upload_commands{};
+    VkFence upload_fence{};
+    std::vector<VkBuffer> upload_staging_buffers;
+    std::vector<VkDeviceMemory> upload_staging_memories;
     struct alignas(16) GpuLight {
         std::array<float, 4> position_type{}, direction_inner{}, color_intensity{},
             attenuation_outer{};
@@ -105,6 +123,13 @@ struct VulkanWindow::Impl {
         std::array<float, 4> camera_count{0, 0, 5, 0};
         std::array<GpuLight, 16> lights{};
     };
+    struct alignas(16) GpuMaterial {
+        std::array<float, 4> base_color_factor;
+        std::array<float, 4> emissive_metallic;
+        std::array<float, 4> surface_parameters;
+        std::array<std::uint32_t, 4> texture_indices;
+    };
+    static_assert(sizeof(GpuMaterial) == 64U);
     static_assert(sizeof(GpuLight)==80U && sizeof(GpuLighting)==1296U);
     VkSwapchainKHR swapchain{};
     VkFormat swapchain_format{VK_FORMAT_UNDEFINED};
@@ -115,6 +140,7 @@ struct VulkanWindow::Impl {
     VkRenderPass render_pass{};
     VkPipelineLayout pipeline_layout{};
     VkPipeline pipeline{};
+    VkPipeline transparent_pipeline{};
     VkPipeline grid_pipeline{};
     VkPipeline selection_mask_pipeline{}, selection_outline_pipeline{};
     // Each swapchain image owns its depth attachment. Multiple frames may be executing on the GPU
@@ -163,6 +189,11 @@ struct VulkanWindow::Impl {
 
     ~Impl() {
         if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
+        cleanup_upload_batch();
+        if (retired_assets.has_value()) {
+            destroy_asset_resources(*retired_assets);
+            retired_assets.reset();
+        }
         flush_readbacks();
         for (auto& slot : readbacks) {
             if (device) { vkDestroyBuffer(device, slot.buffer, nullptr); vkFreeMemory(device, slot.memory, nullptr); }
@@ -223,10 +254,12 @@ struct VulkanWindow::Impl {
             last_error = "render graph compilation failed: " + render_graph.error;
             return false;
         }
-        return create_instance() && create_surface() && pick_physical_device() &&
-               create_logical_device() && create_timestamp_pool() && create_command_pool() &&
-               create_mesh_buffers() && create_texture_resources() && create_swapchain_resources() &&
-               create_sync_objects();
+        if (!(create_instance() && create_surface() && pick_physical_device() &&
+              create_logical_device() && create_timestamp_pool() && create_command_pool() &&
+              begin_upload_batch() && create_mesh_buffers() && create_texture_resources() &&
+              finish_upload_batch()))
+            return false;
+        return create_swapchain_resources() && create_sync_objects();
     }
 
     bool create_instance() {
@@ -468,9 +501,138 @@ struct VulkanWindow::Impl {
         return true;
     }
 
+    void cleanup_upload_batch() {
+        if (device == VK_NULL_HANDLE) return;
+        for (const auto buffer : upload_staging_buffers)
+            vkDestroyBuffer(device, buffer, nullptr);
+        for (const auto memory : upload_staging_memories)
+            vkFreeMemory(device, memory, nullptr);
+        upload_staging_buffers.clear();
+        upload_staging_memories.clear();
+        if (upload_commands != VK_NULL_HANDLE && command_pool != VK_NULL_HANDLE)
+            vkFreeCommandBuffers(device, command_pool, 1U, &upload_commands);
+        upload_commands = VK_NULL_HANDLE;
+        vkDestroyFence(device, upload_fence, nullptr);
+        upload_fence = VK_NULL_HANDLE;
+    }
+
+    AssetResources release_active_assets() {
+        AssetResources released{mesh_vertex_buffer, mesh_index_buffer, material_buffer,
+                                mesh_vertex_memory, mesh_index_memory, material_memory,
+                                std::move(textures), texture_pool, texture_sets,
+                                mesh_vertex_capacity, mesh_index_capacity, material_capacity,
+                                uploaded_vertex_count, uploaded_index_count,
+                                uploaded_material_count, uploaded_texture_count,
+                                uploaded_asset_revision};
+        mesh_vertex_buffer = mesh_index_buffer = material_buffer = VK_NULL_HANDLE;
+        mesh_vertex_memory = mesh_index_memory = material_memory = VK_NULL_HANDLE;
+        texture_pool = VK_NULL_HANDLE;
+        texture_sets.fill(VK_NULL_HANDLE);
+        mesh_vertex_capacity = mesh_index_capacity = material_capacity = 0U;
+        uploaded_vertex_count = uploaded_index_count = 0U;
+        uploaded_material_count = uploaded_texture_count = 0U;
+        uploaded_asset_revision = 0U;
+        return released;
+    }
+
+    void restore_active_assets(AssetResources resources) {
+        mesh_vertex_buffer = resources.vertex_buffer;
+        mesh_index_buffer = resources.index_buffer;
+        material_buffer = resources.material_buffer;
+        mesh_vertex_memory = resources.vertex_memory;
+        mesh_index_memory = resources.index_memory;
+        material_memory = resources.material_memory;
+        textures = std::move(resources.textures);
+        texture_pool = resources.descriptor_pool;
+        texture_sets = resources.descriptor_sets;
+        mesh_vertex_capacity = resources.vertex_capacity;
+        mesh_index_capacity = resources.index_capacity;
+        material_capacity = resources.material_capacity;
+        uploaded_vertex_count = resources.vertex_count;
+        uploaded_index_count = resources.index_count;
+        uploaded_material_count = resources.material_count;
+        uploaded_texture_count = resources.texture_count;
+        uploaded_asset_revision = resources.revision;
+    }
+
+    void destroy_asset_resources(const AssetResources& resources) {
+        vkDestroyBuffer(device, resources.index_buffer, nullptr);
+        vkFreeMemory(device, resources.index_memory, nullptr);
+        vkDestroyBuffer(device, resources.vertex_buffer, nullptr);
+        vkFreeMemory(device, resources.vertex_memory, nullptr);
+        vkDestroyBuffer(device, resources.material_buffer, nullptr);
+        vkFreeMemory(device, resources.material_memory, nullptr);
+        vkDestroyDescriptorPool(device, resources.descriptor_pool, nullptr);
+        for (const auto& texture : resources.textures) {
+            vkDestroySampler(device, texture.sampler, nullptr);
+            vkDestroyImageView(device, texture.view, nullptr);
+            vkDestroyImage(device, texture.image, nullptr);
+            vkFreeMemory(device, texture.memory, nullptr);
+        }
+    }
+
+    bool collect_upload_batch() {
+        if (upload_fence == VK_NULL_HANDLE) return true;
+        const auto result = vkGetFenceStatus(device, upload_fence);
+        if (result == VK_NOT_READY) return true;
+        if (result != VK_SUCCESS) {
+            last_error = vk_error("checking asset upload batch", result);
+            return false;
+        }
+        cleanup_upload_batch();
+        if (retired_assets.has_value()) {
+            destroy_asset_resources(*retired_assets);
+            retired_assets.reset();
+        }
+        return true;
+    }
+
+    bool begin_upload_batch() {
+        cleanup_upload_batch();
+        VkFenceCreateInfo fence_info{};
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        auto result = vkCreateFence(device, &fence_info, nullptr, &upload_fence);
+        VkCommandBufferAllocateInfo allocation{};
+        allocation.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocation.commandPool = command_pool;
+        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocation.commandBufferCount = 1U;
+        if (result == VK_SUCCESS)
+            result = vkAllocateCommandBuffers(device, &allocation, &upload_commands);
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (result == VK_SUCCESS) result = vkBeginCommandBuffer(upload_commands, &begin);
+        if (result != VK_SUCCESS) {
+            last_error = vk_error("starting asset upload batch", result);
+            cleanup_upload_batch();
+            return false;
+        }
+        return true;
+    }
+
+    bool finish_upload_batch(const bool wait = true) {
+        auto result = vkEndCommandBuffer(upload_commands);
+        if (result == VK_SUCCESS) {
+            VkSubmitInfo submit{};
+            submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit.commandBufferCount = 1U;
+            submit.pCommandBuffers = &upload_commands;
+            result = vkQueueSubmit(graphics_queue, 1U, &submit, upload_fence);
+        }
+        if (result == VK_SUCCESS && wait)
+            result = vkWaitForFences(device, 1U, &upload_fence, VK_TRUE,
+                                     std::numeric_limits<std::uint64_t>::max());
+        if (result != VK_SUCCESS)
+            last_error = vk_error("asset upload batch", result);
+        if (wait || result != VK_SUCCESS) cleanup_upload_batch();
+        return result == VK_SUCCESS;
+    }
+
     bool upload_buffer(const void* data, const VkDeviceSize size,
                        const VkBufferUsageFlags final_usage, VkBuffer& destination,
-                       VkDeviceMemory& destination_memory) {
+                       VkDeviceMemory& destination_memory,
+                       const VkDeviceSize allocation_size = 0U) {
         VkBuffer staging{};
         VkDeviceMemory staging_memory{};
         if (!create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -483,92 +645,158 @@ struct VulkanWindow::Impl {
             vkUnmapMemory(device, staging_memory);
         }
         if (result == VK_SUCCESS &&
-            !create_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | final_usage,
+            !create_buffer(std::max(size, allocation_size),
+                           VK_BUFFER_USAGE_TRANSFER_DST_BIT | final_usage,
                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, destination, destination_memory)) {
             result = VK_ERROR_INITIALIZATION_FAILED;
         }
-        VkCommandBuffer commands{};
+        if (result == VK_SUCCESS && upload_commands == VK_NULL_HANDLE)
+            result = VK_ERROR_INITIALIZATION_FAILED;
         if (result == VK_SUCCESS) {
-            VkCommandBufferAllocateInfo allocation{};
-            allocation.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            allocation.commandPool = command_pool;
-            allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocation.commandBufferCount = 1U;
-            result = vkAllocateCommandBuffers(device, &allocation, &commands);
+            VkBufferCopy copy{};
+            copy.size = size;
+            vkCmdCopyBuffer(upload_commands, staging, destination, 1U, &copy);
+            upload_staging_buffers.push_back(staging);
+            upload_staging_memories.push_back(staging_memory);
+        } else {
+            vkDestroyBuffer(device, staging, nullptr);
+            vkFreeMemory(device, staging_memory, nullptr);
         }
-        if (result == VK_SUCCESS) {
-            VkCommandBufferBeginInfo begin{};
-            begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            result = vkBeginCommandBuffer(commands, &begin);
-            if (result == VK_SUCCESS) {
-                VkBufferCopy copy{};
-                copy.size = size;
-                vkCmdCopyBuffer(commands, staging, destination, 1U, &copy);
-                result = vkEndCommandBuffer(commands);
-            }
-        }
-        if (result == VK_SUCCESS) {
-            VkSubmitInfo submit{};
-            submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            submit.commandBufferCount = 1U;
-            submit.pCommandBuffers = &commands;
-            // This upload synchronizes with vkQueueWaitIdle and submits no fence, so there is
-            // nothing to reset here. The frame fences do not exist yet during initialization.
-            result = vkQueueSubmit(graphics_queue, 1U, &submit, VK_NULL_HANDLE);
-            if (result == VK_SUCCESS) result = vkQueueWaitIdle(graphics_queue);
-        }
-        if (commands != VK_NULL_HANDLE) vkFreeCommandBuffers(device, command_pool, 1U, &commands);
-        vkDestroyBuffer(device, staging, nullptr);
-        vkFreeMemory(device, staging_memory, nullptr);
         if (result != VK_SUCCESS) {
-            last_error = vk_error("mesh asset upload", result);
+            last_error = vk_error("recording buffer asset upload", result);
             return false;
         }
         return true;
     }
 
+    bool upload_buffer_region(const void* data, const VkDeviceSize size,
+                              const VkBuffer destination, const VkDeviceSize destination_offset) {
+        if (size == 0U) return true;
+        VkBuffer staging{};
+        VkDeviceMemory staging_memory{};
+        if (!create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                           staging, staging_memory))
+            return false;
+        void* mapped = nullptr;
+        auto result = vkMapMemory(device, staging_memory, 0U, size, 0U, &mapped);
+        if (result == VK_SUCCESS) {
+            std::memcpy(mapped, data, static_cast<std::size_t>(size));
+            vkUnmapMemory(device, staging_memory);
+        }
+        if (result == VK_SUCCESS && upload_commands == VK_NULL_HANDLE)
+            result = VK_ERROR_INITIALIZATION_FAILED;
+        if (result == VK_SUCCESS) {
+            VkBufferCopy copy{};
+            copy.dstOffset = destination_offset;
+            copy.size = size;
+            vkCmdCopyBuffer(upload_commands, staging, destination, 1U, &copy);
+            upload_staging_buffers.push_back(staging);
+            upload_staging_memories.push_back(staging_memory);
+            return true;
+        }
+        vkDestroyBuffer(device, staging, nullptr);
+        vkFreeMemory(device, staging_memory, nullptr);
+        last_error = vk_error("recording incremental buffer upload", result);
+        return false;
+    }
+
+    static VkDeviceSize growing_capacity(const VkDeviceSize used) {
+        VkDeviceSize capacity = 1U;
+        while (capacity <= used && capacity <= std::numeric_limits<VkDeviceSize>::max() / 2U)
+            capacity *= 2U;
+        return std::max(capacity, used);
+    }
+
     bool create_mesh_buffers() {
         const auto vertices = assets->mesh_vertices();
         const auto indices = assets->mesh_indices();
+        mesh_vertex_capacity = growing_capacity(vertices.size_bytes());
+        mesh_index_capacity = growing_capacity(indices.size_bytes());
+        uploaded_vertex_count = vertices.size();
+        uploaded_index_count = indices.size();
         return upload_buffer(vertices.data(), vertices.size_bytes(),
                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                             mesh_vertex_buffer, mesh_vertex_memory) &&
+                             mesh_vertex_buffer, mesh_vertex_memory, mesh_vertex_capacity) &&
                upload_buffer(indices.data(), indices.size_bytes(),
                              VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                             mesh_index_buffer, mesh_index_memory);
+                             mesh_index_buffer, mesh_index_memory, mesh_index_capacity);
     }
 
     bool refresh_mesh_assets() {
         if (uploaded_asset_revision == assets->revision()) return true;
-        auto result = vkDeviceWaitIdle(device);
-        if (result != VK_SUCCESS) {
-            last_error = vk_error("waiting to refresh imported meshes", result);
+        // Coalesce revisions that arrive while a batch is in flight. The next frame after its fence
+        // signals will submit one replacement containing the newest complete registry state.
+        if (upload_fence != VK_NULL_HANDLE) return true;
+        const auto vertices = assets->mesh_vertices();
+        const auto indices = assets->mesh_indices();
+        const auto vertex_bytes = vertices.size_bytes();
+        const auto index_bytes = indices.size_bytes();
+        const auto material_bytes = assets->materials().size() * sizeof(GpuMaterial);
+        const bool incremental_append =
+            assets->materials().size() >= uploaded_material_count &&
+            assets->textures().size() == uploaded_texture_count &&
+            vertices.size() >= uploaded_vertex_count && indices.size() >= uploaded_index_count &&
+            vertex_bytes <= mesh_vertex_capacity && index_bytes <= mesh_index_capacity &&
+            material_bytes <= material_capacity;
+        if (incremental_append) {
+            if (!begin_upload_batch()) return false;
+            const auto new_vertices = vertices.subspan(uploaded_vertex_count);
+            const auto new_indices = indices.subspan(uploaded_index_count);
+            const auto new_materials = make_gpu_materials(uploaded_material_count);
+            const bool recorded =
+                upload_buffer_region(new_vertices.data(), new_vertices.size_bytes(),
+                                     mesh_vertex_buffer,
+                                     uploaded_vertex_count * sizeof(MeshVertex)) &&
+                upload_buffer_region(new_indices.data(), new_indices.size_bytes(),
+                                     mesh_index_buffer,
+                                     uploaded_index_count * sizeof(std::uint32_t)) &&
+                upload_buffer_region(new_materials.data(),
+                                     new_materials.size() * sizeof(GpuMaterial), material_buffer,
+                                     uploaded_material_count * sizeof(GpuMaterial));
+            if (!recorded) {
+                cleanup_upload_batch();
+                return false;
+            }
+            if (!finish_upload_batch(false)) return false;
+            uploaded_vertex_count = vertices.size();
+            uploaded_index_count = indices.size();
+            uploaded_material_count = assets->materials().size();
+            uploaded_asset_revision = assets->revision();
+            return true;
+        }
+        if (!begin_upload_batch()) return false;
+        auto previous = release_active_assets();
+        // AssetRegistry is append-only. Copy the old handles into the candidate descriptor table;
+        // ownership remains with `previous` until submission succeeds.
+        const auto reused_texture_count = previous.textures.size();
+        textures = previous.textures;
+        const auto destroy_incomplete = [&] {
+            auto incomplete = release_active_assets();
+            incomplete.textures.erase(
+                incomplete.textures.begin(),
+                incomplete.textures.begin() + static_cast<std::ptrdiff_t>(
+                                                  std::min(reused_texture_count,
+                                                           incomplete.textures.size())));
+            destroy_asset_resources(incomplete);
+        };
+        if (!(create_mesh_buffers() && create_texture_resources())) {
+            cleanup_upload_batch();
+            destroy_incomplete();
+            restore_active_assets(std::move(previous));
             return false;
         }
-        vkDestroyBuffer(device, mesh_index_buffer, nullptr);
-        vkFreeMemory(device, mesh_index_memory, nullptr);
-        vkDestroyBuffer(device, mesh_vertex_buffer, nullptr);
-        vkFreeMemory(device, mesh_vertex_memory, nullptr);
-        mesh_index_buffer = VK_NULL_HANDLE;
-        mesh_index_memory = VK_NULL_HANDLE;
-        mesh_vertex_buffer = VK_NULL_HANDLE;
-        mesh_vertex_memory = VK_NULL_HANDLE;
-        vkDestroyBuffer(device, material_buffer, nullptr);
-        vkFreeMemory(device, material_memory, nullptr);
-        material_buffer = VK_NULL_HANDLE;
-        material_memory = VK_NULL_HANDLE;
-        vkDestroyDescriptorPool(device, texture_pool, nullptr);
-        texture_pool = VK_NULL_HANDLE;
-        texture_sets.fill(VK_NULL_HANDLE);
-        for (const auto& texture : textures) {
-            vkDestroySampler(device, texture.sampler, nullptr);
-            vkDestroyImageView(device, texture.view, nullptr);
-            vkDestroyImage(device, texture.image, nullptr);
-            vkFreeMemory(device, texture.memory, nullptr);
+        if (!finish_upload_batch(false)) {
+            destroy_incomplete();
+            restore_active_assets(std::move(previous));
+            return false;
         }
-        textures.clear();
-        return create_mesh_buffers() && create_texture_resources();
+        // The upload was enqueued after every frame that can reference `previous`. Later draws are
+        // enqueued after the upload, so the new handles are safe immediately; the fence covers both
+        // upload completion and the last possible use of the retired set.
+        previous.textures.clear();
+        retired_assets = std::move(previous);
+        return true;
     }
 
     bool create_texture_image(const TextureAsset& asset, GpuTexture& texture) {
@@ -636,21 +864,8 @@ struct VulkanWindow::Impl {
             std::memcpy(mapped, asset.rgba.data(), asset.rgba.size());
             vkUnmapMemory(device, staging_memory);
         }
-        VkCommandBuffer commands{};
-        if (result == VK_SUCCESS) {
-            VkCommandBufferAllocateInfo command_allocation{};
-            command_allocation.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            command_allocation.commandPool = command_pool;
-            command_allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            command_allocation.commandBufferCount = 1U;
-            result = vkAllocateCommandBuffers(device, &command_allocation, &commands);
-        }
-        if (result == VK_SUCCESS) {
-            VkCommandBufferBeginInfo begin{};
-            begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            result = vkBeginCommandBuffer(commands, &begin);
-        }
+        if (result == VK_SUCCESS && upload_commands == VK_NULL_HANDLE)
+            result = VK_ERROR_INITIALIZATION_FAILED;
         if (result == VK_SUCCESS) {
             VkImageMemoryBarrier initial{};
             initial.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -664,14 +879,14 @@ struct VulkanWindow::Impl {
             initial.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             initial.subresourceRange.levelCount = texture.mip_levels;
             initial.subresourceRange.layerCount = 1U;
-            vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            vkCmdPipelineBarrier(upload_commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr,
                                  1U, &initial);
             VkBufferImageCopy copy{};
             copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             copy.imageSubresource.layerCount = 1U;
             copy.imageExtent = {asset.width, asset.height, 1U};
-            vkCmdCopyBufferToImage(commands, staging, texture.image,
+            vkCmdCopyBufferToImage(upload_commands, staging, texture.image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &copy);
             std::int32_t mip_width = static_cast<std::int32_t>(asset.width);
             std::int32_t mip_height = static_cast<std::int32_t>(asset.height);
@@ -689,7 +904,7 @@ struct VulkanWindow::Impl {
                 source.subresourceRange.baseMipLevel = level - 1U;
                 source.subresourceRange.levelCount = 1U;
                 source.subresourceRange.layerCount = 1U;
-                vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vkCmdPipelineBarrier(upload_commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr,
                                      1U, &source);
                 VkImageBlit blit{};
@@ -701,14 +916,14 @@ struct VulkanWindow::Impl {
                 blit.dstSubresource.mipLevel = level;
                 blit.dstSubresource.layerCount = 1U;
                 blit.dstOffsets[1] = {std::max(mip_width / 2, 1), std::max(mip_height / 2, 1), 1};
-                vkCmdBlitImage(commands, texture.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                vkCmdBlitImage(upload_commands, texture.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &blit,
                                VK_FILTER_LINEAR);
                 source.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
                 source.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
                 source.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
                 source.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vkCmdPipelineBarrier(upload_commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0U, 0U, nullptr,
                                      0U, nullptr, 1U, &source);
                 mip_width = std::max(mip_width / 2, 1);
@@ -727,26 +942,19 @@ struct VulkanWindow::Impl {
             last.subresourceRange.baseMipLevel = texture.mip_levels - 1U;
             last.subresourceRange.levelCount = 1U;
             last.subresourceRange.layerCount = 1U;
-            vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            vkCmdPipelineBarrier(upload_commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0U, 0U, nullptr, 0U,
                                  nullptr, 1U, &last);
-            result = vkEndCommandBuffer(commands);
         }
         if (result == VK_SUCCESS) {
-            VkSubmitInfo submit{};
-            submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            submit.commandBufferCount = 1U;
-            submit.pCommandBuffers = &commands;
-            // Same as the mesh upload: no fence is submitted, and initialization has not created
-            // the frame fences yet.
-            result = vkQueueSubmit(graphics_queue, 1U, &submit, VK_NULL_HANDLE);
-            if (result == VK_SUCCESS) result = vkQueueWaitIdle(graphics_queue);
+            upload_staging_buffers.push_back(staging);
+            upload_staging_memories.push_back(staging_memory);
+        } else {
+            vkDestroyBuffer(device, staging, nullptr);
+            vkFreeMemory(device, staging_memory, nullptr);
         }
-        if (commands != VK_NULL_HANDLE) vkFreeCommandBuffers(device, command_pool, 1U, &commands);
-        vkDestroyBuffer(device, staging, nullptr);
-        vkFreeMemory(device, staging_memory, nullptr);
         if (result != VK_SUCCESS) {
-            last_error = vk_error("texture upload and mip generation", result);
+            last_error = vk_error("recording texture upload and mip generation", result);
             return false;
         }
         VkImageViewCreateInfo view_info{};
@@ -792,31 +1000,16 @@ struct VulkanWindow::Impl {
         return true;
     }
 
-    bool create_texture_resources() {
-        const auto texture_assets = assets->textures();
-        if (texture_assets.empty() || texture_assets.size() > bindless_texture_capacity) {
-            last_error = "built-in textures exceed the bindless table capacity";
-            return false;
-        }
-        textures.resize(texture_assets.size());
-        for (std::size_t index = 0; index < texture_assets.size(); ++index) {
-            if (!create_texture_image(texture_assets[index], textures[index])) return false;
-        }
-        struct alignas(16) GpuMaterial {
-            std::array<float, 4> base_color_factor;
-            std::array<float, 4> emissive_metallic;
-            std::array<float, 4> surface_parameters;
-            std::array<std::uint32_t, 4> texture_indices;
-        };
-        static_assert(sizeof(GpuMaterial) == 64U);
+    std::vector<GpuMaterial> make_gpu_materials(const std::size_t first = 0U) const {
         const auto missing_texture = std::numeric_limits<std::uint32_t>::max();
         const auto texture_slot = [&](const std::string& name) {
             return !name.empty() && assets->find_texture(name) != nullptr
                        ? assets->texture_index(name) : missing_texture;
         };
         std::vector<GpuMaterial> gpu_materials;
-        gpu_materials.reserve(assets->materials().size());
-        for (const auto& material : assets->materials()) {
+        const auto materials = assets->materials();
+        gpu_materials.reserve(materials.size() - std::min(first, materials.size()));
+        for (const auto& material : materials.subspan(std::min(first, materials.size()))) {
             const auto occlusion = texture_slot(material.occlusion_texture);
             const auto emissive = texture_slot(material.emissive_texture);
             const auto packed = (occlusion == missing_texture ? 0xFFU : occlusion) |
@@ -832,9 +1025,26 @@ struct VulkanWindow::Impl {
                 {texture_slot(material.texture), texture_slot(material.metallic_roughness_texture),
                  texture_slot(material.normal_texture), packed}});
         }
+        return gpu_materials;
+    }
+
+    bool create_texture_resources() {
+        const auto texture_assets = assets->textures();
+        if (texture_assets.empty() || texture_assets.size() > bindless_texture_capacity) {
+            last_error = "built-in textures exceed the bindless table capacity";
+            return false;
+        }
+        const auto first_new_texture = textures.size();
+        textures.resize(texture_assets.size());
+        for (std::size_t index = first_new_texture; index < texture_assets.size(); ++index) {
+            if (!create_texture_image(texture_assets[index], textures[index])) return false;
+        }
+        const auto gpu_materials = make_gpu_materials();
+        material_capacity = growing_capacity(gpu_materials.size() * sizeof(GpuMaterial));
         if (gpu_materials.empty() ||
             !upload_buffer(gpu_materials.data(), gpu_materials.size() * sizeof(GpuMaterial),
-                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, material_buffer, material_memory)) {
+                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, material_buffer, material_memory,
+                           material_capacity)) {
             return false;
         }
         auto result = VK_SUCCESS;
@@ -888,7 +1098,7 @@ struct VulkanWindow::Impl {
         }
         VkDescriptorBufferInfo material_info{};
         material_info.buffer = material_buffer;
-        material_info.range = gpu_materials.size() * sizeof(GpuMaterial);
+        material_info.range = material_capacity;
         std::array<VkWriteDescriptorSet, 3> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstBinding = 0U;
@@ -916,6 +1126,8 @@ struct VulkanWindow::Impl {
             vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(),
                                    0U, nullptr);
         }
+        uploaded_material_count = assets->materials().size();
+        uploaded_texture_count = assets->textures().size();
         uploaded_asset_revision = assets->revision();
         return true;
     }
@@ -1318,6 +1530,22 @@ struct VulkanWindow::Impl {
             result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline);
         }
         if (result == VK_SUCCESS) {
+            // Transparent geometry keeps depth testing but cannot write depth, and uses straight
+            // alpha source-over compositing. RenderScene orders these draws back to front.
+            depth_stencil.depthWriteEnable = VK_FALSE;
+            blend_attachment.blendEnable = VK_TRUE;
+            blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+            blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+            result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
+                                               &transparent_pipeline);
+            blend_attachment.blendEnable = VK_FALSE;
+            depth_stencil.depthWriteEnable = VK_TRUE;
+        }
+        if (result == VK_SUCCESS) {
             const auto selection_vertex = read_shader(RELAY_SELECTION_VERTEX_PATH, last_error);
             const auto selection_fragment = read_shader(RELAY_SELECTION_FRAGMENT_PATH, last_error);
             const auto vertex_layout = reflect_spirv(selection_vertex);
@@ -1478,6 +1706,8 @@ struct VulkanWindow::Impl {
         selection_mask_pipeline = selection_outline_pipeline = VK_NULL_HANDLE;
         vkDestroyPipeline(device, grid_pipeline, nullptr);
         grid_pipeline = VK_NULL_HANDLE;
+        vkDestroyPipeline(device, transparent_pipeline, nullptr);
+        transparent_pipeline = VK_NULL_HANDLE;
         vkDestroyPipeline(device, pipeline, nullptr);
         pipeline = VK_NULL_HANDLE;
         vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
@@ -1639,10 +1869,17 @@ struct VulkanWindow::Impl {
             vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0U, 1U,
                                     &texture_sets[current_frame], 0U, nullptr);
             if (scene != nullptr && !scene->entities().empty()) {
+                bool transparent_bound = false;
                 for (const auto& draw_instance : render_scene.instances) {
                     const auto* mesh = assets->find_mesh(draw_instance.mesh);
                     if (mesh == nullptr)
                         continue;
+                    if (draw_instance.alpha_blended != transparent_bound) {
+                        vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                          draw_instance.alpha_blended ? transparent_pipeline
+                                                                      : pipeline);
+                        transparent_bound = draw_instance.alpha_blended;
+                    }
                     const auto buffer = draw_instance.deformed_vertex_offset >= 0
                                             ? deformed_buffers[current_frame]
                                             : mesh_vertex_buffer;
@@ -1788,6 +2025,7 @@ struct VulkanWindow::Impl {
               const VkBuffer capture_buffer = VK_NULL_HANDLE) {
         if (submission_failed) return false;
         collect_readbacks(false);
+        if (!collect_upload_batch()) return false;
         if (!refresh_mesh_assets()) return false;
         if (swapchain == VK_NULL_HANDLE) return recreate_swapchain();
         auto result = vkWaitForFences(device, 1, &frame_fences[current_frame], VK_TRUE,

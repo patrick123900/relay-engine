@@ -302,6 +302,37 @@ int main() {
                "opaque instances draw front to back regardless of creation order");
         expect(ordered.instances.front().view_depth < ordered.instances.back().view_depth,
                "render instances carry an increasing camera-relative depth");
+
+        // Blended geometry must follow opaque geometry and composite back to front, regardless of
+        // creation order. Register a material carrying the same metadata an imported glTF uses.
+        relay::AssetRegistry blended_assets;
+        relay::MaterialAsset glass;
+        glass.name = "test.glass";
+        glass.color = {0.5F, 0.7F, 1.0F, 0.4F};
+        glass.alpha_mode = relay::MaterialAsset::AlphaMode::blend;
+        relay::MeshAsset glass_test_mesh;
+        glass_test_mesh.name = "test.glass.mesh";
+        glass_test_mesh.index_count = 1U;
+        expect(blended_assets.register_imported({relay::MeshVertex{}}, {0U}, {glass_test_mesh},
+                                                {glass}),
+               "test registers an alpha-blended material");
+        (void)order_scene.set_mesh_renderer(near_entity,
+                                            relay::MeshRenderer{"builtin.quad", "test.glass"});
+        const auto transparent_far = order_scene.create("Transparent far");
+        auto transparent_far_transform = far_transform;
+        transparent_far_transform.position.z = -8.0;
+        (void)order_scene.set_transform(transparent_far, transparent_far_transform);
+        (void)order_scene.set_mesh_renderer(
+            transparent_far, relay::MeshRenderer{"builtin.quad", "test.glass"});
+        const auto transparent_ordered =
+            relay::build_render_scene(order_scene, blended_assets, 1.0F);
+        expect(transparent_ordered.instances.size() == 3U &&
+                   !transparent_ordered.instances.front().alpha_blended &&
+                   transparent_ordered.instances[1].entity == transparent_far &&
+                   transparent_ordered.instances[2].entity == near_entity &&
+                   transparent_ordered.instances[1].view_depth >
+                       transparent_ordered.instances[2].view_depth,
+               "opaque geometry precedes alpha blending, which draws back to front");
     }
 
     const auto render_graph = relay::make_scene_render_graph();

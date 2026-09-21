@@ -730,6 +730,8 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         instance.texture_index =
             material_asset != nullptr ? texture_slot(material_asset->texture) : missing_texture;
         instance.material_index = material_asset != nullptr ? assets.material_index(material) : 0U;
+        instance.alpha_blended = material_asset != nullptr &&
+                                 material_asset->alpha_mode == MaterialAsset::AlphaMode::blend;
         instance.view_depth = view_depth;
         if (material_asset != nullptr) {
             instance.emissive_metallic = {
@@ -753,11 +755,15 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         }
         output.instances.push_back(std::move(instance));
     }
-    // Opaque geometry draws front to back so the depth test rejects hidden fragments early. The
-    // remaining keys make the order total, so it never depends on entity creation order.
+    // Opaque/masked geometry draws front to back so the depth test rejects hidden fragments early.
+    // Alpha-blended geometry follows it back to front so source-over compositing is correct. The
+    // remaining keys make both groups total and independent of entity creation order.
     std::sort(output.instances.begin(), output.instances.end(),
               [](const RenderInstance& a, const RenderInstance& b) {
-                  if (a.view_depth != b.view_depth) return a.view_depth < b.view_depth;
+                  if (a.alpha_blended != b.alpha_blended) return !a.alpha_blended;
+                  if (a.view_depth != b.view_depth)
+                      return a.alpha_blended ? a.view_depth > b.view_depth
+                                             : a.view_depth < b.view_depth;
                   if (a.mesh != b.mesh) return a.mesh < b.mesh;
                   if (a.material != b.material) return a.material < b.material;
                   return a.entity.packed() < b.entity.packed();

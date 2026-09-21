@@ -28,8 +28,10 @@ struct RenderInstance {
     std::string material;
     std::uint32_t texture_index{};
     std::uint32_t material_index{};
+    // Alpha-blended instances render after opaque/masked geometry, back to front.
+    bool alpha_blended{false};
     // Distance from the camera plane to the instance's bounds centre. Opaque instances are drawn
-    // in increasing order of this value.
+    // in increasing order; alpha-blended instances use decreasing order.
     float view_depth{};
     std::array<float, 4> emissive_metallic{};
     std::array<float, 4> surface_parameters{1.0F, 1.0F, 1.0F, 0.5F};

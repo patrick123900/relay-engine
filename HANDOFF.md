@@ -36,8 +36,18 @@ without blocking simultaneous human editing.
 ### Rendering and assets
 
 - Deterministic CPU renderer for headless verification.
-- Vulkan presentation, resize/swapchain handling, selection outlines, grid, PBR materials, cameras,
-  punctual lights, animation, skinning, morph targets, and synchronized capture.
+- Vulkan presentation, resize/swapchain handling, selection outlines, grid, PBR materials (including
+  masked and correctly ordered alpha-blended geometry), cameras, punctual lights, animation,
+  skinning, morph targets, and synchronized capture.
+- Asset revisions batch all mesh, material, texture, and mip-generation transfers into one command
+  submission without blocking frame production. Queue ordering makes the replacement visible to
+  later draws; staging allocations and the previous complete resource set retire only after the
+  upload fence signals. Mid-upload registry changes coalesce into the next batch, and setup failures
+  restore the previous set.
+- Vertex, index, and material buffers reserve geometric headroom. Append revisions with an unchanged
+  texture table upload only new geometry/material ranges in place. Replacement batches reuse all
+  unchanged texture images and upload only appended images while atomically replacing descriptors;
+  capacity overflow remains non-blocking.
 - Asynchronous PNG capture and WebM recording with bounded queues and explicit provenance.
 - Native glTF/GLB path; Assimp for OBJ/FBX/DAE; Blender-to-glTF conversion on Linux through a
   Bubblewrap sandbox. Imports are dependency-bounded, content-addressed, and recorded in a manifest.
@@ -104,12 +114,10 @@ without blocking simultaneous human editing.
 
 ## Next priorities
 
-1. Reproduce a long live-provider task using the existing connection diagnostics; fix the observed
-   failure without weakening call deduplication or authorization.
-2. Perform one intentional visual pass of the current Agent UI and an image-guided edit loop.
-3. Continue renderer correctness and asynchronous resource upload work.
-4. Add Windows/macOS Blender sandboxing before advertising untrusted conversion there.
-5. Extend authoring toward editable keyframes, packaging, and export.
+1. Continue renderer correctness, lighting, shadows, HDR, and post-processing work.
+2. Add upload memory budgets/telemetry and move large texture mip generation to a dedicated transfer
+   path where the selected Vulkan device supports it.
+3. Extend authoring toward editable keyframes, packaging, and export.
 
 ## Verification baseline
 

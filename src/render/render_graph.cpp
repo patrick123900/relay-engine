@@ -193,6 +193,7 @@ CompiledRenderGraph make_scene_render_graph() {
     // Depth is created and consumed inside the geometry pass, so unlike the swapchain and the
     // texture table it is not imported from outside the graph.
     const auto depth = graph.add_resource("scene_depth", RenderResourceKind::image);
+    const auto hdr = graph.add_resource("scene_hdr", RenderResourceKind::image);
     std::array<RenderResourceId, 3> shadows{};
     for (std::size_t cascade = 0; cascade < shadows.size(); ++cascade) {
         shadows[cascade] = graph.add_resource("directional_shadow_" + std::to_string(cascade),
@@ -214,7 +215,9 @@ CompiledRenderGraph make_scene_render_graph() {
                                       {spot_shadow, RenderAccess::sampled},
                                       {point_shadow, RenderAccess::sampled},
                                       {depth, RenderAccess::depth_stencil_attachment},
-                                      {swapchain, RenderAccess::color_attachment}});
+                                      {hdr, RenderAccess::color_attachment}});
+    graph.add_pass("tone_map", {{hdr, RenderAccess::sampled},
+                                {swapchain, RenderAccess::color_attachment}});
     graph.add_pass("present", {{swapchain, RenderAccess::present}});
     return graph.compile();
 }

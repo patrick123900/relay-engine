@@ -33,6 +33,7 @@
 #include <set>
 #include <span>
 #include <sstream>
+#include <tuple>
 #include <vector>
 #include <mutex>
 #include <filesystem>
@@ -389,6 +390,7 @@ struct EditorUi::Impl {
     ImVec2 viewport_min{}, viewport_max{};
 
     std::array<char, 129> scene_filename{"main.relay.json"};
+    std::array<char, 129> package_filename{"project.tar"};
     // The scene's current content revision and the one last written to or read from a file. They
     // only differ when there is unsaved authoring work, because undoing back to a saved state
     // restores that state's revision. Playback time never enters the history and so never counts.
@@ -1711,6 +1713,11 @@ struct EditorUi::Impl {
         scalar("Ortho height", "orthographic_height", height, 0.05F);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Zero selects perspective; positive values select orthographic");
+        auto exposure = number_or(*camera, "exposure_ev", 0.0);
+        if (drag_scalar("Exposure (EV)", exposure, 0.05F)) {
+            fields += ",\"exposure_ev\":" + number_text(std::clamp(exposure, -16.0, 16.0));
+            commit = true;
+        }
         if (commit) mutate("scene.set_camera", fields, "Camera updated");
         if (!active && ImGui::Button("Make active")) {
             mutate("scene.set_camera", entity_field(selection) + ",\"active\":true",
@@ -1851,6 +1858,100 @@ struct EditorUi::Impl {
         if (drag_scalar("Speed", speed, 0.01F, "%.2fx")) {
             mutate("scene.set_animation",
                    entity_field(selection) + ",\"speed\":" + number_text(speed), "Speed updated");
+        }
+    }
+
+    void draw_keyframes_section(const JsonValue::Object& entity) {
+        const auto* animation = component(entity, "transform_animation");
+        if (!ImGui::CollapsingHeader("Transform keyframes")) return;
+        const auto entity_request = entity_field(selection);
+        if (!animation) {
+            if (ImGui::Button("Add first key"))
+                mutate("scene.keyframe.set", entity_request + ",\"time_seconds\":0",
+                       "Transform key added");
+            return;
+        }
+        const auto playing = boolean_or(*animation, "playing", false);
+        const auto loop = boolean_or(*animation, "loop", true);
+        if (ImGui::Button(playing ? "Pause keys" : "Play keys"))
+            mutate("scene.keyframes.playback", entity_request +
+                   ",\"playing\":" + (playing ? "false" : "true"), "Key playback updated");
+        ImGui::SameLine();
+        if (ImGui::Button(loop ? "Loop keys: on" : "Loop keys: off"))
+            mutate("scene.keyframes.playback", entity_request +
+                   ",\"loop\":" + (loop ? "false" : "true"), "Key loop updated");
+        auto duration = number_or(*animation, "duration_seconds", 1.0);
+        auto time = number_or(*animation, "time_seconds", 0.0);
+        if (slider_scalar("Key time", time, 0.0, duration, "%.3f s"))
+            mutate("scene.keyframes.playback", entity_request +
+                   ",\"playing\":false,\"time_seconds\":" + number_text(time),
+                   "Key time updated");
+        if (drag_scalar("Key duration", duration, 0.05F) && duration > 0.0)
+            mutate("scene.keyframes.playback", entity_request +
+                   ",\"duration_seconds\":" + number_text(duration),
+                   "Key duration updated");
+        if (ImGui::Button("Add key at time"))
+            mutate("scene.keyframe.set", entity_request +
+                   ",\"time_seconds\":" + number_text(time), "Transform key added");
+        const auto* keys = field(*animation, "keys");
+        if (!keys || !keys->array()) return;
+        for (std::size_t index = 0; index < keys->array()->size(); ++index) {
+            const auto* key = (*keys->array())[index].object();
+            if (!key) continue;
+            const auto key_time = number_or(*key, "time_seconds", 0.0);
+            ImGui::PushID(static_cast<int>(index));
+            const auto label = "Key " + number_text(key_time) + " s";
+            if (ImGui::TreeNode(label.c_str())) {
+                if (ImGui::Button("Use current transform")) {
+                    auto fields = entity_request + ",\"time_seconds\":" + number_text(key_time);
+                    if (const auto* transform = component(entity, "transform")) {
+                        for (const auto& [name, prefix] : {
+                                 std::pair{"position", "p"},
+                                 std::pair{"rotation_degrees", "r"},
+                                 std::pair{"scale", "s"}}) {
+                            const auto* vector = field(*transform, name);
+                            if (!vector || !vector->object()) continue;
+                            for (const char axis : {'x', 'y', 'z'}) {
+                                const auto wire = std::string(prefix) + axis;
+                                fields += ",\"" + wire + "\":" +
+                                          number_text(number_or(*vector->object(),
+                                                                std::string(1, axis).c_str(), 0.0));
+                            }
+                        }
+                    }
+                    mutate("scene.keyframe.set", fields, "Transform key updated");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Delete key"))
+                    mutate("scene.keyframe.delete", entity_request +
+                           ",\"time_seconds\":" + number_text(key_time),
+                           "Transform key deleted");
+                for (const auto& [name, field_name, prefix] : {
+                         std::tuple{"Position", "position", "p"},
+                         std::tuple{"Rotation", "rotation_degrees", "r"},
+                         std::tuple{"Scale", "scale", "s"}}) {
+                    const auto* vector = field(*key, field_name);
+                    if (!vector || !vector->object()) continue;
+                    std::array<double, 3> values{
+                        number_or(*vector->object(), "x", 0.0),
+                        number_or(*vector->object(), "y", 0.0),
+                        number_or(*vector->object(), "z", 0.0)};
+                    for (std::size_t axis = 0; axis < 3U; ++axis) {
+                        ImGui::PushID(static_cast<int>(axis));
+                        const auto axis_label = std::string(name) + " " + "XYZ"[axis];
+                        if (drag_scalar(axis_label.c_str(), values[axis], 0.05F)) {
+                            const auto wire = std::string(prefix) + "xyz"[axis];
+                            mutate("scene.keyframe.set", entity_request +
+                                   ",\"time_seconds\":" + number_text(key_time) +
+                                   ",\"" + wire + "\":" + number_text(values[axis]),
+                                   "Transform key updated");
+                        }
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
         }
     }
 
@@ -2189,6 +2290,7 @@ struct EditorUi::Impl {
         draw_camera_section(*entity);
         draw_renderer_section(*entity);
         draw_animator_section(*entity);
+        draw_keyframes_section(*entity);
         draw_morph_section(*entity);
         draw_light_section(*entity);
     }
@@ -2302,6 +2404,13 @@ struct EditorUi::Impl {
                         ImGui::EndPopup();
                     }
                 }
+            ImGui::Separator();
+            ImGui::InputText("Package file", package_filename.data(), package_filename.size());
+            if (ImGui::Button("Export saved project"))
+                (void)mutate("project.package", "\"filename\":\"" +
+                             json_escape(package_filename.data()) + "\"",
+                             "Project package saved under exports");
+            ImGui::TextDisabled("Save scene changes before exporting. Existing packages are kept.");
         } else ImGui::TextDisabled("No project open. Scene files can still be edited.");
         ImGui::Separator();
         ImGui::TextDisabled("Available projects");

@@ -1,5 +1,7 @@
 #include "relay/scene/scene.hpp"
+#include "relay/scene/scene_io.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <iomanip>
@@ -58,7 +60,8 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
                << ",\"near_plane\":" << record.camera->near_plane
                << ",\"far_plane\":" << record.camera->far_plane
                << ",\"active\":" << (record.camera->active ? "true" : "false")
-               << ",\"orthographic_height\":" << record.camera->orthographic_height << '}';
+               << ",\"orthographic_height\":" << record.camera->orthographic_height
+               << ",\"exposure_ev\":" << record.camera->exposure_ev << '}';
     } else {
         output << "null";
     }
@@ -84,6 +87,27 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
                << ",\"loop\":" << (a.loop ? "true" : "false") << '}';
     } else
         output << "null";
+    output << ",\"transform_animation\":";
+    if (record.transform_animation) {
+        const auto& a = *record.transform_animation;
+        output << "{\"time_seconds\":" << a.time_seconds
+               << ",\"duration_seconds\":" << a.duration_seconds
+               << ",\"speed\":" << a.speed
+               << ",\"playing\":" << (a.playing ? "true" : "false")
+               << ",\"loop\":" << (a.loop ? "true" : "false") << ",\"keys\":[";
+        for (std::size_t i = 0; i < a.keys.size(); ++i) {
+            if (i) output << ',';
+            const auto& key = a.keys[i];
+            output << "{\"time_seconds\":" << key.time_seconds << ",\"position\":";
+            append_vec3(output, key.value.position);
+            output << ",\"rotation_degrees\":";
+            append_vec3(output, key.value.rotation_degrees);
+            output << ",\"scale\":";
+            append_vec3(output, key.value.scale);
+            output << '}';
+        }
+        output << "]}";
+    } else output << "null";
     output << ",\"model_node\":";
     if (record.model_node) {
         output << "{\"root\":\"" << record.model_node->root.to_string()
@@ -113,6 +137,8 @@ std::string_view field_type_name(const ReflectedFieldType type) {
     case ReflectedFieldType::boolean: return "boolean";
     case ReflectedFieldType::number_array:
         return "number_array";
+    case ReflectedFieldType::object_array:
+        return "object_array";
     }
     return "unknown";
 }
@@ -237,7 +263,9 @@ bool Scene::set_camera(const Entity entity, std::optional<Camera> camera) {
             !std::isfinite(camera->far_plane) || camera->field_of_view_y_degrees <= 1.0 ||
             camera->field_of_view_y_degrees >= 179.0 || camera->near_plane <= 0.0 ||
             camera->far_plane <= camera->near_plane ||
-            !std::isfinite(camera->orthographic_height) || camera->orthographic_height < 0.0) {
+            !std::isfinite(camera->orthographic_height) || camera->orthographic_height < 0.0 ||
+            !std::isfinite(camera->exposure_ev) || camera->exposure_ev < -16.0 ||
+            camera->exposure_ev > 16.0) {
             return false;
         }
         if (camera->active) {
@@ -277,6 +305,57 @@ bool Scene::set_animator(const Entity entity, std::optional<Animator> animator) 
         return false;
     record->animator = std::move(animator);
     return true;
+}
+
+bool Scene::set_transform_animation(const Entity entity,
+                                    std::optional<TransformAnimation> animation) {
+    auto* record = get(entity);
+    if (!record) return false;
+    if (animation) {
+        if (!std::isfinite(animation->duration_seconds) ||
+            animation->duration_seconds <= 0.0 || animation->duration_seconds > 1'000'000.0 ||
+            !std::isfinite(animation->time_seconds) || animation->time_seconds < 0.0 ||
+            animation->time_seconds > animation->duration_seconds ||
+            !std::isfinite(animation->speed) || std::abs(animation->speed) > 100.0 ||
+            animation->keys.size() > 1024U) return false;
+        double previous = -1.0;
+        const auto valid_vec = [](const Vec3& v) {
+            return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) &&
+                   std::abs(v.x) <= 1'000'000.0 && std::abs(v.y) <= 1'000'000.0 &&
+                   std::abs(v.z) <= 1'000'000.0;
+        };
+        for (const auto& key : animation->keys) {
+            if (!std::isfinite(key.time_seconds) || key.time_seconds <= previous ||
+                key.time_seconds > animation->duration_seconds ||
+                !valid_vec(key.value.position) ||
+                !valid_vec(key.value.rotation_degrees) || !valid_vec(key.value.scale)) return false;
+            previous = key.time_seconds;
+        }
+    }
+    record->transform_animation = std::move(animation);
+    return true;
+}
+
+Transform sample_transform_animation(const TransformAnimation& animation,
+                                     const Transform& fallback) {
+    if (animation.keys.empty()) return fallback;
+    const auto& keys = animation.keys;
+    const auto upper = std::upper_bound(keys.begin(), keys.end(), animation.time_seconds,
+        [](const double time, const TransformKeyframe& key) { return time < key.time_seconds; });
+    if (upper == keys.begin()) return keys.front().value;
+    if (upper == keys.end()) return keys.back().value;
+    const auto& right = *upper;
+    const auto& left = *(upper - 1);
+    const auto t = (animation.time_seconds - left.time_seconds) /
+                   (right.time_seconds - left.time_seconds);
+    const auto interpolate = [t](const Vec3& a, const Vec3& b) {
+        return Vec3{a.x + (b.x - a.x) * t,
+                    a.y + (b.y - a.y) * t,
+                    a.z + (b.z - a.z) * t};
+    };
+    return {interpolate(left.value.position, right.value.position),
+            interpolate(left.value.rotation_degrees, right.value.rotation_degrees),
+            interpolate(left.value.scale, right.value.scale)};
 }
 
 bool Scene::set_light(const Entity entity, std::optional<Light> light) {
@@ -442,7 +521,8 @@ std::string Scene::list_json() const {
 std::string Scene::serialize_json() const {
     std::ostringstream output;
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
-    output << "{\"format\":\"relay.scene\",\"version\":4,\"components\":[";
+    output << "{\"format\":\"relay.scene\",\"version\":" << scene_file_version
+           << ",\"components\":[";
     const auto& descriptors = component_descriptors();
     for (std::size_t descriptor_index = 0; descriptor_index < descriptors.size(); ++descriptor_index) {
         if (descriptor_index != 0) output << ',';
@@ -488,7 +568,15 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
           {"near_plane", ReflectedFieldType::number},
           {"far_plane", ReflectedFieldType::number},
           {"active", ReflectedFieldType::boolean},
-          {"orthographic_height", ReflectedFieldType::number}}},
+          {"orthographic_height", ReflectedFieldType::number},
+          {"exposure_ev", ReflectedFieldType::number}}},
+        {"TransformAnimation", 0x09U,
+         {{"time_seconds", ReflectedFieldType::number},
+          {"duration_seconds", ReflectedFieldType::number},
+          {"speed", ReflectedFieldType::number},
+          {"playing", ReflectedFieldType::boolean},
+          {"loop", ReflectedFieldType::boolean},
+          {"keys", ReflectedFieldType::object_array}}},
         {"MeshRenderer",
          0x05U,
          {{"mesh", ReflectedFieldType::string},

@@ -42,6 +42,7 @@ public:
     [[nodiscard]] std::uint32_t render_resource_count() const;
     [[nodiscard]] std::string render_graph_json() const;
     [[nodiscard]] std::string shader_interfaces_json() const;
+    [[nodiscard]] std::string upload_status_json() const;
     using FrameReceiver = std::function<void(OwnedFrame, std::string)>;
     bool readback_async(const Scene& scene, double elapsed_seconds, FrameReceiver receiver, std::string& error);
     void flush_readbacks();

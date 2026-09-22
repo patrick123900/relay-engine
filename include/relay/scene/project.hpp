@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -24,5 +25,9 @@ struct Project {
 [[nodiscard]] std::optional<Project> load_project(std::string_view filename, std::string& error);
 [[nodiscard]] bool save_project(const Project& project, std::string& error, bool create = false);
 [[nodiscard]] std::vector<std::string> available_projects();
+// Write a portable, uncompressed tar of on-disk project metadata, member scenes,
+// and non-hidden assets. The archive is created under the project's exports folder.
+[[nodiscard]] bool package_project(const Project& project, std::string_view filename,
+                                   std::string& error, std::uint64_t& bytes);
 
 } // namespace relay

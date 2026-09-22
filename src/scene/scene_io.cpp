@@ -294,6 +294,16 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                     }
                     camera->orthographic_height = *height->number();
                 }
+                if (result.source_version >= 5U) {
+                    const auto* exposure = field(*camera_object, "exposure_ev");
+                    if (!exposure || !exposure->number() ||
+                        !std::isfinite(*exposure->number()) ||
+                        *exposure->number() < -16.0 || *exposure->number() > 16.0) {
+                        result.error = "camera requires exposure_ev between -16 and 16";
+                        return result;
+                    }
+                    camera->exposure_ev = *exposure->number();
+                }
             }
         }
         std::optional<MeshRenderer> mesh_renderer;
@@ -403,6 +413,56 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                 !validator.set_light(handle, slot.record.light)) {
                 result.error = "component values outside valid ranges";
                 return result;
+            }
+        }
+        if (result.source_version >= 6U) {
+            const auto* animation_value = field(*entity_object, "transform_animation");
+            if (!animation_value) {
+                result.error = "version 6 entity requires transform_animation";
+                return result;
+            }
+            if (!animation_value->is_null()) {
+                const auto* o = animation_value->object();
+                const auto* time = o ? field(*o, "time_seconds") : nullptr;
+                const auto* duration = o ? field(*o, "duration_seconds") : nullptr;
+                const auto* speed = o ? field(*o, "speed") : nullptr;
+                const auto* playing = o ? field(*o, "playing") : nullptr;
+                const auto* loop = o ? field(*o, "loop") : nullptr;
+                const auto* keys = o ? field(*o, "keys") : nullptr;
+                if (!time || !time->number() || !duration || !duration->number() ||
+                    !speed || !speed->number() || !playing || !playing->boolean() ||
+                    !loop || !loop->boolean() || !keys || !keys->array() ||
+                    keys->array()->size() > 1024U) {
+                    result.error = "invalid transform animation fields";
+                    return result;
+                }
+                TransformAnimation animation;
+                animation.time_seconds = *time->number();
+                animation.duration_seconds = *duration->number();
+                animation.speed = *speed->number();
+                animation.playing = *playing->boolean();
+                animation.loop = *loop->boolean();
+                for (const auto& key_value : *keys->array()) {
+                    const auto* key = key_value.object();
+                    const auto* key_time = key ? field(*key, "time_seconds") : nullptr;
+                    TransformKeyframe parsed;
+                    if (!key_time || !key_time->number() ||
+                        !read_vec3(field(*key, "position"), parsed.value.position) ||
+                        !read_vec3(field(*key, "rotation_degrees"), parsed.value.rotation_degrees) ||
+                        !read_vec3(field(*key, "scale"), parsed.value.scale)) {
+                        result.error = "invalid transform keyframe";
+                        return result;
+                    }
+                    parsed.time_seconds = *key_time->number();
+                    animation.keys.push_back(parsed);
+                }
+                Scene validator;
+                const auto handle = validator.create();
+                if (!validator.set_transform_animation(handle, animation)) {
+                    result.error = "transform animation values outside valid ranges";
+                    return result;
+                }
+                slot.record.transform_animation = std::move(animation);
             }
         }
         ++result.entity_count;

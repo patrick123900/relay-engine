@@ -260,6 +260,21 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "render_upload_status",
+    {
+      title: "Inspect upload memory",
+      description: "Read Vulkan asset upload budgets, staging peaks, estimated resident bytes and transfer-path state.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["render_upload_status"];
+        if (override) return override({});
+        return invoke("render.upload_status", {});
+      },
+  );
+
+  server.registerTool(
     "render_assets",
     {
       title: "Inspect render assets",
@@ -561,14 +576,15 @@ export function registerGeneratedTools(
         "fieldOfViewY": z.number().finite().min(1.01).max(178.99).default(60),
         "nearPlane": z.number().finite().min(0.0001).max(1000).default(0.1),
         "farPlane": z.number().finite().min(0.001).max(1000000).default(1000),
-        "orthographicHeight": z.number().finite().min(0).max(1000000).optional().describe("Full viewport height; zero selects perspective")
+        "orthographicHeight": z.number().finite().min(0).max(1000000).optional().describe("Full viewport height; zero selects perspective"),
+        "exposureEv": z.number().finite().min(-16).max(16).optional().describe("Exposure compensation in stops; zero is the reference exposure")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
     },
     async (input) => {
         const override = overrides["scene_set_camera"];
         if (override) return override(input as JsonObject);
-        return invoke("scene.set_camera", {"entity": input["entity"], "enabled": input["enabled"], "active": input["active"], "field_of_view_y_degrees": input["fieldOfViewY"], "near_plane": input["nearPlane"], "far_plane": input["farPlane"], "orthographic_height": input["orthographicHeight"]});
+        return invoke("scene.set_camera", {"entity": input["entity"], "enabled": input["enabled"], "active": input["active"], "field_of_view_y_degrees": input["fieldOfViewY"], "near_plane": input["nearPlane"], "far_plane": input["farPlane"], "orthographic_height": input["orthographicHeight"], "exposure_ev": input["exposureEv"]});
       },
   );
 
@@ -1159,6 +1175,92 @@ export function registerGeneratedTools(
         const override = overrides["project_close"];
         if (override) return override({});
         return invoke("project.close", {});
+      },
+  );
+
+  server.registerTool(
+    "project_package",
+    {
+      title: "Package project",
+      description: "Export saved project metadata, member scenes and non-hidden assets as a portable uncompressed tar under the project exports directory. Refuses to overwrite; save scene changes first.",
+      inputSchema: z.object({
+        "filename": z.string().min(5).max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._-]*\\.tar$"))
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["project_package"];
+        if (override) return override(input as JsonObject);
+        return invoke("project.package", {"filename": input["filename"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_keyframe_set",
+    {
+      title: "Set transform keyframe",
+      description: "Add or update a scene-owned transform keyframe at an exact time. Unspecified transform fields use the current entity transform or existing key. Undoable and saved with the scene.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "timeSeconds": z.number().finite().min(0).max(1000000),
+        "px": z.number().finite().min(-1000000).max(1000000).optional(),
+        "py": z.number().finite().min(-1000000).max(1000000).optional(),
+        "pz": z.number().finite().min(-1000000).max(1000000).optional(),
+        "rx": z.number().finite().min(-1000000).max(1000000).optional(),
+        "ry": z.number().finite().min(-1000000).max(1000000).optional(),
+        "rz": z.number().finite().min(-1000000).max(1000000).optional(),
+        "sx": z.number().finite().min(-1000000).max(1000000).optional(),
+        "sy": z.number().finite().min(-1000000).max(1000000).optional(),
+        "sz": z.number().finite().min(-1000000).max(1000000).optional(),
+        "gesture": z.number().int().min(0).max(4294967295).optional()
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_keyframe_set"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.keyframe.set", {"entity": input["entity"], "time_seconds": input["timeSeconds"], "px": input["px"], "py": input["py"], "pz": input["pz"], "rx": input["rx"], "ry": input["ry"], "rz": input["rz"], "sx": input["sx"], "sy": input["sy"], "sz": input["sz"], "gesture": input["gesture"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_keyframe_delete",
+    {
+      title: "Delete transform keyframe",
+      description: "Remove one scene-owned transform keyframe at an exact time as an undoable edit.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "timeSeconds": z.number().finite().min(0).max(1000000)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_keyframe_delete"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.keyframe.delete", {"entity": input["entity"], "time_seconds": input["timeSeconds"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_keyframes_playback",
+    {
+      title: "Control transform keyframes",
+      description: "Set playback, loop, speed, duration or current time for scene-owned transform keys. Undoable and saved with the scene.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "playing": z.boolean().optional(),
+        "loop": z.boolean().optional(),
+        "speed": z.number().finite().min(-100).max(100).optional(),
+        "durationSeconds": z.number().finite().min(0.001).max(1000000).optional(),
+        "timeSeconds": z.number().finite().min(0).max(1000000).optional(),
+        "gesture": z.number().int().min(0).max(4294967295).optional()
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_keyframes_playback"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.keyframes.playback", {"entity": input["entity"], "playing": input["playing"], "loop": input["loop"], "speed": input["speed"], "duration_seconds": input["durationSeconds"], "time_seconds": input["timeSeconds"], "gesture": input["gesture"]});
       },
   );
 

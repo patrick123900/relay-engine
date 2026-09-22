@@ -163,8 +163,9 @@ class Editor:
         deadline = time.monotonic() + 8
         while not self.layout_path.exists() and time.monotonic() < deadline:
             time.sleep(.1)
-        controls = self.panel_rect("Controls")
-        button_y = controls[1] + 49
+        # The toolbar is an unsaved viewport side bar, so recent ImGui layouts no longer
+        # contain a [Window][Controls] entry. Its buttons remain directly below the menu.
+        button_y = 49
         for y in (button_y, button_y-6, button_y+6):
             for x in range(20, 230, 10):
                 before = self.result("runtime.status")["paused"]

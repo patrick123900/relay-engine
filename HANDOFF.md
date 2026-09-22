@@ -8,10 +8,10 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v15: 85 native methods. Scene v4, project v1, import manifest v3.
+- Protocol schema v19: 90 native methods. Scene v6, project v1, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
-- The working tree contains the latest Agent-panel, chat-media, resilience, hierarchy-spacing, and
-  usage-meter work. Preserve unrelated edits and inspect `git diff` before changing them.
+- HDR rendering, bounded asynchronous uploads, transform keyframes, and portable project export
+  are implemented. Preserve unrelated working-tree edits and inspect `git diff` before changing them.
 
 ## Product intent
 
@@ -32,10 +32,22 @@ without blocking simultaneous human editing.
 - Dockable hierarchy, inspector, viewport, transform gizmos, asset browser, animation timeline,
   history, diagnostics, and project/save workflows.
 - Human editor mutations use the same versioned control protocol as tests and agents.
+- Scene-owned transform keys interpolate position, Euler rotation, and scale. The inspector and
+  protocol can add, edit, delete, scrub, play, and loop keys with undo/redo. Scene v6 saves keys;
+  older scenes load without them. Imported animation channels remain read-only.
+- `project.package` writes a bounded uncompressed tar under `exports/` containing normalized
+  project metadata, member scenes, and non-hidden project assets, including import metadata.
+  It excludes private state, captures, traces, and prior exports, and refuses overwrites. The
+  project panel exposes the same operation. Save scene changes before packaging.
 
 ### Rendering and assets
 
 - Deterministic CPU renderer for headless verification.
+- Vulkan scene geometry and transparent blending render into a per-swapchain-image RGBA16F target.
+  A fullscreen post-process pass applies camera exposure in EV stops, ACES-fit tone mapping and
+  correct SDR transfer encoding before editor UI or capture. The PBR shader uses an analytic
+  sky/ground hemisphere for diffuse and roughness-aware specular environment lighting. Camera
+  exposure is serialized, undoable and available through the typed protocol and inspector.
 - Vulkan presentation, resize/swapchain handling, selection outlines, grid, PBR materials (including
   masked and correctly ordered alpha-blended geometry), cameras, punctual lights, animation,
   skinning, morph targets, synchronized capture, and bounded punctual shadows. The first GPU-visible
@@ -54,6 +66,12 @@ without blocking simultaneous human editing.
   texture table upload only new geometry/material ranges in place. Replacement batches reuse all
   unchanged texture images and upload only appended images while atomically replacing descriptors;
   capacity overflow remains non-blocking.
+- Uploads preflight a 512 MiB staging budget, 2 GiB estimated resident device budget, and
+  256 MiB per-texture mip-chain budget. `render.upload_status` reports staging peaks, latest
+  batch size, estimated residency, rejects, and whether a transfer-only queue is in use. When a
+  transfer-only queue exists, buffer copies and texture mip blits run there. A semaphore makes the
+  new resources visible to graphics without blocking the CPU; old resources retire only after
+  both the upload and preceding graphics frames complete. Other devices use the graphics queue.
 - Asynchronous PNG capture and WebM recording with bounded queues and explicit provenance.
 - Native glTF/GLB path; Assimp for OBJ/FBX/DAE; Blender-to-glTF conversion on Linux through a
   Bubblewrap sandbox. Imports are dependency-bounded, content-addressed, and recorded in a manifest.
@@ -113,22 +131,27 @@ without blocking simultaneous human editing.
    needs deliberate live-provider and desktop visual validation.
 3. Untrusted `.blend` conversion fails closed on Windows and macOS because equivalent OS sandboxes
    are not implemented. `RELAY_BLENDER_TRUSTED=1` is only for administrator-approved input.
-4. Rendering remains early: HDR/post-processing, scalable resource streaming, configurable
-   shadow-quality controls, Direct3D 12, and Metal are not implemented.
+4. Rendering remains early: image-based environment maps, scalable resource streaming,
+   configurable shadow-quality controls, Direct3D 12, and Metal are not implemented. The HDR
+   path now has live desktop capture coverage. The tested GPU exposes no dedicated transfer-only
+   queue, so that queue branch still has compile and headless checks only.
 5. Agent sessions are designed for one local human/editor workflow; multi-client identities and a
    tamper-proof continuous audit store are not implemented.
 
 ## Next priorities
 
-1. Add HDR, exposure, environment lighting, tone mapping, and post-processing.
-2. Add upload memory budgets/telemetry and move large texture mip generation to a dedicated transfer
-   path where the selected Vulkan device supports it.
-3. Extend authoring toward editable keyframes, packaging, and export.
+1. Expand authoring to additional editable animation tracks and richer export formats.
 
 ## Verification baseline
 
-The current implementation was last verified with development and release builds, all four native
-CTest suites, generated-protocol checks, and 26 ordinary bridge tests. Headless editor tests cover
+The current implementation was verified with development and release builds, all four native
+CTest suites, generated-protocol checks, and 26 ordinary bridge tests. The live Vulkan shadow and
+visual smokes pass, as does `tests/editor_hdr_upload_smoke.py`: exposure changes captured pixels,
+keyframe scrubbing changes the image, a model import submits another GPU upload, and a package
+containing the saved keys and imported asset opens as a tar. The legacy coordinate-based
+`editor_interaction_smoke.py` misses targets on this desktop's 2560x1410 layout; its input
+assertions are inconclusive until recalibrated. Socket-dependent tests were run with loopback
+access after the sandbox refused local socket creation. Headless editor tests cover
 the current hierarchy spacing, chat selection/wrapping, attachments, media viewer, composer layout,
 usage meters, camera controls, and authorization. A separate sustained fixture has exercised more
 than two minutes of editing/capture work with injected disconnects. The Vulkan directional-shadow

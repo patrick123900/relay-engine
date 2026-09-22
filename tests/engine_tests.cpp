@@ -9,10 +9,12 @@
 #include "relay/render/asset_manifest.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/render/render_graph.hpp"
+#include "relay/render/upload_budget.hpp"
 #include "relay/render/shader_reflection.hpp"
 #include "relay/scene/scene.hpp"
 #include "relay/scene/scene_history.hpp"
 #include "relay/scene/scene_io.hpp"
+#include "relay/scene/project.hpp"
 #include "../src/render/gltf_animation.hpp"
 
 #include <algorithm>
@@ -365,13 +367,14 @@ int main() {
     }
 
     const auto render_graph = relay::make_scene_render_graph();
-    expect(render_graph.valid && render_graph.ordered_passes.size() == 7U &&
+    expect(render_graph.valid && render_graph.ordered_passes.size() == 8U &&
                render_graph.ordered_passes.front().name == "directional_shadow_0" &&
                render_graph.ordered_passes[2].name == "directional_shadow_2" &&
                render_graph.ordered_passes[3].name == "spot_shadow" &&
                render_graph.ordered_passes[4].name == "point_shadow" &&
                render_graph.ordered_passes[5].name == "scene_geometry" &&
-               render_graph.transitions.size() == 14U,
+               render_graph.ordered_passes[6].name == "tone_map" &&
+               render_graph.transitions.size() == 16U,
            "render graph compiles geometry and presentation with explicit transitions: " +
                render_graph.error);
     const auto depth_resource = std::find_if(
@@ -385,6 +388,20 @@ int main() {
                                   transition.pass == "scene_geometry";
                        }),
            "render graph records the depth attachment transition in the geometry pass");
+    expect(relay::texture_mip_bytes(4U, 2U) == 44U &&
+               relay::texture_mip_bytes(1U, 1U) == 4U,
+           "upload planning accounts for every RGBA8 mip level");
+    const auto upload_estimate = relay::estimate_asset_upload(
+        registry, 0U, 4096U, 4096U, 4096U, 8192U);
+    expect(upload_estimate.new_textures == registry.textures().size() &&
+               upload_estimate.staging_bytes > 8192U &&
+               upload_estimate.device_bytes > 12288U,
+           "upload planning includes texture staging and device mip chains");
+    relay::UploadBudget tight_budget{};
+    tight_budget.staging_bytes = 1U;
+    expect(relay::check_upload_budget(upload_estimate, tight_budget).find("staging") !=
+               std::string::npos,
+           "oversized asset batches fail before changing active GPU resources");
     relay::RenderGraph invalid_graph;
     const auto orphan = invalid_graph.add_resource("orphan", relay::RenderResourceKind::image);
     invalid_graph.add_pass("reader", {{orphan, relay::RenderAccess::sampled}});
@@ -1119,6 +1136,14 @@ int main() {
                !fragment_interface.bindings.empty() && fragment_interface.bindings.front().set == 0U &&
                fragment_interface.bindings.front().binding == 0U,
            "SPIR-V reflection discovers the fragment output and texture-table binding");
+    const auto tone_vertex = relay::reflect_spirv(read_spirv(RELAY_TEST_TONE_VERTEX_PATH));
+    const auto tone_fragment = relay::reflect_spirv(read_spirv(RELAY_TEST_TONE_FRAGMENT_PATH));
+    expect(tone_vertex.valid && tone_vertex.stage == "vertex" && tone_vertex.inputs.empty() &&
+               tone_fragment.valid && tone_fragment.stage == "fragment" &&
+               tone_fragment.push_constant_bytes == 8U &&
+               !tone_fragment.bindings.empty() && tone_fragment.bindings.front().set == 0U &&
+               tone_fragment.bindings.front().binding == 0U,
+           "post-process shaders use a vertex-free fullscreen pass and an HDR sampler");
 #endif
 
     const auto scene_test_directory = std::filesystem::temp_directory_path() / "relay-engine-scene-tests";
@@ -1134,6 +1159,36 @@ int main() {
         restored.restore_state(*loaded_scene.state);
         expect(restored.serialize_json() == scene.serialize_json(),
                "scene round trip preserves exact handles, hierarchy and components");
+    }
+    relay::Scene exposure_scene;
+    const auto exposure_entity = exposure_scene.create("Exposure camera");
+    relay::Camera exposure_camera;
+    exposure_camera.exposure_ev = 2.25;
+    expect(exposure_scene.set_camera(exposure_entity, exposure_camera),
+           "camera accepts exposure compensation within its valid range");
+    const auto exposure_path = scene_test_directory / "exposure.relay.json";
+    expect(relay::save_scene_file_atomic(exposure_scene, exposure_path, scene_file_error),
+           "version 6 scene with exposure saves");
+    const auto exposure_loaded = relay::load_scene_file(exposure_path);
+    expect(exposure_loaded && exposure_loaded.source_version == 6U &&
+               exposure_loaded.state->slots[exposure_entity.index].record.camera->exposure_ev == 2.25,
+           "camera exposure survives the version 6 scene round trip");
+    auto legacy_exposure_json = exposure_scene.serialize_json();
+    const auto version_position = legacy_exposure_json.find("\"version\":6");
+    const auto exposure_position = legacy_exposure_json.find(",\"exposure_ev\":2.25");
+    expect(version_position != std::string::npos && exposure_position != std::string::npos,
+           "version 6 serialization includes camera exposure");
+    if (version_position != std::string::npos && exposure_position != std::string::npos) {
+        legacy_exposure_json.replace(version_position, 11U, "\"version\":4");
+        legacy_exposure_json.erase(exposure_position, std::string(",\"exposure_ev\":2.25").size());
+        const auto legacy_exposure_path = scene_test_directory / "legacy-exposure.relay.json";
+        std::ofstream legacy_exposure_stream(legacy_exposure_path);
+        legacy_exposure_stream << legacy_exposure_json;
+        legacy_exposure_stream.close();
+        const auto migrated_exposure = relay::load_scene_file(legacy_exposure_path);
+        expect(migrated_exposure && migrated_exposure.migrated &&
+                   migrated_exposure.state->slots[exposure_entity.index].record.camera->exposure_ev == 0.0,
+               "version 4 cameras migrate to reference exposure");
     }
     bool found_temporary_file = false;
     for (const auto& entry : std::filesystem::directory_iterator(scene_test_directory)) {
@@ -1201,7 +1256,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 15U && relay::protocol_methods().size() == 85U,
+    expect(relay::protocol_schema_version == 19U && relay::protocol_methods().size() == 90U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");
@@ -1241,11 +1296,100 @@ int main() {
     const auto scene_undo = protocol.handle(R"({"id":12,"method":"scene.undo"})");
     expect(scene_undo.find(R"("ok":true)") != std::string::npos,
            "protocol exposes undoable scene operations");
+    const auto first_key = protocol.handle(R"({"id":12001,"method":"scene.keyframe.set","entity":"0:1","time_seconds":0,"px":0})");
+    const auto second_key = protocol.handle(R"({"id":12002,"method":"scene.keyframe.set","entity":"0:1","time_seconds":1,"px":10})");
+    expect(first_key.find(R"("ok":true)") != std::string::npos &&
+               second_key.find(R"("ok":true)") != std::string::npos,
+           "protocol adds scene-owned transform keys");
+    auto animation = *engine.scene().get({0U, 1U})->transform_animation;
+    animation.time_seconds = 0.5;
+    expect(std::abs(relay::sample_transform_animation(animation, {}).position.x - 5.0) < 0.001,
+           "transform keys interpolate between authored positions");
+    expect(protocol.handle(R"({"id":12003,"method":"scene.keyframes.playback","entity":"0:1","time_seconds":0.5,"playing":true})")
+                   .find(R"("ok":true)") != std::string::npos,
+           "key playback controls are protocol editable");
+    const auto key_path = scene_test_directory / "keyframe.relay.json";
+    std::string key_error;
+    expect(relay::save_scene_file_atomic(engine.scene(), key_path, key_error),
+           "transform keys save with the scene");
+    const auto key_load = relay::load_scene_file(key_path);
+    expect(key_load && key_load.state->slots[0].record.transform_animation &&
+               key_load.state->slots[0].record.transform_animation->keys.size() == 2U,
+           "transform keys survive scene reload");
+    auto invalid_keys = *engine.scene().get({0U, 1U})->transform_animation;
+    invalid_keys.keys[1].time_seconds = invalid_keys.keys[0].time_seconds;
+    expect(!engine.scene().set_transform_animation({0U, 1U}, invalid_keys) &&
+               engine.scene().get({0U, 1U})->transform_animation->keys.size() == 2U,
+           "duplicate key times are rejected without mutating the component");
+    expect(protocol.handle(R"({"id":12004,"method":"scene.keyframe.delete","entity":"0:1","time_seconds":1})")
+                   .find(R"("ok":true)") != std::string::npos &&
+               engine.scene().get({0U, 1U})->transform_animation->keys.size() == 1U,
+           "key deletion updates the scene");
+    (void)protocol.handle(R"({"id":12005,"method":"scene.undo"})");
+    expect(engine.scene().get({0U, 1U})->transform_animation->keys.size() == 2U,
+           "undo restores deleted keyframes");
+    std::filesystem::remove(key_path);
+    {
+        const auto package_root = std::filesystem::path("projects") /
+            ("relay-package-test-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(package_root / "scenes");
+        std::filesystem::create_directories(package_root / "textures");
+        std::filesystem::create_directories(package_root / "captures");
+        const auto project_file = package_root / "sample.relayproject";
+        relay::Project package{project_file.generic_string(), "Portable test", {"main.relay.json"},
+                               "main.relay.json"};
+        std::string package_error;
+        expect(relay::save_project(package, package_error, true), "test project metadata saves");
+        expect(relay::save_scene_file_atomic(engine.scene(), package_root / "scenes/main.relay.json",
+                                             package_error), "test member scene saves");
+        write_file(package_root / "textures/pixel.png", "asset-bytes");
+        write_file(package_root / ".relay-imports.json", "{}\n");
+        write_file(package_root / "captures/private.png", "private");
+        std::uint64_t package_bytes{};
+        expect(relay::package_project(package, "bundle.tar", package_error, package_bytes),
+               "project packaging exports saved scenes and assets: " + package_error);
+        const auto archive = package_root / "exports/bundle.tar";
+        std::ifstream archive_stream(archive, std::ios::binary);
+        const std::string archive_data{std::istreambuf_iterator<char>(archive_stream), {}};
+        expect(archive_data.size() == package_bytes && package_bytes % 512U == 0U &&
+                   archive_data.find("project.relayproject") != std::string::npos &&
+                   archive_data.find("scenes/main.relay.json") != std::string::npos &&
+                   archive_data.find("textures/pixel.png") != std::string::npos &&
+                   archive_data.find(".relay-imports.json") != std::string::npos &&
+                   archive_data.find("captures/private.png") == std::string::npos,
+               "portable tar includes project inputs but excludes captures");
+        engine.project() = package;
+        expect(protocol.handle(R"({"id":12006,"method":"project.package","filename":"from-protocol.tar"})")
+                   .find(R"("ok":true)") != std::string::npos &&
+                   std::filesystem::is_regular_file(package_root / "exports/from-protocol.tar"),
+               "project package protocol writes an export in the active project");
+        expect(protocol.handle(R"({"id":12007,"method":"project.package","filename":"../bad.tar"})")
+                   .find(R"("ok":false)") != std::string::npos,
+               "project package protocol rejects traversal");
+        engine.project().reset();
+        expect(!relay::package_project(package, "bundle.tar", package_error, package_bytes) &&
+                   package_error == "package already exists",
+               "package export refuses overwrite");
+        std::filesystem::create_symlink("pixel.png", package_root / "textures/link.png");
+        expect(!relay::package_project(package, "unsafe.tar", package_error, package_bytes) &&
+                   package_error.find("symlink") != std::string::npos,
+               "package export rejects linked asset files");
+        std::filesystem::remove_all(package_root);
+    }
     const auto set_camera = protocol.handle(
-        R"({"id":120,"method":"scene.set_camera","entity":"0:1","field_of_view_y_degrees":72,"near_plane":0.25,"far_plane":500})");
+        R"({"id":120,"method":"scene.set_camera","entity":"0:1","field_of_view_y_degrees":72,"near_plane":0.25,"far_plane":500,"exposure_ev":1.5})");
     expect(set_camera.find(R"("field_of_view_y_degrees":72)") != std::string::npos &&
+               set_camera.find(R"("exposure_ev":1.5)") != std::string::npos &&
                engine.scene().active_camera() == relay::Entity{0U, 1U},
            "protocol configures the active scene camera through a generated tool contract");
+    expect(std::abs(relay::build_render_scene(engine.scene(), registry, 1.0F)
+                        .camera.exposure_ev - 1.5F) < 0.001F,
+           "active camera exposure reaches the Vulkan render description");
+    expect(protocol.handle(
+               R"({"id":1201,"method":"scene.set_camera","entity":"0:1","exposure_ev":17})")
+               .find(R"("ok":false)") != std::string::npos,
+           "camera exposure outside the documented range is rejected before mutation");
     expect(protocol.handle(
                R"({"id":121,"method":"scene.set_camera","entity":"0:1","near_plane":10,"far_plane":2})")
                .find("greater than near_plane") != std::string::npos,
@@ -1266,6 +1410,9 @@ int main() {
     expect(protocol.handle(R"({"id":125,"method":"render.shader_interfaces"})").find(
                R"("available":false)") != std::string::npos,
            "headless protocol explains when live shader reflection is unavailable");
+    expect(protocol.handle(R"({"id":1251,"method":"render.upload_status"})").find(
+               R"("available":false)") != std::string::npos,
+           "headless protocol reports that Vulkan upload telemetry needs a live renderer");
     const auto unsafe_save = protocol.handle(
         R"({"id":15,"method":"scene.save","filename":"../escape.relay.json"})");
     expect(unsafe_save.find(R"("ok":false)") != std::string::npos,
@@ -1828,6 +1975,8 @@ int main() {
     std::filesystem::remove("traces/test.relay-trace.jsonl");
     std::filesystem::remove("captures/test-observability.webm");
     std::filesystem::remove(round_trip_path);
+    std::filesystem::remove(exposure_path);
+    std::filesystem::remove(scene_test_directory / "legacy-exposure.relay.json");
     std::filesystem::remove(legacy_path);
     std::filesystem::remove(version_one_path);
     std::filesystem::remove(version_two_path);

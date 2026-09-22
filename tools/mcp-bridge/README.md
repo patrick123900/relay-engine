@@ -37,7 +37,7 @@ for scope, revocation and trust boundaries.
 
 Tool registrations, Zod inputs and safety annotations are generated from
 `protocol/relay.protocol.json`. See `docs/protocol.md` at the repository root for the generated
-72-tool reference (protocol v14; 85 native methods). Run `npm run generate` after changing the schema; `npm run check` detects drift.
+77-tool reference (protocol v19; 90 native methods). Run `npm run generate` after changing the schema; `npm run check` detects drift.
 
 Capture filenames are restricted to a single safe `.png` or `.bmp` filename and always resolve inside Relay's
 `captures` directory. Capture source defaults to `vulkan`; use `deterministic` for the headless CPU
@@ -185,7 +185,7 @@ in ignored `.relay/chat-files` with private permissions. Images become native pr
 small UTF-8 files receive explicitly untrusted text previews. `chat_attachment_read` is an extra
 bridge tool that accepts opaque attachment IDs and bounded byte ranges, never arbitrary paths.
 Binary data and chunks split inside a UTF-8 character are returned losslessly as base64. This does
-not add a filesystem tool to the engine MCP catalog, which remains 72 tools. Binary documents
+not add a filesystem tool to the engine MCP catalog, which remains 77 tools. Binary documents
 are not automatically extracted. Attachment-read capabilities clear on new chat or sign-out.
 
 Assistant Markdown media embeds display local PNG/JPEG images and silent WebM/MP4/MOV video with

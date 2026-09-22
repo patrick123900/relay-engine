@@ -98,7 +98,7 @@ constexpr std::array<ProtocolFieldSpec, 11> fields_scene_set_transform{{
     {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 1000000000, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 7> fields_scene_set_camera{{
+constexpr std::array<ProtocolFieldSpec, 8> fields_scene_set_camera{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"active", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
@@ -106,6 +106,7 @@ constexpr std::array<ProtocolFieldSpec, 7> fields_scene_set_camera{{
     {"near_plane", ProtocolValueType::number, false, false, true, true, 0.0001, 1000, 0U, 0U, "", ""},
     {"far_plane", ProtocolValueType::number, false, false, true, true, 0.001, 1000000, 0U, 0U, "", ""},
     {"orthographic_height", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+    {"exposure_ev", ProtocolValueType::number, false, false, true, true, -16, 16, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_renderer{{
@@ -234,6 +235,40 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_project_set_startup{{
     {"scene_file", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 1> fields_project_package{{
+    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 5U, 128U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.tar$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 12> fields_scene_keyframe_set{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"time_seconds", ProtocolValueType::number, true, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+    {"px", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"py", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"pz", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"rx", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"ry", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"rz", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"sx", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"sy", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"sz", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_scene_keyframe_delete{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"time_seconds", ProtocolValueType::number, true, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 7> fields_scene_keyframes_playback{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"playing", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"loop", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"speed", ProtocolValueType::number, false, false, true, true, -100, 100, 0U, 0U, "", ""},
+    {"duration_seconds", ProtocolValueType::number, false, false, true, true, 0.001, 1000000, 0U, 0U, "", ""},
+    {"time_seconds", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 6> fields_scene_set_animations{{
     {"entities", ProtocolValueType::string_array, true, false, false, false, 0, 0, 1U, 4096U, "^\\d+:\\d+$", ""},
     {"playing", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
@@ -306,7 +341,7 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_chat_control{{
     {"provider", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "openai|compatible"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 85> methods{{
+constexpr std::array<ProtocolMethodSpec, 90> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current run, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.pause", "runtime_pause", "Pause Relay runtime", "Pause automatic simulation so the scene can be inspected deterministically.", false, false, true, false, false, no_fields},
     {"runtime.resume", "runtime_resume", "Resume Relay runtime", "Resume automatic simulation after an inspection or controlled frame step.", false, false, true, false, false, no_fields},
@@ -322,6 +357,7 @@ constexpr std::array<ProtocolMethodSpec, 85> methods{{
     {"render.capabilities", "render_capabilities", "Inspect graphics capabilities", "Create a temporary Vulkan device and report adapter and modern rendering support.", true, false, false, false, false, no_fields},
     {"render.graph", "render_graph", "Inspect render graph", "Read compiled render passes, resources, dependencies and access transitions.", true, false, false, false, false, no_fields},
     {"render.shader_interfaces", "render_shader_interfaces", "Inspect shader interfaces", "Read SPIR-V-reflected stages, locations, descriptor bindings and push-constant sizes from the live Vulkan pipeline.", true, false, false, false, false, no_fields},
+    {"render.upload_status", "render_upload_status", "Inspect upload memory", "Read Vulkan asset upload budgets, staging peaks, estimated resident bytes and transfer-path state.", true, false, false, false, false, no_fields},
     {"render.assets", "render_assets", "Inspect render assets", "List built-in and imported meshes, materials and textures currently available to scene renderer components.", true, false, false, false, false, no_fields},
     {"assets.formats", "asset_import_formats", "Inspect model import formats", "Report model formats and feature coverage available in this Relay build, including Godot-compatible interchange paths.", true, false, false, false, false, no_fields},
     {"assets.import_model", "asset_import_model", "Import project model", "Import a model from the project-local assets directory using a content-addressed identity and optionally instantiate its node hierarchy.", false, false, false, false, false, fields_assets_import_model},
@@ -374,6 +410,10 @@ constexpr std::array<ProtocolMethodSpec, 85> methods{{
     {"project.remove_scene", "project_remove_scene", "Remove Scene project", "Remove scene membership without deleting its file; chooses a remaining startup scene when needed.", false, false, false, false, false, fields_project_remove_scene},
     {"project.set_startup", "project_set_startup", "Set Startup project", "Choose a current project member as the startup scene.", false, false, false, false, false, fields_project_set_startup},
     {"project.close", "project_close", "Close project", "Close project metadata while leaving the current scene intact.", false, false, false, false, false, no_fields},
+    {"project.package", "project_package", "Package project", "Export saved project metadata, member scenes and non-hidden assets as a portable uncompressed tar under the project exports directory. Refuses to overwrite; save scene changes first.", false, false, false, false, false, fields_project_package},
+    {"scene.keyframe.set", "scene_keyframe_set", "Set transform keyframe", "Add or update a scene-owned transform keyframe at an exact time. Unspecified transform fields use the current entity transform or existing key. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_keyframe_set},
+    {"scene.keyframe.delete", "scene_keyframe_delete", "Delete transform keyframe", "Remove one scene-owned transform keyframe at an exact time as an undoable edit.", false, false, false, false, false, fields_scene_keyframe_delete},
+    {"scene.keyframes.playback", "scene_keyframes_playback", "Control transform keyframes", "Set playback, loop, speed, duration or current time for scene-owned transform keys. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_keyframes_playback},
     {"scene.set_animations", "scene_set_animations", "Control animation tracks", "Seek or configure multiple animation roots in one undoable gesture; time clamps to each clip duration.", false, false, false, false, false, fields_scene_set_animations},
     {"animation.clip", "animation_clip", "Inspect animation timeline", "Read bounded channel key times for an imported animation clip. Key times are read-only; truncated channels report their full key count.", true, false, false, false, false, fields_animation_clip},
     {"session.status", "session_status", "Inspect session grants", "Inspect exact native method grants for this connection. Grants are approved only by the host; no tool can expand them.", true, false, false, false, false, no_fields},

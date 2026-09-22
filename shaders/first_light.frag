@@ -211,8 +211,20 @@ void main() {
     if (emissive_texture != 0xffu) {
         emissive *= texture(textures[emissive_texture], texture_coordinates).rgb;
     }
-    vec3 ambient = base_color.rgb * 0.08 * occlusion;
+    // Analytic hemispherical environment. The sky and ground are linear radiances; rough
+    // surfaces see a broad reflection while polished surfaces retain directional variation.
+    vec3 sky = vec3(0.20, 0.31, 0.48);
+    vec3 ground = vec3(0.055, 0.047, 0.039);
+    vec3 environment_diffuse = mix(ground, sky, clamp(normal.y * 0.5 + 0.5, 0.0, 1.0));
+    vec3 reflection = reflect(-view_direction, normal);
+    vec3 environment_specular = mix(ground, sky,
+                                    mix(clamp(reflection.y * 0.5 + 0.5, 0.0, 1.0), 0.5, roughness));
+    vec3 environment_fresnel = mix(vec3(0.04), base_color.rgb, metallic) +
+                               (1.0 - mix(vec3(0.04), base_color.rgb, metallic)) *
+                               pow(1.0 - max(dot(normal, view_direction), 0.0), 5.0);
+    vec3 ambient = (base_color.rgb * (1.0 - metallic) * environment_diffuse / pi +
+                    environment_fresnel * environment_specular * (1.0 - roughness * 0.5)) *
+                   occlusion;
     vec3 color = ambient + direct_color + emissive;
-    color = color / (color + vec3(1.0));
     output_color = vec4(color, base_color.a);
 }

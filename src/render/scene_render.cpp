@@ -380,6 +380,11 @@ class WorldResolver {
                 }
             }
         }
+        if (record != nullptr && record->transform_animation &&
+            !record->transform_animation->keys.empty()) {
+            result = local_matrix(sample_transform_animation(*record->transform_animation,
+                                                             record->transform));
+        }
         if (record != nullptr && record->parent.valid()) {
             result = multiply(world(record->parent), result);
         }
@@ -547,6 +552,7 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
     }
     output.camera.view_projection =
         multiply(perspective(selected_camera, aspect_ratio), inverse(camera_world));
+    output.camera.exposure_ev = static_cast<float>(selected_camera.exposure_ev);
     output.camera_position = transform_point(camera_world, {});
     output.camera_forward = normalized(transform_point(camera_world, {0, 0, -1}, true));
     for (const auto entity : entities)

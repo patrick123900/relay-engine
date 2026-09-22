@@ -45,6 +45,8 @@ struct Camera {
     bool active{true};
     // Zero selects perspective; otherwise the full orthographic viewport height.
     double orthographic_height{};
+    // Exposure compensation in stops. Zero preserves the renderer's reference exposure.
+    double exposure_ev{};
 
     auto operator<=>(const Camera&) const = default;
 };
@@ -67,6 +69,22 @@ struct Animator {
     auto operator<=>(const Animator &) const = default;
 };
 
+struct TransformKeyframe {
+    double time_seconds{};
+    Transform value{};
+    auto operator<=>(const TransformKeyframe&) const = default;
+};
+
+struct TransformAnimation {
+    double time_seconds{};
+    double duration_seconds{1.0};
+    double speed{1.0};
+    bool playing{false};
+    bool loop{true};
+    std::vector<TransformKeyframe> keys;
+    auto operator<=>(const TransformAnimation&) const = default;
+};
+
 struct ModelNode {
     Entity root;
     std::uint32_t node{};
@@ -84,7 +102,7 @@ struct Light {
     auto operator<=>(const Light &) const = default;
 };
 
-enum class ReflectedFieldType { string, entity, vec3, number, boolean, number_array };
+enum class ReflectedFieldType { string, entity, vec3, number, boolean, number_array, object_array };
 
 struct ReflectedField {
     std::string_view name;
@@ -104,6 +122,7 @@ struct EntityRecord {
     std::optional<Camera> camera;
     std::optional<MeshRenderer> mesh_renderer;
     std::optional<Animator> animator{};
+    std::optional<TransformAnimation> transform_animation{};
     std::optional<ModelNode> model_node{};
     std::optional<Light> light{};
 };
@@ -143,6 +162,8 @@ public:
     [[nodiscard]] bool set_camera(Entity entity, std::optional<Camera> camera);
     [[nodiscard]] bool set_mesh_renderer(Entity entity, std::optional<MeshRenderer> renderer);
     [[nodiscard]] bool set_animator(Entity entity, std::optional<Animator> animator);
+    [[nodiscard]] bool set_transform_animation(Entity entity,
+                                               std::optional<TransformAnimation> animation);
     [[nodiscard]] bool set_light(Entity entity, std::optional<Light> light);
     [[nodiscard]] std::optional<Entity> active_camera() const;
 
@@ -162,5 +183,8 @@ private:
     std::vector<SceneSlotState> slots_;
     std::vector<std::uint32_t> free_indices_;
 };
+
+[[nodiscard]] Transform sample_transform_animation(const TransformAnimation& animation,
+                                                   const Transform& fallback);
 
 } // namespace relay

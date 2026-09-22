@@ -35,10 +35,12 @@ add_library(relay_engine
     src/render/model_import.cpp
     src/render/scene_render.cpp
     src/render/render_graph.cpp
+    src/render/upload_budget.cpp
     src/render/shader_reflection.cpp
     src/render/vulkan_device.cpp
     src/scene/scene.cpp
     src/scene/project.cpp
+    src/scene/project_package.cpp
     src/scene/scene_edit.cpp
     src/scene/scene_history.cpp
     src/scene/scene_io.cpp
@@ -150,6 +152,8 @@ if(RELAY_ENABLE_SDL)
             set(RELAY_SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
             set(RELAY_VERTEX_SHADER "${RELAY_SHADER_OUTPUT_DIR}/first_light.vert.spv")
             set(RELAY_FRAGMENT_SHADER "${RELAY_SHADER_OUTPUT_DIR}/first_light.frag.spv")
+            set(RELAY_TONE_VERTEX "${RELAY_SHADER_OUTPUT_DIR}/tone_map.vert.spv")
+            set(RELAY_TONE_FRAGMENT "${RELAY_SHADER_OUTPUT_DIR}/tone_map.frag.spv")
             set(RELAY_SHADOW_VERTEX "${RELAY_SHADER_OUTPUT_DIR}/directional_shadow.vert.spv")
             set(RELAY_SHADOW_FRAGMENT "${RELAY_SHADER_OUTPUT_DIR}/directional_shadow.frag.spv")
             add_custom_command(
@@ -170,6 +174,17 @@ if(RELAY_ENABLE_SDL)
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/first_light.frag"
                 VERBATIM
             )
+            foreach(stage vert frag)
+                add_custom_command(
+                    OUTPUT "${RELAY_SHADER_OUTPUT_DIR}/tone_map.${stage}.spv"
+                    COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
+                    COMMAND "${RELAY_GLSLC}" -fshader-stage=${stage}
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/tone_map.${stage}"
+                            -o "${RELAY_SHADER_OUTPUT_DIR}/tone_map.${stage}.spv"
+                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/tone_map.${stage}"
+                    VERBATIM
+                )
+            endforeach()
             foreach(stage vert frag)
                 add_custom_command(
                     OUTPUT "${RELAY_SHADER_OUTPUT_DIR}/directional_shadow.${stage}.spv"
@@ -206,6 +221,7 @@ if(RELAY_ENABLE_SDL)
                 )
             endforeach()
             add_custom_target(relay_shaders DEPENDS "${RELAY_VERTEX_SHADER}" "${RELAY_FRAGMENT_SHADER}"
+                              "${RELAY_TONE_VERTEX}" "${RELAY_TONE_FRAGMENT}"
                               "${RELAY_SHADOW_VERTEX}" "${RELAY_SHADOW_FRAGMENT}"
                               "${RELAY_GRID_vert}" "${RELAY_GRID_frag}"
                               "${RELAY_SELECTION_vert}" "${RELAY_SELECTION_frag}")
@@ -219,6 +235,8 @@ if(RELAY_ENABLE_SDL)
                 RELAY_HAS_VULKAN_WINDOW=1
                 RELAY_VERTEX_SHADER_PATH="${RELAY_VERTEX_SHADER}"
                 RELAY_FRAGMENT_SHADER_PATH="${RELAY_FRAGMENT_SHADER}"
+                RELAY_TONE_VERTEX_PATH="${RELAY_TONE_VERTEX}"
+                RELAY_TONE_FRAGMENT_PATH="${RELAY_TONE_FRAGMENT}"
                 RELAY_SHADOW_VERTEX_PATH="${RELAY_SHADOW_VERTEX}"
                 RELAY_SHADOW_FRAGMENT_PATH="${RELAY_SHADOW_FRAGMENT}"
                 RELAY_GRID_VERTEX_PATH="${RELAY_GRID_vert}"
@@ -308,6 +326,8 @@ if(RELAY_BUILD_TESTS)
         target_compile_definitions(relay_tests PRIVATE
             RELAY_TEST_VERTEX_SHADER_PATH="${RELAY_VERTEX_SHADER}"
             RELAY_TEST_FRAGMENT_SHADER_PATH="${RELAY_FRAGMENT_SHADER}"
+            RELAY_TEST_TONE_VERTEX_PATH="${RELAY_TONE_VERTEX}"
+            RELAY_TEST_TONE_FRAGMENT_PATH="${RELAY_TONE_FRAGMENT}"
         )
     endif()
     add_test(NAME relay_tests COMMAND relay_tests)

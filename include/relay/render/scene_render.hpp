@@ -18,6 +18,7 @@ struct RenderCamera {
     Entity entity{};
     bool using_default{true};
     RenderMatrix view_projection{};
+    float exposure_ev{};
 };
 
 struct RenderInstance {

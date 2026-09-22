@@ -278,6 +278,7 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
         [&](const std::string_view kind) {
             if (kind == "graph") return window.render_graph_json();
             if (kind == "shader_interfaces") return window.shader_interfaces_json();
+            if (kind == "upload_status") return window.upload_status_json();
             return std::string{};
         });
 

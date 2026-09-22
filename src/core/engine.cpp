@@ -167,6 +167,22 @@ void Engine::advance_one_frame() {
     elapsed_seconds_ += config_.fixed_delta_seconds;
     for (const auto entity : scene_.entities()) {
         auto *record = scene_.get(entity);
+        if (record->transform_animation && record->transform_animation->playing) {
+            auto& animation = *record->transform_animation;
+            animation.time_seconds += config_.fixed_delta_seconds * animation.speed;
+            if (animation.loop) {
+                animation.time_seconds = std::fmod(animation.time_seconds,
+                                                   animation.duration_seconds);
+                if (animation.time_seconds < 0.0)
+                    animation.time_seconds += animation.duration_seconds;
+            } else {
+                if (animation.time_seconds <= 0.0 ||
+                    animation.time_seconds >= animation.duration_seconds)
+                    animation.playing = false;
+                animation.time_seconds = std::clamp(animation.time_seconds, 0.0,
+                                                    animation.duration_seconds);
+            }
+        }
         if (!record->animator || !record->animator->playing)
             continue;
         auto &animator = *record->animator;

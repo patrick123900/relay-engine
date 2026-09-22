@@ -29,7 +29,9 @@ in control of the same project.
   attachments, inline media, usage meters, and permission management.
 - **Visual feedback loop** — agents can frame objects, control an inspection camera, capture the
   Vulkan viewport, inspect the image, and iterate.
-- **One typed API** — 85 versioned native methods cover scene editing, rendering, projects,
+- **HDR lighting** — a floating-point scene target, camera exposure, procedural environment
+  lighting, and tone mapping produce the final SDR viewport and captures.
+- **One typed API** — 90 versioned native methods cover scene editing, rendering, projects,
   observability, capture, and session authorization. A generated MCP bridge exposes the supported
   model-facing subset.
 - **Deterministic core** — fixed-step simulation, transactional undo/redo, strict scene validation,
@@ -37,6 +39,16 @@ in control of the same project.
 - **Practical asset pipeline** — glTF/GLB, OBJ, FBX, DAE, and sandboxed Blender conversion on Linux,
   with PBR materials, animation, skinning, morph targets, cameras, punctual lights, stabilized
   cascaded directional shadows, spot shadows, and point-light cubemap shadows.
+- **Bounded GPU uploads** — explicit staging and estimated device-memory limits, upload telemetry,
+  and transfer-queue mip generation when a dedicated queue is available.
+- **Scene authoring and export** — editable, undoable transform keyframes and portable project tar
+  packages of saved scenes and assets.
+
+Select an entity and open **Transform keyframes** in the Inspector to add, edit, scrub, or play
+position, rotation, and scale keys. To share a project, save its scenes, then use **Export saved
+project** in the Project panel. Relay writes an uncompressed `.tar` under that project's `exports/`
+folder, containing the project metadata, member scenes, and non-hidden assets. Export refuses to
+overwrite an existing package.
 
 ## Built-in agent workspace
 
@@ -106,7 +118,9 @@ npm --prefix tools/mcp-bridge test
 ```
 
 Windowed smoke tests live under `tests/editor_*_smoke.py`; they are intended for deliberate manual
-or dedicated-desktop runs because they move focus and synthesize input.
+or dedicated-desktop runs because they move focus and synthesize input. The focused
+`tests/editor_hdr_upload_smoke.py` verifies exposure, upload telemetry, transform key rendering,
+and portable project export against a live Vulkan window.
 
 ## Architecture
 
@@ -138,10 +152,10 @@ drifting apart.
 ## Near-term direction
 
 1. Validate and improve long-running live-provider sessions.
-2. Expand renderer correctness with HDR, environment lighting, post-processing, and resource
-   streaming.
+2. Expand renderer correctness with image-based environment lighting, configurable effects, and
+   resource streaming.
 3. Add Windows and macOS backend and import-sandbox parity.
-4. Continue game-authoring, packaging, and export workflows.
+4. Extend game authoring with more component tracks and expand project export formats.
 
 Relay currently targets local, single-user authoring. Treat project files and imported assets as
 untrusted input; the loader, protocol, and importer intentionally fail closed at their boundaries.

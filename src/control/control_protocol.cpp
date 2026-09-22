@@ -296,6 +296,14 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) +
                "{\"available\":false,\"reason\":\"no live Vulkan renderer is attached\"}}";
     }
+    if (method == "render.upload_status") {
+        if (render_inspection_handler_) {
+            const auto live = render_inspection_handler_("upload_status");
+            if (!live.empty()) return response_prefix(id) + live + '}';
+        }
+        return response_prefix(id) +
+               "{\"available\":false,\"reason\":\"no live Vulkan renderer is attached\"}}";
+    }
     if (method == "render.assets") {
         return response_prefix(id) + engine_.assets().to_json() + '}';
     }
@@ -604,6 +612,17 @@ std::string ControlProtocol::handle(const std::string_view request) {
         }
         return response_prefix(id) + "{\"projects\":" + files + "]}}";
     }
+    if (method == "project.package") {
+        if (!engine_.project()) return error_response(id, "no project is open");
+        const auto filename = string_field(request, "filename");
+        std::string error;
+        std::uint64_t bytes{};
+        if (!package_project(*engine_.project(), filename, error, bytes))
+            return error_response(id, error);
+        return response_prefix(id) + "{\"filename\":\"" +
+               escape_json((engine_.project()->root() / "exports" / filename).generic_string()) +
+               "\",\"bytes\":" + std::to_string(bytes) + "}}";
+    }
     if (method == "project.close") {
         engine_.project().reset();
         return response_prefix(id) + "{\"project\":null}}";
@@ -906,6 +925,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
             if (const auto value = number_field(request, "far_plane")) camera->far_plane = *value;
             if (const auto value = number_field(request, "orthographic_height"))
                 camera->orthographic_height = *value;
+            if (const auto value = number_field(request, "exposure_ev"))
+                camera->exposure_ev = *value;
             if (camera->far_plane <= camera->near_plane) {
                 return error_response(id, "camera far_plane must be greater than near_plane");
             }
@@ -918,6 +939,63 @@ std::string ControlProtocol::handle(const std::string_view request) {
         engine_.logs().write(LogLevel::info,
                              std::string(enabled ? "Configured camera for " : "Removed camera from ") +
                                  entity->to_string());
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.keyframe.set" || method == "scene.keyframe.delete" ||
+        method == "scene.keyframes.playback") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        const auto* record = engine_.scene().get(*entity);
+        auto animation = record->transform_animation.value_or(TransformAnimation{});
+        if (method == "scene.keyframe.set") {
+            const auto time = number_field(request, "time_seconds").value_or(0.0);
+            auto found = std::lower_bound(animation.keys.begin(), animation.keys.end(), time,
+                [](const TransformKeyframe& key, const double value) {
+                    return key.time_seconds < value;
+                });
+            Transform value = found != animation.keys.end() && found->time_seconds == time
+                                  ? found->value : record->transform;
+            const auto update = [&](const char* field_name, double& target) {
+                if (const auto number = number_field(request, field_name)) target = *number;
+            };
+            update("px", value.position.x); update("py", value.position.y);
+            update("pz", value.position.z); update("rx", value.rotation_degrees.x);
+            update("ry", value.rotation_degrees.y); update("rz", value.rotation_degrees.z);
+            update("sx", value.scale.x); update("sy", value.scale.y);
+            update("sz", value.scale.z);
+            if (found != animation.keys.end() && found->time_seconds == time)
+                found->value = value;
+            else animation.keys.insert(found, TransformKeyframe{time, value});
+            animation.duration_seconds = std::max(animation.duration_seconds, time);
+        } else if (method == "scene.keyframe.delete") {
+            if (!record->transform_animation)
+                return error_response(id, "entity has no transform keyframes");
+            const auto time = number_field(request, "time_seconds").value_or(0.0);
+            const auto found = std::lower_bound(animation.keys.begin(), animation.keys.end(), time,
+                [](const TransformKeyframe& key, const double value) {
+                    return key.time_seconds < value;
+                });
+            if (found == animation.keys.end() || found->time_seconds != time)
+                return error_response(id, "keyframe does not exist at this time");
+            animation.keys.erase(found);
+        } else {
+            animation.playing = boolean_field(request, "playing", animation.playing);
+            animation.loop = boolean_field(request, "loop", animation.loop);
+            if (const auto value = number_field(request, "speed")) animation.speed = *value;
+            if (const auto value = number_field(request, "duration_seconds"))
+                animation.duration_seconds = *value;
+            if (const auto value = number_field(request, "time_seconds"))
+                animation.time_seconds = *value;
+            animation.time_seconds = std::min(animation.time_seconds,
+                                              animation.duration_seconds);
+        }
+        if (!engine_.scene_history().execute(
+                "Edit transform keyframes " + entity->to_string(),
+                [&](Scene& scene) { return scene.set_transform_animation(*entity, animation); },
+                unsigned_field(request, "gesture", 0U)))
+            return error_response(id, "invalid transform animation values or keyframe limit");
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }

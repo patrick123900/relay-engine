@@ -45,7 +45,7 @@ try:
     for camera_tool in ("editor_camera_status", "editor_camera_set"):
         camera_result, camera_error = tool(camera_tool, {})
         assert camera_result.get("isError") and "requires a live editor" in str(camera_error), (camera_result, camera_error)
-    assert len(names) == 72 and "render_capture_cancel" in names and "scene_pick" in names
+    assert len(names) == 77 and "render_capture_cancel" in names and "scene_pick" in names
     assert {"scene_duplicate", "scene_clear", "scene_copy", "scene_cut", "scene_paste",
             "scene_transform_many", "project_create", "project_open", "animation_clip",
             "scene_set_animations"} <= names

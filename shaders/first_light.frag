@@ -24,11 +24,15 @@ layout(std430,set=0,binding=2) readonly buffer LightingBuffer {
     LightData lights[16];
     mat4 shadow_view_projections[3];
     mat4 spot_shadow_view_projection;
+    mat4 point_shadow_view_projections[6];
     vec4 shadow_splits;
     vec4 camera_forward;
+    vec4 point_shadow_position_far;
     uvec4 shadow_parameters;
+    uvec4 point_shadow_parameters;
 } lighting;
 layout(set=0,binding=3) uniform sampler2DShadow shadow_maps[4];
+layout(set=0,binding=4) uniform samplerCubeShadow point_shadow_map;
 
 layout(push_constant) uniform FrameData {
     mat4 model_view_projection;
@@ -68,6 +72,29 @@ float cascade_visibility(uint cascade, float n_dot_l) {
     float scale = exp2(float(cascade));
     float bias = max(0.00018 * scale * (1.0 - n_dot_l), 0.00004 * scale);
     return projected_visibility(lighting.shadow_view_projections[cascade], cascade, bias);
+}
+
+float point_visibility(float n_dot_l) {
+    vec3 delta = world_position - lighting.point_shadow_position_far.xyz;
+    float major = max(max(abs(delta.x), abs(delta.y)), abs(delta.z));
+    float near_plane = uintBitsToFloat(lighting.point_shadow_parameters.z);
+    float far_plane = lighting.point_shadow_position_far.w;
+    if (major <= near_plane || major >= far_plane) return 1.0;
+    float reference = far_plane / (far_plane - near_plane) -
+                      near_plane * far_plane / ((far_plane - near_plane) * major);
+    reference -= max(0.001 * (1.0 - n_dot_l), 0.0002);
+    vec3 direction = normalize(delta);
+    vec3 helper = abs(direction.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(helper, direction));
+    vec3 bitangent = cross(direction, tangent);
+    float visibility = 0.0;
+    const float radius = 2.0 / 1024.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x)
+            visibility += texture(point_shadow_map,
+                                  vec4(direction + (tangent * x + bitangent * y) * radius,
+                                       reference));
+    return visibility / 9.0;
 }
 
 void main() {
@@ -166,6 +193,9 @@ void main() {
                light_index == lighting.shadow_parameters.w) {
         float bias = max(0.0003 * (1.0 - n_dot_l), 0.00008);
         visibility = projected_visibility(lighting.spot_shadow_view_projection, 3u, bias);
+    } else if (lighting.point_shadow_parameters.x != 0u &&
+               light_index == lighting.point_shadow_parameters.y) {
+        visibility = point_visibility(n_dot_l);
     }
     direct_color+=(diffuse+specular)*n_dot_l*radiance*visibility;
     }

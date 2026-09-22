@@ -339,6 +339,9 @@ int main() {
         relay::Light directional;
         directional.type = relay::Light::Type::directional;
         (void)shadow_caster_scene.set_light(shadow_light, directional);
+        const auto brighter_shadow_light = shadow_caster_scene.create("Brighter sun");
+        directional.intensity = 2.0;
+        (void)shadow_caster_scene.set_light(brighter_shadow_light, directional);
         const auto off_camera_caster = shadow_caster_scene.create("Off-camera caster");
         auto caster_transform = shadow_caster_scene.get(off_camera_caster)->transform;
         caster_transform.position.z = 6.0;
@@ -355,15 +358,20 @@ int main() {
         expect(caster != shadow_caster_render.instances.end() && !caster->camera_visible &&
                    caster->shadow_cascade_mask != 0U,
                "camera-culled geometry remains available when it intersects a shadow cascade");
+        expect(shadow_caster_render.directional_shadow.enabled &&
+                   shadow_caster_render.lights[shadow_caster_render.directional_shadow.light_index]
+                           .light.intensity == 2.0,
+               "the brightest visible light wins its type's bounded shadow budget");
     }
 
     const auto render_graph = relay::make_scene_render_graph();
-    expect(render_graph.valid && render_graph.ordered_passes.size() == 6U &&
+    expect(render_graph.valid && render_graph.ordered_passes.size() == 7U &&
                render_graph.ordered_passes.front().name == "directional_shadow_0" &&
                render_graph.ordered_passes[2].name == "directional_shadow_2" &&
                render_graph.ordered_passes[3].name == "spot_shadow" &&
-               render_graph.ordered_passes[4].name == "scene_geometry" &&
-               render_graph.transitions.size() == 12U,
+               render_graph.ordered_passes[4].name == "point_shadow" &&
+               render_graph.ordered_passes[5].name == "scene_geometry" &&
+               render_graph.transitions.size() == 14U,
            "render graph compiles geometry and presentation with explicit transitions: " +
                render_graph.error);
     const auto depth_resource = std::find_if(
@@ -526,8 +534,13 @@ int main() {
                    pose0.spot_shadow.enabled &&
                    pose0.spot_shadow.light_index < pose0.lights.size() &&
                    pose0.lights[pose0.spot_shadow.light_index].light.type ==
-                       relay::Light::Type::spot,
-               "directional and spot lights receive their bounded shadow-map budgets");
+                       relay::Light::Type::spot && pose0.point_shadow.enabled &&
+                   pose0.point_shadow.light_index < pose0.lights.size() &&
+                   pose0.lights[pose0.point_shadow.light_index].light.type ==
+                       relay::Light::Type::point &&
+                   pose0.point_shadow.view_projections[0].values !=
+                       pose0.point_shadow.view_projections[1].values,
+               "directional, spot and point lights receive their bounded shadow-map budgets");
         relay::ViewOverride stable_view;
         stable_view.position = {0.0, 0.0, 5.0};
         stable_view.target = {};
@@ -543,7 +556,8 @@ int main() {
         relay::Scene no_light_scene;
         const auto no_light_render =
             relay::build_render_scene(no_light_scene, dynamic_engine.assets(), 1.0F);
-        expect(!no_light_render.directional_shadow.enabled && !no_light_render.spot_shadow.enabled,
+        expect(!no_light_render.directional_shadow.enabled && !no_light_render.spot_shadow.enabled &&
+                   !no_light_render.point_shadow.enabled,
                "scenes without supported lights explicitly use the unshadowed fallback");
         expect(command("scene.set_animation", root, ",\"clip\":0,\"time_seconds\":0.5")
                        .find("\"ok\":true") != std::string::npos,
@@ -1213,7 +1227,8 @@ int main() {
     expect(capabilities.find(R"("vulkan":)") != std::string::npos,
            "protocol exposes Vulkan capabilities even when Vulkan is unavailable");
     expect(capabilities.find(R"("directional_cascades":3)") != std::string::npos &&
-               capabilities.find(R"("spot_maps":1)") != std::string::npos,
+               capabilities.find(R"("spot_maps":1)") != std::string::npos &&
+               capabilities.find(R"("point_maps":1)") != std::string::npos,
            "render capabilities expose the bounded shadow-map budget");
     const auto create_entity = protocol.handle(
         R"({"id":10,"method":"scene.create","name":"Agent Camera"})");

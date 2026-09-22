@@ -33,7 +33,7 @@ struct RenderInstance {
     bool alpha_blended{false};
     // Off-camera objects can still enter the render list when they cast into a shadow cascade.
     bool camera_visible{true};
-    std::uint8_t shadow_cascade_mask{};
+    std::uint16_t shadow_cascade_mask{};
     // Distance from the camera plane to the instance's bounds centre. Opaque instances are drawn
     // in increasing order; alpha-blended instances use decreasing order.
     float view_depth{};
@@ -60,9 +60,12 @@ struct DrawableBounds {
 inline constexpr std::size_t directional_shadow_cascade_count = 3U;
 inline constexpr std::size_t spot_shadow_map_index = directional_shadow_cascade_count;
 inline constexpr std::size_t shadow_map_count = directional_shadow_cascade_count + 1U;
+inline constexpr std::size_t point_shadow_face_count = 6U;
+inline constexpr std::size_t point_shadow_mask_offset = shadow_map_count;
 inline constexpr std::array<std::uint32_t, directional_shadow_cascade_count>
     directional_shadow_resolutions{2048U, 1024U, 1024U};
 inline constexpr std::uint32_t spot_shadow_resolution = 1024U;
+inline constexpr std::uint32_t point_shadow_resolution = 1024U;
 
 struct DirectionalShadow {
     bool enabled{false};
@@ -77,6 +80,15 @@ struct SpotShadow {
     RenderMatrix view_projection{};
 };
 
+struct PointShadow {
+    bool enabled{false};
+    std::size_t light_index{};
+    std::array<RenderMatrix, point_shadow_face_count> view_projections{};
+    Vec3 position{};
+    float near_plane{0.05F};
+    float far_plane{50.0F};
+};
+
 struct RenderScene {
     std::vector<DrawableBounds> drawable_bounds;
     RenderCamera camera{};
@@ -87,6 +99,7 @@ struct RenderScene {
     // depths live here so fitting, stabilization and fallback behavior remain headlessly testable.
     DirectionalShadow directional_shadow{};
     SpotShadow spot_shadow{};
+    PointShadow point_shadow{};
     Vec3 camera_position{0.0, 0.0, 5.0};
     Vec3 camera_forward{0.0, 0.0, -1.0};
     // Drawable entities rejected by frustum culling this frame.

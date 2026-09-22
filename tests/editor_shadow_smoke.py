@@ -72,6 +72,24 @@ def main():
         assert spot_darker > 150, (
             f"spot shadow absent or too small: {spot_darker} darker pixels")
         print(f"PASS: live Vulkan spot shadow contributes {spot_darker} darker pixels")
+
+        editor.result("scene.set_light", entity=spot, enabled=False)
+        editor.result("scene.set_transform", entity=caster, px=0, py=-.7, pz=1)
+        point = editor.result("scene.create", name="Shadow point")["entity"]
+        editor.result("scene.set_transform", entity=point, py=-2, pz=3)
+        editor.result("scene.set_light", entity=point, enabled=True, type="point", intensity=12,
+                      red=1, green=1, blue=1, constant=1, linear=0, quadratic=0, range=10)
+        time.sleep(1)
+        point_shadow_path = Path("captures/point-shadow-live-caster.png")
+        point_clear_path = Path("captures/point-shadow-live-clear.png")
+        editor.result("render.capture", path=str(point_shadow_path), source="vulkan")
+        editor.result("scene.set_transform", entity=caster, px=20)
+        time.sleep(1)
+        editor.result("render.capture", path=str(point_clear_path), source="vulkan")
+        point_darker = darker_pixel_count(point_shadow_path, point_clear_path)
+        assert point_darker > 150, (
+            f"point shadow absent or too small: {point_darker} darker pixels")
+        print(f"PASS: live Vulkan point shadow contributes {point_darker} darker pixels")
     finally:
         editor.close()
 

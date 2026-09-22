@@ -204,11 +204,15 @@ CompiledRenderGraph make_scene_render_graph() {
     const auto spot_shadow = graph.add_resource("spot_shadow", RenderResourceKind::image);
     graph.add_pass("spot_shadow", {{textures, RenderAccess::sampled},
                                     {spot_shadow, RenderAccess::depth_stencil_attachment}});
+    const auto point_shadow = graph.add_resource("point_shadow_cube", RenderResourceKind::image);
+    graph.add_pass("point_shadow", {{textures, RenderAccess::sampled},
+                                     {point_shadow, RenderAccess::depth_stencil_attachment}});
     graph.add_pass("scene_geometry", {{textures, RenderAccess::sampled},
                                       {shadows[0], RenderAccess::sampled},
                                       {shadows[1], RenderAccess::sampled},
                                       {shadows[2], RenderAccess::sampled},
                                       {spot_shadow, RenderAccess::sampled},
+                                      {point_shadow, RenderAccess::sampled},
                                       {depth, RenderAccess::depth_stencil_attachment},
                                       {swapchain, RenderAccess::color_attachment}});
     graph.add_pass("present", {{swapchain, RenderAccess::present}});

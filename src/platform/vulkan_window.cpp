@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -125,9 +126,13 @@ struct VulkanWindow::Impl {
         std::array<std::array<float, 16>, directional_shadow_cascade_count>
             shadow_view_projections{};
         std::array<float, 16> spot_shadow_view_projection{};
+        std::array<std::array<float, 16>, point_shadow_face_count>
+            point_shadow_view_projections{};
         std::array<float, 4> shadow_splits{};
         std::array<float, 4> camera_forward{};
+        std::array<float, 4> point_shadow_position_far{};
         std::array<std::uint32_t, 4> shadow_parameters{};
+        std::array<std::uint32_t, 4> point_shadow_parameters{};
     };
     struct alignas(16) GpuMaterial {
         std::array<float, 4> base_color_factor;
@@ -141,7 +146,7 @@ struct VulkanWindow::Impl {
     };
     static_assert(sizeof(DrawPushConstants) == 128U);
     static_assert(sizeof(GpuMaterial) == 64U);
-    static_assert(sizeof(GpuLight) == 80U && sizeof(GpuLighting) == 1600U);
+    static_assert(sizeof(GpuLight) == 80U && sizeof(GpuLighting) == 2016U);
     VkSwapchainKHR swapchain{};
     VkFormat swapchain_format{VK_FORMAT_UNDEFINED};
     VkExtent2D swapchain_extent{};
@@ -158,6 +163,7 @@ struct VulkanWindow::Impl {
     VkPipelineLayout shadow_pipeline_layout{};
     VkPipeline shadow_pipeline{};
     VkSampler shadow_sampler{};
+    VkSampler point_shadow_sampler{};
     VkFormat shadow_format{VK_FORMAT_UNDEFINED};
     struct ShadowAttachment {
         VkImage image{};
@@ -168,6 +174,14 @@ struct VulkanWindow::Impl {
     };
     std::array<ShadowAttachment, frames_in_flight * shadow_map_count>
         shadow_attachments{};
+    struct PointShadowAttachment {
+        VkImage image{};
+        VkDeviceMemory memory{};
+        VkImageView cube_view{};
+        std::array<VkImageView, point_shadow_face_count> face_views{};
+        std::array<VkFramebuffer, point_shadow_face_count> framebuffers{};
+    };
+    std::array<PointShadowAttachment, frames_in_flight> point_shadow_attachments{};
     // Each swapchain image owns its depth attachment. Multiple frames may be executing on the GPU
     // concurrently, so sharing one depth image across their framebuffers would introduce a write
     // hazard that the per-frame fences do not prevent.
@@ -455,7 +469,7 @@ struct VulkanWindow::Impl {
         VkPhysicalDeviceProperties device_properties{};
         vkGetPhysicalDeviceProperties(physical_device, &device_properties);
         constexpr std::uint32_t required_fragment_samplers =
-            bindless_texture_capacity + static_cast<std::uint32_t>(shadow_map_count);
+            bindless_texture_capacity + static_cast<std::uint32_t>(shadow_map_count) + 1U;
         if (device_properties.limits.maxPerStageDescriptorSamplers < required_fragment_samplers ||
             device_properties.limits.maxPerStageDescriptorSampledImages <
                 required_fragment_samplers ||
@@ -1087,7 +1101,7 @@ struct VulkanWindow::Impl {
         }
         auto result = VK_SUCCESS;
         if (texture_layout == VK_NULL_HANDLE) {
-            std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
+            std::array<VkDescriptorSetLayoutBinding, 5> bindings{};
             bindings[0].binding = 0U;
             bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             bindings[0].descriptorCount = bindless_texture_capacity;
@@ -1102,6 +1116,9 @@ struct VulkanWindow::Impl {
             bindings[3] = bindings[0];
             bindings[3].binding = 3U;
             bindings[3].descriptorCount = shadow_map_count;
+            bindings[4] = bindings[0];
+            bindings[4].binding = 4U;
+            bindings[4].descriptorCount = 1U;
             VkDescriptorSetLayoutCreateInfo layout_info{};
             layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
             layout_info.bindingCount = static_cast<std::uint32_t>(bindings.size());
@@ -1110,7 +1127,7 @@ struct VulkanWindow::Impl {
         }
         const std::array pool_sizes{
             VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                 (bindless_texture_capacity + shadow_map_count) *
+                                 (bindless_texture_capacity + shadow_map_count + 1U) *
                                      frames_in_flight},
             VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2U * frames_in_flight}};
         VkDescriptorPoolCreateInfo pool_info{};
@@ -1142,7 +1159,7 @@ struct VulkanWindow::Impl {
         VkDescriptorBufferInfo material_info{};
         material_info.buffer = material_buffer;
         material_info.range = material_capacity;
-        std::array<VkWriteDescriptorSet, 4> writes{};
+        std::array<VkWriteDescriptorSet, 5> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstBinding = 0U;
         writes[0].descriptorCount = bindless_texture_capacity;
@@ -1179,9 +1196,21 @@ struct VulkanWindow::Impl {
                 writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 writes[3].pImageInfo = shadow_infos.data();
             }
+            VkDescriptorImageInfo point_shadow_info{};
+            if (point_shadow_sampler != VK_NULL_HANDLE) {
+                point_shadow_info.sampler = point_shadow_sampler;
+                point_shadow_info.imageView = point_shadow_attachments[f].cube_view;
+                point_shadow_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[4].dstBinding = 4U;
+                writes[4].descriptorCount = 1U;
+                writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[4].pImageInfo = &point_shadow_info;
+            }
             for (auto &write : writes)
                 write.dstSet = texture_sets[f];
-            vkUpdateDescriptorSets(device, shadow_sampler != VK_NULL_HANDLE ? 4U : 3U,
+            vkUpdateDescriptorSets(device, point_shadow_sampler != VK_NULL_HANDLE ? 5U :
+                                           shadow_sampler != VK_NULL_HANDLE ? 4U : 3U,
                                    writes.data(), 0U, nullptr);
         }
         uploaded_material_count = assets->materials().size();
@@ -1620,6 +1649,102 @@ struct VulkanWindow::Impl {
         return true;
     }
 
+    bool create_point_shadow_resources() {
+        auto result = VK_SUCCESS;
+        for (std::size_t frame = 0; frame < frames_in_flight; ++frame) {
+            auto& shadow = point_shadow_attachments[frame];
+            VkImageCreateInfo image_info{};
+            image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            image_info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+            image_info.imageType = VK_IMAGE_TYPE_2D;
+            image_info.format = shadow_format;
+            image_info.extent = {point_shadow_resolution, point_shadow_resolution, 1U};
+            image_info.mipLevels = 1U;
+            image_info.arrayLayers = point_shadow_face_count;
+            image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+            image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                               VK_IMAGE_USAGE_SAMPLED_BIT;
+            image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            if (result == VK_SUCCESS)
+                result = vkCreateImage(device, &image_info, nullptr, &shadow.image);
+            VkMemoryRequirements requirements{};
+            if (result == VK_SUCCESS)
+                vkGetImageMemoryRequirements(device, shadow.image, &requirements);
+            const auto memory_type = result == VK_SUCCESS
+                                         ? find_memory_type(requirements.memoryTypeBits,
+                                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                                         : std::optional<std::uint32_t>{};
+            if (result == VK_SUCCESS && !memory_type) result = VK_ERROR_FEATURE_NOT_PRESENT;
+            VkMemoryAllocateInfo allocation{};
+            allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = memory_type.value_or(0U);
+            if (result == VK_SUCCESS)
+                result = vkAllocateMemory(device, &allocation, nullptr, &shadow.memory);
+            if (result == VK_SUCCESS)
+                result = vkBindImageMemory(device, shadow.image, shadow.memory, 0U);
+            VkImageViewCreateInfo view_info{};
+            view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            view_info.image = shadow.image;
+            view_info.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+            view_info.format = shadow_format;
+            view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            view_info.subresourceRange.levelCount = 1U;
+            view_info.subresourceRange.layerCount = point_shadow_face_count;
+            if (result == VK_SUCCESS)
+                result = vkCreateImageView(device, &view_info, nullptr, &shadow.cube_view);
+            for (std::size_t face = 0; face < point_shadow_face_count; ++face) {
+                view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                view_info.subresourceRange.baseArrayLayer = static_cast<std::uint32_t>(face);
+                view_info.subresourceRange.layerCount = 1U;
+                if (result == VK_SUCCESS)
+                    result = vkCreateImageView(device, &view_info, nullptr,
+                                               &shadow.face_views[face]);
+                VkFramebufferCreateInfo framebuffer_info{};
+                framebuffer_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+                framebuffer_info.renderPass = shadow_render_pass;
+                framebuffer_info.attachmentCount = 1U;
+                framebuffer_info.pAttachments = &shadow.face_views[face];
+                framebuffer_info.width = point_shadow_resolution;
+                framebuffer_info.height = point_shadow_resolution;
+                framebuffer_info.layers = 1U;
+                if (result == VK_SUCCESS)
+                    result = vkCreateFramebuffer(device, &framebuffer_info, nullptr,
+                                                 &shadow.framebuffers[face]);
+            }
+        }
+        VkSamplerCreateInfo sampler_info{};
+        sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sampler_info.magFilter = VK_FILTER_LINEAR;
+        sampler_info.minFilter = VK_FILTER_LINEAR;
+        sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampler_info.compareEnable = VK_TRUE;
+        sampler_info.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        if (result == VK_SUCCESS)
+            result = vkCreateSampler(device, &sampler_info, nullptr, &point_shadow_sampler);
+        if (result != VK_SUCCESS) {
+            last_error = vk_error("point shadow resource creation", result);
+            return false;
+        }
+        for (std::size_t frame = 0; frame < frames_in_flight; ++frame) {
+            VkDescriptorImageInfo image_info{point_shadow_sampler,
+                                             point_shadow_attachments[frame].cube_view,
+                                             VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = texture_sets[frame];
+            write.dstBinding = 4U;
+            write.descriptorCount = 1U;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &image_info;
+            vkUpdateDescriptorSets(device, 1U, &write, 0U, nullptr);
+        }
+        return true;
+    }
+
     bool create_render_pass() {
         VkAttachmentDescription color_attachment{};
         color_attachment.format = swapchain_format;
@@ -1963,6 +2088,7 @@ struct VulkanWindow::Impl {
     bool create_swapchain_resources() {
         return create_swapchain() && swapchain != VK_NULL_HANDLE && create_image_views() &&
                create_depth_resources() && create_directional_shadow_resources() &&
+               create_point_shadow_resources() &&
                create_render_pass() && create_pipeline() &&
                create_framebuffers();
     }
@@ -2000,6 +2126,16 @@ struct VulkanWindow::Impl {
             vkFreeMemory(device, shadow.memory, nullptr);
             shadow = {};
         }
+        for (auto& shadow : point_shadow_attachments) {
+            for (const auto framebuffer : shadow.framebuffers)
+                vkDestroyFramebuffer(device, framebuffer, nullptr);
+            for (const auto view : shadow.face_views)
+                vkDestroyImageView(device, view, nullptr);
+            vkDestroyImageView(device, shadow.cube_view, nullptr);
+            vkDestroyImage(device, shadow.image, nullptr);
+            vkFreeMemory(device, shadow.memory, nullptr);
+            shadow = {};
+        }
         vkDestroyPipeline(device, shadow_pipeline, nullptr);
         shadow_pipeline = VK_NULL_HANDLE;
         vkDestroyPipelineLayout(device, shadow_pipeline_layout, nullptr);
@@ -2008,6 +2144,8 @@ struct VulkanWindow::Impl {
         shadow_render_pass = VK_NULL_HANDLE;
         vkDestroySampler(device, shadow_sampler, nullptr);
         shadow_sampler = VK_NULL_HANDLE;
+        vkDestroySampler(device, point_shadow_sampler, nullptr);
+        point_shadow_sampler = VK_NULL_HANDLE;
         vkDestroyPipeline(device, selection_mask_pipeline, nullptr);
         vkDestroyPipeline(device, selection_outline_pipeline, nullptr);
         selection_mask_pipeline = selection_outline_pipeline = VK_NULL_HANDLE;
@@ -2119,15 +2257,28 @@ struct VulkanWindow::Impl {
                 render_scene.directional_shadow.split_depths[cascade];
         }
         lighting.spot_shadow_view_projection = render_scene.spot_shadow.view_projection.values;
+        for (std::size_t face = 0; face < point_shadow_face_count; ++face)
+            lighting.point_shadow_view_projections[face] =
+                render_scene.point_shadow.view_projections[face].values;
         lighting.camera_forward = {static_cast<float>(render_scene.camera_forward.x),
                                    static_cast<float>(render_scene.camera_forward.y),
                                    static_cast<float>(render_scene.camera_forward.z), 0.0F};
+        lighting.point_shadow_position_far = {
+            static_cast<float>(render_scene.point_shadow.position.x),
+            static_cast<float>(render_scene.point_shadow.position.y),
+            static_cast<float>(render_scene.point_shadow.position.z),
+            render_scene.point_shadow.far_plane};
         lighting.shadow_parameters[0] = render_scene.directional_shadow.enabled ? 1U : 0U;
         lighting.shadow_parameters[1] =
             static_cast<std::uint32_t>(render_scene.directional_shadow.light_index);
         lighting.shadow_parameters[2] = render_scene.spot_shadow.enabled ? 1U : 0U;
         lighting.shadow_parameters[3] =
             static_cast<std::uint32_t>(render_scene.spot_shadow.light_index);
+        lighting.point_shadow_parameters[0] = render_scene.point_shadow.enabled ? 1U : 0U;
+        lighting.point_shadow_parameters[1] =
+            static_cast<std::uint32_t>(render_scene.point_shadow.light_index);
+        lighting.point_shadow_parameters[2] =
+            std::bit_cast<std::uint32_t>(render_scene.point_shadow.near_plane);
         if (!write_memory(lighting_memories[current_frame], &lighting, sizeof(lighting)))
             return false;
         VkCommandBufferBeginInfo begin_info{};
@@ -2211,6 +2362,55 @@ struct VulkanWindow::Impl {
                                      ? draw_instance.deformed_vertex_offset : mesh->vertex_offset,
                                  draw_instance.material_index);
                 ++latest_draw_calls;
+            }
+            vkCmdEndRenderPass(commands);
+        }
+        for (std::size_t face = 0; face < point_shadow_face_count; ++face) {
+            VkRenderPassBeginInfo shadow_info{};
+            shadow_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            shadow_info.renderPass = shadow_render_pass;
+            shadow_info.framebuffer = point_shadow_attachments[current_frame].framebuffers[face];
+            shadow_info.renderArea.extent = {point_shadow_resolution, point_shadow_resolution};
+            shadow_info.clearValueCount = 1U;
+            shadow_info.pClearValues = &shadow_clear;
+            vkCmdBeginRenderPass(commands, &shadow_info, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline);
+            vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    shadow_pipeline_layout, 0U, 1U,
+                                    &texture_sets[current_frame], 0U, nullptr);
+            VkViewport viewport{0.0F, 0.0F, static_cast<float>(point_shadow_resolution),
+                                static_cast<float>(point_shadow_resolution), 0.0F, 1.0F};
+            VkRect2D scissor{{0, 0}, {point_shadow_resolution, point_shadow_resolution}};
+            vkCmdSetViewport(commands, 0U, 1U, &viewport);
+            vkCmdSetScissor(commands, 0U, 1U, &scissor);
+            if (render_scene.point_shadow.enabled) {
+                const VkDeviceSize vertex_offset = 0U;
+                vkCmdBindIndexBuffer(commands, mesh_index_buffer, 0U, VK_INDEX_TYPE_UINT32);
+                for (const auto& draw_instance : render_scene.instances) {
+                    if (draw_instance.alpha_blended ||
+                        (draw_instance.shadow_cascade_mask &
+                         (1U << (point_shadow_mask_offset + face))) == 0U)
+                        continue;
+                    const auto* mesh = assets->find_mesh(draw_instance.mesh);
+                    if (!mesh) continue;
+                    const auto buffer = draw_instance.deformed_vertex_offset >= 0
+                                            ? deformed_buffers[current_frame] : mesh_vertex_buffer;
+                    vkCmdBindVertexBuffers(commands, 0U, 1U, &buffer, &vertex_offset);
+                    DrawPushConstants constants{};
+                    constants.model_view_projection = multiply_matrices(
+                        render_scene.point_shadow.view_projections[face].values,
+                        draw_instance.model.values);
+                    constants.model = draw_instance.model.values;
+                    vkCmdPushConstants(commands, shadow_pipeline_layout,
+                                       VK_SHADER_STAGE_VERTEX_BIT, 0U, sizeof(constants),
+                                       &constants);
+                    vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
+                                     draw_instance.deformed_vertex_offset >= 0
+                                         ? draw_instance.deformed_vertex_offset
+                                         : mesh->vertex_offset,
+                                     draw_instance.material_index);
+                    ++latest_draw_calls;
+                }
             }
             vkCmdEndRenderPass(commands);
         }
@@ -2761,9 +2961,12 @@ std::uint32_t VulkanWindow::render_resource_count() const {
     const std::size_t depth_resources = impl_->depth_attachments.size() * 3U;
     // Every cascade owns an image, allocation, view and framebuffer.
     const std::size_t shadow_resources = impl_->shadow_attachments.size() * 4U;
+    const std::size_t point_shadow_resources =
+        impl_->point_shadow_attachments.size() * (3U + point_shadow_face_count * 2U);
     return static_cast<std::uint32_t>(impl_->swapchain_images.size() + impl_->image_views.size() +
                                       impl_->framebuffers.size() + impl_->textures.size() * 4U +
-                                      depth_resources + shadow_resources + 11U);
+                                      depth_resources + shadow_resources + point_shadow_resources +
+                                      12U);
 }
 
 std::string VulkanWindow::render_graph_json() const {

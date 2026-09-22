@@ -40,8 +40,9 @@ without blocking simultaneous human editing.
   masked and correctly ordered alpha-blended geometry), cameras, punctual lights, animation,
   skinning, morph targets, synchronized capture, and bounded punctual shadows. The first GPU-visible
   directional light receives three stable, camera-fitted cascades (2048/1024/1024) out to 120
-  units; the first spot light receives a perspective 1024-square map. Both use 3x3 PCF,
-  cascade blending/fade,
+  units; the brightest spot light receives a perspective 1024-square map and the brightest point
+  light receives a six-face 1024-square cubemap. The one-per-type budget is deterministic. All use
+  3x3 PCF, with cascade blending/fade for directional light,
   slope plus receiver bias, alpha-mask and double-sided casting, off-camera caster retention,
   per-cascade culling, depth-format fallback, and explicit unshadowed behavior.
 - Asset revisions batch all mesh, material, texture, and mip-generation transfers into one command
@@ -112,15 +113,14 @@ without blocking simultaneous human editing.
    needs deliberate live-provider and desktop visual validation.
 3. Untrusted `.blend` conversion fails closed on Windows and macOS because equivalent OS sandboxes
    are not implemented. `RELAY_BLENDER_TRUSTED=1` is only for administrator-approved input.
-4. Rendering remains early: point-light cubemap shadows, configurable multi-light shadow budgets,
-   HDR/post-processing, scalable resource streaming, Direct3D 12, and Metal are not implemented.
+4. Rendering remains early: HDR/post-processing, scalable resource streaming, configurable
+   shadow-quality controls, Direct3D 12, and Metal are not implemented.
 5. Agent sessions are designed for one local human/editor workflow; multi-client identities and a
    tamper-proof continuous audit store are not implemented.
 
 ## Next priorities
 
-1. Add point-light cubemap shadows and configurable multi-light shadow budgets, then HDR and
-   post-processing.
+1. Add HDR, exposure, environment lighting, tone mapping, and post-processing.
 2. Add upload memory budgets/telemetry and move large texture mip generation to a dedicated transfer
    path where the selected Vulkan device supports it.
 3. Extend authoring toward editable keyframes, packaging, and export.
@@ -133,9 +133,9 @@ the current hierarchy spacing, chat selection/wrapping, attachments, media viewe
 usage meters, camera controls, and authorization. A separate sustained fixture has exercised more
 than two minutes of editing/capture work with injected disconnects. The Vulkan directional-shadow
 path also has real-desktop coverage that compares captured receiver pixels with and without an
-occluder for both cascaded directional and perspective spot shadows; the general visual smoke covers
-capture isolation and swapchain resizing with all shadow resources active. These results do not
-prove live-provider stability or the newest Agent-panel presentation quality.
+occluder for cascaded directional, perspective spot, and cubemap point shadows; the general visual
+smoke covers capture isolation and swapchain resizing with all shadow resources active. These
+results do not prove live-provider stability or the newest Agent-panel presentation quality.
 
 Run native suites sequentially because some fixtures share temporary import paths:
 

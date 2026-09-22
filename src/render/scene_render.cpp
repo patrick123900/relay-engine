@@ -326,11 +326,8 @@ Vec3 scaled(const Vec3& value, const double factor) {
 
 // Camera world matrix for an eye looking at a target. Relay cameras look down local -Z, matching
 // the default viewpoint at +5Z and the direction convention used for spot and directional lights.
-RenderMatrix look_at_world(const Vec3& eye, const Vec3& target) {
+RenderMatrix look_at_world_up(const Vec3& eye, const Vec3& target, Vec3 up) {
     const auto forward = normalized({target.x - eye.x, target.y - eye.y, target.z - eye.z});
-    Vec3 up{0.0, 1.0, 0.0};
-    // Looking straight up or down leaves the horizontal axis undefined; pick a stable fallback.
-    if (std::abs(forward.y) > 0.9999) up = {0.0, 0.0, forward.y > 0.0 ? -1.0 : 1.0};
     const Vec3 backward{-forward.x, -forward.y, -forward.z};
     const auto right = normalized(cross(up, backward));
     const auto adjusted_up = cross(backward, right);
@@ -349,6 +346,14 @@ RenderMatrix look_at_world(const Vec3& eye, const Vec3& target) {
     result.values[13] = static_cast<float>(eye.y);
     result.values[14] = static_cast<float>(eye.z);
     return result;
+}
+
+RenderMatrix look_at_world(const Vec3& eye, const Vec3& target) {
+    Vec3 up{0.0, 1.0, 0.0};
+    const auto forward = normalized({target.x - eye.x, target.y - eye.y, target.z - eye.z});
+    // Looking straight up or down leaves the horizontal axis undefined; pick a stable fallback.
+    if (std::abs(forward.y) > 0.9999) up = {0.0, 0.0, forward.y > 0.0 ? -1.0 : 1.0};
+    return look_at_world_up(eye, target, up);
 }
 
 // Resolves animation-aware world matrices, memoized per entity. Rendering, picking and bounds
@@ -550,9 +555,24 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
             output.lights.push_back({*light, transform_point(world, {}),
                                      normalized(transform_point(world, {0, 0, -1}, true))});
         }
+    const auto shadow_budget_winner = [&output](const Light::Type type) {
+        std::size_t winner = output.lights.size();
+        for (std::size_t index = 0; index < std::min<std::size_t>(16U, output.lights.size());
+             ++index) {
+            const auto& light = output.lights[index].light;
+            if (light.type == type &&
+                (winner == output.lights.size() ||
+                 light.intensity > output.lights[winner].light.intensity))
+                winner = index;
+        }
+        return winner;
+    };
+    const auto directional_winner = shadow_budget_winner(Light::Type::directional);
+    const auto point_winner = shadow_budget_winner(Light::Type::point);
+    const auto spot_winner = shadow_budget_winner(Light::Type::spot);
     for (std::size_t index = 0; index < std::min<std::size_t>(16U, output.lights.size()); ++index) {
         const auto& light = output.lights[index];
-        if (light.light.type != Light::Type::directional) continue;
+        if (index != directional_winner) continue;
         output.directional_shadow.enabled = true;
         output.directional_shadow.light_index = index;
 
@@ -632,7 +652,33 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
     }
     for (std::size_t index = 0; index < std::min<std::size_t>(16U, output.lights.size()); ++index) {
         const auto& light = output.lights[index];
-        if (light.light.type != Light::Type::spot) continue;
+        if (index != point_winner) continue;
+        Camera shadow_camera;
+        shadow_camera.field_of_view_y_degrees = 90.0;
+        shadow_camera.near_plane = 0.05;
+        shadow_camera.far_plane = light.light.range > shadow_camera.near_plane
+                                      ? light.light.range : 50.0;
+        output.point_shadow.enabled = true;
+        output.point_shadow.light_index = index;
+        output.point_shadow.position = light.position;
+        output.point_shadow.near_plane = static_cast<float>(shadow_camera.near_plane);
+        output.point_shadow.far_plane = static_cast<float>(shadow_camera.far_plane);
+        constexpr std::array<Vec3, point_shadow_face_count> directions{{
+            {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}}};
+        constexpr std::array<Vec3, point_shadow_face_count> ups{{
+            {0, -1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
+            {0, -1, 0}, {0, -1, 0}}};
+        for (std::size_t face = 0; face < point_shadow_face_count; ++face) {
+            output.point_shadow.view_projections[face] = multiply(
+                perspective(shadow_camera, 1.0F),
+                inverse(look_at_world_up(light.position,
+                                         add(light.position, directions[face]), ups[face])));
+        }
+        break;
+    }
+    for (std::size_t index = 0; index < std::min<std::size_t>(16U, output.lights.size()); ++index) {
+        const auto& light = output.lights[index];
+        if (index != spot_winner) continue;
         Camera shadow_camera;
         shadow_camera.field_of_view_y_degrees = std::clamp(
             light.light.outer_cone * 360.0 / static_cast<double>(pi), 1.0, 175.0);
@@ -804,19 +850,28 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         }
         const bool camera_visible =
             mesh_asset == nullptr || !outside_frustum(model_view_projection, low, high);
-        std::uint8_t shadow_cascade_mask = 0U;
+        std::uint16_t shadow_cascade_mask = 0U;
         if (mesh_asset != nullptr && output.directional_shadow.enabled) {
             for (std::size_t cascade = 0; cascade < directional_shadow_cascade_count; ++cascade) {
                 const auto shadow_mvp = multiply(
                     output.directional_shadow.view_projections[cascade], model);
                 if (!outside_frustum(shadow_mvp, low, high))
-                    shadow_cascade_mask |= static_cast<std::uint8_t>(1U << cascade);
+                    shadow_cascade_mask |= static_cast<std::uint16_t>(1U << cascade);
             }
         }
         if (mesh_asset != nullptr && output.spot_shadow.enabled) {
             const auto shadow_mvp = multiply(output.spot_shadow.view_projection, model);
             if (!outside_frustum(shadow_mvp, low, high))
-                shadow_cascade_mask |= static_cast<std::uint8_t>(1U << spot_shadow_map_index);
+                shadow_cascade_mask |= static_cast<std::uint16_t>(1U << spot_shadow_map_index);
+        }
+        if (mesh_asset != nullptr && output.point_shadow.enabled) {
+            for (std::size_t face = 0; face < point_shadow_face_count; ++face) {
+                const auto shadow_mvp =
+                    multiply(output.point_shadow.view_projections[face], model);
+                if (!outside_frustum(shadow_mvp, low, high))
+                    shadow_cascade_mask |= static_cast<std::uint16_t>(
+                        1U << (point_shadow_mask_offset + face));
+            }
         }
         if (!camera_visible) {
             ++output.culled;

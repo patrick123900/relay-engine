@@ -5,7 +5,6 @@ layout(location = 1) in vec3 surface_normal;
 layout(location = 2) in vec4 surface_tangent;
 layout(location = 3) flat in uint material_index;
 layout(location = 4) in vec3 world_position;
-layout(location = 5) in vec4 shadow_position;
 layout(location = 0) out vec4 output_color;
 
 layout(set = 0, binding = 0) uniform sampler2D textures[16];
@@ -23,10 +22,13 @@ struct LightData { vec4 position_type; vec4 direction_inner; vec4 color_intensit
 layout(std430,set=0,binding=2) readonly buffer LightingBuffer {
     vec4 camera_count;
     LightData lights[16];
-    mat4 shadow_view_projection;
+    mat4 shadow_view_projections[3];
+    mat4 spot_shadow_view_projection;
+    vec4 shadow_splits;
+    vec4 camera_forward;
     uvec4 shadow_parameters;
 } lighting;
-layout(set=0,binding=3) uniform sampler2DShadow directional_shadow;
+layout(set=0,binding=3) uniform sampler2DShadow shadow_maps[4];
 
 layout(push_constant) uniform FrameData {
     mat4 model_view_projection;
@@ -35,6 +37,38 @@ layout(push_constant) uniform FrameData {
 
 const uint missing_texture = 0xffffffffu;
 const float pi = 3.14159265359;
+
+float filtered_shadow(uint map_index, vec3 coordinates) {
+    vec2 texel = 1.0 / vec2(textureSize(shadow_maps[0], 0));
+    float visibility = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec3 sample_coordinates = vec3(coordinates.xy + vec2(x, y) * texel, coordinates.z);
+            if (map_index == 0u) visibility += texture(shadow_maps[0], sample_coordinates);
+            else if (map_index == 1u) visibility += texture(shadow_maps[1], sample_coordinates);
+            else if (map_index == 2u) visibility += texture(shadow_maps[2], sample_coordinates);
+            else visibility += texture(shadow_maps[3], sample_coordinates);
+        }
+    }
+    return visibility / 9.0;
+}
+
+float projected_visibility(mat4 view_projection, uint map_index, float bias) {
+    vec4 position = view_projection * vec4(world_position, 1.0);
+    vec3 projected = position.xyz / position.w;
+    vec2 uv = projected.xy * 0.5 + 0.5;
+    if (projected.z < 0.0 || projected.z > 1.0 ||
+        any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 1.0;
+    return filtered_shadow(map_index, vec3(uv, projected.z - bias));
+}
+
+float cascade_visibility(uint cascade, float n_dot_l) {
+    // Bias grows with cascade footprint and grazing angle. Raster depth bias handles the caster;
+    // this receiver bias suppresses residual acne without detaching nearby contact shadows.
+    float scale = exp2(float(cascade));
+    float bias = max(0.00018 * scale * (1.0 - n_dot_l), 0.00004 * scale);
+    return projected_visibility(lighting.shadow_view_projections[cascade], cascade, bias);
+}
 
 void main() {
     MaterialData material = materials[material_index];
@@ -108,13 +142,30 @@ void main() {
     vec3 diffuse = (1.0 - fresnel) * (1.0 - metallic) * base_color.rgb / pi;
     float visibility = 1.0;
     if (lighting.shadow_parameters.x != 0u && light_index == lighting.shadow_parameters.y) {
-        vec3 projected = shadow_position.xyz / shadow_position.w;
-        vec2 uv = projected.xy * 0.5 + 0.5;
-        float bias = max(0.0005 * (1.0 - n_dot_l), 0.0001);
-        if (projected.z >= 0.0 && projected.z <= 1.0 &&
-            all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
-            visibility = texture(directional_shadow, vec3(uv, projected.z - bias));
+        float view_depth = max(dot(world_position - lighting.camera_count.xyz,
+                                   lighting.camera_forward.xyz), 0.0);
+        uint cascade = view_depth <= lighting.shadow_splits.x ? 0u :
+                       view_depth <= lighting.shadow_splits.y ? 1u : 2u;
+        if (view_depth <= lighting.shadow_splits.z) {
+            visibility = cascade_visibility(cascade, n_dot_l);
+            if (cascade < 2u) {
+                float lower = cascade == 0u ? 0.0 : lighting.shadow_splits[cascade - 1u];
+                float width = max((lighting.shadow_splits[cascade] - lower) * 0.1, 0.001);
+                float blend = smoothstep(lighting.shadow_splits[cascade] - width,
+                                         lighting.shadow_splits[cascade], view_depth);
+                visibility = mix(visibility, cascade_visibility(cascade + 1u, n_dot_l), blend);
+            } else {
+                float fade_width = max((lighting.shadow_splits.z - lighting.shadow_splits.y) *
+                                           0.1, 0.001);
+                float fade = smoothstep(lighting.shadow_splits.z - fade_width,
+                                        lighting.shadow_splits.z, view_depth);
+                visibility = mix(visibility, 1.0, fade);
+            }
         }
+    } else if (lighting.shadow_parameters.z != 0u &&
+               light_index == lighting.shadow_parameters.w) {
+        float bias = max(0.0003 * (1.0 - n_dot_l), 0.00008);
+        visibility = projected_visibility(lighting.spot_shadow_view_projection, 3u, bias);
     }
     direct_color+=(diffuse+specular)*n_dot_l*radiance*visibility;
     }

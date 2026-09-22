@@ -11,6 +11,18 @@ from PIL import Image
 from editor_interaction_smoke import Editor
 
 
+def darker_pixel_count(shadow_path, clear_path):
+    with Image.open(shadow_path) as image:
+        shadow = image.convert("RGB").tobytes()
+    with Image.open(clear_path) as image:
+        clear = image.convert("RGB").tobytes()
+    assert len(shadow) == len(clear)
+    shadow_pixels = zip(shadow[0::3], shadow[1::3], shadow[2::3])
+    clear_pixels = zip(clear[0::3], clear[1::3], clear[2::3])
+    return sum(sum(reference) - sum(cast) > 45
+               for cast, reference in zip(shadow_pixels, clear_pixels))
+
+
 def main():
     editor = Editor()
     try:
@@ -38,17 +50,28 @@ def main():
         time.sleep(1)
         editor.result("render.capture", path=str(clear_path), source="vulkan")
 
-        with Image.open(shadow_path) as image:
-            shadow = image.convert("RGB").tobytes()
-        with Image.open(clear_path) as image:
-            clear = image.convert("RGB").tobytes()
-        assert len(shadow) == len(clear)
-        shadow_pixels = zip(shadow[0::3], shadow[1::3], shadow[2::3])
-        clear_pixels = zip(clear[0::3], clear[1::3], clear[2::3])
-        darker = sum(sum(reference) - sum(cast) > 45
-                     for cast, reference in zip(shadow_pixels, clear_pixels))
+        darker = darker_pixel_count(shadow_path, clear_path)
         assert darker > 250, f"directional shadow absent or too small: {darker} darker pixels"
         print(f"PASS: live Vulkan directional shadow contributes {darker} darker pixels")
+
+        editor.result("scene.set_light", entity=light, enabled=False)
+        editor.result("scene.set_transform", entity=caster, px=0, py=-1, pz=1)
+        spot = editor.result("scene.create", name="Shadow spot")["entity"]
+        editor.result("scene.set_transform", entity=spot, py=-3, pz=3, rx=45)
+        editor.result("scene.set_light", entity=spot, enabled=True, type="spot", intensity=12,
+                      red=1, green=1, blue=1, constant=1, linear=0, quadratic=0,
+                      inner_cone=.45, outer_cone=.7, range=10)
+        time.sleep(1)
+        spot_shadow_path = Path("captures/spot-shadow-live-caster.png")
+        spot_clear_path = Path("captures/spot-shadow-live-clear.png")
+        editor.result("render.capture", path=str(spot_shadow_path), source="vulkan")
+        editor.result("scene.set_transform", entity=caster, px=20)
+        time.sleep(1)
+        editor.result("render.capture", path=str(spot_clear_path), source="vulkan")
+        spot_darker = darker_pixel_count(spot_shadow_path, spot_clear_path)
+        assert spot_darker > 150, (
+            f"spot shadow absent or too small: {spot_darker} darker pixels")
+        print(f"PASS: live Vulkan spot shadow contributes {spot_darker} darker pixels")
     finally:
         editor.close()
 

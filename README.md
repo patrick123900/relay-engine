@@ -35,7 +35,8 @@ in control of the same project.
 - **Deterministic core** — fixed-step simulation, transactional undo/redo, strict scene validation,
   and a CPU renderer used as a headless test oracle.
 - **Practical asset pipeline** — glTF/GLB, OBJ, FBX, DAE, and sandboxed Blender conversion on Linux,
-  with PBR materials, animation, skinning, morph targets, cameras, and punctual lights.
+  with PBR materials, animation, skinning, morph targets, cameras, punctual lights, stabilized
+  cascaded directional shadows, and spot shadows.
 
 ## Built-in agent workspace
 
@@ -137,7 +138,7 @@ drifting apart.
 ## Near-term direction
 
 1. Validate and improve long-running live-provider sessions.
-2. Expand renderer correctness, lighting, shadows, HDR, and resource streaming.
+2. Expand renderer correctness with point-light/multi-light shadows, HDR, and resource streaming.
 3. Add Windows and macOS backend and import-sandbox parity.
 4. Continue game-authoring, packaging, and export workflows.
 

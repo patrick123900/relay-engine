@@ -275,7 +275,9 @@ std::string ControlProtocol::handle(const std::string_view request) {
                << ",\"ray_query\":" << (capabilities.ray_query ? "true" : "false")
                << ",\"mesh_shader\":" << (capabilities.mesh_shader ? "true" : "false")
                << ",\"descriptor_buffer\":" << (capabilities.descriptor_buffer ? "true" : "false")
-               << ",\"error\":\"" << escape_json(capabilities.error) << "\"}}}";
+               << ",\"error\":\"" << escape_json(capabilities.error)
+               << "\"},\"shadows\":{\"directional_cascades\":3,\"spot_maps\":1,"
+                  "\"point_maps\":0,\"pcf_kernel\":3,\"maximum_distance\":120}}}";
         return result.str();
     }
     if (method == "render.graph") {

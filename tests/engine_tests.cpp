@@ -333,13 +333,37 @@ int main() {
                    transparent_ordered.instances[1].view_depth >
                        transparent_ordered.instances[2].view_depth,
                "opaque geometry precedes alpha blending, which draws back to front");
+
+        relay::Scene shadow_caster_scene;
+        const auto shadow_light = shadow_caster_scene.create("Sun");
+        relay::Light directional;
+        directional.type = relay::Light::Type::directional;
+        (void)shadow_caster_scene.set_light(shadow_light, directional);
+        const auto off_camera_caster = shadow_caster_scene.create("Off-camera caster");
+        auto caster_transform = shadow_caster_scene.get(off_camera_caster)->transform;
+        caster_transform.position.z = 6.0;
+        (void)shadow_caster_scene.set_transform(off_camera_caster, caster_transform);
+        (void)shadow_caster_scene.set_mesh_renderer(
+            off_camera_caster, relay::MeshRenderer{"builtin.quad", "builtin.orange"});
+        const auto shadow_caster_render =
+            relay::build_render_scene(shadow_caster_scene, registry, 1.0F);
+        const auto caster = std::find_if(
+            shadow_caster_render.instances.begin(), shadow_caster_render.instances.end(),
+            [off_camera_caster](const auto& instance) {
+                return instance.entity == off_camera_caster;
+            });
+        expect(caster != shadow_caster_render.instances.end() && !caster->camera_visible &&
+                   caster->shadow_cascade_mask != 0U,
+               "camera-culled geometry remains available when it intersects a shadow cascade");
     }
 
     const auto render_graph = relay::make_scene_render_graph();
-    expect(render_graph.valid && render_graph.ordered_passes.size() == 3U &&
-               render_graph.ordered_passes.front().name == "directional_shadow" &&
-               render_graph.ordered_passes[1].name == "scene_geometry" &&
-               render_graph.transitions.size() == 6U,
+    expect(render_graph.valid && render_graph.ordered_passes.size() == 6U &&
+               render_graph.ordered_passes.front().name == "directional_shadow_0" &&
+               render_graph.ordered_passes[2].name == "directional_shadow_2" &&
+               render_graph.ordered_passes[3].name == "spot_shadow" &&
+               render_graph.ordered_passes[4].name == "scene_geometry" &&
+               render_graph.transitions.size() == 12U,
            "render graph compiles geometry and presentation with explicit transitions: " +
                render_graph.error);
     const auto depth_resource = std::find_if(
@@ -490,12 +514,37 @@ int main() {
         expect(pose0.directional_shadow.enabled &&
                    pose0.directional_shadow.light_index < pose0.lights.size() &&
                    pose0.lights[pose0.directional_shadow.light_index].light.type ==
-                       relay::Light::Type::directional,
-               "the first directional light deterministically owns the shadow map");
+                       relay::Light::Type::directional &&
+                   pose0.directional_shadow.split_depths[0] > 0.1F &&
+                   pose0.directional_shadow.split_depths[0] <
+                       pose0.directional_shadow.split_depths[1] &&
+                   pose0.directional_shadow.split_depths[1] <
+                       pose0.directional_shadow.split_depths[2] &&
+                   std::abs(pose0.directional_shadow.split_depths[2] - 120.0F) < 0.001F &&
+                   pose0.directional_shadow.view_projections[0].values !=
+                       pose0.directional_shadow.view_projections[1].values &&
+                   pose0.spot_shadow.enabled &&
+                   pose0.spot_shadow.light_index < pose0.lights.size() &&
+                   pose0.lights[pose0.spot_shadow.light_index].light.type ==
+                       relay::Light::Type::spot,
+               "directional and spot lights receive their bounded shadow-map budgets");
+        relay::ViewOverride stable_view;
+        stable_view.position = {0.0, 0.0, 5.0};
+        stable_view.target = {};
+        const auto stable_shadow = relay::build_render_scene(
+            dynamic_engine.scene(), dynamic_engine.assets(), 1.0F, &stable_view);
+        stable_view.position.x += 0.00001;
+        stable_view.target.x += 0.00001;
+        const auto sub_texel_shadow = relay::build_render_scene(
+            dynamic_engine.scene(), dynamic_engine.assets(), 1.0F, &stable_view);
+        expect(stable_shadow.directional_shadow.view_projections[0].values ==
+                   sub_texel_shadow.directional_shadow.view_projections[0].values,
+               "sub-texel camera translation leaves the stabilized near cascade unchanged");
         relay::Scene no_light_scene;
-        expect(!relay::build_render_scene(no_light_scene, dynamic_engine.assets(), 1.0F)
-                    .directional_shadow.enabled,
-               "scenes without a directional light explicitly use the unshadowed fallback");
+        const auto no_light_render =
+            relay::build_render_scene(no_light_scene, dynamic_engine.assets(), 1.0F);
+        expect(!no_light_render.directional_shadow.enabled && !no_light_render.spot_shadow.enabled,
+               "scenes without supported lights explicitly use the unshadowed fallback");
         expect(command("scene.set_animation", root, ",\"clip\":0,\"time_seconds\":0.5")
                        .find("\"ok\":true") != std::string::npos,
                "animation control supports deterministic seeking");
@@ -1163,6 +1212,9 @@ int main() {
     const auto capabilities = protocol.handle(R"({"id":9,"method":"render.capabilities"})");
     expect(capabilities.find(R"("vulkan":)") != std::string::npos,
            "protocol exposes Vulkan capabilities even when Vulkan is unavailable");
+    expect(capabilities.find(R"("directional_cascades":3)") != std::string::npos &&
+               capabilities.find(R"("spot_maps":1)") != std::string::npos,
+           "render capabilities expose the bounded shadow-map budget");
     const auto create_entity = protocol.handle(
         R"({"id":10,"method":"scene.create","name":"Agent Camera"})");
     expect(create_entity.find(R"("entity":"0:1")") != std::string::npos,

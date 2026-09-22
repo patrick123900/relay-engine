@@ -312,6 +312,18 @@ Vec3 cross(const Vec3& a, const Vec3& b) {
     return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
 }
 
+double dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+Vec3 add(const Vec3& a, const Vec3& b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+Vec3 scaled(const Vec3& value, const double factor) {
+    return {value.x * factor, value.y * factor, value.z * factor};
+}
+
 // Camera world matrix for an eye looking at a target. Relay cameras look down local -Z, matching
 // the default viewpoint at +5Z and the direction convention used for spot and directional lights.
 RenderMatrix look_at_world(const Vec3& eye, const Vec3& target) {
@@ -531,6 +543,7 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
     output.camera.view_projection =
         multiply(perspective(selected_camera, aspect_ratio), inverse(camera_world));
     output.camera_position = transform_point(camera_world, {});
+    output.camera_forward = normalized(transform_point(camera_world, {0, 0, -1}, true));
     for (const auto entity : entities)
         if (const auto& light = scene.get(entity)->light) {
             const auto world = resolve_world(entity);
@@ -540,20 +553,97 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
     for (std::size_t index = 0; index < std::min<std::size_t>(16U, output.lights.size()); ++index) {
         const auto& light = output.lights[index];
         if (light.light.type != Light::Type::directional) continue;
-        // Keep the first shadow milestone deliberately bounded: one directional light, a stable
-        // camera-centred 40-unit orthographic volume, and an unshadowed fallback otherwise.
-        const Vec3 target = output.camera_position;
-        const Vec3 eye{target.x - light.direction.x * 30.0,
-                       target.y - light.direction.y * 30.0,
-                       target.z - light.direction.z * 30.0};
-        Camera shadow_camera;
-        shadow_camera.orthographic_height = 40.0;
-        shadow_camera.near_plane = 0.1;
-        shadow_camera.far_plane = 80.0;
         output.directional_shadow.enabled = true;
         output.directional_shadow.light_index = index;
-        output.directional_shadow.view_projection =
-            multiply(perspective(shadow_camera, 1.0F), inverse(look_at_world(eye, target)));
+
+        constexpr double maximum_shadow_distance = 120.0;
+        constexpr double split_lambda = 0.65;
+        constexpr double caster_margin = 30.0;
+        const double camera_near = std::max(selected_camera.near_plane, 0.01);
+        const double camera_far = std::max(
+            camera_near + 0.01, std::min(selected_camera.far_plane, maximum_shadow_distance));
+        const Vec3 camera_right = normalized(transform_point(camera_world, {1, 0, 0}, true));
+        const Vec3 camera_up = normalized(transform_point(camera_world, {0, 1, 0}, true));
+        const Vec3 camera_forward = output.camera_forward;
+
+        // Anchor the light-space texel grid at the world origin. Snapping each cascade centre to
+        // this grid prevents sub-texel camera motion from making the shadow crawl over surfaces.
+        const auto light_basis = look_at_world(scaled(light.direction, -1.0), {});
+        const Vec3 light_right = normalized(transform_point(light_basis, {1, 0, 0}, true));
+        const Vec3 light_up = normalized(transform_point(light_basis, {0, 1, 0}, true));
+        double slice_near = camera_near;
+        for (std::size_t cascade = 0; cascade < directional_shadow_cascade_count; ++cascade) {
+            const double fraction = static_cast<double>(cascade + 1U) /
+                                    static_cast<double>(directional_shadow_cascade_count);
+            const double logarithmic = camera_near * std::pow(camera_far / camera_near, fraction);
+            const double linear = camera_near + (camera_far - camera_near) * fraction;
+            const double slice_far = selected_camera.orthographic_height > 0.0
+                                         ? linear
+                                         : split_lambda * logarithmic + (1.0 - split_lambda) * linear;
+            output.directional_shadow.split_depths[cascade] = static_cast<float>(slice_far);
+
+            std::array<Vec3, 8> corners{};
+            for (std::size_t plane = 0; plane < 2U; ++plane) {
+                const double depth = plane == 0U ? slice_near : slice_far;
+                const double half_height = selected_camera.orthographic_height > 0.0
+                                               ? selected_camera.orthographic_height * 0.5
+                                               : std::tan(selected_camera.field_of_view_y_degrees *
+                                                          static_cast<double>(pi) / 360.0) * depth;
+                const double half_width = half_height * std::max(static_cast<double>(aspect_ratio),
+                                                                 0.001);
+                const Vec3 plane_center =
+                    add(output.camera_position, scaled(camera_forward, depth));
+                for (std::size_t corner = 0; corner < 4U; ++corner) {
+                    const double x = (corner & 1U) != 0U ? half_width : -half_width;
+                    const double y = (corner & 2U) != 0U ? half_height : -half_height;
+                    corners[plane * 4U + corner] =
+                        add(add(plane_center, scaled(camera_right, x)), scaled(camera_up, y));
+                }
+            }
+            Vec3 centre{};
+            for (const auto& corner : corners)
+                centre = add(centre, scaled(corner, 1.0 / static_cast<double>(corners.size())));
+            double radius = 0.0;
+            for (const auto& corner : corners) {
+                const Vec3 delta{corner.x - centre.x, corner.y - centre.y, corner.z - centre.z};
+                radius = std::max(radius, std::sqrt(dot(delta, delta)));
+            }
+            // Quantizing the radius prevents small camera rotations from continually resizing the
+            // projection, while leaving only a tiny amount of unused map area.
+            radius = std::ceil(std::max(radius, 0.5) * 16.0) / 16.0;
+            const double texel = 2.0 * radius /
+                                 static_cast<double>(directional_shadow_resolutions[cascade]);
+            const double snapped_x = std::round(dot(centre, light_right) / texel) * texel;
+            const double snapped_y = std::round(dot(centre, light_up) / texel) * texel;
+            centre = add(centre, scaled(light_right, snapped_x - dot(centre, light_right)));
+            centre = add(centre, scaled(light_up, snapped_y - dot(centre, light_up)));
+
+            const Vec3 eye = add(centre, scaled(light.direction, -(radius + caster_margin)));
+            Camera shadow_camera;
+            shadow_camera.orthographic_height = radius * 2.0;
+            shadow_camera.near_plane = 0.1;
+            shadow_camera.far_plane = radius * 2.0 + caster_margin * 2.0;
+            output.directional_shadow.view_projections[cascade] =
+                multiply(perspective(shadow_camera, 1.0F),
+                         inverse(look_at_world(eye, centre)));
+            slice_near = slice_far;
+        }
+        break;
+    }
+    for (std::size_t index = 0; index < std::min<std::size_t>(16U, output.lights.size()); ++index) {
+        const auto& light = output.lights[index];
+        if (light.light.type != Light::Type::spot) continue;
+        Camera shadow_camera;
+        shadow_camera.field_of_view_y_degrees = std::clamp(
+            light.light.outer_cone * 360.0 / static_cast<double>(pi), 1.0, 175.0);
+        shadow_camera.near_plane = 0.05;
+        shadow_camera.far_plane = light.light.range > shadow_camera.near_plane
+                                      ? light.light.range : 100.0;
+        output.spot_shadow.enabled = true;
+        output.spot_shadow.light_index = index;
+        output.spot_shadow.view_projection = multiply(
+            perspective(shadow_camera, 1.0F),
+            inverse(look_at_world(light.position, add(light.position, light.direction))));
         break;
     }
 
@@ -712,9 +802,25 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
             }
             continue;
         }
-        if (mesh_asset != nullptr && outside_frustum(model_view_projection, low, high)) {
+        const bool camera_visible =
+            mesh_asset == nullptr || !outside_frustum(model_view_projection, low, high);
+        std::uint8_t shadow_cascade_mask = 0U;
+        if (mesh_asset != nullptr && output.directional_shadow.enabled) {
+            for (std::size_t cascade = 0; cascade < directional_shadow_cascade_count; ++cascade) {
+                const auto shadow_mvp = multiply(
+                    output.directional_shadow.view_projections[cascade], model);
+                if (!outside_frustum(shadow_mvp, low, high))
+                    shadow_cascade_mask |= static_cast<std::uint8_t>(1U << cascade);
+            }
+        }
+        if (mesh_asset != nullptr && output.spot_shadow.enabled) {
+            const auto shadow_mvp = multiply(output.spot_shadow.view_projection, model);
+            if (!outside_frustum(shadow_mvp, low, high))
+                shadow_cascade_mask |= static_cast<std::uint8_t>(1U << spot_shadow_map_index);
+        }
+        if (!camera_visible) {
             ++output.culled;
-            continue;
+            if (shadow_cascade_mask == 0U) continue;
         }
         // The clip-space w of the bounds centre is its distance along the camera's view direction.
         float view_depth = 0.0F;
@@ -751,6 +857,8 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         instance.material_index = material_asset != nullptr ? assets.material_index(material) : 0U;
         instance.alpha_blended = material_asset != nullptr &&
                                  material_asset->alpha_mode == MaterialAsset::AlphaMode::blend;
+        instance.camera_visible = camera_visible;
+        instance.shadow_cascade_mask = shadow_cascade_mask;
         instance.view_depth = view_depth;
         if (material_asset != nullptr) {
             instance.emissive_metallic = {

@@ -31,6 +31,9 @@ struct RenderInstance {
     std::uint32_t material_index{};
     // Alpha-blended instances render after opaque/masked geometry, back to front.
     bool alpha_blended{false};
+    // Off-camera objects can still enter the render list when they cast into a shadow cascade.
+    bool camera_visible{true};
+    std::uint8_t shadow_cascade_mask{};
     // Distance from the camera plane to the instance's bounds centre. Opaque instances are drawn
     // in increasing order; alpha-blended instances use decreasing order.
     float view_depth{};
@@ -54,7 +57,21 @@ struct DrawableBounds {
     Vec3 minimum, maximum;
 };
 
+inline constexpr std::size_t directional_shadow_cascade_count = 3U;
+inline constexpr std::size_t spot_shadow_map_index = directional_shadow_cascade_count;
+inline constexpr std::size_t shadow_map_count = directional_shadow_cascade_count + 1U;
+inline constexpr std::array<std::uint32_t, directional_shadow_cascade_count>
+    directional_shadow_resolutions{2048U, 1024U, 1024U};
+inline constexpr std::uint32_t spot_shadow_resolution = 1024U;
+
 struct DirectionalShadow {
+    bool enabled{false};
+    std::size_t light_index{};
+    std::array<RenderMatrix, directional_shadow_cascade_count> view_projections{};
+    std::array<float, directional_shadow_cascade_count> split_depths{};
+};
+
+struct SpotShadow {
     bool enabled{false};
     std::size_t light_index{};
     RenderMatrix view_projection{};
@@ -66,10 +83,12 @@ struct RenderScene {
     std::vector<RenderInstance> instances;
     std::vector<MeshVertex> deformed_vertices;
     std::vector<RenderLight> lights;
-    // The first directional light owns the initial single-map shadow budget. The matrix is kept in
-    // RenderScene so fitting and fallback behavior remain deterministic and headlessly testable.
+    // The first GPU-visible directional light owns the cascaded shadow budget. Matrices and split
+    // depths live here so fitting, stabilization and fallback behavior remain headlessly testable.
     DirectionalShadow directional_shadow{};
+    SpotShadow spot_shadow{};
     Vec3 camera_position{0.0, 0.0, 5.0};
+    Vec3 camera_forward{0.0, 0.0, -1.0};
     // Drawable entities rejected by frustum culling this frame.
     std::size_t culled{};
     std::size_t deformation_overflow{};

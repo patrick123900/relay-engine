@@ -4,6 +4,7 @@
 #include "relay/scene/scene.hpp"
 
 #include <array>
+#include <cstddef>
 #include <vector>
 
 namespace relay {
@@ -53,12 +54,21 @@ struct DrawableBounds {
     Vec3 minimum, maximum;
 };
 
+struct DirectionalShadow {
+    bool enabled{false};
+    std::size_t light_index{};
+    RenderMatrix view_projection{};
+};
+
 struct RenderScene {
     std::vector<DrawableBounds> drawable_bounds;
     RenderCamera camera{};
     std::vector<RenderInstance> instances;
     std::vector<MeshVertex> deformed_vertices;
     std::vector<RenderLight> lights;
+    // The first directional light owns the initial single-map shadow budget. The matrix is kept in
+    // RenderScene so fitting and fallback behavior remain deterministic and headlessly testable.
+    DirectionalShadow directional_shadow{};
     Vec3 camera_position{0.0, 0.0, 5.0};
     // Drawable entities rejected by frustum culling this frame.
     std::size_t culled{};

@@ -192,7 +192,11 @@ CompiledRenderGraph make_scene_render_graph() {
     // Depth is created and consumed inside the geometry pass, so unlike the swapchain and the
     // texture table it is not imported from outside the graph.
     const auto depth = graph.add_resource("scene_depth", RenderResourceKind::image);
+    const auto shadow = graph.add_resource("directional_shadow", RenderResourceKind::image);
+    graph.add_pass("directional_shadow", {{textures, RenderAccess::sampled},
+                                           {shadow, RenderAccess::depth_stencil_attachment}});
     graph.add_pass("scene_geometry", {{textures, RenderAccess::sampled},
+                                      {shadow, RenderAccess::sampled},
                                       {depth, RenderAccess::depth_stencil_attachment},
                                       {swapchain, RenderAccess::color_attachment}});
     graph.add_pass("present", {{swapchain, RenderAccess::present}});

@@ -150,6 +150,8 @@ if(RELAY_ENABLE_SDL)
             set(RELAY_SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
             set(RELAY_VERTEX_SHADER "${RELAY_SHADER_OUTPUT_DIR}/first_light.vert.spv")
             set(RELAY_FRAGMENT_SHADER "${RELAY_SHADER_OUTPUT_DIR}/first_light.frag.spv")
+            set(RELAY_SHADOW_VERTEX "${RELAY_SHADER_OUTPUT_DIR}/directional_shadow.vert.spv")
+            set(RELAY_SHADOW_FRAGMENT "${RELAY_SHADER_OUTPUT_DIR}/directional_shadow.frag.spv")
             add_custom_command(
                 OUTPUT "${RELAY_VERTEX_SHADER}"
                 COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
@@ -168,6 +170,17 @@ if(RELAY_ENABLE_SDL)
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/first_light.frag"
                 VERBATIM
             )
+            foreach(stage vert frag)
+                add_custom_command(
+                    OUTPUT "${RELAY_SHADER_OUTPUT_DIR}/directional_shadow.${stage}.spv"
+                    COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
+                    COMMAND "${RELAY_GLSLC}" -fshader-stage=${stage}
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/directional_shadow.${stage}"
+                            -o "${RELAY_SHADER_OUTPUT_DIR}/directional_shadow.${stage}.spv"
+                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/directional_shadow.${stage}"
+                    VERBATIM
+                )
+            endforeach()
             foreach(stage vert frag)
                 set(RELAY_GRID_${stage} "${RELAY_SHADER_OUTPUT_DIR}/editor_grid.${stage}.spv")
                 add_custom_command(
@@ -193,6 +206,7 @@ if(RELAY_ENABLE_SDL)
                 )
             endforeach()
             add_custom_target(relay_shaders DEPENDS "${RELAY_VERTEX_SHADER}" "${RELAY_FRAGMENT_SHADER}"
+                              "${RELAY_SHADOW_VERTEX}" "${RELAY_SHADOW_FRAGMENT}"
                               "${RELAY_GRID_vert}" "${RELAY_GRID_frag}"
                               "${RELAY_SELECTION_vert}" "${RELAY_SELECTION_frag}")
             add_dependencies(relay_demo relay_shaders)
@@ -205,6 +219,8 @@ if(RELAY_ENABLE_SDL)
                 RELAY_HAS_VULKAN_WINDOW=1
                 RELAY_VERTEX_SHADER_PATH="${RELAY_VERTEX_SHADER}"
                 RELAY_FRAGMENT_SHADER_PATH="${RELAY_FRAGMENT_SHADER}"
+                RELAY_SHADOW_VERTEX_PATH="${RELAY_SHADOW_VERTEX}"
+                RELAY_SHADOW_FRAGMENT_PATH="${RELAY_SHADOW_FRAGMENT}"
                 RELAY_GRID_VERTEX_PATH="${RELAY_GRID_vert}"
                 RELAY_GRID_FRAGMENT_PATH="${RELAY_GRID_frag}"
                 RELAY_SELECTION_VERTEX_PATH="${RELAY_SELECTION_vert}"

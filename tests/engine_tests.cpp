@@ -336,9 +336,10 @@ int main() {
     }
 
     const auto render_graph = relay::make_scene_render_graph();
-    expect(render_graph.valid && render_graph.ordered_passes.size() == 2U &&
-               render_graph.ordered_passes.front().name == "scene_geometry" &&
-               render_graph.transitions.size() == 4U,
+    expect(render_graph.valid && render_graph.ordered_passes.size() == 3U &&
+               render_graph.ordered_passes.front().name == "directional_shadow" &&
+               render_graph.ordered_passes[1].name == "scene_geometry" &&
+               render_graph.transitions.size() == 6U,
            "render graph compiles geometry and presentation with explicit transitions: " +
                render_graph.error);
     const auto depth_resource = std::find_if(
@@ -486,6 +487,15 @@ int main() {
             relay::build_render_scene(dynamic_engine.scene(), dynamic_engine.assets(), 1.0F);
         expect(pose0.deformed_vertices.size() == 3U && pose0.lights.size() == 3U,
                "dynamic geometry and all punctual light types reach the render scene");
+        expect(pose0.directional_shadow.enabled &&
+                   pose0.directional_shadow.light_index < pose0.lights.size() &&
+                   pose0.lights[pose0.directional_shadow.light_index].light.type ==
+                       relay::Light::Type::directional,
+               "the first directional light deterministically owns the shadow map");
+        relay::Scene no_light_scene;
+        expect(!relay::build_render_scene(no_light_scene, dynamic_engine.assets(), 1.0F)
+                    .directional_shadow.enabled,
+               "scenes without a directional light explicitly use the unshadowed fallback");
         expect(command("scene.set_animation", root, ",\"clip\":0,\"time_seconds\":0.5")
                        .find("\"ok\":true") != std::string::npos,
                "animation control supports deterministic seeking");

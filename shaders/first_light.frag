@@ -5,6 +5,7 @@ layout(location = 1) in vec3 surface_normal;
 layout(location = 2) in vec4 surface_tangent;
 layout(location = 3) flat in uint material_index;
 layout(location = 4) in vec3 world_position;
+layout(location = 5) in vec4 shadow_position;
 layout(location = 0) out vec4 output_color;
 
 layout(set = 0, binding = 0) uniform sampler2D textures[16];
@@ -22,7 +23,10 @@ struct LightData { vec4 position_type; vec4 direction_inner; vec4 color_intensit
 layout(std430,set=0,binding=2) readonly buffer LightingBuffer {
     vec4 camera_count;
     LightData lights[16];
+    mat4 shadow_view_projection;
+    uvec4 shadow_parameters;
 } lighting;
+layout(set=0,binding=3) uniform sampler2DShadow directional_shadow;
 
 layout(push_constant) uniform FrameData {
     mat4 model_view_projection;
@@ -102,7 +106,17 @@ void main() {
     vec3 specular = distribution * geometry_v * geometry_l * fresnel /
                     max(4.0 * n_dot_v * n_dot_l, 0.0001);
     vec3 diffuse = (1.0 - fresnel) * (1.0 - metallic) * base_color.rgb / pi;
-    direct_color+=(diffuse+specular)*n_dot_l*radiance;
+    float visibility = 1.0;
+    if (lighting.shadow_parameters.x != 0u && light_index == lighting.shadow_parameters.y) {
+        vec3 projected = shadow_position.xyz / shadow_position.w;
+        vec2 uv = projected.xy * 0.5 + 0.5;
+        float bias = max(0.0005 * (1.0 - n_dot_l), 0.0001);
+        if (projected.z >= 0.0 && projected.z <= 1.0 &&
+            all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
+            visibility = texture(directional_shadow, vec3(uv, projected.z - bias));
+        }
+    }
+    direct_color+=(diffuse+specular)*n_dot_l*radiance*visibility;
     }
 
     float occlusion = 1.0;

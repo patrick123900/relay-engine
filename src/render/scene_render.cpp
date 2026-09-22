@@ -537,6 +537,25 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
             output.lights.push_back({*light, transform_point(world, {}),
                                      normalized(transform_point(world, {0, 0, -1}, true))});
         }
+    for (std::size_t index = 0; index < std::min<std::size_t>(16U, output.lights.size()); ++index) {
+        const auto& light = output.lights[index];
+        if (light.light.type != Light::Type::directional) continue;
+        // Keep the first shadow milestone deliberately bounded: one directional light, a stable
+        // camera-centred 40-unit orthographic volume, and an unshadowed fallback otherwise.
+        const Vec3 target = output.camera_position;
+        const Vec3 eye{target.x - light.direction.x * 30.0,
+                       target.y - light.direction.y * 30.0,
+                       target.z - light.direction.z * 30.0};
+        Camera shadow_camera;
+        shadow_camera.orthographic_height = 40.0;
+        shadow_camera.near_plane = 0.1;
+        shadow_camera.far_plane = 80.0;
+        output.directional_shadow.enabled = true;
+        output.directional_shadow.light_index = index;
+        output.directional_shadow.view_projection =
+            multiply(perspective(shadow_camera, 1.0F), inverse(look_at_world(eye, target)));
+        break;
+    }
 
     std::size_t query_vertices = 0;
     output.instances.reserve(entities.size());

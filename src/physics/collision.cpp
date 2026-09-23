@@ -1,16 +1,22 @@
 #include "relay/physics/collision.hpp"
 
+#include "collider_mesh.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <set>
+#include <utility>
 
 namespace relay {
 namespace {
 
 constexpr std::size_t maximum_query_colliders = 4096U;
 constexpr std::size_t maximum_hierarchy_depth = 4096U;
+constexpr std::size_t maximum_outline_lines = 768U;
+constexpr std::size_t maximum_total_outline_lines = 8192U;
 constexpr double pi = 3.14159265358979323846;
 
 Vec3 add(const Vec3 a, const Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
@@ -58,6 +64,9 @@ struct Shape {
     std::array<Vec3, 3> edges{};
     Vec3 minimum{};
     Vec3 maximum{};
+    double radius{};
+    Vec3 axis{};
+    std::optional<detail::ColliderMeshData> mesh; // World-space points for convex and mesh.
 };
 
 std::optional<Affine> affine_for(const Scene& scene, const Entity entity) {
@@ -88,7 +97,8 @@ std::optional<Affine> affine_for(const Scene& scene, const Entity entity) {
 }
 
 std::optional<Shape> shape_for(const Scene& scene, const Entity entity,
-                               const bool include_disabled = false) {
+                               const bool include_disabled = false,
+                               const AssetRegistry* assets = nullptr) {
     const auto* record = scene.get(entity);
     if (!record || !record->collider || (!include_disabled && !record->collider->enabled))
         return std::nullopt;
@@ -101,6 +111,48 @@ std::optional<Shape> shape_for(const Scene& scene, const Entity entity,
     shape.edges = {{scale(affine->axes[0], shape.collider.half_extents.x),
                     scale(affine->axes[1], shape.collider.half_extents.y),
                     scale(affine->axes[2], shape.collider.half_extents.z)}};
+    if (shape.collider.type != BoxCollider::Type::box) {
+        const auto length = [](Vec3 value) {
+            return std::sqrt(dot(value, value));
+        };
+        const double world_scale = std::max({length(affine->axes[0]),
+                                             length(affine->axes[1]),
+                                             length(affine->axes[2])});
+        const double radius = shape.collider.radius * world_scale;
+        const double height = shape.collider.type == BoxCollider::Type::capsule
+            ? shape.collider.half_height * world_scale : 0.0;
+        const double y_length = length(affine->axes[1]);
+        if (!std::isfinite(radius) || radius <= 0.0 || y_length <= 0.0) return std::nullopt;
+        const auto axis = scale(affine->axes[1], 1.0 / y_length);
+        shape.radius = radius;
+        shape.axis = scale(axis, height);
+        shape.edges = {{{radius + std::abs(axis.x) * height, 0, 0},
+                        {0, radius + std::abs(axis.y) * height, 0},
+                        {0, 0, radius + std::abs(axis.z) * height}}};
+    }
+    if (shape.collider.type == BoxCollider::Type::convex ||
+        shape.collider.type == BoxCollider::Type::mesh) {
+        if (!assets) return std::nullopt;
+        auto mesh = detail::collider_mesh(*record, *assets);
+        if (!mesh) return std::nullopt;
+        Vec3 low{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+                 std::numeric_limits<double>::infinity()};
+        Vec3 high = scale(low, -1.0);
+        for (auto& point : mesh->points) {
+            point = add(affine->position, transform_direction(*affine, point));
+            low = {std::min(low.x, point.x), std::min(low.y, point.y), std::min(low.z, point.z)};
+            high = {std::max(high.x, point.x), std::max(high.y, point.y),
+                    std::max(high.z, point.z)};
+        }
+        // Flat meshes are valid triangle colliders; keep their bounds visibly non-degenerate.
+        const auto half = [](const double a, const double b) {
+            return std::max((b - a) * 0.5, 0.0005);
+        };
+        shape.center = scale(add(low, high), 0.5);
+        shape.edges = {{{half(low.x, high.x), 0, 0}, {0, half(low.y, high.y), 0},
+                        {0, 0, half(low.z, high.z)}}};
+        shape.mesh = std::move(mesh);
+    }
     const auto radius = Vec3{
         std::abs(shape.edges[0].x) + std::abs(shape.edges[1].x) + std::abs(shape.edges[2].x),
         std::abs(shape.edges[0].y) + std::abs(shape.edges[1].y) + std::abs(shape.edges[2].y),
@@ -116,8 +168,47 @@ std::optional<Shape> shape_for(const Scene& scene, const Entity entity,
 
 } // namespace
 
-CollisionDebugBoxes collision_debug_boxes(const Scene& scene, bool enabled_only) {
+std::optional<detail::ColliderMeshData> detail::collider_mesh(const EntityRecord& record,
+                                                              const AssetRegistry& assets) {
+    if (!record.collider) return std::nullopt;
+    const auto& name = !record.collider->mesh.empty() ? record.collider->mesh :
+                       record.mesh_renderer ? record.mesh_renderer->mesh : std::string{};
+    const auto* mesh = name.empty() ? nullptr : assets.find_mesh(name);
+    if (!mesh || mesh->index_count < 3U ||
+        mesh->index_count / 3U > maximum_collider_triangles) return std::nullopt;
+    const auto vertices = assets.mesh_vertices();
+    const auto indices = assets.mesh_indices();
+    if (static_cast<std::size_t>(mesh->first_index) + mesh->index_count > indices.size())
+        return std::nullopt;
+    ColliderMeshData result;
+    std::vector<std::uint32_t> remap;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> used;
+    used.reserve(mesh->index_count);
+    for (std::uint32_t i = 0; i < mesh->index_count; ++i)
+        used.emplace_back(indices[mesh->first_index + i], i);
+    std::sort(used.begin(), used.end());
+    remap.resize(mesh->index_count);
+    for (std::size_t i = 0; i < used.size(); ++i) {
+        if (i == 0 || used[i].first != used[i - 1].first) {
+            const auto vertex = static_cast<std::int64_t>(mesh->vertex_offset) + used[i].first;
+            if (vertex < 0 || static_cast<std::size_t>(vertex) >= vertices.size())
+                return std::nullopt;
+            const auto& source = vertices[static_cast<std::size_t>(vertex)];
+            const Vec3 point = add({source.x, source.y, source.z}, record.collider->center);
+            if (!bounded(point)) return std::nullopt;
+            result.points.push_back(point);
+        }
+        remap[used[i].second] = static_cast<std::uint32_t>(result.points.size() - 1U);
+    }
+    for (std::uint32_t i = 0; i + 2U < mesh->index_count; i += 3U)
+        result.triangles.push_back({remap[i], remap[i + 1U], remap[i + 2U]});
+    return result;
+}
+
+CollisionDebugBoxes collision_debug_boxes(const Scene& scene, bool enabled_only,
+                                          const AssetRegistry* assets) {
     CollisionDebugBoxes result;
+    std::size_t line_budget = maximum_total_outline_lines;
     for (const auto entity : scene.entities()) {
         const auto* record = scene.get(entity);
         if (!record || !record->collider || (enabled_only && !record->collider->enabled)) continue;
@@ -125,8 +216,33 @@ CollisionDebugBoxes collision_debug_boxes(const Scene& scene, bool enabled_only)
             result.truncated = true;
             break;
         }
-        if (const auto shape = shape_for(scene, entity, true))
-            result.boxes.push_back({entity, shape->collider.enabled, shape->center, shape->edges});
+        const auto shape = shape_for(scene, entity, true, assets);
+        if (!shape) continue;
+        CollisionDebugBox box{entity, shape->collider.enabled, shape->collider.type,
+                              shape->center, shape->edges, shape->radius, shape->axis, {}, false};
+        if (shape->mesh) {
+            const auto limit = std::min(maximum_outline_lines, line_budget);
+            const auto& points = shape->mesh->points;
+            if (shape->collider.type == BoxCollider::Type::convex) {
+                box.lines = detail::convex_hull_edges(points, limit, box.lines_truncated);
+            } else {
+                std::set<std::pair<std::uint32_t, std::uint32_t>> seen;
+                for (const auto& triangle : shape->mesh->triangles) {
+                    for (std::size_t corner = 0; corner < 3U; ++corner) {
+                        const auto edge = std::minmax(triangle[corner], triangle[(corner + 1U) % 3U]);
+                        if (edge.first == edge.second || !seen.insert(edge).second) continue;
+                        if (box.lines.size() == limit) {
+                            box.lines_truncated = true;
+                            break;
+                        }
+                        box.lines.push_back({points[edge.first], points[edge.second]});
+                    }
+                    if (box.lines_truncated) break;
+                }
+            }
+            line_budget -= box.lines.size();
+        }
+        result.boxes.push_back(std::move(box));
     }
     return result;
 }

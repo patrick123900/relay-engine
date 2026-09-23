@@ -484,6 +484,28 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                     result.error = "invalid box collider";
                     return result;
                 }
+                if (result.source_version >= 10U) {
+                    std::uint32_t type{};
+                    const auto* radius = field(*collider_object, "radius");
+                    const auto* half_height = field(*collider_object, "half_height");
+                    if (!read_integer(field(*collider_object, "type"), type) ||
+                        type > (result.source_version >= 11U ? 4U : 2U) ||
+                        !radius || !radius->number() || !half_height || !half_height->number()) {
+                        result.error = "invalid collider shape";
+                        return result;
+                    }
+                    collider.type = static_cast<BoxCollider::Type>(type);
+                    collider.radius = *radius->number();
+                    collider.half_height = *half_height->number();
+                }
+                if (result.source_version >= 11U) {
+                    const auto* mesh = field(*collider_object, "mesh");
+                    if (!mesh || !mesh->string()) {
+                        result.error = "invalid collider mesh";
+                        return result;
+                    }
+                    collider.mesh = *mesh->string();
+                }
                 collider.enabled = *enabled->boolean();
                 Scene validator;
                 const auto handle = validator.create();

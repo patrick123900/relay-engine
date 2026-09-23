@@ -103,8 +103,13 @@ struct Light {
 };
 
 struct BoxCollider {
+    enum class Type : std::uint8_t { box, sphere, capsule, convex, mesh } type{Type::box};
     Vec3 center{};
     Vec3 half_extents{0.5, 0.5, 0.5};
+    double radius{0.5};
+    double half_height{0.5}; // Capsule cylinder, excluding the round ends.
+    // Convex and mesh shapes use this registered mesh, or the entity's renderer mesh when empty.
+    std::string mesh{};
     bool enabled{true};
     std::uint32_t layer{1};
     std::uint32_t mask{0xffffffffU};

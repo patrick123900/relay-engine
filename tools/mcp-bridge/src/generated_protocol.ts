@@ -732,18 +732,22 @@ export function registerGeneratedTools(
   server.registerTool(
     "scene_set_collider",
     {
-      title: "Configure box collider",
-      description: "Add, edit or remove an authored box collider. The box follows the entity hierarchy and scene-owned transform animation. Undoable and saved with the scene.",
+      title: "Configure collider",
+      description: "Add, edit or remove an authored box, sphere, capsule, convex or triangle-mesh collider. Sphere and capsule use the largest world scale uniformly. Convex and mesh shapes use a registered mesh, defaulting to the entity renderer mesh. Undoable and saved with the scene.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
         "attached": z.boolean().optional(),
         "enabled": z.boolean().optional(),
+        "type": z.enum(["box", "sphere", "capsule", "convex", "mesh"]).optional(),
         "centerX": z.number().finite().min(-1000000).max(1000000).optional(),
         "centerY": z.number().finite().min(-1000000).max(1000000).optional(),
         "centerZ": z.number().finite().min(-1000000).max(1000000).optional(),
         "halfX": z.number().finite().min(1e-06).max(1000000).optional(),
         "halfY": z.number().finite().min(1e-06).max(1000000).optional(),
         "halfZ": z.number().finite().min(1e-06).max(1000000).optional(),
+        "radius": z.number().finite().min(1e-06).max(1000000).optional(),
+        "halfHeight": z.number().finite().min(1e-06).max(1000000).optional(),
+        "mesh": z.string().max(128).regex(new RegExp("^[A-Za-z0-9._:-]*$")).optional().describe("Registered mesh for convex and mesh shapes; empty uses the entity renderer mesh"),
         "layer": z.number().int().min(1).max(4294967295).optional(),
         "mask": z.number().int().min(0).max(4294967295).optional()
       }),
@@ -752,15 +756,15 @@ export function registerGeneratedTools(
     async (input) => {
         const override = overrides["scene_set_collider"];
         if (override) return override(input as JsonObject);
-        return invoke("scene.set_collider", {"entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "center_x": input["centerX"], "center_y": input["centerY"], "center_z": input["centerZ"], "half_x": input["halfX"], "half_y": input["halfY"], "half_z": input["halfZ"], "layer": input["layer"], "mask": input["mask"]});
+        return invoke("scene.set_collider", {"entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "center_x": input["centerX"], "center_y": input["centerY"], "center_z": input["centerZ"], "half_x": input["halfX"], "half_y": input["halfY"], "half_z": input["halfZ"], "radius": input["radius"], "half_height": input["halfHeight"], "mesh": input["mesh"], "layer": input["layer"], "mask": input["mask"]});
       },
   );
 
   server.registerTool(
     "physics_raycast",
     {
-      title: "Raycast box colliders",
-      description: "Find the nearest enabled authored box collider hit by a world-space ray. Returns hit point and surface normal; does not move objects.",
+      title: "Raycast colliders",
+      description: "Find the nearest enabled authored collider of any shape hit by a world-space ray. Returns hit point and surface normal; does not move objects.",
       inputSchema: z.object({
         "originX": z.number().finite().min(-1000000).max(1000000),
         "originY": z.number().finite().min(-1000000).max(1000000),
@@ -784,7 +788,7 @@ export function registerGeneratedTools(
     "physics_overlaps",
     {
       title: "Find overlapping colliders",
-      description: "List up to 128 enabled box colliders overlapping an entity collider. Both colliders must pass their layer masks; reports truncation.",
+      description: "List up to 128 enabled colliders of any shape overlapping an entity collider. Both colliders must pass their layer masks; reports truncation. Triangle-mesh colliders report surface contact only.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
       }),
@@ -811,6 +815,23 @@ export function registerGeneratedTools(
         const override = overrides["physics_body_status"];
         if (override) return override(input as JsonObject);
         return invoke("physics.body_status", {"entity": input["entity"]});
+      },
+  );
+
+  server.registerTool(
+    "physics_contact_events",
+    {
+      title: "Read collision contacts",
+      description: "Read bounded contact begin and end events from the current game session, using a sequence cursor. Events are cleared on Stop Game.",
+      inputSchema: z.object({
+        "after": z.number().int().min(0).default(0).describe("Last contact event sequence already seen")
+      }),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["physics_contact_events"];
+        if (override) return override(input as JsonObject);
+        return invoke("physics.contact_events", {"after": input["after"]});
       },
   );
 

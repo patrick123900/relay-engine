@@ -277,6 +277,8 @@ struct EditorUi::Impl {
             ImGui::SameLine(0.0F, style.ItemInnerSpacing.x);
             ImGui::SetNextItemWidth(width);
             if (drag_scalar("##field", value[axis], speed, "%.3f")) committed |= 1U << axis;
+            if (label == std::string_view{"Half extents"})
+                note_item(std::string("collider:half_extent:") + names[axis]);
             if (axis < 2) ImGui::SameLine(0.0F, style.ItemSpacing.x);
             ImGui::PopID();
         }
@@ -1300,6 +1302,18 @@ struct EditorUi::Impl {
                 matrix[1] * point.x + matrix[5] * point.y + matrix[9] * point.z + matrix[13],
                 matrix[2] * point.x + matrix[6] * point.y + matrix[10] * point.z + matrix[14]};
         };
+        const auto project = [&](const Vec3 point) {
+            const double depth = -point.z;
+            return ImVec2{
+                static_cast<float>(viewport_min.x + width * 0.5 +
+                                   point.x * focal * height * 0.5 / depth),
+                static_cast<float>(viewport_min.y + height * 0.5 -
+                                   point.y * focal * height * 0.5 / depth)};
+        };
+        const auto add = [](const Vec3 a, const Vec3 b) {
+            return Vec3{a.x + b.x, a.y + b.y, a.z + b.z};
+        };
+        const auto scaled = [](const Vec3 a, const double s) { return Vec3{a.x * s, a.y * s, a.z * s}; };
         viewport_draw_list->PushClipRect(viewport_min, viewport_max, true);
         for (const auto& value : *boxes) {
             const auto* box = value.object();
@@ -1312,46 +1326,101 @@ struct EditorUi::Impl {
                 edge_array->size() != 3 || !read_vector(&(*edge_array)[0], edges[0]) ||
                 !read_vector(&(*edge_array)[1], edges[1]) ||
                 !read_vector(&(*edge_array)[2], edges[2])) continue;
-            std::array<Vec3, 8> corners{};
-            for (unsigned corner = 0; corner < 8; ++corner) {
-                Vec3 point = center;
-                for (unsigned axis = 0; axis < 3; ++axis) {
-                    const double sign = (corner & (1U << axis)) ? 1.0 : -1.0;
-                    point.x += sign * edges[axis].x;
-                    point.y += sign * edges[axis].y;
-                    point.z += sign * edges[axis].z;
-                }
-                corners[corner] = camera_point(point);
-            }
             const auto selected = string_or(*box, "entity") == selection;
             const auto enabled = boolean_or(*box, "enabled", true);
             const ImU32 color = selected ? IM_COL32(255, 194, 67, 255) :
                                   enabled ? IM_COL32(75, 224, 174, 190) :
                                             IM_COL32(147, 156, 165, 110);
+            const float thickness = selected ? 2.0F : 1.4F;
+            const auto line = [&](const Vec3 from, const Vec3 to) {
+                auto a = camera_point(from), b = camera_point(to);
+                if (a.z > -near && b.z > -near) return;
+                if (a.z > -near || b.z > -near) {
+                    const double fraction = (-near - a.z) / (b.z - a.z);
+                    const Vec3 clipped{a.x + fraction * (b.x - a.x),
+                                       a.y + fraction * (b.y - a.y), -near};
+                    if (a.z > -near) a = clipped; else b = clipped;
+                }
+                const auto first = project(a), last = project(b);
+                if (!std::isfinite(first.x) || !std::isfinite(first.y) ||
+                    !std::isfinite(last.x) || !std::isfinite(last.y)) return;
+                viewport_draw_list->AddLine(first, last, color, thickness);
+            };
+            // Circle or arc of `radius` around `origin` in the plane spanned by unit u and v.
+            const auto arc = [&](const Vec3 origin, const Vec3 u, const Vec3 v, const double radius,
+                                 const double start, const double sweep) {
+                constexpr int segments = 32;
+                const int count = std::max(4, static_cast<int>(segments * sweep /
+                                                               (2.0 * 3.14159265358979323846)));
+                Vec3 previous{};
+                for (int step = 0; step <= count; ++step) {
+                    const double angle = start + sweep * step / count;
+                    const auto point = add(origin, add(scaled(u, radius * std::cos(angle)),
+                                                       scaled(v, radius * std::sin(angle))));
+                    if (step) line(previous, point);
+                    previous = point;
+                }
+            };
+            const auto type = string_or(*box, "type", "box");
+            const auto radius = number_or(*box, "radius", 0.0);
+            constexpr double tau = 2.0 * 3.14159265358979323846;
+            if (type == "sphere" && radius > 0.0) {
+                arc(center, {1, 0, 0}, {0, 1, 0}, radius, 0.0, tau);
+                arc(center, {0, 1, 0}, {0, 0, 1}, radius, 0.0, tau);
+                arc(center, {0, 0, 1}, {1, 0, 0}, radius, 0.0, tau);
+                continue;
+            }
+            Vec3 axis{};
+            if (type == "capsule" && radius > 0.0 && read_vector(field(*box, "axis"), axis)) {
+                const double length = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+                const Vec3 up = length > 0.0 ? scaled(axis, 1.0 / length) : Vec3{0, 1, 0};
+                const Vec3 seed = std::abs(up.x) < 0.9 ? Vec3{1, 0, 0} : Vec3{0, 0, 1};
+                const Vec3 side_raw{up.y * seed.z - up.z * seed.y, up.z * seed.x - up.x * seed.z,
+                                    up.x * seed.y - up.y * seed.x};
+                const double side_length = std::sqrt(side_raw.x * side_raw.x +
+                                                      side_raw.y * side_raw.y +
+                                                      side_raw.z * side_raw.z);
+                const Vec3 side = scaled(side_raw, 1.0 / side_length);
+                const Vec3 depth{up.y * side.z - up.z * side.y, up.z * side.x - up.x * side.z,
+                                 up.x * side.y - up.y * side.x};
+                const auto top = add(center, axis), bottom = add(center, scaled(axis, -1.0));
+                arc(top, side, depth, radius, 0.0, tau);
+                arc(bottom, side, depth, radius, 0.0, tau);
+                for (const auto& offset : {side, scaled(side, -1.0), depth, scaled(depth, -1.0)})
+                    line(add(top, scaled(offset, radius)), add(bottom, scaled(offset, radius)));
+                arc(top, side, up, radius, 0.0, tau / 2.0);
+                arc(top, depth, up, radius, 0.0, tau / 2.0);
+                arc(bottom, side, up, radius, tau / 2.0, tau / 2.0);
+                arc(bottom, depth, up, radius, tau / 2.0, tau / 2.0);
+                continue;
+            }
+            const auto* line_value = field(*box, "lines");
+            const auto* lines = line_value ? line_value->array() : nullptr;
+            bool drew_lines = false;
+            if (lines && (type == "convex" || type == "mesh")) {
+                for (std::size_t index = 0; index + 1U < lines->size(); index += 2U) {
+                    Vec3 a{}, b{};
+                    if (!read_vector(&(*lines)[index], a) || !read_vector(&(*lines)[index + 1U], b))
+                        continue;
+                    line(a, b);
+                    drew_lines = true;
+                }
+                // A partial outline still shows the full extent through its bounds.
+                if (drew_lines && !boolean_or(*box, "lines_truncated", false)) continue;
+            }
+            std::array<Vec3, 8> corners{};
+            for (unsigned corner = 0; corner < 8; ++corner) {
+                Vec3 point = center;
+                for (unsigned index = 0; index < 3; ++index) {
+                    const double sign = (corner & (1U << index)) ? 1.0 : -1.0;
+                    point = add(point, scaled(edges[index], sign));
+                }
+                corners[corner] = point;
+            }
             for (unsigned corner = 0; corner < 8; ++corner)
-                for (unsigned axis = 0; axis < 3; ++axis) {
-                    const unsigned other = corner ^ (1U << axis);
-                    if (corner > other) continue;
-                    auto a = corners[corner], b = corners[other];
-                    if (a.z > -near && b.z > -near) continue;
-                    if (a.z > -near || b.z > -near) {
-                        const double fraction = (-near - a.z) / (b.z - a.z);
-                        const Vec3 clipped{a.x + fraction * (b.x - a.x),
-                                           a.y + fraction * (b.y - a.y), -near};
-                        if (a.z > -near) a = clipped; else b = clipped;
-                    }
-                    const auto project = [&](const Vec3 point) {
-                        const double depth = -point.z;
-                        return ImVec2{
-                            static_cast<float>(viewport_min.x + width * 0.5 +
-                                               point.x * focal * height * 0.5 / depth),
-                            static_cast<float>(viewport_min.y + height * 0.5 -
-                                               point.y * focal * height * 0.5 / depth)};
-                    };
-                    const auto first = project(a), last = project(b);
-                    if (!std::isfinite(first.x) || !std::isfinite(first.y) ||
-                        !std::isfinite(last.x) || !std::isfinite(last.y)) continue;
-                    viewport_draw_list->AddLine(first, last, color, selected ? 2.0F : 1.4F);
+                for (unsigned index = 0; index < 3; ++index) {
+                    const unsigned other = corner ^ (1U << index);
+                    if (corner < other) line(corners[corner], corners[other]);
                 }
         }
         viewport_draw_list->PopClipRect();
@@ -2357,13 +2426,29 @@ struct EditorUi::Impl {
 
     void draw_collider_section(const JsonValue::Object& entity) {
         const auto* collider = component(entity, "collider");
-        if (!ImGui::CollapsingHeader("Box collider",
+        if (!ImGui::CollapsingHeader("Collider",
                                      collider ? ImGuiTreeNodeFlags_DefaultOpen : 0)) return;
         const auto entity_request = entity_field(selection);
         if (!collider) {
-            if (ImGui::Button("Add box collider"))
-                mutate("scene.set_collider", entity_request, "Box collider added");
+            if (ImGui::Button("Add collider"))
+                mutate("scene.set_collider", entity_request, "Collider added");
             return;
+        }
+        constexpr std::array<const char*, 5> shape_names{"Box", "Sphere", "Capsule", "Convex hull",
+                                                         "Triangle mesh"};
+        constexpr std::array<const char*, 5> shape_values{"box", "sphere", "capsule", "convex",
+                                                          "mesh"};
+        auto shape_index = std::clamp(static_cast<int>(number_or(*collider, "type", 0)), 0, 4);
+        if (ImGui::BeginCombo("Shape", shape_names[static_cast<std::size_t>(shape_index)])) {
+            for (int index = 0; index < 5; ++index) {
+                if (ImGui::Selectable(shape_names[static_cast<std::size_t>(index)],
+                                      index == shape_index)) {
+                    shape_index = index;
+                    mutate("scene.set_collider", entity_request + ",\"type\":\"" +
+                           shape_values[static_cast<std::size_t>(index)] + "\"", "Collider shape updated");
+                }
+            }
+            ImGui::EndCombo();
         }
         auto enabled = boolean_or(*collider, "enabled", true);
         if (ImGui::Checkbox("Enabled##collider", &enabled))
@@ -2374,12 +2459,48 @@ struct EditorUi::Impl {
             mutate("scene.set_collider", entity_request +
                    vector_fields(center, {"center_x", "center_y", "center_z"}, mask),
                    "Collider center updated");
-        auto extents = editor_vector(*collider, "half_extents", {0.5, 0.5, 0.5});
-        if (const auto mask = drag_vector3("Half extents", extents, 0.05F, 84.0F * ui_scale)) {
-            for (auto& value : extents) value = std::max(value, 0.000001);
-            mutate("scene.set_collider", entity_request +
-                   vector_fields(extents, {"half_x", "half_y", "half_z"}, mask),
-                   "Collider size updated");
+        if (shape_index == 0) {
+            auto extents = editor_vector(*collider, "half_extents", {0.5, 0.5, 0.5});
+            if (const auto mask = drag_vector3("Half extents", extents, 0.05F, 84.0F * ui_scale)) {
+                for (auto& value : extents) value = std::max(value, 0.01);
+                mutate("scene.set_collider", entity_request +
+                       vector_fields(extents, {"half_x", "half_y", "half_z"}, mask),
+                       "Collider size updated");
+            }
+        } else if (shape_index >= 3) {
+            const auto mesh = string_or(*collider, "mesh");
+            const auto* renderer = component(entity, "mesh_renderer");
+            const auto renderer_mesh = renderer ? string_or(*renderer, "mesh") : std::string{};
+            const auto preview = mesh.empty() ? "Renderer mesh" : mesh;
+            if (ImGui::BeginCombo("Collision mesh", preview.c_str())) {
+                if (ImGui::Selectable("Renderer mesh", mesh.empty()))
+                    mutate("scene.set_collider", entity_request + ",\"mesh\":\"\"",
+                           "Collider mesh updated");
+                for (const auto& option : mesh_names)
+                    if (ImGui::Selectable(option.c_str(), option == mesh))
+                        mutate("scene.set_collider", entity_request + ",\"mesh\":\"" +
+                               json_escape(option) + '"', "Collider mesh updated");
+                ImGui::EndCombo();
+            }
+            const auto& source = mesh.empty() ? renderer_mesh : mesh;
+            if (source.empty())
+                ImGui::TextDisabled("Add a mesh renderer or choose a collision mesh.");
+            else if (std::find(mesh_names.begin(), mesh_names.end(), source) == mesh_names.end())
+                ImGui::TextDisabled("Mesh %s is not loaded; the collider is inactive.",
+                                    source.c_str());
+            else if (shape_index == 4)
+                ImGui::TextDisabled("Dynamic bodies use this mesh's convex hull.");
+        } else {
+            auto radius = number_or(*collider, "radius", 0.5);
+            if (drag_scalar("Radius", radius, 0.05F))
+                mutate("scene.set_collider", entity_request + ",\"radius\":" +
+                       number_text(std::max(radius, 0.01)), "Collider radius updated");
+            if (shape_index == 2) {
+                auto half_height = number_or(*collider, "half_height", 0.5);
+                if (drag_scalar("Cylinder half height", half_height, 0.05F))
+                    mutate("scene.set_collider", entity_request + ",\"half_height\":" +
+                           number_text(std::max(half_height, 0.01)), "Collider height updated");
+            }
         }
         auto layer = static_cast<std::uint32_t>(number_or(*collider, "layer", 1));
         if (ImGui::InputScalar("Layer bits", ImGuiDataType_U32, &layer) && layer != 0U)
@@ -2389,9 +2510,9 @@ struct EditorUi::Impl {
         if (ImGui::InputScalar("Mask bits", ImGuiDataType_U32, &collision_mask))
             mutate("scene.set_collider", entity_request + ",\"mask\":" +
                    std::to_string(collision_mask), "Collider mask updated");
-        if (ImGui::Button("Remove box collider"))
+        if (ImGui::Button("Remove collider"))
             mutate("scene.set_collider", entity_request + ",\"attached\":false",
-                   "Box collider removed");
+                   "Collider removed");
     }
 
     void draw_physics_body_section(const JsonValue::Object& entity) {

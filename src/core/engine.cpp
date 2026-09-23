@@ -10,6 +10,7 @@ namespace relay {
 Engine::Engine(EngineConfig config)
     : config_(config), renderer_(config.width, config.height), scene_history_(scene_) {
     mode_ = config.editor_mode ? RuntimeMode::editor : RuntimeMode::game;
+    physics_.set_assets(&assets_);
     std::ostringstream message;
     message << "Relay runtime initialized at " << config_.width << 'x' << config_.height;
     logs_.write(LogLevel::info, message.str());

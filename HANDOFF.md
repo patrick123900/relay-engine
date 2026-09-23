@@ -8,10 +8,10 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v24: 99 native methods. Scene v9, project v1, import manifest v3.
+- Protocol schema v27: 100 native methods. Scene v11, project v1, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
-- HDR rendering, bounded asynchronous uploads, transform keyframes, box colliders, Jolt body
-  simulation, and portable project export are implemented. Preserve unrelated working-tree
+- HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
+  colliders, Jolt body simulation, and portable project export are implemented. Preserve unrelated working-tree
   edits and inspect `git diff` before changing them.
 
 ## Product intent
@@ -47,6 +47,23 @@ without blocking simultaneous human editing.
   scene-owned transform keys. Queries cap active colliders at 4096 and overlap results at 128.
   Colliders on imported model nodes currently follow the authored entity hierarchy, not imported
   animation node poses.
+  The Inspector clamps a zero half extent to a visible 0.01-unit minimum; the protocol and scene
+  validator reject zero extents. A headless editor input regression covers the zero-entry path.
+- Scene v10 adds authored sphere and capsule collider types, radius, and capsule cylinder half height.
+  Older scenes load their colliders as boxes. The Inspector, protocol, Jolt simulation, raycasts,
+  overlaps, saves, and undo handle all three shapes. Sphere and capsule use the largest world scale
+  axis uniformly.
+- Scene v11 adds convex-hull and triangle-mesh collider types plus an optional `mesh` name; empty
+  uses the entity renderer mesh. Geometry comes from the engine `AssetRegistry` (bind pose; skin and
+  morph deformation are ignored), with the full world scale baked into body-local vertices.
+  `scene.set_collider` rejects unregistered meshes; a mesh that later disappears leaves the
+  collider inactive. One collider accepts at most 65,536 triangles and one Jolt world build
+  1,048,576 mesh triangles; queries over that budget return an error. Jolt hulls keep at most 256
+  points. Dynamic bodies use the convex hull of a mesh collider because Jolt cannot simulate
+  dynamic triangle meshes. Mesh-versus-mesh overlaps are skipped and mesh overlaps report surface
+  crossings, not containment. Mirrored scale flips triangle winding so raycasts hit front faces.
+  Collision free functions take an optional registry; `Engine` wires its registry into the
+  protocol and `PhysicsWorld`.
 - Scene v8 adds undoable static/dynamic physics bodies with mass, gravity scale, and restitution;
   scene v9 adds friction plus linear and angular damping. Existing v8 files migrate with Jolt's
   default material values. The game-only Jolt 5.6 world provides gravity, full rigid-body contact
@@ -54,11 +71,17 @@ without blocking simultaneous human editing.
   Colliders without bodies are static. Linear/angular velocities are runtime state, cleared on Run
   Game and Stop Game, and observable through `physics.body_status`; `physics.apply_impulse` accepts
   an optional world-space point to generate torque. Paused games advance only via frame step.
-  Dynamic bodies with authored transform keys are kinematic. Authored collider types currently
-  comprise boxes; joints and persistent contact events remain future work.
-- The editor camera overlays world-space collider wireframes from the same shape computation as
-  physics queries. Selected boxes are amber, enabled boxes green, disabled boxes gray. The View
-  menu toggles them. The host-only read-only `physics.debug_boxes` method caps output at 4096.
+  Dynamic bodies with authored transform keys are kinematic. Joints remain future work. Jolt
+  contact callbacks record ordered entity-pair
+  begin/end events in a bounded, sequence-cursor stream exposed by `physics.contact_events`.
+  The stream resets on Run Game and Stop Game, and reports the oldest retained sequence for
+  detecting missed events.
+- The editor camera overlays world-space collider outlines from the same shape computation as
+  physics queries: boxes, three great circles for spheres, rings and arcs for capsules, Jolt hull
+  edges for convex colliders, and unique triangle edges for meshes. Selected colliders are amber,
+  enabled green, disabled gray. The View menu toggles them. The host-only read-only
+  `physics.debug_boxes` method caps output at 4096 colliders, 768 lines per collider, and 8192
+  lines per call; a truncated outline also draws its bounding box.
 - The editor viewport overlays clickable camera and directional/point/spot light icons, with type
   labels on hover. Selected cameras show a compact perspective or orthographic view guide; its
   display depth is capped independently of the authored far clipping plane. Markers follow
@@ -166,15 +189,12 @@ without blocking simultaneous human editing.
    queue, so that queue branch still has compile and headless checks only.
 5. Agent sessions are designed for one local human/editor workflow; multi-client identities and a
    tamper-proof continuous audit store are not implemented.
-6. Setting any box-collider size axis to zero currently crashes the engine (reported in the editor,
-   for example when making a floor). Use a small positive thickness until this is fixed.
 
 ## Next priorities
 
-1. Add persistent contact begin/end events to the Jolt backend so games can react to collisions.
-2. Add gameplay scripting with a lifecycle tied to Run Game and Stop Game, including access to
+1. Add gameplay scripting with a lifecycle tied to Run Game and Stop Game, including access to
    contact events.
-3. Add joints and more collider shapes to the Jolt backend.
+2. Add joints to the Jolt backend.
 
 ## Verification baseline
 
@@ -187,7 +207,8 @@ containing the saved keys and imported asset opens as a tar. The legacy coordina
 assertions are inconclusive until recalibrated. Socket-dependent tests were run with loopback
 access after the sandbox refused local socket creation. Headless editor tests cover
 the current hierarchy spacing, chat selection/wrapping, attachments, media viewer, composer layout,
-usage meters, camera controls, and authorization. A separate sustained fixture has exercised more
+usage meters, camera controls, authorization, collider zero-extent input, and round collider
+outlines. Convex and mesh colliders have headless physics coverage but no real-desktop visual check. A separate sustained fixture has exercised more
 than two minutes of editing/capture work with injected disconnects. The Vulkan directional-shadow
 path also has real-desktop coverage that compares captured receiver pixels with and without an
 occluder for cascaded directional, perspective spot, and cubemap point shadows; the general visual
@@ -220,6 +241,7 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Protocol source | `protocol/relay.protocol.json` |
 | Native protocol/session | `src/control/`, `include/relay/control/` |
 | Engine and scene | `src/core/`, `src/scene/` |
+| Physics and collision | `src/physics/`, `include/relay/physics/` |
 | Rendering/import | `src/render/`, `shaders/` |
 | Editor | `src/editor/`, `include/relay/editor/` |
 | Agent bridge | `tools/mcp-bridge/src/` |

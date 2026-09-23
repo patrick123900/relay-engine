@@ -81,12 +81,47 @@ void run() {
         return false;
     };
     check(has_wireframe(), "editor viewport draws collider wireframe without a desktop");
+    const auto wire_vertices = [&] {
+        std::size_t count = 0;
+        for (const auto& vertex : viewport_window->DrawList->VtxBuffer)
+            count += vertex.col == wire_color;
+        return count;
+    };
+    const auto box_vertices = wire_vertices();
+    relay::BoxCollider round;
+    round.type = relay::BoxCollider::Type::sphere;
+    check(engine.scene().set_collider(third, round), "attach headless sphere collider");
+    frame(ui, 40);
+    // Three 32-segment great circles draw far more lines than a second 12-edge box would.
+    check(wire_vertices() > box_vertices * 4U, "sphere collider draws a round outline");
+    check(engine.scene().set_collider(third, std::nullopt), "remove headless sphere collider");
+    frame(ui, 40);
     const auto row = [&](relay::Entity entity) {
         const auto rect = ui.headless_item_rect("entity:" + entity.to_string());
         check(rect.has_value(), "visible hierarchy row is recorded");
         return *rect;
     };
     click(ui, row(first));
+    if (const auto extent = ui.headless_item_rect("collider:half_extent:Y")) {
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(((*extent)[0] + (*extent)[2]) * 0.5F,
+                            ((*extent)[1] + (*extent)[3]) * 0.5F);
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        frame(ui);
+        io.AddMouseButtonEvent(0, true);
+        frame(ui);
+        io.AddMouseButtonEvent(0, false);
+        frame(ui);
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        io.AddInputCharactersUTF8("0");
+        frame(ui, 2);
+        key(ui, ImGuiKey_Enter, false);
+        frame(ui, 2);
+        check(std::abs(engine.scene().get(first)->collider->half_extents.y - 0.01) < 1e-9,
+              "zero entered in collider inspector commits a visible safe thickness");
+    } else {
+        check(false, "selected collider half-extent field is visible in headless inspector");
+    }
     click(ui, row(third), false, true);
     check(ui.selected_entities().size() == 3, "Shift-click selects visible hierarchy range");
     check(std::abs(row(first)[3] - row(second)[1]) < .01F && std::abs(row(second)[3] - row(third)[1]) < .01F,

@@ -42,6 +42,14 @@ std::string string_field(const std::string_view json, const std::string_view key
     return value && value->string() ? *value->string() : std::string{};
 }
 
+std::optional<std::string> optional_string_field(const std::string_view json,
+                                                 const std::string_view key) {
+    JsonParser parser(json);
+    const auto parsed = parser.parse();
+    const auto* value = parsed && parsed->object() ? field(*parsed->object(), key) : nullptr;
+    return value && value->string() ? std::optional{*value->string()} : std::nullopt;
+}
+
 std::uint64_t unsigned_field(const std::string_view json, const std::string_view key,
                              const std::uint64_t fallback) {
     const std::string marker = "\"" + std::string(key) + "\"";
@@ -559,7 +567,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
         const auto result = collision_raycast(
             engine_.scene(), origin, direction,
             number_field(request, "maximum_distance").value_or(1'000'000.0),
-            static_cast<std::uint32_t>(unsigned_field(request, "layer_mask", 0xffffffffU)));
+            static_cast<std::uint32_t>(unsigned_field(request, "layer_mask", 0xffffffffU)),
+            &engine_.assets());
         if (!result.error.empty()) return error_response(id, result.error);
         if (!result.hit) return response_prefix(id) + "{\"entity\":null,\"distance\":null,\"point\":null,\"normal\":null}}";
         std::ostringstream output;
@@ -571,7 +580,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) + output.str() + '}';
     }
     if (method == "physics.debug_boxes") {
-        const auto result = collision_debug_boxes(engine_.scene());
+        const auto result = collision_debug_boxes(engine_.scene(), false, &engine_.assets());
         std::ostringstream output;
         output << std::setprecision(std::numeric_limits<double>::max_digits10)
                << "{\"boxes\":[";
@@ -581,15 +590,28 @@ std::string ControlProtocol::handle(const std::string_view request) {
         for (std::size_t index = 0; index < result.boxes.size(); ++index) {
             const auto& box = result.boxes[index];
             if (index) output << ',';
+            constexpr std::array<const char*, 5> shapes{"box", "sphere", "capsule", "convex", "mesh"};
             output << "{\"entity\":\"" << box.entity.to_string() << "\",\"enabled\":"
-                   << (box.enabled ? "true" : "false") << ",\"center\":";
+                   << (box.enabled ? "true" : "false") << ",\"type\":\""
+                   << shapes[static_cast<std::size_t>(box.type)] << "\",\"center\":";
             vector(box.center);
             output << ",\"edges\":[";
             for (std::size_t edge = 0; edge < 3; ++edge) {
                 if (edge) output << ',';
                 vector(box.edges[edge]);
             }
-            output << "]}";
+            output << "],\"radius\":" << box.radius << ",\"axis\":";
+            vector(box.axis);
+            // Outline vertices come from single-precision meshes; seven digits keep them exact.
+            output << std::setprecision(7) << ",\"lines\":[";
+            for (std::size_t line = 0; line < box.lines.size(); ++line) {
+                if (line) output << ',';
+                vector(box.lines[line][0]);
+                output << ',';
+                vector(box.lines[line][1]);
+            }
+            output << std::setprecision(std::numeric_limits<double>::max_digits10)
+                   << "],\"lines_truncated\":" << (box.lines_truncated ? "true" : "false") << '}';
         }
         output << "],\"truncated\":" << (result.truncated ? "true" : "false") << '}';
         return response_prefix(id) + output.str() + '}';
@@ -620,6 +642,22 @@ std::string ControlProtocol::handle(const std::string_view request) {
         output << '}';
         return response_prefix(id) + output.str() + '}';
     }
+    if (method == "physics.contact_events") {
+        const auto events = engine_.physics().contact_events(unsigned_field(request, "after", 0));
+        std::ostringstream output;
+        output << "{\"latest_sequence\":" << events.latest_sequence
+               << ",\"oldest_sequence\":" << events.oldest_sequence << ",\"events\":[";
+        for (std::size_t index = 0; index < events.events.size(); ++index) {
+            const auto& event = events.events[index];
+            if (index) output << ',';
+            output << "{\"sequence\":" << event.sequence << ",\"type\":\""
+                   << (event.began ? "begin" : "end") << "\",\"first\":\""
+                   << event.first.to_string() << "\",\"second\":\""
+                   << event.second.to_string() << "\"}";
+        }
+        output << "]}";
+        return response_prefix(id) + output.str() + '}';
+    }
     if (method == "physics.apply_impulse") {
         if (engine_.status().mode != RuntimeMode::game)
             return error_response(id, "game is not running");
@@ -644,7 +682,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
     if (method == "physics.overlaps") {
         const auto entity = Entity::parse(string_field(request, "entity"));
         if (!entity) return error_response(id, "invalid collider entity");
-        const auto result = collision_overlaps(engine_.scene(), *entity);
+        const auto result = collision_overlaps(engine_.scene(), *entity, &engine_.assets());
         if (!result.error.empty()) return error_response(id, result.error);
         std::string output = "{\"entities\":[";
         for (const auto hit : result.entities) {
@@ -1162,6 +1200,20 @@ std::string ControlProtocol::handle(const std::string_view request) {
         std::optional<BoxCollider> collider;
         if (boolean_field(request, "attached", true)) {
             collider = engine_.scene().get(*entity)->collider.value_or(BoxCollider{});
+            const auto type = string_field(request, "type");
+            if (!type.empty()) {
+                if (type == "box") collider->type = BoxCollider::Type::box;
+                else if (type == "sphere") collider->type = BoxCollider::Type::sphere;
+                else if (type == "capsule") collider->type = BoxCollider::Type::capsule;
+                else if (type == "convex") collider->type = BoxCollider::Type::convex;
+                else if (type == "mesh") collider->type = BoxCollider::Type::mesh;
+                else return error_response(id, "invalid collider shape");
+            }
+            if (auto mesh = optional_string_field(request, "mesh")) {
+                if (!mesh->empty() && !engine_.assets().find_mesh(*mesh))
+                    return error_response(id, "unknown collider mesh");
+                collider->mesh = std::move(*mesh);
+            }
             collider->enabled = boolean_field(request, "enabled", collider->enabled);
             if (const auto value = number_field(request, "center_x")) collider->center.x = *value;
             if (const auto value = number_field(request, "center_y")) collider->center.y = *value;
@@ -1169,14 +1221,16 @@ std::string ControlProtocol::handle(const std::string_view request) {
             if (const auto value = number_field(request, "half_x")) collider->half_extents.x = *value;
             if (const auto value = number_field(request, "half_y")) collider->half_extents.y = *value;
             if (const auto value = number_field(request, "half_z")) collider->half_extents.z = *value;
+            if (const auto value = number_field(request, "radius")) collider->radius = *value;
+            if (const auto value = number_field(request, "half_height")) collider->half_height = *value;
             collider->layer = static_cast<std::uint32_t>(
                 unsigned_field(request, "layer", collider->layer));
             collider->mask = static_cast<std::uint32_t>(
                 unsigned_field(request, "mask", collider->mask));
         }
-        if (!engine_.scene_history().execute("Configure box collider " + entity->to_string(),
+        if (!engine_.scene_history().execute("Configure collider " + entity->to_string(),
                 [&](Scene& scene) { return scene.set_collider(*entity, collider); }))
-            return error_response(id, "invalid box collider values");
+            return error_response(id, "invalid collider values");
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }

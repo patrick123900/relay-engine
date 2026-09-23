@@ -31,7 +31,7 @@ in control of the same project.
   Vulkan viewport, inspect the image, and iterate.
 - **HDR lighting** — a floating-point scene target, camera exposure, procedural environment
   lighting, and tone mapping produce the final SDR viewport and captures.
-- **One typed API** — 99 versioned native methods cover scene editing, rendering, projects,
+- **One typed API** — 100 versioned native methods cover scene editing, rendering, projects,
   observability, capture, and session authorization. A generated MCP bridge exposes the supported
   model-facing subset.
 - **Deterministic core** — fixed-step simulation, transactional undo/redo, strict scene validation,
@@ -46,7 +46,8 @@ in control of the same project.
   and transfer-queue mip generation when a dedicated queue is available.
 - **Scene authoring and export** — editable, undoable transform keyframes and portable project tar
   packages of saved scenes and assets.
-- **Jolt physics** — authored box colliders support oriented overlap checks and raycasts.
+- **Jolt physics** — authored box, sphere, capsule, convex-hull, and triangle-mesh colliders support
+  overlap checks and raycasts.
   Static and dynamic rigid bodies provide gravity, momentum, friction, bounce, and angular motion
   during Run Game. Runtime impulses can be applied at a world-space point through the protocol.
 
@@ -59,23 +60,30 @@ overwrite an existing package.
 Use **Run Game** from the toolbar or Run menu to test the current scene. The game viewport uses the
 active scene camera. Scene edits and saves are unavailable during the run; **Stop Game** restores
 the scene as it was when the run began. Pause and frame step control the running game only.
-Select an entity and open **Box collider** in the Inspector to add a collider independent of its
-visible mesh. Its layer and mask determine which other colliders it can overlap; raycasts can also
+Select an entity and open **Collider** in the Inspector to add a box, sphere, capsule, convex hull,
+or triangle mesh. Convex and mesh colliders use the entity's renderer mesh unless you choose a
+separate collision mesh; the other shapes are independent of the visible mesh. Its layer and mask determine which other colliders it can overlap; raycasts can also
 filter by layer. The queries report intersections without changing objects. The editor camera
-shows collider wireframes in the viewport: selected colliders are amber, enabled colliders are
-green, and disabled colliders are gray. Toggle them with **View → Collider wireframes**.
+outlines each collider's shape in the viewport: selected colliders are amber, enabled colliders
+are green, and disabled colliders are gray. Toggle them with **View → Collider wireframes**.
+Sphere and capsule shapes use the largest world scale axis as their uniform scale. Convex and mesh
+colliders follow the full scale, including non-uniform scale. Triangle meshes suit static floors
+and level geometry; a dynamic body with a mesh collider uses the mesh's convex hull instead.
 The editor viewport also shows clickable camera and light icons. Directional, point, and spot
 lights have distinct markers; selecting a camera shows a compact perspective or orthographic
 view guide. The guide preserves the camera's field of view and aspect but caps its display size.
 These guides can be toggled from **View** and stay out of Run Game.
 Open **Physics body** in the Inspector to make an object static or dynamic. Dynamic bodies fall
-under gravity and respond to enabled box colliders during Run Game. A collider without a body is
+under gravity and respond to enabled colliders during Run Game. A collider without a body is
 static. Mass, gravity scale, bounciness, friction, and linear/angular damping are editable;
 Stop Game restores authored positions. Jolt uses continuous collision detection for dynamic
 bodies. An off-center `physics.apply_impulse` command adds rotation as well as linear motion.
 Bodies with transform keyframes follow those keys rather than dynamic simulation.
-Setting a box-collider size axis to zero currently crashes the engine; use a small positive
-thickness for flat surfaces such as floors until this is fixed.
+The Inspector clamps a box-collider half extent entered as zero to 0.01 units, so thin floors
+remain valid. Protocol requests with zero extents are rejected.
+During Run Game, `physics.contact_events` reports contact `begin` and `end` pairs in sequence
+order. Pass the last sequence as `after` to read new events; `oldest_sequence` shows when older
+events have left the bounded history. Stop Game clears the stream.
 
 ## Built-in agent workspace
 
@@ -100,8 +108,8 @@ scene workflow, import pipeline, control protocol, MCP bridge, and embedded agen
 functional. APIs and file formats may still change. Windows and macOS renderer parity, broader
 import sandboxing, and sustained live-provider validation remain in progress.
 
-The next engine work is collision contact begin/end events, followed by gameplay scripting tied
-to Run Game and Stop Game. Joints and additional collider shapes follow those foundations.
+The next engine work is gameplay scripting tied to Run Game and Stop Game, using the new collision
+contact begin/end stream. Joints follow those foundations.
 
 ## Build
 

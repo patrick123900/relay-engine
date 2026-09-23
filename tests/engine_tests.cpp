@@ -1201,19 +1201,19 @@ int main() {
            "camera accepts exposure compensation within its valid range");
     const auto exposure_path = scene_test_directory / "exposure.relay.json";
     expect(relay::save_scene_file_atomic(exposure_scene, exposure_path, scene_file_error),
-           "version 9 scene with exposure saves");
+           "version 11 scene with exposure saves");
     const auto exposure_loaded = relay::load_scene_file(exposure_path);
-    expect(exposure_loaded && exposure_loaded.source_version == 9U &&
+    expect(exposure_loaded && exposure_loaded.source_version == 11U &&
                exposure_loaded.state->slots[exposure_entity.index].record.camera->exposure_ev == 2.25,
-           "camera exposure survives the version 9 scene round trip");
+           "camera exposure survives the version 11 scene round trip");
     auto legacy_exposure_json = exposure_scene.serialize_json();
-    const auto version_position = legacy_exposure_json.find("\"version\":9");
+    const auto version_position = legacy_exposure_json.find("\"version\":11");
     const auto exposure_position = legacy_exposure_json.find(",\"exposure_ev\":2.25");
     expect(version_position != std::string::npos && exposure_position != std::string::npos,
-           "version 9 serialization includes camera exposure");
+           "version 11 serialization includes camera exposure");
     if (version_position != std::string::npos && exposure_position != std::string::npos) {
-        legacy_exposure_json.replace(version_position, 11U, "\"version\":4");
         legacy_exposure_json.erase(exposure_position, std::string(",\"exposure_ev\":2.25").size());
+        legacy_exposure_json.replace(version_position, 12U, "\"version\":4");
         const auto legacy_exposure_path = scene_test_directory / "legacy-exposure.relay.json";
         std::ofstream legacy_exposure_stream(legacy_exposure_path);
         legacy_exposure_stream << legacy_exposure_json;
@@ -1399,19 +1399,42 @@ int main() {
         expect(relay::save_scene_file_atomic(collision_engine.scene(), collision_path,
                                              collision_error), "scene with colliders saves");
         const auto loaded_colliders = relay::load_scene_file(collision_path);
-        expect(loaded_colliders && loaded_colliders.source_version == 9U &&
+        expect(loaded_colliders && loaded_colliders.source_version == 11U &&
                    loaded_colliders.state->slots[box.index].record.collider &&
                    loaded_colliders.state->slots[box.index].record.collider->layer == 2U,
-               "colliders survive scene version 9 round trip");
+               "colliders survive scene version 11 round trip");
+        auto old_box_json = collision_engine.scene().serialize_json();
+        const auto old_type = old_box_json.find("{\"type\":0,\"center\":");
+        const auto old_dimensions = old_box_json.find(",\"radius\":0.5,\"half_height\":0.5");
+        expect(old_type != std::string::npos && old_dimensions != std::string::npos,
+               "current box scene includes version 10 shape fields");
+        if (old_type != std::string::npos && old_dimensions != std::string::npos) {
+            old_box_json.replace(old_type, std::string("{\"type\":0,\"center\":").size(),
+                                 "{\"center\":");
+            const auto dimensions = old_box_json.find(",\"radius\":0.5,\"half_height\":0.5");
+            old_box_json.erase(dimensions, std::string(",\"radius\":0.5,\"half_height\":0.5").size());
+            const auto mesh_field = old_box_json.find(",\"mesh\":\"\"");
+            if (mesh_field != std::string::npos)
+                old_box_json.erase(mesh_field, std::string(",\"mesh\":\"\"").size());
+            old_box_json.replace(old_box_json.find("\"version\":11"), 12, "\"version\":9");
+            const auto old_box_path = scene_test_directory / "v9-box.relay.json";
+            write_file(old_box_path, old_box_json);
+            const auto old_box = relay::load_scene_file(old_box_path);
+            expect(old_box && old_box.migrated &&
+                       old_box.state->slots[box.index].record.collider->type ==
+                           relay::BoxCollider::Type::box,
+                   "version 9 box colliders migrate with the box shape default");
+            std::filesystem::remove(old_box_path);
+        }
         relay::Scene pre_collider_scene;
         const auto legacy_entity = pre_collider_scene.create("Older scene");
         auto legacy_json = pre_collider_scene.serialize_json();
-        const auto version = legacy_json.find("\"version\":9");
+        const auto version = legacy_json.find("\"version\":11");
         const auto absent_collider = legacy_json.find(",\"collider\":null");
         expect(version != std::string::npos && absent_collider != std::string::npos,
-               "version 9 serializer includes an explicit collider slot");
+               "version 11 serializer includes an explicit collider slot");
         if (version != std::string::npos && absent_collider != std::string::npos) {
-            legacy_json.replace(version, 11U, "\"version\":6");
+            legacy_json.replace(version, 12U, "\"version\":6");
             legacy_json.erase(absent_collider, std::string(",\"collider\":null").size());
             const auto pre_collider_path = scene_test_directory / "pre-collider.relay.json";
             write_file(pre_collider_path, legacy_json);
@@ -1489,9 +1512,9 @@ int main() {
         const auto body_path = scene_test_directory / "physics-body.relay.json";
         std::string body_error;
         expect(relay::save_scene_file_atomic(physics_engine.scene(), body_path, body_error),
-               "physics body saves in scene version 9");
+               "physics body saves in scene version 11");
         const auto body_scene = relay::load_scene_file(body_path);
-        expect(body_scene && body_scene.source_version == 9U &&
+        expect(body_scene && body_scene.source_version == 11U &&
                    body_scene.state->slots[falling.index].record.physics_body &&
                    body_scene.state->slots[falling.index].record.physics_body->mass == 2.0 &&
                    body_scene.state->slots[falling.index].record.physics_body->friction == 0.7 &&
@@ -1499,11 +1522,11 @@ int main() {
                    body_scene.state->slots[falling.index].record.physics_body->angular_damping == 0.2,
                "physics body settings round trip");
         auto old_body_json = physics_engine.scene().serialize_json();
-        const auto old_body_version = old_body_json.find("\"version\":9");
+        const auto old_body_version = old_body_json.find("\"version\":11");
         const auto material_start = old_body_json.find(",\"friction\":");
         if (old_body_version != std::string::npos && material_start != std::string::npos) {
-            old_body_json.replace(old_body_version, 11, "\"version\":8");
             old_body_json.erase(material_start, old_body_json.find('}', material_start) - material_start);
+            old_body_json.replace(old_body_version, 12, "\"version\":8");
             const auto old_body_path = scene_test_directory / "v8-physics.relay.json";
             write_file(old_body_path, old_body_json);
             const auto old_body = relay::load_scene_file(old_body_path);
@@ -1514,13 +1537,13 @@ int main() {
             std::filesystem::remove(old_body_path);
         }
         auto prior_version = physics_engine.scene().serialize_json();
-        const auto version_field = prior_version.find("\"version\":9");
+        const auto version_field = prior_version.find("\"version\":11");
         const auto body_field = prior_version.find(",\"physics_body\":null");
         expect(version_field != std::string::npos && body_field != std::string::npos,
-               "version 9 scene has an explicit optional body field");
+               "version 11 scene has an explicit optional body field");
         if (version_field != std::string::npos && body_field != std::string::npos) {
-            prior_version.replace(version_field, 11, "\"version\":7");
             prior_version.erase(body_field, std::string(",\"physics_body\":null").size());
+            prior_version.replace(version_field, 12, "\"version\":7");
             const auto prior_path = scene_test_directory / "pre-physics.relay.json";
             write_file(prior_path, prior_version);
             const auto previous = relay::load_scene_file(prior_path);
@@ -1543,6 +1566,16 @@ int main() {
         const auto resting = physics_engine.scene().get(falling)->transform.position.y;
         expect(resting >= 0.47 && resting <= 0.51,
                "falling dynamic box rests on static floor after collision response");
+        const auto contacts = physics_protocol.handle(
+            R"({"id":9310,"method":"physics.contact_events"})");
+        expect(contacts.find("\"type\":\"begin\"") != std::string::npos &&
+                   contacts.find(floor.to_string()) != std::string::npos &&
+                   contacts.find(falling.to_string()) != std::string::npos,
+               "protocol reports a persistent floor contact begin event");
+        const auto no_new_contacts = physics_protocol.handle(
+            R"({"id":9311,"method":"physics.contact_events","after":1000000})");
+        expect(no_new_contacts.find("\"events\":[]") != std::string::npos,
+               "contact sequence cursor excludes previously seen events");
         const auto velocity_response = physics_protocol.handle(
             "{\"id\":9303,\"method\":\"physics.body_status\",\"entity\":\"" +
             falling.to_string() + "\"}");
@@ -1560,11 +1593,256 @@ int main() {
             physics_engine.scene(), falling);
         expect(impulsed_angular && std::abs(impulsed_angular->z) > 0.01,
                "protocol impulse generates angular velocity");
+        expect(physics_engine.physics().apply_impulse(physics_engine.scene(), falling,
+                                                       {0, 30, 0}),
+               "contact fixture can lift the box away from the floor");
+        physics_engine.step(10);
+        const auto ended_contacts = physics_protocol.handle(
+            R"({"id":9313,"method":"physics.contact_events"})");
+        expect(ended_contacts.find("\"type\":\"end\"") != std::string::npos,
+               "protocol reports contact end after separation");
         expect(physics_protocol.handle(R"({"id":9304,"method":"runtime.stop"})")
                    .find("\"ok\":true") != std::string::npos &&
                    physics_engine.scene().get(falling)->transform.position.y == 3.0,
                "stopping game restores authored body transform");
+        expect(physics_protocol.handle(R"({"id":9312,"method":"physics.contact_events"})")
+                   .find("\"events\":[]") != std::string::npos,
+               "Stop Game clears runtime contact history");
         std::filesystem::remove(body_path);
+    }
+    {
+        relay::Engine shape_engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+        relay::ControlProtocol shape_protocol(shape_engine);
+        const auto floor = shape_engine.scene().create("Shape floor");
+        const auto sphere = shape_engine.scene().create("Sphere");
+        const auto capsule = shape_engine.scene().create("Capsule");
+        relay::BoxCollider floor_collider;
+        floor_collider.half_extents = {5, 0.5, 5};
+        expect(shape_engine.scene().set_collider(floor, floor_collider) &&
+                   shape_engine.scene().set_transform(floor,
+                       relay::Transform{{0, -0.5, 0}, {}, {1, 1, 1}}) &&
+                   shape_engine.scene().set_transform(sphere,
+                       relay::Transform{{0, 3, 0}, {}, {1, 1, 1}}) &&
+                   shape_engine.scene().set_transform(capsule,
+                       relay::Transform{{2, 3, 0}, {}, {1, 1, 1}}),
+               "sphere and capsule fixture transforms are valid");
+        const auto set_sphere = shape_protocol.handle(
+            "{\"id\":9401,\"method\":\"scene.set_collider\",\"entity\":\"" +
+            sphere.to_string() + "\",\"type\":\"sphere\",\"radius\":0.5}");
+        const auto set_capsule = shape_protocol.handle(
+            "{\"id\":9402,\"method\":\"scene.set_collider\",\"entity\":\"" +
+            capsule.to_string() +
+            "\",\"type\":\"capsule\",\"radius\":0.25,\"half_height\":0.75}");
+        expect(set_sphere.find("\"ok\":true") != std::string::npos &&
+                   set_capsule.find("\"ok\":true") != std::string::npos,
+               "protocol authors sphere and capsule shapes");
+        const auto sphere_ray = relay::collision_raycast(shape_engine.scene(),
+            {-2, 3, 0}, {1, 0, 0}, 5);
+        const auto capsule_ray = relay::collision_raycast(shape_engine.scene(),
+            {2, 5, 0}, {0, -1, 0}, 5);
+        expect(sphere_ray.hit && sphere_ray.entity == sphere &&
+                   std::abs(sphere_ray.distance - 1.5) < 0.01 &&
+                   capsule_ray.hit && capsule_ray.entity == capsule &&
+                   std::abs(capsule_ray.distance - 1.0) < 0.01,
+               "sphere and capsule raycasts use their round Jolt shapes");
+        const auto sphere_probe = shape_engine.scene().create("Sphere probe");
+        const auto capsule_probe = shape_engine.scene().create("Capsule probe");
+        expect(shape_engine.scene().set_collider(sphere_probe, relay::BoxCollider{}) &&
+                   shape_engine.scene().set_collider(capsule_probe, relay::BoxCollider{}) &&
+                   shape_engine.scene().set_transform(sphere_probe,
+                       relay::Transform{{0.8, 3, 0}, {}, {1, 1, 1}}) &&
+                   shape_engine.scene().set_transform(capsule_probe,
+                       relay::Transform{{2.6, 3, 0}, {}, {1, 1, 1}}),
+               "round-shape overlap probes are valid");
+        const auto sphere_hits = relay::collision_overlaps(shape_engine.scene(), sphere);
+        const auto capsule_hits = relay::collision_overlaps(shape_engine.scene(), capsule);
+        expect(sphere_hits.error.empty() &&
+                   std::find(sphere_hits.entities.begin(), sphere_hits.entities.end(), sphere_probe) !=
+                       sphere_hits.entities.end() &&
+                   capsule_hits.error.empty() &&
+                   std::find(capsule_hits.entities.begin(), capsule_hits.entities.end(), capsule_probe) !=
+                       capsule_hits.entities.end(),
+               "round-shape overlaps use the same Jolt geometry as simulation");
+        expect(shape_engine.scene().destroy(sphere_probe) &&
+                   shape_engine.scene().destroy(capsule_probe),
+               "overlap probes are removed before game simulation");
+        const auto saved = scene_test_directory / "round-colliders.relay.json";
+        std::string save_error;
+        expect(relay::save_scene_file_atomic(shape_engine.scene(), saved, save_error),
+               "round collider scene saves");
+        const auto loaded = relay::load_scene_file(saved);
+        expect(loaded && loaded.source_version == 11U &&
+                   loaded.state->slots[sphere.index].record.collider->type ==
+                       relay::BoxCollider::Type::sphere &&
+                   loaded.state->slots[capsule.index].record.collider->type ==
+                       relay::BoxCollider::Type::capsule &&
+                   loaded.state->slots[capsule.index].record.collider->half_height == 0.75,
+               "current scene version round trips sphere and capsule dimensions");
+        std::filesystem::remove(saved);
+        relay::PhysicsBody body;
+        expect(shape_engine.scene().set_physics_body(sphere, body) &&
+                   shape_engine.scene().set_physics_body(capsule, body) &&
+                   shape_engine.run_game(),
+               "round dynamic bodies start a game session");
+        shape_engine.step(120);
+        expect(std::abs(shape_engine.scene().get(sphere)->transform.position.y - 0.5) < 0.05 &&
+                   std::abs(shape_engine.scene().get(capsule)->transform.position.y - 1.0) < 0.05,
+               "sphere and capsule settle on a box floor at their respective radii");
+        expect(shape_engine.stop_game(), "round collider game session stops");
+    }
+    {
+        relay::Engine mesh_engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+        relay::ControlProtocol mesh_protocol(mesh_engine);
+        std::vector<relay::MeshVertex> cube_vertices;
+        for (int corner = 0; corner < 8; ++corner) {
+            relay::MeshVertex vertex;
+            vertex.x = (corner == 1 || corner == 2 || corner == 5 || corner == 6) ? 0.5F : -0.5F;
+            vertex.y = (corner == 2 || corner == 3 || corner == 6 || corner == 7) ? 0.5F : -0.5F;
+            vertex.z = corner >= 4 ? 0.5F : -0.5F;
+            cube_vertices.push_back(vertex);
+        }
+        const std::vector<std::uint32_t> cube_indices{
+            0, 3, 2, 0, 2, 1, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4,
+            3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5};
+        relay::MeshAsset cube_mesh;
+        cube_mesh.name = "test.collision.cube";
+        cube_mesh.index_count = static_cast<std::uint32_t>(cube_indices.size());
+        expect(mesh_engine.assets().register_imported(cube_vertices, cube_indices, {cube_mesh}, {}),
+               "test registers a closed cube collision mesh");
+        const auto hull = mesh_engine.scene().create("Convex hull");
+        const auto floor = mesh_engine.scene().create("Mesh floor");
+        expect(mesh_engine.scene().set_transform(hull,
+                   relay::Transform{{0, 3, 0}, {}, {2, 1, 1}}) &&
+                   mesh_engine.scene().set_transform(floor,
+                       relay::Transform{{0, 0, 0}, {-90, 0, 0}, {10, 10, 10}}) &&
+                   mesh_engine.scene().set_mesh_renderer(floor,
+                       relay::MeshRenderer{"builtin.quad", "builtin.orange"}),
+               "convex and mesh collider fixtures are valid");
+        const auto set_hull = mesh_protocol.handle(
+            "{\"id\":9501,\"method\":\"scene.set_collider\",\"entity\":\"" + hull.to_string() +
+            "\",\"type\":\"convex\",\"mesh\":\"test.collision.cube\"}");
+        const auto set_floor = mesh_protocol.handle(
+            "{\"id\":9502,\"method\":\"scene.set_collider\",\"entity\":\"" + floor.to_string() +
+            "\",\"type\":\"mesh\"}");
+        expect(set_hull.find("\"ok\":true") != std::string::npos &&
+                   set_floor.find("\"ok\":true") != std::string::npos &&
+                   mesh_engine.scene().get(floor)->collider->mesh.empty(),
+               "protocol authors convex and renderer-mesh colliders");
+        expect(mesh_protocol.handle("{\"id\":9503,\"method\":\"scene.set_collider\",\"entity\":\"" +
+                   hull.to_string() + "\",\"mesh\":\"missing.mesh\"}")
+                   .find("unknown collider mesh") != std::string::npos &&
+                   mesh_engine.scene().get(hull)->collider->mesh == "test.collision.cube",
+               "protocol rejects an unregistered collider mesh without changing the collider");
+        expect(mesh_protocol.handle("{\"id\":9506,\"method\":\"scene.set_collider\",\"entity\":\"" +
+                   floor.to_string() + "\",\"mesh\":\"\"}").find("\"ok\":true") != std::string::npos,
+               "protocol accepts an empty collider mesh to follow the renderer mesh");
+        const auto hull_ray = mesh_protocol.handle(
+            R"({"id":9504,"method":"physics.raycast","origin_x":-5,"origin_y":3,"origin_z":0,"direction_x":1,"direction_y":0,"direction_z":0})");
+        const auto floor_ray = relay::collision_raycast(mesh_engine.scene(), {3, 5, 1}, {0, -1, 0},
+                                                        10, 0xffffffffU, &mesh_engine.assets());
+        const auto hull_hit = relay::collision_raycast(mesh_engine.scene(), {-5, 3, 0}, {1, 0, 0},
+                                                       10, 0xffffffffU, &mesh_engine.assets());
+        expect(hull_ray.find("\"entity\":\"" + hull.to_string() + "\"") != std::string::npos &&
+                   hull_hit.hit && std::abs(hull_hit.distance - 4) < 1e-5,
+               "convex raycast bakes non-uniform scale into the hull");
+        expect(floor_ray.hit && floor_ray.entity == floor && std::abs(floor_ray.distance - 5) < 1e-4 &&
+                   std::abs(floor_ray.normal.y - 1) < 1e-4,
+               "triangle-mesh raycast uses the renderer mesh and its rotated surface normal");
+        expect(!relay::collision_raycast(mesh_engine.scene(), {3, 5, 1}, {0, -1, 0}, 10).hit,
+               "mesh colliders are inactive without an asset registry");
+        const auto outlines = relay::collision_debug_boxes(mesh_engine.scene(), false,
+                                                           &mesh_engine.assets());
+        const auto outline = [&](relay::Entity entity) -> const relay::CollisionDebugBox* {
+            for (const auto& box : outlines.boxes) if (box.entity == entity) return &box;
+            return nullptr;
+        };
+        const auto* hull_outline = outline(hull);
+        const auto* floor_outline = outline(floor);
+        expect(hull_outline && hull_outline->type == relay::BoxCollider::Type::convex &&
+                   hull_outline->lines.size() >= 12U && !hull_outline->lines_truncated &&
+                   std::abs(hull_outline->edges[0].x - 1.0) < 1e-6,
+               "convex outline lists hull edges and world bounds");
+        expect(floor_outline && floor_outline->lines.size() == 5U &&
+                   std::abs(floor_outline->edges[2].z - 5.5) < 1e-5,
+               "mesh outline lists each unique triangle edge once");
+        const auto debug_response = mesh_protocol.handle(R"({"id":9505,"method":"physics.debug_boxes"})");
+        expect(debug_response.find("\"type\":\"mesh\"") != std::string::npos &&
+                   debug_response.find("\"type\":\"convex\"") != std::string::npos &&
+                   debug_response.find("\"lines_truncated\":false") != std::string::npos,
+               "protocol debug outlines include shape types and line lists");
+        const auto probe = mesh_engine.scene().create("Mesh probe");
+        expect(mesh_engine.scene().set_collider(probe, relay::BoxCollider{}) &&
+                   mesh_engine.scene().set_transform(probe,
+                       relay::Transform{{1.2, 3, 0}, {}, {1, 1, 1}}),
+               "convex overlap probe is valid");
+        const auto hull_hits = relay::collision_overlaps(mesh_engine.scene(), hull,
+                                                         &mesh_engine.assets());
+        expect(hull_hits.error.empty() && hull_hits.entities.size() == 1U &&
+                   hull_hits.entities.front() == probe,
+               "convex overlap uses the scaled hull rather than the unit mesh");
+        expect(mesh_engine.scene().set_transform(probe, relay::Transform{{2, 0.2, 2}, {}, {1, 1, 1}}),
+               "mesh surface probe moves onto the floor");
+        const auto floor_hits = relay::collision_overlaps(mesh_engine.scene(), floor,
+                                                          &mesh_engine.assets());
+        expect(floor_hits.error.empty() && floor_hits.entities.size() == 1U &&
+                   floor_hits.entities.front() == probe,
+               "triangle-mesh overlap reports colliders crossing its surface");
+        expect(mesh_engine.scene().destroy(probe), "mesh probe is removed before simulation");
+        const auto mesh_body = mesh_engine.scene().create("Dynamic mesh body");
+        relay::BoxCollider cube_collider;
+        cube_collider.type = relay::BoxCollider::Type::mesh;
+        cube_collider.mesh = "test.collision.cube";
+        expect(mesh_engine.scene().set_collider(mesh_body, cube_collider) &&
+                   mesh_engine.scene().set_transform(mesh_body,
+                       relay::Transform{{-3, 2, 0}, {}, {1, 1, 1}}) &&
+                   mesh_engine.scene().set_transform(hull,
+                       relay::Transform{{0, 3, 0}, {}, {1, 1, 1}}),
+               "dynamic mesh-collider fixture is valid");
+        const auto saved = scene_test_directory / "mesh-colliders.relay.json";
+        std::string save_error;
+        expect(relay::save_scene_file_atomic(mesh_engine.scene(), saved, save_error),
+               "convex and mesh collider scene saves");
+        const auto loaded = relay::load_scene_file(saved);
+        expect(loaded && loaded.source_version == 11U &&
+                   loaded.state->slots[hull.index].record.collider->type ==
+                       relay::BoxCollider::Type::convex &&
+                   loaded.state->slots[hull.index].record.collider->mesh == "test.collision.cube" &&
+                   loaded.state->slots[floor.index].record.collider->type ==
+                       relay::BoxCollider::Type::mesh,
+               "scene version 11 round trips convex and mesh collider sources");
+        std::filesystem::remove(saved);
+        relay::PhysicsBody body;
+        expect(mesh_engine.scene().set_physics_body(hull, body) &&
+                   mesh_engine.scene().set_physics_body(mesh_body, body) &&
+                   mesh_engine.run_game(),
+               "convex and mesh dynamic bodies start a game session");
+        mesh_engine.step(150);
+        expect(std::abs(mesh_engine.scene().get(hull)->transform.position.y - 0.5) < 0.05 &&
+                   std::abs(mesh_engine.scene().get(mesh_body)->transform.position.y - 0.5) < 0.05,
+               "convex and dynamic mesh bodies settle on a triangle-mesh floor");
+        const auto contacts = mesh_engine.physics().contact_events();
+        expect(std::any_of(contacts.events.begin(), contacts.events.end(),
+                   [&](const relay::ContactEvent& event) {
+                       return event.began && (event.first == floor || event.second == floor);
+                   }),
+               "triangle-mesh floor reports contact begin events");
+        expect(mesh_engine.stop_game(), "mesh collider game session stops");
+    }
+    {
+        relay::Scene thin_scene;
+        const auto floor = thin_scene.create("Near-zero floor");
+        const auto box = thin_scene.create("Falling body");
+        relay::BoxCollider thin_floor;
+        thin_floor.half_extents = {5, 0.000001, 5};
+        expect(thin_scene.set_collider(floor, thin_floor) &&
+                   thin_scene.set_collider(box, relay::BoxCollider{}) &&
+                   thin_scene.set_transform(box, relay::Transform{{0, 2, 0}, {}, {1, 1, 1}}) &&
+                   thin_scene.set_physics_body(box, relay::PhysicsBody{}),
+               "near-zero floor fixture is valid");
+        relay::PhysicsWorld thin_world;
+        for (unsigned frame = 0; frame < 120; ++frame) thin_world.step(thin_scene, 1.0 / 60.0);
+        expect(thin_scene.get(box)->transform.position.y > 0.45,
+               "near-zero floor remains a usable Jolt collider");
     }
     {
         relay::Scene impulse_scene;
@@ -1653,6 +1931,11 @@ int main() {
         const auto distance = pair_scene.get(right)->transform.position.x -
                               pair_scene.get(left)->transform.position.x;
         expect(distance >= 0.95, "two dynamic boxes separate under Jolt contact resolution");
+        const auto pair_events = world.contact_events();
+        expect(!pair_events.events.empty() && pair_events.events.front().began &&
+                   pair_events.events.front().first == left &&
+                   pair_events.events.front().second == right,
+               "Jolt reports one ordered contact begin for a dynamic pair");
         auto filtered = *pair_scene.get(right)->collider;
         filtered.mask = 0;
         expect(pair_scene.set_collider(right, filtered) &&
@@ -1691,7 +1974,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 24U && relay::protocol_methods().size() == 99U,
+    expect(relay::protocol_schema_version == 27U && relay::protocol_methods().size() == 100U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");

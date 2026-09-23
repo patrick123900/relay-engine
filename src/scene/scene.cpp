@@ -128,10 +128,14 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
     output << ",\"collider\":";
     if (record.collider) {
         const auto& collider = *record.collider;
-        output << "{\"center\":";
+        output << "{\"type\":" << static_cast<unsigned>(collider.type)
+               << ",\"center\":";
         append_vec3(output, collider.center);
         output << ",\"half_extents\":";
         append_vec3(output, collider.half_extents);
+        output << ",\"radius\":" << collider.radius
+               << ",\"half_height\":" << collider.half_height
+               << ",\"mesh\":\"" << escape_json(collider.mesh) << '"';
         output << ",\"enabled\":" << (collider.enabled ? "true" : "false")
                << ",\"layer\":" << collider.layer << ",\"mask\":" << collider.mask << '}';
     } else output << "null";
@@ -411,7 +415,9 @@ bool Scene::set_collider(const Entity entity, std::optional<BoxCollider> collide
         const auto valid_extent = [](const double value) {
             return std::isfinite(value) && value > 0.0 && value <= 1'000'000.0;
         };
-        if (!valid_center(collider->center.x) || !valid_center(collider->center.y) ||
+        if (static_cast<unsigned>(collider->type) > 4U || collider->mesh.size() > 128U ||
+            !valid_extent(collider->radius) || !valid_extent(collider->half_height) ||
+            !valid_center(collider->center.x) || !valid_center(collider->center.y) ||
             !valid_center(collider->center.z) || !valid_extent(collider->half_extents.x) ||
             !valid_extent(collider->half_extents.y) || !valid_extent(collider->half_extents.z) ||
             collider->layer == 0U) return false;
@@ -660,8 +666,12 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
           {"outer_cone", ReflectedFieldType::number},
           {"range", ReflectedFieldType::number}}},
         {"BoxCollider", 0x0aU,
-         {{"center", ReflectedFieldType::vec3},
+         {{"type", ReflectedFieldType::number},
+          {"center", ReflectedFieldType::vec3},
           {"half_extents", ReflectedFieldType::vec3},
+          {"radius", ReflectedFieldType::number},
+          {"half_height", ReflectedFieldType::number},
+          {"mesh", ReflectedFieldType::string},
           {"enabled", ReflectedFieldType::boolean},
           {"layer", ReflectedFieldType::number},
           {"mask", ReflectedFieldType::number}}},

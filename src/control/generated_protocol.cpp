@@ -138,16 +138,20 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_morph{{
     {"reset", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 11> fields_scene_set_collider{{
+constexpr std::array<ProtocolFieldSpec, 15> fields_scene_set_collider{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "box|sphere|capsule|convex|mesh"},
     {"center_x", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
     {"center_y", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
     {"center_z", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
     {"half_x", ProtocolValueType::number, false, false, true, true, 1e-06, 1000000, 0U, 0U, "", ""},
     {"half_y", ProtocolValueType::number, false, false, true, true, 1e-06, 1000000, 0U, 0U, "", ""},
     {"half_z", ProtocolValueType::number, false, false, true, true, 1e-06, 1000000, 0U, 0U, "", ""},
+    {"radius", ProtocolValueType::number, false, false, true, true, 1e-06, 1000000, 0U, 0U, "", ""},
+    {"half_height", ProtocolValueType::number, false, false, true, true, 1e-06, 1000000, 0U, 0U, "", ""},
+    {"mesh", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9._:-]*$", ""},
     {"layer", ProtocolValueType::integer, false, false, true, true, 1, 4294967295, 0U, 0U, "", ""},
     {"mask", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
@@ -169,6 +173,10 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_physics_overlaps{{
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_physics_body_status{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_physics_contact_events{{
+    {"after", ProtocolValueType::integer, false, false, true, false, 0, 0, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 7> fields_physics_apply_impulse{{
@@ -396,7 +404,7 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_chat_control{{
     {"provider", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "openai|compatible"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 99> methods{{
+constexpr std::array<ProtocolMethodSpec, 100> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -439,11 +447,12 @@ constexpr std::array<ProtocolMethodSpec, 99> methods{{
     {"scene.redo", "scene_redo", "Redo scene change", "Reapply the most recently undone scene transaction.", false, false, false, false, false, no_fields},
     {"scene.set_animation", "scene_set_animation", "Control imported animation", "Configure clip, playback, looping, speed and seek time on an imported model root.", false, false, false, false, false, fields_scene_set_animation},
     {"scene.set_morph", "scene_set_morph", "Set imported morph weight", "Override a mesh morph weight, or reset all overrides to imported defaults and animation.", false, false, false, false, false, fields_scene_set_morph},
-    {"scene.set_collider", "scene_set_collider", "Configure box collider", "Add, edit or remove an authored box collider. The box follows the entity hierarchy and scene-owned transform animation. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_collider},
-    {"physics.raycast", "physics_raycast", "Raycast box colliders", "Find the nearest enabled authored box collider hit by a world-space ray. Returns hit point and surface normal; does not move objects.", true, false, false, false, false, fields_physics_raycast},
-    {"physics.overlaps", "physics_overlaps", "Find overlapping colliders", "List up to 128 enabled box colliders overlapping an entity collider. Both colliders must pass their layer masks; reports truncation.", true, false, false, false, false, fields_physics_overlaps},
-    {"physics.debug_boxes", "physics_debug_boxes", "Inspect collider wireframes", "Read bounded world-space collider boxes for the editor overlay, including disabled colliders.", true, false, false, true, false, no_fields},
+    {"scene.set_collider", "scene_set_collider", "Configure collider", "Add, edit or remove an authored box, sphere, capsule, convex or triangle-mesh collider. Sphere and capsule use the largest world scale uniformly. Convex and mesh shapes use a registered mesh, defaulting to the entity renderer mesh. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_collider},
+    {"physics.raycast", "physics_raycast", "Raycast colliders", "Find the nearest enabled authored collider of any shape hit by a world-space ray. Returns hit point and surface normal; does not move objects.", true, false, false, false, false, fields_physics_raycast},
+    {"physics.overlaps", "physics_overlaps", "Find overlapping colliders", "List up to 128 enabled colliders of any shape overlapping an entity collider. Both colliders must pass their layer masks; reports truncation. Triangle-mesh colliders report surface contact only.", true, false, false, false, false, fields_physics_overlaps},
+    {"physics.debug_boxes", "physics_debug_boxes", "Inspect collider wireframes", "Read bounded world-space collider outlines for the editor overlay, including disabled colliders.", true, false, false, true, false, no_fields},
     {"physics.body_status", "physics_body_status", "Inspect physics body", "Read the current linear and angular velocities of a dynamic body during Run Game.", true, false, false, false, false, fields_physics_body_status},
+    {"physics.contact_events", "physics_contact_events", "Read collision contacts", "Read bounded contact begin and end events from the current game session, using a sequence cursor. Events are cleared on Stop Game.", true, false, false, false, false, fields_physics_contact_events},
     {"physics.apply_impulse", "physics_apply_impulse", "Apply rigid body impulse", "Apply a world-space impulse to a dynamic body during Run Game. Optional world-space point produces torque and angular motion.", false, false, false, false, false, fields_physics_apply_impulse},
     {"scene.set_physics_body", "scene_set_physics_body", "Configure physics body", "Add, edit or remove an undoable static or dynamic physics body. Dynamic bodies use Jolt rigid-body collision, gravity and angular dynamics during Run Game.", false, false, false, false, false, fields_scene_set_physics_body},
     {"scene.set_light", "scene_set_light", "Configure scene light", "Add, update or remove a directional, point or spot light.", false, false, false, false, false, fields_scene_set_light},

@@ -25,13 +25,22 @@ Engine::~Engine() {
 }
 
 void Engine::tick() {
+    scripts_.poll();
+    sync_input_map();
     if (running_ && mode_ == RuntimeMode::game && !paused_) {
         advance_one_frame();
     }
 }
 
 bool Engine::run_game() {
-    if (!running_ || mode_ != RuntimeMode::editor) return false;
+    run_game_error_.clear();
+    if (!running_ || mode_ != RuntimeMode::editor) {
+        run_game_error_ = "game can only start from editor mode";
+        return false;
+    }
+    if (!scripts_.can_start(scene_, run_game_error_)) return false;
+    sync_input_map();
+    input_.clear_edges();
     authored_scene_ = scene_.capture_state();
     physics_.reset();
     mode_ = RuntimeMode::game;
@@ -39,6 +48,8 @@ bool Engine::run_game() {
     frame_index_ = 0;
     elapsed_seconds_ = 0.0;
     logs_.write(LogLevel::info, "Game started");
+    first_person_.start(scene_, logs_);
+    scripts_.start();
     return true;
 }
 
@@ -48,6 +59,8 @@ bool Engine::stop_game() {
         std::string error;
         if (!stop_video(error)) return false;
     }
+    scripts_.stop();
+    first_person_.stop();
     scene_.restore_state(std::move(*authored_scene_));
     physics_.reset();
     authored_scene_.reset();
@@ -171,6 +184,7 @@ std::uint64_t Engine::random_seed() const { return config_.random_seed; }
 
 void Engine::apply_input_event(std::string payload) {
     trace_.record(frame_index_, "input", payload);
+    input_.apply(payload);
     if (recent_input_events_.size() == 64U) recent_input_events_.pop_front();
     recent_input_events_.push_back(std::move(payload));
 }
@@ -193,12 +207,44 @@ Scene& Engine::scene() { return scene_; }
 const Scene& Engine::scene() const { return scene_; }
 SceneHistory& Engine::scene_history() { return scene_history_; }
 AssetRegistry& Engine::assets() { return assets_; }
+
+InputState& Engine::input() {
+    sync_input_map();
+    return input_;
+}
+
+// Loads the open project's input map when the project changes; standalone sessions use defaults.
+void Engine::sync_input_map() {
+    std::optional<std::filesystem::path> root;
+    if (project_) root = std::filesystem::absolute(project_->root()).lexically_normal();
+    if (input_loaded_ && root == input_root_) return;
+    input_loaded_ = true;
+    input_root_ = root;
+    std::string error;
+    input_.set_map(root ? load_input_map(*root, error) : default_input_map());
+    if (!error.empty()) logs_.write(LogLevel::warning, error);
+}
+
+bool Engine::set_input_map(InputMap map, std::string& error) {
+    sync_input_map();
+    if (!input_root_) {
+        error = "the input map is saved with a project; open one first";
+        return false;
+    }
+    if (!save_input_map(*input_root_, map, error)) return false;
+    input_.set_map(std::move(map));
+    return true;
+}
 const AssetRegistry& Engine::assets() const { return assets_; }
 
 void Engine::advance_one_frame() {
     const auto start = std::chrono::steady_clock::now();
     ++frame_index_;
     elapsed_seconds_ += config_.fixed_delta_seconds;
+    input_.begin_step();
+    if (mode_ == RuntimeMode::game)
+        first_person_.update(scene_, physics_, input_, config_.fixed_delta_seconds);
+    scripts_.update(config_.fixed_delta_seconds);
     for (const auto entity : scene_.entities()) {
         auto *record = scene_.get(entity);
         if (record->transform_animation && record->transform_animation->playing) {
@@ -239,6 +285,7 @@ void Engine::advance_one_frame() {
         }
     }
     physics_.step(scene_, config_.fixed_delta_seconds);
+    scripts_.dispatch_contacts();
     renderer_.render(frame_index_, elapsed_seconds_);
     if (video_.status().recording && video_.status().source == "vulkan") {
         if (video_.sample_due()) {

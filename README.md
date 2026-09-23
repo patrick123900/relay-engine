@@ -14,7 +14,7 @@
   <img alt="status" src="https://img.shields.io/badge/status-experimental-f0b44d">
 </p>
 
-![Relay Editor](docs/images/relay-editor.webp)
+![Relay Editor](docs/images/relay_editor.png)
 
 Relay is an experimental game engine and editor built around a shared control surface. Human UI,
 automation, tests, and model tools all operate through the same typed protocol. Agents can inspect
@@ -31,7 +31,7 @@ in control of the same project.
   Vulkan viewport, inspect the image, and iterate.
 - **HDR lighting** — a floating-point scene target, camera exposure, procedural environment
   lighting, and tone mapping produce the final SDR viewport and captures.
-- **One typed API** — 105 versioned native methods cover scene editing, rendering, projects,
+- **One typed API** — 127 versioned native methods cover scene editing, rendering, projects,
   observability, capture, and session authorization. A generated MCP bridge exposes the supported
   model-facing subset.
 - **Deterministic core** — fixed-step simulation, transactional undo/redo, strict scene validation,
@@ -46,10 +46,22 @@ in control of the same project.
   and transfer-queue mip generation when a dedicated queue is available.
 - **Scene authoring and export** — editable, undoable transform keyframes and portable project tar
   packages of saved scenes and assets.
+- **Components, node types and templates** — every node is a Transform plus any components you add
+  or remove in the Inspector. Node types form an inheritance tree (a Rigid Body is a Physics Body
+  is a Node), a node's type follows from its components, and saved templates reuse whole node
+  trees (prefabs).
+- **Native C++ gameplay scripts** — behaviours in a project's `scripts/` folder are script
+  components with Inspector-editable properties. They build in the background with per-file
+  caching, run during Run Game with start, update, contact and stop callbacks, and hot reload while
+  the game runs. Agents write, build and debug them through the same protocol.
+- **Input mapping** — keyboard, mouse and gamepad controls map to named actions and axes per
+  project, edited in the Game Configuration window and read by scripts once per game step.
 - **Jolt physics** — authored box, sphere, capsule, convex-hull, and triangle-mesh colliders support
-  overlap checks and raycasts.
-  Static and dynamic rigid bodies provide gravity, momentum, friction, bounce, and angular motion
-  during Run Game. Runtime impulses can be applied at a world-space point through the protocol.
+  overlap checks and raycasts. Static and dynamic rigid bodies provide gravity, momentum,
+  friction, bounce, and angular motion during Run Game, and runtime impulses can be applied at a
+  world-space point through the protocol.
+- **First person controller** — a native node type and component that walks, sprints, jumps, and
+  looks around with the input map, ready to play without writing code.
 
 The editor remembers its layout between sessions and builds: docked and floating panels, which
 panels are open, and the **View** menu toggles. They are saved per user in
@@ -57,10 +69,36 @@ panels are open, and the **View** menu toggles. They are saved per user in
 `~/Library/Application Support/Relay` on macOS). **Layout → Reset layout** restores the default
 arrangement, and `RELAY_EDITOR_LAYOUT_PATH` points the editor at another file.
 
-The **Hierarchy** lists the scene's entities. Right-click empty space to create an entity, or a row
-to add a child, duplicate, move, rename, or destroy it. Rename in place with **F2**, **Rename** in
-the context menu, or a second, slower click on the selected row; **Enter** or clicking away
-commits and **Escape** cancels. Drag rows onto each other to reparent them.
+A node is a Transform plus the components you give it. The **Inspector** shows only the
+components a node has; remove one with the **×** on its header (or right-click → **Remove
+component**). **+ Add Component** at the bottom opens the Add Component window: categories on the
+left, engine components and your script behaviours on the right, a description of the selection,
+and search. The Transform cannot be removed.
+
+**+ Add Node** at the bottom of the Hierarchy (also **Scene → Add Node...** and the Hierarchy's
+context menu) opens the Add Node window. Node types are shown as a tree: each type inherits its
+parent's components and adds its own, so a Rigid Body is a Node with a collider (Physics Body)
+and a dynamic physics body. The details pane shows the inheritance chain, description and
+components. Light and Physics Body are categories; pick one of the types beneath them. The
+Hierarchy labels each node with the deepest type its current components match, so removing a
+Static Mesh's mesh renderer makes it a plain Node and adding a camera makes it a Camera.
+
+**Node › Physics Body › First Person Controller** creates a player you can walk around with
+straight away: an upright capsule body, a camera at eye height, and a native **First person
+controller** component for mouse, keyboard and gamepad look, walking, sprinting and jumping from
+the input map. Its speeds, mouse sensitivity, jump and camera node are Inspector fields, and it
+locks the mouse while the game has input. The component can also be added to any node with a
+dynamic, rotation-locked body, a collider and a child camera; the Inspector says what is missing.
+
+Right-click a node and choose **Save as template...** to store it and its children in the
+project's `templates/` folder. Saved templates appear in the Add Node window below the node
+types; creating one makes an independent copy, like a prefab without a live link. You can also
+double-click a template file in Assets or drag it into the viewport.
+
+The **Hierarchy** lists the scene's nodes. Right-click empty space to create a node, or a row to
+add a child, duplicate, move, rename, save as a template, or destroy it. Rename in place with
+**F2**, **Rename** in the context menu, or a second, slower click on the selected row; **Enter** or
+clicking away commits and **Escape** cancels. Drag rows onto each other to reparent them.
 
 The **Assets** panel shows the open project folder as a tree. Expand a folder with its arrow, a
 double-click, or the arrow keys. Right-click empty space to create a folder at the top level, or a
@@ -69,8 +107,8 @@ also work. Deleting moves the entry into the project's hidden `.relay-trash` fol
 be recovered by hand. Drag entries onto a folder to move them there, or onto the empty space below
 the tree to move them to the top level. Type in the search box (**Ctrl+F** while the panel is
 focused) to find assets by name anywhere in the project, and use the funnel button to show only
-models, scenes, images, shaders, scripts, text, audio and video, folders, project files, or other
-files; the menu stays open so several categories can be ticked at once. Right-click an entry and
+models, scenes, templates, images, shaders, scripts, text, audio and video, folders, project files,
+or other files; the menu stays open so several categories can be ticked at once. Right-click an entry and
 choose **Open in file browser** to show it in your system file manager.
 Results list each match with its folder; double-click a folder result or choose **Show in
 folder** to jump back to the tree there. **Escape** clears the search. The project file and the project's member
@@ -100,9 +138,10 @@ The editor viewport also shows clickable camera and light icons. Directional, po
 lights have distinct markers; selecting a camera shows a compact perspective or orthographic
 view guide. The guide preserves the camera's field of view and aspect but caps its display size.
 These guides can be toggled from **View** and stay out of Run Game.
-Open **Physics body** in the Inspector to make an object static or dynamic. Dynamic bodies fall
-under gravity and respond to enabled colliders during Run Game. A collider without a body is
-static. Mass, gravity scale, bounciness, friction, and linear/angular damping are editable;
+Open **Physics body** in the Inspector to make an object static or dynamic. **Lock rotation**
+keeps a dynamic body upright, so collisions push it around without tipping it over, as characters
+need. Dynamic bodies fall under gravity and respond to enabled colliders during Run Game. A
+collider without a body is static. Mass, gravity scale, bounciness, friction, and linear/angular damping are editable;
 Stop Game restores authored positions. Jolt uses continuous collision detection for dynamic
 bodies. An off-center `physics.apply_impulse` command adds rotation as well as linear motion.
 Bodies with transform keyframes follow those keys rather than dynamic simulation.
@@ -111,6 +150,24 @@ remain valid. Protocol requests with zero extents are rejected.
 During Run Game, `physics.contact_events` reports contact `begin` and `end` pairs in sequence
 order. Pass the last sequence as `after` to read new events; `oldest_sequence` shows when older
 events have left the bounded history. Stop Game clears the stream.
+
+Gameplay code is native C++. Choose **Create → C++ script...** in the Assets panel (or **New C++
+script...** in the Add Component window), add the behaviour to a node as a script component, and
+press **Run Game**. A node can carry several scripts, and fields a behaviour declares as
+properties are editable per node in the Inspector. Relay builds the project's scripts first and
+starts the game when they compile; errors appear under **Diagnostics → Scripts** with file and
+line. Saving a script while the game runs rebuilds it and swaps in the new code.
+Because scripts run with your full user permissions, Relay only builds a project's scripts after
+you trust that project. See the [scripting guide](docs/scripting.md).
+
+Player input goes through the project's input map. **Edit → Game Configuration...** opens the
+Input page, where actions (buttons such as `jump`) and axes (values from -1 to 1 such as `move_x`)
+list their bindings. Click **+ Add**, **+ Keys** or **+ Stick** and press the key, mouse button or
+gamepad control to bind; keys are recorded by physical position, so WASD stays in place on other
+keyboard layouts. New projects start with move, look, jump, interact, fire and sprint. The map is
+saved as `input.relay-input.json` in the project. During Run Game, click the viewport to give the
+game keyboard and mouse input and press **Escape** to hand it back to the editor; the Input page
+can also lock the mouse cursor while the game has input, for first-person controls.
 
 ## Built-in agent workspace
 
@@ -135,14 +192,16 @@ scene workflow, import pipeline, control protocol, MCP bridge, and embedded agen
 functional. APIs and file formats may still change. Windows and macOS renderer parity, broader
 import sandboxing, and sustained live-provider validation remain in progress.
 
-The next engine work is gameplay scripting tied to Run Game and Stop Game, using the new collision
-contact begin/end stream. Joints follow those foundations.
+Native C++ gameplay scripting, input mapping, components, node types, templates, and a first person
+controller are in place and verified on Linux. The next engine work is joints in the Jolt backend,
+followed by script access to entity creation and scene queries, and script loading on Windows.
 
 ## Build
 
 You need CMake 3.25+, Ninja, Python 3.10+, and a C++20 compiler. The graphical editor additionally
 needs SDL3, Vulkan, and `glslc`. CMake fetches pinned Jolt 5.6 sources for physics, plus Dear ImGui
-and ImGuizmo sources when the editor is enabled.
+and ImGuizmo sources when the editor is enabled. The editor compiles projects' gameplay scripts
+with the same C++ compiler (`RELAY_SCRIPT_COMPILER` chooses another).
 
 ```sh
 cmake --preset dev
@@ -217,6 +276,7 @@ drifting apart.
 ## Documentation
 
 - [Protocol reference](docs/protocol.md) — generated methods, parameters, and safety annotations
+- [Gameplay scripting](docs/scripting.md) — writing, building, trusting, and hot reloading scripts
 - [Agent bridge](tools/mcp-bridge/README.md) — provider integration and bridge behavior
 - [Engineering handoff](HANDOFF.md) — current implementation state, limits, and next priorities
 - [Agent instructions](AGENTS.md) — repository working and verification rules
@@ -231,3 +291,5 @@ drifting apart.
 
 Relay currently targets local, single-user authoring. Treat project files and imported assets as
 untrusted input; the loader, protocol, and importer intentionally fail closed at their boundaries.
+Native gameplay scripts are the exception: they run with your permissions, so Relay builds them
+only for projects you have trusted.

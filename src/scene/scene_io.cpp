@@ -552,6 +552,14 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                     body.linear_damping = *linear->number();
                     body.angular_damping = *angular->number();
                 }
+                if (result.source_version >= 14U) {
+                    const auto* lock = field(*body_object, "lock_rotation");
+                    if (!lock || !lock->boolean()) {
+                        result.error = "version 14 physics body requires lock_rotation";
+                        return result;
+                    }
+                    body.lock_rotation = *lock->boolean();
+                }
                 Scene validator;
                 const auto handle = validator.create();
                 if (!validator.set_physics_body(handle, body)) {
@@ -559,6 +567,126 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                     return result;
                 }
                 slot.record.physics_body = body;
+            }
+        }
+        if (result.source_version == 12U) {
+            // Version 12 allowed one optional script; it becomes the first script component.
+            const auto* script_value = field(*entity_object, "script");
+            if (!script_value) {
+                result.error = "version 12 entity requires script";
+                return result;
+            }
+            if (!script_value->is_null()) {
+                const auto* script_object = script_value->object();
+                const auto* behaviour = script_object ? field(*script_object, "behaviour") : nullptr;
+                const auto* enabled = script_object ? field(*script_object, "enabled") : nullptr;
+                if (!behaviour || !behaviour->string() || !enabled || !enabled->boolean() ||
+                    !valid_behaviour_name(*behaviour->string())) {
+                    result.error = "invalid script component";
+                    return result;
+                }
+                slot.record.scripts.push_back(Script{*behaviour->string(), *enabled->boolean(), {}});
+            }
+        }
+        if (result.source_version >= 13U) {
+            const auto* scripts_value = field(*entity_object, "scripts");
+            if (!scripts_value || !scripts_value->array() ||
+                scripts_value->array()->size() > maximum_scripts_per_entity) {
+                result.error = "version 13 entity requires a bounded scripts array";
+                return result;
+            }
+            for (const auto& script_value : *scripts_value->array()) {
+                const auto* script_object = script_value.object();
+                const auto* behaviour = script_object ? field(*script_object, "behaviour") : nullptr;
+                const auto* enabled = script_object ? field(*script_object, "enabled") : nullptr;
+                const auto* properties = script_object ? field(*script_object, "properties") : nullptr;
+                if (!behaviour || !behaviour->string() || !enabled || !enabled->boolean() ||
+                    !properties || !properties->array()) {
+                    result.error = "invalid script component";
+                    return result;
+                }
+                Script script{*behaviour->string(), *enabled->boolean(), {}};
+                for (const auto& property_value : *properties->array()) {
+                    const auto* property_object = property_value.object();
+                    const auto* property_name = property_object ? field(*property_object, "name") : nullptr;
+                    const auto* type_name = property_object ? field(*property_object, "type") : nullptr;
+                    const auto* value = property_object ? field(*property_object, "value") : nullptr;
+                    const auto type = type_name && type_name->string()
+                        ? script_property_type_from_name(*type_name->string()) : std::nullopt;
+                    if (!property_name || !property_name->string() || !type || !value) {
+                        result.error = "invalid script property";
+                        return result;
+                    }
+                    ScriptProperty property;
+                    property.name = *property_name->string();
+                    property.type = *type;
+                    bool valid = false;
+                    switch (*type) {
+                    case ScriptProperty::Type::boolean:
+                        valid = value->boolean() != nullptr;
+                        if (valid) property.boolean = *value->boolean();
+                        break;
+                    case ScriptProperty::Type::number:
+                        valid = value->number() != nullptr;
+                        if (valid) property.number = *value->number();
+                        break;
+                    case ScriptProperty::Type::vector:
+                        valid = read_vec3(value, property.vector);
+                        break;
+                    case ScriptProperty::Type::text:
+                        valid = value->string() != nullptr;
+                        if (valid) property.text = *value->string();
+                        break;
+                    }
+                    if (!valid) {
+                        result.error = "script property value does not match its type";
+                        return result;
+                    }
+                    script.properties.push_back(std::move(property));
+                }
+                if (!valid_script(script)) {
+                    result.error = "script component values outside valid ranges";
+                    return result;
+                }
+                slot.record.scripts.push_back(std::move(script));
+            }
+        }
+        if (result.source_version >= 15U) {
+            const auto* value = field(*entity_object, "first_person_controller");
+            if (!value) {
+                result.error = "version 15 entity requires first_person_controller";
+                return result;
+            }
+            if (!value->is_null()) {
+                const auto* object = value->object();
+                FirstPersonController controller;
+                const auto number = [&](const char* key, double& target) {
+                    const auto* item = object ? field(*object, key) : nullptr;
+                    if (!item || !item->number()) return false;
+                    target = *item->number();
+                    return true;
+                };
+                const auto* invert = object ? field(*object, "invert_y") : nullptr;
+                const auto* camera_name = object ? field(*object, "camera") : nullptr;
+                if (!number("walk_speed", controller.walk_speed) ||
+                    !number("sprint_speed", controller.sprint_speed) ||
+                    !number("jump_speed", controller.jump_speed) ||
+                    !number("mouse_sensitivity", controller.mouse_sensitivity) ||
+                    !number("stick_look_speed", controller.stick_look_speed) ||
+                    !number("ground_distance", controller.ground_distance) || !invert ||
+                    !invert->boolean() || !camera_name || !camera_name->string()) {
+                    result.error = "invalid first person controller";
+                    return result;
+                }
+                controller.invert_y = *invert->boolean();
+                controller.camera = *camera_name->string();
+                Scene validator;
+                const auto handle = validator.create();
+                if (!validator.set_first_person_controller(handle, controller)) {
+                    result.error = "first person controller values outside valid ranges";
+                    return result;
+                }
+                slot.record.first_person_controller = std::move(controller);
             }
         }
         ++result.entity_count;

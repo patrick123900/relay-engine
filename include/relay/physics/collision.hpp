@@ -88,7 +88,18 @@ public:
     [[nodiscard]] ContactEvents contact_events(std::uint64_t after = 0) const;
     [[nodiscard]] bool apply_impulse(const Scene& scene, Entity entity, Vec3 impulse,
                                      std::optional<Vec3> world_point = std::nullopt);
+    [[nodiscard]] bool set_velocity(const Scene& scene, Entity entity, Vec3 linear);
+    [[nodiscard]] bool set_angular_velocity(const Scene& scene, Entity entity, Vec3 radians);
+    // Teleports the bodies of `entity` and its descendants to their scene transforms, after a
+    // game-time transform edit. Collider shapes keep the scale they were built with.
+    void sync_transforms(const Scene& scene, Entity entity);
+    // Casts against the running world, without rebuilding it as collision_raycast does.
+    [[nodiscard]] CollisionRaycast raycast(const Scene& scene, Vec3 origin, Vec3 direction,
+                                           double maximum_distance,
+                                           std::uint32_t layer_mask = 0xffffffffU,
+                                           Entity ignore = {});
 private:
+    void ensure_built(const Scene& scene);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

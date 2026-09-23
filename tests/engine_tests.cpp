@@ -32,6 +32,10 @@ namespace {
 
 int failures = 0;
 
+// Serialized scenes carry the current format version; migration tests rewrite it to an older one.
+const std::string current_version_field =
+    "\"version\":" + std::to_string(relay::scene_file_version);
+
 void expect(const bool condition, const std::string& message) {
     if (!condition) {
         std::cerr << "FAIL: " << message << '\n';
@@ -1203,17 +1207,17 @@ int main() {
     expect(relay::save_scene_file_atomic(exposure_scene, exposure_path, scene_file_error),
            "version 11 scene with exposure saves");
     const auto exposure_loaded = relay::load_scene_file(exposure_path);
-    expect(exposure_loaded && exposure_loaded.source_version == 11U &&
+    expect(exposure_loaded && exposure_loaded.source_version == relay::scene_file_version &&
                exposure_loaded.state->slots[exposure_entity.index].record.camera->exposure_ev == 2.25,
            "camera exposure survives the version 11 scene round trip");
     auto legacy_exposure_json = exposure_scene.serialize_json();
-    const auto version_position = legacy_exposure_json.find("\"version\":11");
+    const auto version_position = legacy_exposure_json.find(current_version_field);
     const auto exposure_position = legacy_exposure_json.find(",\"exposure_ev\":2.25");
     expect(version_position != std::string::npos && exposure_position != std::string::npos,
            "version 11 serialization includes camera exposure");
     if (version_position != std::string::npos && exposure_position != std::string::npos) {
         legacy_exposure_json.erase(exposure_position, std::string(",\"exposure_ev\":2.25").size());
-        legacy_exposure_json.replace(version_position, 12U, "\"version\":4");
+        legacy_exposure_json.replace(version_position, current_version_field.size(), "\"version\":4");
         const auto legacy_exposure_path = scene_test_directory / "legacy-exposure.relay.json";
         std::ofstream legacy_exposure_stream(legacy_exposure_path);
         legacy_exposure_stream << legacy_exposure_json;
@@ -1399,7 +1403,7 @@ int main() {
         expect(relay::save_scene_file_atomic(collision_engine.scene(), collision_path,
                                              collision_error), "scene with colliders saves");
         const auto loaded_colliders = relay::load_scene_file(collision_path);
-        expect(loaded_colliders && loaded_colliders.source_version == 11U &&
+        expect(loaded_colliders && loaded_colliders.source_version == relay::scene_file_version &&
                    loaded_colliders.state->slots[box.index].record.collider &&
                    loaded_colliders.state->slots[box.index].record.collider->layer == 2U,
                "colliders survive scene version 11 round trip");
@@ -1416,7 +1420,8 @@ int main() {
             const auto mesh_field = old_box_json.find(",\"mesh\":\"\"");
             if (mesh_field != std::string::npos)
                 old_box_json.erase(mesh_field, std::string(",\"mesh\":\"\"").size());
-            old_box_json.replace(old_box_json.find("\"version\":11"), 12, "\"version\":9");
+            old_box_json.replace(old_box_json.find(current_version_field),
+                                 current_version_field.size(), "\"version\":9");
             const auto old_box_path = scene_test_directory / "v9-box.relay.json";
             write_file(old_box_path, old_box_json);
             const auto old_box = relay::load_scene_file(old_box_path);
@@ -1429,12 +1434,12 @@ int main() {
         relay::Scene pre_collider_scene;
         const auto legacy_entity = pre_collider_scene.create("Older scene");
         auto legacy_json = pre_collider_scene.serialize_json();
-        const auto version = legacy_json.find("\"version\":11");
+        const auto version = legacy_json.find(current_version_field);
         const auto absent_collider = legacy_json.find(",\"collider\":null");
         expect(version != std::string::npos && absent_collider != std::string::npos,
                "version 11 serializer includes an explicit collider slot");
         if (version != std::string::npos && absent_collider != std::string::npos) {
-            legacy_json.replace(version, 12U, "\"version\":6");
+            legacy_json.replace(version, current_version_field.size(), "\"version\":6");
             legacy_json.erase(absent_collider, std::string(",\"collider\":null").size());
             const auto pre_collider_path = scene_test_directory / "pre-collider.relay.json";
             write_file(pre_collider_path, legacy_json);
@@ -1514,7 +1519,7 @@ int main() {
         expect(relay::save_scene_file_atomic(physics_engine.scene(), body_path, body_error),
                "physics body saves in scene version 11");
         const auto body_scene = relay::load_scene_file(body_path);
-        expect(body_scene && body_scene.source_version == 11U &&
+        expect(body_scene && body_scene.source_version == relay::scene_file_version &&
                    body_scene.state->slots[falling.index].record.physics_body &&
                    body_scene.state->slots[falling.index].record.physics_body->mass == 2.0 &&
                    body_scene.state->slots[falling.index].record.physics_body->friction == 0.7 &&
@@ -1522,11 +1527,11 @@ int main() {
                    body_scene.state->slots[falling.index].record.physics_body->angular_damping == 0.2,
                "physics body settings round trip");
         auto old_body_json = physics_engine.scene().serialize_json();
-        const auto old_body_version = old_body_json.find("\"version\":11");
+        const auto old_body_version = old_body_json.find(current_version_field);
         const auto material_start = old_body_json.find(",\"friction\":");
         if (old_body_version != std::string::npos && material_start != std::string::npos) {
             old_body_json.erase(material_start, old_body_json.find('}', material_start) - material_start);
-            old_body_json.replace(old_body_version, 12, "\"version\":8");
+            old_body_json.replace(old_body_version, current_version_field.size(), "\"version\":8");
             const auto old_body_path = scene_test_directory / "v8-physics.relay.json";
             write_file(old_body_path, old_body_json);
             const auto old_body = relay::load_scene_file(old_body_path);
@@ -1537,13 +1542,13 @@ int main() {
             std::filesystem::remove(old_body_path);
         }
         auto prior_version = physics_engine.scene().serialize_json();
-        const auto version_field = prior_version.find("\"version\":11");
+        const auto version_field = prior_version.find(current_version_field);
         const auto body_field = prior_version.find(",\"physics_body\":null");
         expect(version_field != std::string::npos && body_field != std::string::npos,
                "version 11 scene has an explicit optional body field");
         if (version_field != std::string::npos && body_field != std::string::npos) {
             prior_version.erase(body_field, std::string(",\"physics_body\":null").size());
-            prior_version.replace(version_field, 12, "\"version\":7");
+            prior_version.replace(version_field, current_version_field.size(), "\"version\":7");
             const auto prior_path = scene_test_directory / "pre-physics.relay.json";
             write_file(prior_path, prior_version);
             const auto previous = relay::load_scene_file(prior_path);
@@ -1671,7 +1676,7 @@ int main() {
         expect(relay::save_scene_file_atomic(shape_engine.scene(), saved, save_error),
                "round collider scene saves");
         const auto loaded = relay::load_scene_file(saved);
-        expect(loaded && loaded.source_version == 11U &&
+        expect(loaded && loaded.source_version == relay::scene_file_version &&
                    loaded.state->slots[sphere.index].record.collider->type ==
                        relay::BoxCollider::Type::sphere &&
                    loaded.state->slots[capsule.index].record.collider->type ==
@@ -1826,7 +1831,7 @@ int main() {
         expect(relay::save_scene_file_atomic(mesh_engine.scene(), saved, save_error),
                "convex and mesh collider scene saves");
         const auto loaded = relay::load_scene_file(saved);
-        expect(loaded && loaded.source_version == 11U &&
+        expect(loaded && loaded.source_version == relay::scene_file_version &&
                    loaded.state->slots[hull.index].record.collider->type ==
                        relay::BoxCollider::Type::convex &&
                    loaded.state->slots[hull.index].record.collider->mesh == "test.collision.cube" &&
@@ -1997,7 +2002,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 29U && relay::protocol_methods().size() == 105U,
+    expect(relay::protocol_schema_version == 35U && relay::protocol_methods().size() == 127U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");

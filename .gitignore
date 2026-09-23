@@ -12,6 +12,10 @@ npm-debug.log*
 /tests/fixtures/models/.relay-imports.json
 /tests/fixtures/models/.relay-cache/
 
+# Compiled gameplay scripts and deleted assets inside any project
+**/.relay-cache/scripts/
+**/.relay-trash/
+
 # Local runtime output
 /outputs/
 /work/

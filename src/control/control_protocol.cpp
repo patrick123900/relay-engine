@@ -13,7 +13,11 @@
 #include "relay/render/assets.hpp"
 #include "relay/render/render_graph.hpp"
 #include "relay/render/scene_render.hpp"
+#include "relay/scene/components.hpp"
+#include "relay/scene/node_types.hpp"
 #include "relay/scene/scene_io.hpp"
+#include "relay/scene/templates.hpp"
+#include "relay/script/script_system.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +25,8 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <optional>
@@ -168,6 +174,77 @@ std::string capture_state_name(const CaptureJobState state) {
     return "failed";
 }
 
+void append_property(std::ostringstream& output, const ScriptProperty& property) {
+    output << "{\"name\":\"" << escape_json(property.name) << "\",\"type\":\""
+           << script_property_type_name(property.type) << "\",\"value\":";
+    switch (property.type) {
+    case ScriptProperty::Type::boolean: output << (property.boolean ? "true" : "false"); break;
+    case ScriptProperty::Type::number: output << property.number; break;
+    case ScriptProperty::Type::vector:
+        output << '[' << property.vector.x << ',' << property.vector.y << ',' << property.vector.z
+               << ']';
+        break;
+    case ScriptProperty::Type::text: output << '"' << escape_json(property.text) << '"'; break;
+    }
+    output << '}';
+}
+
+void append_behaviours(std::ostringstream& output, const std::vector<ScriptBehaviourInfo>& behaviours) {
+    output << '[';
+    for (std::size_t index = 0; index < behaviours.size(); ++index) {
+        output << (index ? "," : "") << "{\"name\":\"" << escape_json(behaviours[index].name)
+               << "\",\"properties\":[";
+        const auto& properties = behaviours[index].properties;
+        for (std::size_t item = 0; item < properties.size(); ++item) {
+            if (item) output << ',';
+            append_property(output, properties[item]);
+        }
+        output << "]}";
+    }
+    output << ']';
+}
+
+std::string script_status_json(const ScriptStatus& status) {
+    std::ostringstream output;
+    const auto flag = [](bool value) { return value ? "true" : "false"; };
+    // The tail of the compiler output is the useful part; diagnostics carry the structure.
+    constexpr std::size_t output_tail = 8U * 1024U;
+    const auto tail = status.output.size() > output_tail
+                          ? status.output.substr(status.output.size() - output_tail)
+                          : status.output;
+    output << "{\"project\":" << flag(status.project) << ",\"trusted\":" << flag(status.trusted)
+           << ",\"supported\":" << flag(status.supported) << ",\"state\":\""
+           << script_build_state_name(status.state) << "\",\"stale\":" << flag(status.stale)
+           << ",\"build\":" << status.build << ",\"loaded_build\":" << status.loaded_build
+           << ",\"build_seconds\":" << status.build_seconds
+           << ",\"compiled_files\":" << status.compiled_files
+           << ",\"source_files\":" << status.source_files << ",\"error\":\""
+           << escape_json(status.error) << "\",\"compiler\":\"" << escape_json(status.compiler)
+           << "\",\"sdk\":\"" << escape_json(status.sdk) << "\",\"behaviours\":";
+    append_behaviours(output, status.behaviours);
+    output << ",\"instances\":" << status.instances << ",\"reloads\":" << status.reloads
+           << ",\"diagnostics\":[";
+    for (std::size_t index = 0; index < status.diagnostics.size(); ++index) {
+        const auto& diagnostic = status.diagnostics[index];
+        output << (index ? "," : "") << "{\"file\":\"" << escape_json(diagnostic.file)
+               << "\",\"line\":" << diagnostic.line << ",\"column\":" << diagnostic.column
+               << ",\"severity\":\"" << diagnostic.severity << "\",\"message\":\""
+               << escape_json(diagnostic.message) << "\"}";
+    }
+    output << "],\"runtime_errors\":[";
+    for (std::size_t index = 0; index < status.runtime_errors.size(); ++index) {
+        const auto& error = status.runtime_errors[index];
+        output << (index ? "," : "") << "{\"frame\":" << error.frame << ",\"entity\":\""
+               << error.entity.to_string() << "\",\"component\":" << error.component
+               << ",\"behaviour\":\"" << escape_json(error.behaviour)
+               << "\",\"callback\":\"" << error.callback << "\",\"message\":\""
+               << escape_json(error.message) << "\"}";
+    }
+    output << "],\"runtime_error_count\":" << status.runtime_error_count << ",\"output\":\""
+           << escape_json(tail) << "\"}";
+    return output.str();
+}
+
 } // namespace
 
 ControlProtocol::ControlProtocol(Engine& engine, CaptureHandler capture_handler,
@@ -196,7 +273,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
     const bool read_only = specification != nullptr && specification->read_only;
     if (engine_.game_session_active() && !read_only &&
         (method.starts_with("scene.") || method.starts_with("project.") ||
-         method.starts_with("assets.") || method == "trace.replay"))
+         method.starts_with("assets.") || method.starts_with("component.") ||
+         method.starts_with("templates.") || method == "trace.replay"))
         return error_response(id, "stop the game before editing or saving the authored scene");
     if (method.starts_with("session.") || method.starts_with("chat.") || method.starts_with("bridge."))
         return session_dispatch(request);
@@ -237,7 +315,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return result.str();
     }
     if (method == "runtime.play") {
-        if (!engine_.run_game()) return error_response(id, "game can only start from editor mode");
+        if (!engine_.run_game()) return error_response(id, engine_.run_game_error());
         return response_prefix(id) + "{\"mode\":\"game\",\"paused\":false}}";
     }
     if (method == "runtime.stop") {
@@ -246,6 +324,52 @@ std::string ControlProtocol::handle(const std::string_view request) {
         std::erase_if(scoped_grants_, [](const ScopedGrant& grant) { return grant.kind == "entity"; });
         if (scoped_grants_.size() != size) policy_audit("session.entity_revoked", true);
         return response_prefix(id) + "{\"mode\":\"editor\",\"paused\":false}}";
+    }
+    if (method == "scripts.status")
+        return response_prefix(id) + script_status_json(engine_.scripts().status()) + "}";
+    if (method == "scripts.build") {
+        std::string error;
+        if (!engine_.scripts().start_build(error)) return error_response(id, error);
+        return response_prefix(id) + script_status_json(engine_.scripts().status()) + "}";
+    }
+    if (method == "scripts.trust") {
+        std::string error;
+        if (!engine_.scripts().set_trusted(boolean_field(request, "trusted", false), error))
+            return error_response(id, error);
+        return response_prefix(id) + script_status_json(engine_.scripts().status()) + "}";
+    }
+    if (method == "scripts.sdk") {
+        const auto directory = script_sdk_directory();
+        std::ifstream input(directory / "relay_script.hpp", std::ios::binary);
+        std::ostringstream text;
+        text << input.rdbuf();
+        if (!input) return error_response(id, "the script SDK was not found at " + directory.string());
+        return response_prefix(id) + "{\"path\":\"relay_script.hpp\",\"source\":\"" +
+               escape_json(text.str()) + "\"}}";
+    }
+    if (method == "scripts.read" || method == "scripts.write" || method == "scripts.create") {
+        if (!engine_.project()) return error_response(id, "scripts need an open project");
+        const auto root = engine_.project()->root();
+        std::string error;
+        if (method == "scripts.read") {
+            const auto path = string_field(request, "path");
+            const auto source = read_script_source(root, path, error);
+            if (!source) return error_response(id, error);
+            return response_prefix(id) + "{\"path\":\"" + escape_json(path) + "\",\"source\":\"" +
+                   escape_json(*source) + "\"}}";
+        }
+        const bool create = method == "scripts.create";
+        const auto behaviour = string_field(request, "behaviour");
+        if (create && !valid_behaviour_name(behaviour))
+            return error_response(id, "behaviour must be a C++ identifier");
+        const auto path = create ? behaviour + ".cpp" : string_field(request, "path");
+        if (!write_script_source(root, path, create ? script_template(behaviour)
+                                                     : string_field(request, "source"),
+                                 create, error))
+            return error_response(id, error);
+        engine_.logs().write(LogLevel::info, (create ? "Created script " : "Wrote script ") +
+                                                 std::string{script_source_directory} + "/" + path);
+        return response_prefix(id) + "{\"path\":\"" + escape_json(path) + "\"}}";
     }
     if (method == "runtime.pause") {
         if (engine_.status().mode != RuntimeMode::game)
@@ -437,6 +561,37 @@ std::string ControlProtocol::handle(const std::string_view request) {
         }
         result << "]}}";
         return result.str();
+    }
+    if (method == "input.map") {
+        const bool saved = engine_.project() &&
+                           std::filesystem::is_regular_file(engine_.project()->root() / input_map_filename);
+        return response_prefix(id) + "{\"map\":" + input_map_json(engine_.input().map()) +
+               ",\"saved\":" + (saved ? "true" : "false") + ",\"path\":\"" +
+               std::string{input_map_filename} + "\",\"defaults\":" +
+               input_map_json(default_input_map()) + "}}";
+    }
+    if (method == "input.set_map") {
+        std::string error;
+        auto map = parse_input_map(string_field(request, "map"), error);
+        if (!map || !engine_.set_input_map(std::move(*map), error)) return error_response(id, error);
+        engine_.logs().write(LogLevel::info, "Input map saved");
+        return response_prefix(id) + "{\"map\":" + input_map_json(engine_.input().map()) + "}}";
+    }
+    if (method == "input.state")
+        return response_prefix(id) + engine_.input().state_json() + "}";
+    if (method == "input.simulate") {
+        if (engine_.status().mode != RuntimeMode::game)
+            return error_response(id, "run the game before simulating input");
+        const auto name = string_field(request, "name");
+        const auto frames = static_cast<std::uint32_t>(unsigned_field(request, "frames", 1));
+        if (!engine_.input().simulate(name, number_field(request, "value").value_or(1.0), frames))
+            return error_response(id, "no action or axis named " + name + " in the input map");
+        return response_prefix(id) + "{\"name\":\"" + escape_json(name) + "\",\"frames\":" +
+               std::to_string(frames) + "}}";
+    }
+    if (method == "input.release") {
+        engine_.apply_input_event("input:reset");
+        return response_prefix(id) + "{\"released\":true}}";
     }
     if (method == "input.recent") {
         const auto& inputs = engine_.recent_input_events();
@@ -827,18 +982,22 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) + output.str() + '}';
     }
     if (method == "scene.create") {
+        const auto type = string_field(request, "type");
+        const auto* type_info = type.empty() ? nullptr : find_node_type(type);
         auto name = string_field(request, "name");
-        if (name.empty()) name = "Entity";
+        if (name.empty()) name = type_info && type != "Node" ? std::string{type_info->name} : "Entity";
         const auto parent = entity_field(request, "parent");
         if (!parent.has_value() || (parent->valid() && !engine_.scene().contains(*parent))) {
             return error_response(id, "parent does not exist or has a stale handle");
         }
         Entity created{};
+        std::string error;
         const bool changed = engine_.scene_history().execute("Create " + name, [&](Scene& scene) {
             created = scene.create(name, *parent);
-            return created.valid();
+            return created.valid() &&
+                   (type.empty() || apply_node_type(scene, created, type, error));
         });
-        if (!changed) return error_response(id, "could not create entity");
+        if (!changed) return error_response(id, error.empty() ? "could not create entity" : error);
         engine_.logs().write(LogLevel::info, "Created entity " + created.to_string() + " (" + name + ')');
         return response_prefix(id) + "{\"entity\":\"" + created.to_string() + "\",\"history\":" +
                history_json(engine_.scene_history()) + "}}";
@@ -1275,10 +1434,210 @@ std::string ControlProtocol::handle(const std::string_view request) {
                 body->linear_damping = *value;
             if (const auto value = number_field(request, "angular_damping"))
                 body->angular_damping = *value;
+            body->lock_rotation = boolean_field(request, "lock_rotation", body->lock_rotation);
         }
         if (!engine_.scene_history().execute("Configure physics body " + entity->to_string(),
                 [&](Scene& scene) { return scene.set_physics_body(*entity, body); }))
             return error_response(id, "invalid physics body values");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "component.types") {
+        std::ostringstream output;
+        output << response_prefix(id) << "{\"engine\":[";
+        const auto& kinds = engine_components();
+        for (std::size_t index = 0; index < kinds.size(); ++index) {
+            const auto& kind = kinds[index];
+            output << (index ? "," : "") << "{\"id\":\"" << kind.id << "\",\"name\":\""
+                   << kind.name << "\",\"category\":\"" << kind.category
+                   << "\",\"addable\":" << (kind.addable ? "true" : "false")
+                   << ",\"removable\":" << (kind.removable ? "true" : "false")
+                   << ",\"multiple\":" << (kind.multiple ? "true" : "false")
+                   << ",\"description\":\"" << escape_json(kind.description) << "\"}";
+        }
+        output << "],\"behaviours\":";
+        append_behaviours(output, engine_.scripts().status().behaviours);
+        output << "}}";
+        return output.str();
+    }
+    if (method == "component.add" || method == "component.remove" || method == "scene.set_script" ||
+        method == "scene.set_script_property") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        const auto component = string_field(request, "component");
+        const auto index = static_cast<std::size_t>(unsigned_field(request, "index", 0));
+        std::string error;
+        std::string label;
+        std::function<bool(Scene&)> change;
+        if (method == "component.add") {
+            const auto behaviour = string_field(request, "behaviour");
+            label = "Add " + (component == "script" ? behaviour : component) + " to " +
+                    entity->to_string();
+            change = [&](Scene& scene) {
+                return add_component(scene, *entity, component, behaviour, error);
+            };
+        } else if (method == "component.remove") {
+            label = "Remove " + component + " from " + entity->to_string();
+            change = [&](Scene& scene) {
+                return remove_component(scene, *entity, component, index, error);
+            };
+        } else {
+            auto scripts = engine_.scene().get(*entity)->scripts;
+            if (index >= scripts.size())
+                return error_response(id, "the node has no script component at that index");
+            auto& script = scripts[index];
+            if (method == "scene.set_script") {
+                if (const auto behaviour = optional_string_field(request, "behaviour")) {
+                    if (*behaviour != script.behaviour) script.properties.clear();
+                    script.behaviour = *behaviour;
+                }
+                script.enabled = boolean_field(request, "enabled", script.enabled);
+                label = "Configure script " + script.behaviour + " on " + entity->to_string();
+            } else {
+                const auto name = string_field(request, "property");
+                std::erase_if(script.properties,
+                              [&](const ScriptProperty& property) { return property.name == name; });
+                if (!boolean_field(request, "reset", false)) {
+                    ScriptProperty property;
+                    property.name = name;
+                    JsonParser parser(request);
+                    const auto parsed = parser.parse();
+                    const auto& fields = *parsed->object();
+                    int given = 0;
+                    if (const auto* value = field(fields, "number")) {
+                        property.type = ScriptProperty::Type::number;
+                        property.number = *value->number();
+                        ++given;
+                    }
+                    if (const auto* value = field(fields, "boolean")) {
+                        property.type = ScriptProperty::Type::boolean;
+                        property.boolean = *value->boolean();
+                        ++given;
+                    }
+                    if (const auto* value = field(fields, "text")) {
+                        property.type = ScriptProperty::Type::text;
+                        property.text = *value->string();
+                        ++given;
+                    }
+                    if (const auto* value = field(fields, "vector")) {
+                        property.type = ScriptProperty::Type::vector;
+                        const auto& items = *value->array();
+                        property.vector = {*items[0].number(), *items[1].number(),
+                                           *items[2].number()};
+                        ++given;
+                    }
+                    if (given != 1)
+                        return error_response(id, "send exactly one of number, boolean, text or vector");
+                    script.properties.push_back(std::move(property));
+                }
+                label = "Set " + script.behaviour + "." + name + " on " + entity->to_string();
+            }
+            change = [&, scripts](Scene& scene) mutable {
+                if (scene.set_scripts(*entity, std::move(scripts))) return true;
+                error = "invalid script component values";
+                return false;
+            };
+        }
+        if (!engine_.scene_history().execute(label, change))
+            return error_response(id, error.empty() ? "component change failed" : error);
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "nodes.types") {
+        std::ostringstream output;
+        output << response_prefix(id) << "{\"types\":[";
+        const auto& types = node_types();
+        for (std::size_t index = 0; index < types.size(); ++index) {
+            const auto& type = types[index];
+            output << (index ? "," : "") << "{\"id\":\"" << type.id << "\",\"name\":\""
+                   << type.name << "\",\"parent\":";
+            if (type.parent.empty()) output << "null";
+            else output << '"' << type.parent << '"';
+            output << ",\"description\":\"" << escape_json(type.description)
+                   << "\",\"creatable\":" << (type.creatable ? "true" : "false")
+                   << ",\"components\":[";
+            const auto components = node_type_components(type.id);
+            for (std::size_t item = 0; item < components.size(); ++item)
+                output << (item ? "," : "") << '"' << components[item] << '"';
+            output << "]}";
+        }
+        output << "]}}";
+        return output.str();
+    }
+    if (method == "templates.list") {
+        std::optional<std::filesystem::path> root;
+        if (engine_.project()) root = engine_.project()->root();
+        std::ostringstream output;
+        output << response_prefix(id) << "{\"templates\":[";
+        bool first = true;
+        for (const auto& entry : list_templates(root)) {
+            output << (first ? "" : ",") << "{\"id\":\"" << escape_json(entry.id)
+                   << "\",\"name\":\"" << escape_json(entry.name) << "\",\"type\":\""
+                   << entry.type << "\",\"path\":\"" << escape_json(entry.path)
+                   << "\"}";
+            first = false;
+        }
+        output << "]}}";
+        return output.str();
+    }
+    if (method == "templates.instantiate") {
+        const auto parent = entity_field(request, "parent");
+        if (!parent) return error_response(id, "invalid parent entity");
+        std::optional<std::filesystem::path> root;
+        if (engine_.project()) root = engine_.project()->root();
+        const auto identifier = string_field(request, "template");
+        std::optional<Entity> created;
+        std::string error;
+        if (!engine_.scene_history().execute("Create " + identifier, [&](Scene& scene) {
+                created = instantiate_template(scene, root, identifier, *parent,
+                                               string_field(request, "name"), error);
+                return created.has_value();
+            }))
+            return error_response(id, error.empty() ? "template could not be created" : error);
+        return response_prefix(id) + "{\"entity\":\"" + created->to_string() + "\",\"node\":" +
+               engine_.scene().entity_json(*created) + ",\"history\":" +
+               history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "templates.save") {
+        if (!engine_.project()) return error_response(id, "templates need an open project");
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        const auto name = string_field(request, "name");
+        std::string error;
+        if (!save_template(engine_.scene(), *entity, engine_.project()->root(), name,
+                           boolean_field(request, "replace", false), error))
+            return error_response(id, error);
+        engine_.logs().write(LogLevel::info, "Saved template " + name);
+        return response_prefix(id) + "{\"id\":\"project:" + escape_json(name) + "\",\"path\":\"" +
+               std::string{template_directory} + "/" + escape_json(name) +
+               std::string{template_suffix} + "\"}}";
+    }
+    if (method == "scene.set_first_person_controller") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::optional<FirstPersonController> controller;
+        if (boolean_field(request, "attached", true)) {
+            controller = engine_.scene().get(*entity)->first_person_controller.value_or(
+                FirstPersonController{});
+            const auto number = [&](const char* key, double& target) {
+                if (const auto value = number_field(request, key)) target = *value;
+            };
+            number("walk_speed", controller->walk_speed);
+            number("sprint_speed", controller->sprint_speed);
+            number("jump_speed", controller->jump_speed);
+            number("mouse_sensitivity", controller->mouse_sensitivity);
+            number("stick_look_speed", controller->stick_look_speed);
+            number("ground_distance", controller->ground_distance);
+            controller->invert_y = boolean_field(request, "invert_y", controller->invert_y);
+            if (const auto camera = optional_string_field(request, "camera")) controller->camera = *camera;
+        }
+        if (!engine_.scene_history().execute(
+                "Configure first person controller " + entity->to_string(),
+                [&](Scene& scene) { return scene.set_first_person_controller(*entity, controller); }))
+            return error_response(id, "invalid first person controller values");
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }

@@ -124,8 +124,56 @@ struct PhysicsBody {
     double friction{0.2};
     double linear_damping{0.05};
     double angular_damping{0.05};
+    // Keeps a dynamic body upright: collisions move it but never turn it, as characters need.
+    bool lock_rotation{};
     auto operator<=>(const PhysicsBody&) const = default;
 };
+
+// First-person movement driven by the input map during Run Game: look turns the camera child,
+// move_x/move_y walk relative to where it faces, sprint and jump (only on the ground) act on the
+// dynamic physics body the node also needs. Implemented natively by FirstPersonControllers.
+struct FirstPersonController {
+    double walk_speed{4.0};         // Metres per second.
+    double sprint_speed{7.0};
+    double jump_speed{5.0};         // Upward speed when jumping.
+    double mouse_sensitivity{0.12}; // Degrees per pixel.
+    double stick_look_speed{150.0}; // Degrees per second at full stick.
+    bool invert_y{};
+    double ground_distance{1.0};    // From the node's origin down to just below its feet.
+    std::string camera{"Camera"};   // Name of the child node whose camera looks around.
+    auto operator<=>(const FirstPersonController&) const = default;
+};
+
+// An authored value for one of a behaviour's declared properties. Properties a node does not
+// override keep the default written in the script's code.
+struct ScriptProperty {
+    enum class Type : std::uint8_t { boolean, number, vector, text } type{Type::number};
+    std::string name;
+    bool boolean{};
+    double number{};
+    Vec3 vector{};
+    std::string text;
+    auto operator<=>(const ScriptProperty&) const = default;
+};
+
+// A script component: one native gameplay behaviour, by its registered class name, run on the
+// entity during Run Game. An entity may carry several, in order.
+struct Script {
+    std::string behaviour;
+    bool enabled{true};
+    std::vector<ScriptProperty> properties;
+    auto operator<=>(const Script&) const = default;
+};
+
+inline constexpr std::size_t maximum_scripts_per_entity = 32U;
+inline constexpr std::size_t maximum_script_properties = 64U;
+inline constexpr std::size_t maximum_script_text_bytes = 1024U;
+
+// Behaviour and property names are C++ identifiers of at most 128 characters.
+[[nodiscard]] bool valid_behaviour_name(std::string_view name);
+[[nodiscard]] bool valid_script(const Script& script);
+[[nodiscard]] std::string_view script_property_type_name(ScriptProperty::Type type);
+[[nodiscard]] std::optional<ScriptProperty::Type> script_property_type_from_name(std::string_view name);
 
 enum class ReflectedFieldType { string, entity, vec3, number, boolean, number_array, object_array };
 
@@ -152,7 +200,13 @@ struct EntityRecord {
     std::optional<Light> light{};
     std::optional<BoxCollider> collider{};
     std::optional<PhysicsBody> physics_body{};
+    std::vector<Script> scripts{};
+    std::optional<FirstPersonController> first_person_controller{};
 };
+
+// The node type shown to people and agents, derived from the components an entity has now by
+// walking the node type tree (see node_types.hpp). Scripts do not affect it.
+[[nodiscard]] std::string_view node_type(const EntityRecord& record);
 
 struct SceneSlotState {
     std::uint32_t generation{1};
@@ -194,17 +248,22 @@ public:
     [[nodiscard]] bool set_light(Entity entity, std::optional<Light> light);
     [[nodiscard]] bool set_collider(Entity entity, std::optional<BoxCollider> collider);
     [[nodiscard]] bool set_physics_body(Entity entity, std::optional<PhysicsBody> body);
+    [[nodiscard]] bool set_scripts(Entity entity, std::vector<Script> scripts);
+    [[nodiscard]] bool set_first_person_controller(Entity entity,
+                                                   std::optional<FirstPersonController> controller);
     [[nodiscard]] std::optional<Entity> active_camera() const;
 
     [[nodiscard]] SceneState capture_state() const;
     void restore_state(SceneState state);
 
     [[nodiscard]] std::string entity_json(Entity entity) const;
+    // Includes each entity's derived node type, which scene files do not store.
     [[nodiscard]] std::string list_json() const;
     [[nodiscard]] std::string serialize_json() const;
     [[nodiscard]] static const std::vector<ComponentDescriptor>& component_descriptors();
 
 private:
+    [[nodiscard]] std::string list_json(bool derived) const;
     void destroy_recursive(Entity entity);
     [[nodiscard]] std::string unique_copy_name(std::string_view name) const;
     [[nodiscard]] bool would_create_cycle(Entity entity, Entity parent) const;

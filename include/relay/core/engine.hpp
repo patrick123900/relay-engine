@@ -1,6 +1,8 @@
 #pragma once
 #include <functional>
 
+#include "relay/core/first_person.hpp"
+#include "relay/core/input.hpp"
 #include "relay/core/log.hpp"
 #include "relay/observe/capture.hpp"
 #include "relay/observe/performance.hpp"
@@ -12,6 +14,7 @@
 #include "relay/scene/scene_edit.hpp"
 #include "relay/scene/project.hpp"
 #include "relay/scene/scene_history.hpp"
+#include "relay/script/script_system.hpp"
 
 #include <cstdint>
 #include <deque>
@@ -92,6 +95,14 @@ public:
     [[nodiscard]] const std::optional<Project>& project() const { return project_; }
     [[nodiscard]] AssetRegistry& assets();
     [[nodiscard]] const AssetRegistry& assets() const;
+    [[nodiscard]] ScriptSystem& scripts() { return scripts_; }
+    // Game input: live devices latched once per game step, read through the project's input map.
+    [[nodiscard]] InputState& input();
+    [[nodiscard]] const InputState& input() const { return input_; }
+    // Validates, saves to the open project and applies a new input map.
+    [[nodiscard]] bool set_input_map(InputMap map, std::string& error);
+    // Why the last run_game() refused to start, or empty.
+    [[nodiscard]] const std::string& run_game_error() const { return run_game_error_; }
 
 private:
     void advance_one_frame();
@@ -118,6 +129,14 @@ private:
     std::optional<SceneState> authored_scene_;
     std::uint64_t frame_index_{0};
     double elapsed_seconds_{0.0};
+    std::string run_game_error_;
+    InputState input_;
+    FirstPersonControllers first_person_;
+    std::optional<std::filesystem::path> input_root_;
+    bool input_loaded_{};
+    void sync_input_map();
+    // Declared last: script callbacks reach every other member, so it is destroyed first.
+    ScriptSystem scripts_{*this};
 };
 
 } // namespace relay

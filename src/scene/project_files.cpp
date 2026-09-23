@@ -24,8 +24,9 @@ std::string lowercase(std::string value) {
     return value;
 }
 
-constexpr std::array<std::string_view, 10> kind_names{
-    "folder", "model", "scene", "image", "shader", "script", "text", "media", "project", "other"};
+constexpr std::array<std::string_view, 11> kind_names{
+    "folder", "model", "scene", "template", "image", "shader", "script", "text", "media", "project",
+    "other"};
 
 } // namespace
 
@@ -43,6 +44,7 @@ AssetKind asset_kind_of(const std::string_view filename, const bool directory) {
     if (directory) return AssetKind::folder;
     const auto name = lowercase(std::string(filename));
     if (name.ends_with(".relay.json")) return AssetKind::scene;
+    if (name.ends_with(".relay-template.json")) return AssetKind::node_template;
     const auto dot = name.rfind('.');
     const auto extension = dot == std::string::npos ? std::string{} : name.substr(dot + 1U);
     const auto any = [&](std::initializer_list<std::string_view> list) {
@@ -53,7 +55,8 @@ AssetKind asset_kind_of(const std::string_view filename, const bool directory) {
         return AssetKind::image;
     if (any({"glsl", "vert", "frag", "comp", "geom", "tesc", "tese", "spv", "hlsl", "wgsl"}))
         return AssetKind::shader;
-    if (any({"lua", "js", "ts", "py", "wasm"})) return AssetKind::script;
+    if (any({"cpp", "cc", "cxx", "hpp", "h", "hh", "lua", "js", "ts", "py", "wasm"}))
+        return AssetKind::script;
     if (any({"txt", "md", "json", "yaml", "yml", "toml", "csv", "ini", "log"})) return AssetKind::text;
     if (any({"webm", "mp4", "mkv", "wav", "ogg", "mp3", "flac"})) return AssetKind::media;
     if (extension == "relayproject") return AssetKind::project;

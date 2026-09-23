@@ -377,7 +377,7 @@ export function registerGeneratedTools(
       description: "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries and symlinks are skipped; at most 512 results.",
       inputSchema: z.object({
         "query": z.string().max(64).default("").describe("Case-insensitive name fragment; empty matches every name"),
-        "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|image|shader|script|text|media|project|other)$"))).max(10).optional().describe("Asset kinds to include; omitted or empty includes all")
+        "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|shader|script|text|media|project|other)$"))).max(11).optional().describe("Asset kinds to include; omitted or empty includes all")
       }),
       annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
     },
@@ -491,6 +491,72 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "input_map",
+    {
+      title: "Read input map",
+      description: "Read the project's input map: named actions bound to keys, mouse buttons or gamepad buttons, and axes built from button pairs or gamepad sticks. Also returns the engine defaults. Controls look like key:space, key:left_shift, mouse:left, gamepad:a or gamepad:leftx.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["input_map"];
+        if (override) return override({});
+        return invoke("input.map", {});
+      },
+  );
+
+  server.registerTool(
+    "input_set_map",
+    {
+      title: "Replace input map",
+      description: "Validate, save as input.relay-input.json in the project and apply a complete input map document (format relay.input, version 1) as returned by input.map.",
+      inputSchema: z.object({
+        "map": z.string().min(2).max(262144).describe("The whole input map as JSON text")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["input_set_map"];
+        if (override) return override(input as JsonObject);
+        return invoke("input.set_map", {"map": input["map"]});
+      },
+  );
+
+  server.registerTool(
+    "input_state",
+    {
+      title: "Inspect game input",
+      description: "Read the current game step's input: each action's held and pressed state, each axis value, held controls and mouse movement.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["input_state"];
+        if (override) return override({});
+        return invoke("input.state", {});
+      },
+  );
+
+  server.registerTool(
+    "input_simulate",
+    {
+      title: "Simulate game input",
+      description: "Hold an action, or set an axis value, for a number of game steps during Run Game, as if a player pressed it. Use it with runtime.step to play-test scripts.",
+      inputSchema: z.object({
+        "name": z.string().max(64).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).describe("Action or axis name from input.map"),
+        "value": z.number().finite().min(-1).max(1).default(1).describe("Axis value; actions ignore it"),
+        "frames": z.number().int().min(1).max(3600).default(1)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["input_simulate"];
+        if (override) return override(input as JsonObject);
+        return invoke("input.simulate", {"name": input["name"], "value": input["value"], "frames": input["frames"]});
+      },
+  );
+
+  server.registerTool(
     "video_start",
     {
       title: "Start Relay video",
@@ -590,18 +656,19 @@ export function registerGeneratedTools(
   server.registerTool(
     "scene_create",
     {
-      title: "Create scene entity",
-      description: "Create a named entity, optionally parented to another live entity.",
+      title: "Create scene node",
+      description: "Create a node, optionally of a node type from nodes.types (which gives it that type's components, inherited from its ancestors) and optionally parented to another live node.",
       inputSchema: z.object({
-        "name": z.string().min(1).max(128).default("Entity"),
-        "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity handle")
+        "name": z.string().min(1).max(128).optional().describe("Node name; defaults to the type's name, or Entity"),
+        "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity handle"),
+        "type": z.enum(["Node", "Camera", "DirectionalLight", "PointLight", "SpotLight", "FirstPersonController", "RigidBody", "StaticBody", "StaticMesh"]).optional().describe("Node type to create; omitted creates a plain Node")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
     },
     async (input) => {
         const override = overrides["scene_create"];
         if (override) return override(input as JsonObject);
-        return invoke("scene.create", {"name": input["name"], "parent": input["parent"]});
+        return invoke("scene.create", {"name": input["name"], "parent": input["parent"], "type": input["type"]});
       },
   );
 
@@ -959,14 +1026,303 @@ export function registerGeneratedTools(
         "restitution": z.number().finite().min(0).max(1).optional(),
         "friction": z.number().finite().min(0).max(10).optional(),
         "linearDamping": z.number().finite().min(0).max(100).optional(),
-        "angularDamping": z.number().finite().min(0).max(100).optional()
+        "angularDamping": z.number().finite().min(0).max(100).optional(),
+        "lockRotation": z.boolean().optional().describe("Keep a dynamic body upright, as character controllers need")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
     },
     async (input) => {
         const override = overrides["scene_set_physics_body"];
         if (override) return override(input as JsonObject);
-        return invoke("scene.set_physics_body", {"entity": input["entity"], "attached": input["attached"], "type": input["type"], "mass": input["mass"], "gravity_scale": input["gravityScale"], "restitution": input["restitution"], "friction": input["friction"], "linear_damping": input["linearDamping"], "angular_damping": input["angularDamping"]});
+        return invoke("scene.set_physics_body", {"entity": input["entity"], "attached": input["attached"], "type": input["type"], "mass": input["mass"], "gravity_scale": input["gravityScale"], "restitution": input["restitution"], "friction": input["friction"], "linear_damping": input["linearDamping"], "angular_damping": input["angularDamping"], "lock_rotation": input["lockRotation"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_set_first_person_controller",
+    {
+      title: "Configure first person controller",
+      description: "Add, edit or remove an undoable first person controller component. During Run Game it looks around with the mouse and look_x/look_y through a child camera node, walks with move_x/move_y relative to the view, sprints and jumps (only on the ground). It needs a dynamic physics body with rotation locked and a collider; scene.create with type FirstPersonController sets all of that up.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "attached": z.boolean().optional(),
+        "walkSpeed": z.number().finite().min(0).max(1000).optional(),
+        "sprintSpeed": z.number().finite().min(0).max(1000).optional(),
+        "jumpSpeed": z.number().finite().min(0).max(1000).optional(),
+        "mouseSensitivity": z.number().finite().min(0).max(10).optional().describe("Degrees per pixel"),
+        "stickLookSpeed": z.number().finite().min(0).max(3600).optional().describe("Degrees per second at full stick"),
+        "invertY": z.boolean().optional(),
+        "groundDistance": z.number().finite().min(0.001).max(100).optional().describe("From the node's origin down to just below its feet"),
+        "camera": z.string().min(1).max(128).optional().describe("Name of the child node whose camera looks around")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_set_first_person_controller"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.set_first_person_controller", {"entity": input["entity"], "attached": input["attached"], "walk_speed": input["walkSpeed"], "sprint_speed": input["sprintSpeed"], "jump_speed": input["jumpSpeed"], "mouse_sensitivity": input["mouseSensitivity"], "stick_look_speed": input["stickLookSpeed"], "invert_y": input["invertY"], "ground_distance": input["groundDistance"], "camera": input["camera"]});
+      },
+  );
+
+  server.registerTool(
+    "scripts_status",
+    {
+      title: "Inspect gameplay scripts",
+      description: "Read native C++ script state: project trust, build state, whether sources changed since the last build, registered behaviours, compiler diagnostics with file and line, and runtime errors from behaviour callbacks.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["scripts_status"];
+        if (override) return override({});
+        return invoke("scripts.status", {});
+      },
+  );
+
+  server.registerTool(
+    "scripts_build",
+    {
+      title: "Build gameplay scripts",
+      description: "Compile the project's scripts/ C++ files into a native library in the background; unchanged files are reused. Poll scripts.status until the state is ready or failed. A build that finishes during Run Game hot reloads the running behaviours. Requires a project a person has trusted.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["scripts_build"];
+        if (override) return override({});
+        return invoke("scripts.build", {});
+      },
+  );
+
+  server.registerTool(
+    "scripts_sdk",
+    {
+      title: "Read script SDK",
+      description: "Return relay_script.hpp, the complete C++ API available to gameplay scripts, with usage notes and frame order. Read it before writing a script.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["scripts_sdk"];
+        if (override) return override({});
+        return invoke("scripts.sdk", {});
+      },
+  );
+
+  server.registerTool(
+    "scripts_read",
+    {
+      title: "Read script source",
+      description: "Read a C++ source or header from the project's scripts/ folder.",
+      inputSchema: z.object({
+        "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9._/-]*\\.(cpp|cc|cxx|hpp|h|hh)$")).describe("Path inside scripts/, such as player.cpp or ai/enemy.hpp")
+      }),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scripts_read"];
+        if (override) return override(input as JsonObject);
+        return invoke("scripts.read", {"path": input["path"]});
+      },
+  );
+
+  server.registerTool(
+    "scripts_write",
+    {
+      title: "Write script source",
+      description: "Create or replace a C++ source or header in the project's scripts/ folder, creating subfolders. Allowed during Run Game; build afterwards to compile it or hot reload it.",
+      inputSchema: z.object({
+        "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9._/-]*\\.(cpp|cc|cxx|hpp|h|hh)$")).describe("Path inside scripts/, such as player.cpp or ai/enemy.hpp"),
+        "source": z.string().max(262144).describe("Complete file contents")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scripts_write"];
+        if (override) return override(input as JsonObject);
+        return invoke("scripts.write", {"path": input["path"], "source": input["source"]});
+      },
+  );
+
+  server.registerTool(
+    "scripts_create",
+    {
+      title: "Create behaviour script",
+      description: "Create scripts/<behaviour>.cpp from a starter template defining and registering that behaviour class. Refuses to overwrite.",
+      inputSchema: z.object({
+        "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).describe("C++ class name of the new behaviour")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scripts_create"];
+        if (override) return override(input as JsonObject);
+        return invoke("scripts.create", {"behaviour": input["behaviour"]});
+      },
+  );
+
+  server.registerTool(
+    "component_types",
+    {
+      title: "List component types",
+      description: "List every component a node can carry: engine components with their category and whether they can be added, removed or repeated, plus each built script behaviour with its declared properties and code defaults.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["component_types"];
+        if (override) return override({});
+        return invoke("component.types", {});
+      },
+  );
+
+  server.registerTool(
+    "component_add",
+    {
+      title: "Add component",
+      description: "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "first_person_controller", "keyframes", "script"]),
+        "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).optional().describe("Behaviour class name; required for script")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["component_add"];
+        if (override) return override(input as JsonObject);
+        return invoke("component.add", {"entity": input["entity"], "component": input["component"], "behaviour": input["behaviour"]});
+      },
+  );
+
+  server.registerTool(
+    "component_remove",
+    {
+      title: "Remove component",
+      description: "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "first_person_controller", "keyframes", "script"]),
+        "index": z.number().int().min(0).max(31).optional().describe("Which script component, from zero")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["component_remove"];
+        if (override) return override(input as JsonObject);
+        return invoke("component.remove", {"entity": input["entity"], "component": input["component"], "index": input["index"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_set_script",
+    {
+      title: "Configure script component",
+      description: "Change the behaviour or enabled state of one of a node's script components, as an undoable transaction.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "index": z.number().int().min(0).max(31).describe("Position among the node's script components, from zero"),
+        "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).optional(),
+        "enabled": z.boolean().optional()
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_set_script"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.set_script", {"entity": input["entity"], "index": input["index"], "behaviour": input["behaviour"], "enabled": input["enabled"]});
+      },
+  );
+
+  server.registerTool(
+    "scene_set_script_property",
+    {
+      title: "Set script property",
+      description: "Store a value for a behaviour property on one script component, or reset it to the code default. Send exactly one of number, boolean, text or vector unless resetting.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "index": z.number().int().min(0).max(31).describe("Position among the node's script components, from zero"),
+        "property": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")),
+        "number": z.number().finite().min(-1000000000000000.0).max(1000000000000000.0).optional(),
+        "boolean": z.boolean().optional(),
+        "text": z.string().max(1024).optional(),
+        "vector": z.array(z.number().finite()).min(3).max(3).optional(),
+        "reset": z.boolean().default(false)
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_set_script_property"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.set_script_property", {"entity": input["entity"], "index": input["index"], "property": input["property"], "number": input["number"], "boolean": input["boolean"], "text": input["text"], "vector": input["vector"], "reset": input["reset"]});
+      },
+  );
+
+  server.registerTool(
+    "nodes_types",
+    {
+      title: "List node types",
+      description: "List the node type tree. Each type adds components to its parent's; creatable types can be passed to scene.create. A node's reported type is the deepest type whose components it has.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["nodes_types"];
+        if (override) return override({});
+        return invoke("nodes.types", {});
+      },
+  );
+
+  server.registerTool(
+    "templates_list",
+    {
+      title: "List node templates",
+      description: "List the project's saved templates (prefabs) with the node type of each root. Built-in node types are listed by nodes.types.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["templates_list"];
+        if (override) return override({});
+        return invoke("templates.list", {});
+      },
+  );
+
+  server.registerTool(
+    "templates_instantiate",
+    {
+      title: "Create node from template",
+      description: "Create a saved node tree from a project template as one undoable transaction and return its root. The result is an independent copy.",
+      inputSchema: z.object({
+        "template": z.string().max(80).regex(new RegExp("^project:[A-Za-z0-9_][A-Za-z0-9 _-]*$")).describe("Template id from templates.list, such as project:Enemy"),
+        "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity"),
+        "name": z.string().min(1).max(128).optional().describe("Optional name for the root node")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["templates_instantiate"];
+        if (override) return override(input as JsonObject);
+        return invoke("templates.instantiate", {"template": input["template"], "parent": input["parent"], "name": input["name"]});
+      },
+  );
+
+  server.registerTool(
+    "templates_save",
+    {
+      title: "Save node as template",
+      description: "Save a node and its children as a project template in templates/<name>.relay-template.json, usable from the Create menu and templates.instantiate.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "name": z.string().max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")),
+        "replace": z.boolean().default(false).describe("Overwrite an existing template of that name")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["templates_save"];
+        if (override) return override(input as JsonObject);
+        return invoke("templates.save", {"entity": input["entity"], "name": input["name"], "replace": input["replace"]});
       },
   );
 

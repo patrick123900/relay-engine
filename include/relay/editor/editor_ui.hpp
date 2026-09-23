@@ -41,6 +41,10 @@ public:
     // CPU-only ImGui frames for background interaction tests. No SDL window, GPU or OS input.
     bool initialize_headless(std::string& error);
     [[nodiscard]] std::optional<std::array<float, 4>> headless_item_rect(std::string_view key) const;
+    // True while Run Game owns keyboard and mouse input, after a click on the viewport.
+    [[nodiscard]] bool game_has_input() const;
+    // True while the game has input and the editor keeps the pointer locked for it.
+    [[nodiscard]] bool pointer_locked_for_game() const;
     // Changes editor view state without mutating the scene.
     void set_panel_visible(std::string_view name, bool visible);
     [[nodiscard]] bool panel_visible(std::string_view name) const;

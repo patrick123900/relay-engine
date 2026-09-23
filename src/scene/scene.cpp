@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <utility>
 
@@ -43,9 +44,12 @@ void append_vec3(std::ostringstream& output, const Vec3& value) {
     output << "{\"x\":" << value.x << ",\"y\":" << value.y << ",\"z\":" << value.z << '}';
 }
 
-void append_entity(std::ostringstream& output, const Entity entity, const EntityRecord& record) {
+void append_entity(std::ostringstream& output, const Entity entity, const EntityRecord& record,
+                   const bool derived = true) {
     output << "{\"entity\":\"" << entity.to_string() << "\",\"name\":\""
-           << escape_json(record.name) << "\",\"parent\":";
+           << escape_json(record.name) << '"';
+    if (derived) output << ",\"type\":\"" << node_type(record) << '"';
+    output << ",\"parent\":";
     if (record.parent.valid()) output << '"' << record.parent.to_string() << '"';
     else output << "null";
     output << ",\"transform\":{\"position\":";
@@ -148,7 +152,40 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
                << ",\"restitution\":" << body.restitution
                << ",\"friction\":" << body.friction
                << ",\"linear_damping\":" << body.linear_damping
-               << ",\"angular_damping\":" << body.angular_damping << '}';
+               << ",\"angular_damping\":" << body.angular_damping
+               << ",\"lock_rotation\":" << (body.lock_rotation ? "true" : "false") << '}';
+    } else output << "null";
+    output << ",\"scripts\":[";
+    for (std::size_t index = 0; index < record.scripts.size(); ++index) {
+        const auto& script = record.scripts[index];
+        output << (index ? "," : "") << "{\"behaviour\":\"" << escape_json(script.behaviour)
+               << "\",\"enabled\":" << (script.enabled ? "true" : "false") << ",\"properties\":[";
+        for (std::size_t item = 0; item < script.properties.size(); ++item) {
+            const auto& property = script.properties[item];
+            output << (item ? "," : "") << "{\"name\":\"" << escape_json(property.name)
+                   << "\",\"type\":\"" << script_property_type_name(property.type)
+                   << "\",\"value\":";
+            switch (property.type) {
+            case ScriptProperty::Type::boolean: output << (property.boolean ? "true" : "false"); break;
+            case ScriptProperty::Type::number: output << property.number; break;
+            case ScriptProperty::Type::vector: append_vec3(output, property.vector); break;
+            case ScriptProperty::Type::text: output << '"' << escape_json(property.text) << '"'; break;
+            }
+            output << '}';
+        }
+        output << "]}";
+    }
+    output << "],\"first_person_controller\":";
+    if (record.first_person_controller) {
+        const auto& controller = *record.first_person_controller;
+        output << "{\"walk_speed\":" << controller.walk_speed
+               << ",\"sprint_speed\":" << controller.sprint_speed
+               << ",\"jump_speed\":" << controller.jump_speed
+               << ",\"mouse_sensitivity\":" << controller.mouse_sensitivity
+               << ",\"stick_look_speed\":" << controller.stick_look_speed
+               << ",\"invert_y\":" << (controller.invert_y ? "true" : "false")
+               << ",\"ground_distance\":" << controller.ground_distance << ",\"camera\":\""
+               << escape_json(controller.camera) << "\"}";
     } else output << "null";
     output << '}';
 }
@@ -443,6 +480,76 @@ bool Scene::set_physics_body(const Entity entity, std::optional<PhysicsBody> bod
     return true;
 }
 
+bool valid_behaviour_name(const std::string_view name) {
+    if (name.empty() || name.size() > 128U || (name.front() >= '0' && name.front() <= '9'))
+        return false;
+    return std::all_of(name.begin(), name.end(), [](const char character) {
+        return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+               (character >= '0' && character <= '9') || character == '_';
+    });
+}
+
+std::string_view script_property_type_name(const ScriptProperty::Type type) {
+    switch (type) {
+    case ScriptProperty::Type::boolean: return "boolean";
+    case ScriptProperty::Type::number: return "number";
+    case ScriptProperty::Type::vector: return "vector";
+    case ScriptProperty::Type::text: return "text";
+    }
+    return "number";
+}
+
+std::optional<ScriptProperty::Type> script_property_type_from_name(const std::string_view name) {
+    if (name == "boolean") return ScriptProperty::Type::boolean;
+    if (name == "number") return ScriptProperty::Type::number;
+    if (name == "vector") return ScriptProperty::Type::vector;
+    if (name == "text") return ScriptProperty::Type::text;
+    return std::nullopt;
+}
+
+bool valid_script(const Script& script) {
+    if (!valid_behaviour_name(script.behaviour) ||
+        script.properties.size() > maximum_script_properties) return false;
+    std::set<std::string_view> names;
+    for (const auto& property : script.properties) {
+        if (!valid_behaviour_name(property.name) || !names.insert(property.name).second ||
+            property.text.size() > maximum_script_text_bytes ||
+            !std::isfinite(property.number) || !std::isfinite(property.vector.x) ||
+            !std::isfinite(property.vector.y) || !std::isfinite(property.vector.z))
+            return false;
+    }
+    return true;
+}
+
+bool Scene::set_first_person_controller(const Entity entity,
+                                        std::optional<FirstPersonController> controller) {
+    auto* record = get(entity);
+    if (!record) return false;
+    if (controller) {
+        const auto within = [](double value, double minimum, double maximum) {
+            return std::isfinite(value) && value >= minimum && value <= maximum;
+        };
+        if (!within(controller->walk_speed, 0.0, 1000.0) ||
+            !within(controller->sprint_speed, 0.0, 1000.0) ||
+            !within(controller->jump_speed, 0.0, 1000.0) ||
+            !within(controller->mouse_sensitivity, 0.0, 10.0) ||
+            !within(controller->stick_look_speed, 0.0, 3600.0) ||
+            !within(controller->ground_distance, 0.001, 100.0) || controller->camera.empty() ||
+            controller->camera.size() > 128U)
+            return false;
+    }
+    record->first_person_controller = std::move(controller);
+    return true;
+}
+
+bool Scene::set_scripts(const Entity entity, std::vector<Script> scripts) {
+    auto* record = get(entity);
+    if (!record || scripts.size() > maximum_scripts_per_entity ||
+        !std::all_of(scripts.begin(), scripts.end(), valid_script)) return false;
+    record->scripts = std::move(scripts);
+    return true;
+}
+
 void Scene::clear() {
     // Destroying each survivor keeps the generation bump, so handles taken before the clear stay
     // stale rather than aliasing whatever is created next.
@@ -567,7 +674,9 @@ std::string Scene::entity_json(const Entity entity) const {
     return output.str();
 }
 
-std::string Scene::list_json() const {
+std::string Scene::list_json() const { return list_json(true); }
+
+std::string Scene::list_json(const bool derived) const {
     std::ostringstream output;
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
     output << "{\"entities\":[";
@@ -575,7 +684,7 @@ std::string Scene::list_json() const {
     for (std::size_t index = 0; index < current_entities.size(); ++index) {
         if (index != 0) output << ',';
         const auto entity = current_entities[index];
-        append_entity(output, entity, *get(entity));
+        append_entity(output, entity, *get(entity), derived);
     }
     output << "]}";
     return output.str();
@@ -600,7 +709,7 @@ std::string Scene::serialize_json() const {
         }
         output << "]}";
     }
-    const auto entity_list = list_json();
+    const auto entity_list = list_json(false);
     output << "],\"scene\":{" << entity_list.substr(1U, entity_list.size() - 2U)
            << ",\"allocator\":{\"slot_generations\":[";
     for (std::size_t index = 0; index < slots_.size(); ++index) {
@@ -679,7 +788,21 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
          {{"type", ReflectedFieldType::number},
           {"mass", ReflectedFieldType::number},
           {"gravity_scale", ReflectedFieldType::number},
-          {"restitution", ReflectedFieldType::number}}},
+          {"restitution", ReflectedFieldType::number},
+          {"lock_rotation", ReflectedFieldType::boolean}}},
+        {"FirstPersonController", 0x0dU,
+         {{"walk_speed", ReflectedFieldType::number},
+          {"sprint_speed", ReflectedFieldType::number},
+          {"jump_speed", ReflectedFieldType::number},
+          {"mouse_sensitivity", ReflectedFieldType::number},
+          {"stick_look_speed", ReflectedFieldType::number},
+          {"invert_y", ReflectedFieldType::boolean},
+          {"ground_distance", ReflectedFieldType::number},
+          {"camera", ReflectedFieldType::string}}},
+        {"Scripts", 0x0cU,
+         {{"behaviour", ReflectedFieldType::string},
+          {"enabled", ReflectedFieldType::boolean},
+          {"properties", ReflectedFieldType::object_array}}},
     };
     return descriptors;
 }

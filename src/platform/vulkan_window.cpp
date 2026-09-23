@@ -1,4 +1,5 @@
 #include "relay/platform/vulkan_window.hpp"
+#include "relay/platform/sdl_input.hpp"
 #include "relay/editor/editor_overlay.hpp"
 #include "relay/observe/capture.hpp"
 #include "relay/render/assets.hpp"
@@ -3382,38 +3383,14 @@ bool VulkanWindow::poll_quit() {
         // The overlay sees every event first. When it claims one, the event is UI interaction
         // rather than player input, so it must not reach the deterministic input trace and must not
         // be interpreted as a quit request.
+        sdl_track_gamepads(event);
         const bool consumed_by_overlay =
             impl_->overlay != nullptr && impl_->overlay_ready && impl_->overlay->handle_event(&event);
         if (consumed_by_overlay) {
             if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) impl_->resized = true;
             continue;
         }
-        if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
-            impl_->pending_input_events.push_back(
-                std::string{"key:"} + (event.type == SDL_EVENT_KEY_DOWN ? "down:" : "up:") +
-                std::to_string(static_cast<std::int64_t>(event.key.key)));
-        } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
-            impl_->pending_input_events.push_back("mouse_motion:" + std::to_string(event.motion.x) + ':' +
-                                                  std::to_string(event.motion.y));
-        } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
-            impl_->pending_input_events.push_back(
-                std::string{"mouse_button:"} +
-                (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? "down:" : "up:") +
-                std::to_string(event.button.button));
-        } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
-            impl_->pending_input_events.push_back("mouse_wheel:" + std::to_string(event.wheel.x) + ':' +
-                                                  std::to_string(event.wheel.y));
-        } else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
-            impl_->pending_input_events.push_back("gamepad_axis:" + std::to_string(event.gaxis.which) + ':' +
-                                                  std::to_string(event.gaxis.axis) + ':' +
-                                                  std::to_string(event.gaxis.value));
-        } else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
-                   event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
-            impl_->pending_input_events.push_back(
-                std::string{"gamepad_button:"} +
-                (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? "down:" : "up:") +
-                std::to_string(event.gbutton.which) + ':' + std::to_string(event.gbutton.button));
-        }
+        if (auto input = sdl_input_event(event)) impl_->pending_input_events.push_back(std::move(*input));
         if (event.type == SDL_EVENT_QUIT) return true;
         // Escape closes the bare demo window, but in the editor it would throw away unsaved work
         // on a keypress people use to dismiss menus. There, only closing the window quits.

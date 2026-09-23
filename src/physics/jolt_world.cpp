@@ -417,6 +417,10 @@ public:
                     settings.mMassPropertiesOverride.mMass =
                         static_cast<float>(record->physics_body->mass);
                     settings.mMotionQuality = JPH::EMotionQuality::LinearCast;
+                    if (record->physics_body->lock_rotation)
+                        settings.mAllowedDOFs = JPH::EAllowedDOFs::TranslationX |
+                                                JPH::EAllowedDOFs::TranslationY |
+                                                JPH::EAllowedDOFs::TranslationZ;
                 }
             }
             const auto id = system_.GetBodyInterface().CreateAndAddBody(settings,
@@ -483,6 +487,24 @@ public:
         }
     }
 
+    // Moves the bodies of `entity` and its descendants to their current scene transforms.
+    void sync_transforms(const Scene& scene, Entity entity) {
+        auto& api = system_.GetBodyInterface();
+        for (const auto& [owner, id] : bodies_) {
+            bool affected = false;
+            for (auto current = owner; current.valid() && scene.contains(current);
+                 current = scene.get(current)->parent)
+                if (current == entity) { affected = true; break; }
+            if (!affected) continue;
+            const auto pose = world_transform(scene, owner);
+            if (!pose) continue;
+            api.SetPositionAndRotation(id, to_jolt_position(pose->position), pose->rotation,
+                                       dynamic_body(*scene.get(owner))
+                                           ? JPH::EActivation::Activate
+                                           : JPH::EActivation::DontActivate);
+        }
+    }
+
     [[nodiscard]] std::optional<JPH::BodyID> body(Entity entity) const {
         const auto found = bodies_.find(entity);
         return found == bodies_.end() ? std::nullopt : std::optional{found->second};
@@ -490,6 +512,7 @@ public:
     JPH::PhysicsSystem& system() { return system_; }
     const JPH::PhysicsSystem& system() const { return system_; }
     [[nodiscard]] bool over_budget() const { return over_budget_; }
+    [[nodiscard]] bool built() const { return built_; }
     ContactEvents contact_events(std::uint64_t after) const {
         ContactEvents result;
         result.latest_sequence = latest_sequence_;
@@ -519,6 +542,43 @@ class ExcludeTriangleMeshes final : public JPH::BodyFilter {
 public:
     bool ShouldCollideLocked(const JPH::Body& body) const override { return !triangle_mesh(body); }
 };
+
+bool valid_ray(const Vec3 origin, const Vec3 direction, const double maximum_distance,
+               double& length) {
+    length = std::sqrt(direction.x * direction.x + direction.y * direction.y +
+                       direction.z * direction.z);
+    return std::isfinite(origin.x) && std::isfinite(origin.y) && std::isfinite(origin.z) &&
+           std::isfinite(length) && length != 0.0 && std::isfinite(maximum_distance) &&
+           maximum_distance >= 0.0;
+}
+
+void cast_ray(JoltState& state, const Scene& scene, const Vec3 origin, const Vec3 direction,
+              const double maximum_distance, const std::uint32_t layer_mask,
+              CollisionRaycast& result, const Entity ignore = {}) {
+    const JPH::RRayCast ray(to_jolt_position(origin), to_jolt({
+        direction.x * maximum_distance, direction.y * maximum_distance,
+        direction.z * maximum_distance}));
+    JPH::AllHitCollisionCollector<JPH::CastRayCollector> hits;
+    state.system().GetNarrowPhaseQuery().CastRay(ray, {}, hits);
+    float nearest = std::numeric_limits<float>::infinity();
+    for (const auto& hit : hits.mHits) {
+        const auto entity = from_user_data(state.system().GetBodyInterface().GetUserData(hit.mBodyID));
+        const auto* record = scene.get(entity);
+        if (!record || !record->collider || !(record->collider->layer & layer_mask) ||
+            hit.mFraction >= nearest || (ignore.valid() && entity == ignore)) continue;
+        JPH::BodyLockRead lock(state.system().GetBodyLockInterface(), hit.mBodyID);
+        if (!lock.Succeeded()) continue;
+        nearest = hit.mFraction;
+        result.hit = true;
+        result.entity = entity;
+        result.distance = static_cast<double>(nearest) * maximum_distance;
+        result.point = {origin.x + direction.x * result.distance,
+                        origin.y + direction.y * result.distance,
+                        origin.z + direction.z * result.distance};
+        result.normal = from_jolt(lock.GetBody().GetWorldSpaceSurfaceNormal(
+            hit.mSubShapeID2, ray.GetPointOnRay(hit.mFraction)));
+    }
+}
 
 } // namespace
 
@@ -594,6 +654,58 @@ std::optional<Vec3> PhysicsWorld::angular_velocity(const Scene& scene, Entity en
     return id ? from_jolt(impl_->state->system().GetBodyInterface().GetAngularVelocity(*id))
               : std::optional<Vec3>{Vec3{}};
 }
+void PhysicsWorld::ensure_built(const Scene& scene) {
+    initialize_jolt();
+    if (!impl_->state) impl_->state = std::make_unique<JoltState>(impl_->assets);
+    if (!impl_->state->built()) impl_->state->build(scene);
+}
+bool PhysicsWorld::set_velocity(const Scene& scene, Entity entity, Vec3 linear) {
+    if (!scene.contains(entity) || !dynamic_body(*scene.get(entity)) || !std::isfinite(linear.x) ||
+        !std::isfinite(linear.y) || !std::isfinite(linear.z)) return false;
+    ensure_built(scene);
+    auto& state = *impl_->state;
+    const auto id = state.body(entity);
+    if (!id) return false;
+    state.system().GetBodyInterface().SetLinearVelocity(*id, to_jolt(linear));
+    state.system().GetBodyInterface().ActivateBody(*id);
+    return true;
+}
+bool PhysicsWorld::set_angular_velocity(const Scene& scene, Entity entity, Vec3 radians) {
+    if (!scene.contains(entity) || !dynamic_body(*scene.get(entity)) ||
+        !std::isfinite(radians.x) || !std::isfinite(radians.y) || !std::isfinite(radians.z))
+        return false;
+    ensure_built(scene);
+    auto& state = *impl_->state;
+    const auto id = state.body(entity);
+    if (!id) return false;
+    state.system().GetBodyInterface().SetAngularVelocity(*id, to_jolt(radians));
+    state.system().GetBodyInterface().ActivateBody(*id);
+    return true;
+}
+void PhysicsWorld::sync_transforms(const Scene& scene, Entity entity) {
+    // Before the first step the world is built from the scene anyway.
+    if (impl_->state && impl_->state->built()) impl_->state->sync_transforms(scene, entity);
+}
+CollisionRaycast PhysicsWorld::raycast(const Scene& scene, Vec3 origin, Vec3 direction,
+                                       double maximum_distance, std::uint32_t layer_mask,
+                                       Entity ignore) {
+    CollisionRaycast result;
+    double length{};
+    if (!valid_ray(origin, direction, maximum_distance, length)) {
+        result.error = "invalid collision ray";
+        return result;
+    }
+    ensure_built(scene);
+    auto& state = *impl_->state;
+    if (state.over_budget()) {
+        result.error = "physics world exceeds the mesh collider triangle budget";
+        return result;
+    }
+    cast_ray(state, scene, origin,
+             {direction.x / length, direction.y / length, direction.z / length},
+             maximum_distance, layer_mask, result, ignore);
+    return result;
+}
 bool PhysicsWorld::apply_impulse(const Scene& scene, Entity entity, Vec3 impulse,
                                  std::optional<Vec3> world_point) {
     if (!scene.contains(entity) || !dynamic_body(*scene.get(entity)) ||
@@ -601,14 +713,11 @@ bool PhysicsWorld::apply_impulse(const Scene& scene, Entity entity, Vec3 impulse
         !std::isfinite(impulse.z) ||
         (world_point && (!std::isfinite(world_point->x) || !std::isfinite(world_point->y) ||
                          !std::isfinite(world_point->z)))) return false;
-    initialize_jolt();
-    if (!impl_->state) {
-        impl_->state = std::make_unique<JoltState>(impl_->assets);
-        impl_->state->build(scene);
-    }
-    const auto id = impl_->state->body(entity);
+    ensure_built(scene);
+    auto& state = *impl_->state;
+    const auto id = state.body(entity);
     if (!id) return false;
-    auto& api = impl_->state->system().GetBodyInterface();
+    auto& api = state.system().GetBodyInterface();
     if (world_point) api.AddImpulse(*id, to_jolt(impulse), to_jolt_position(*world_point));
     else api.AddImpulse(*id, to_jolt(impulse));
     api.ActivateBody(*id);
@@ -633,11 +742,8 @@ CollisionRaycast collision_raycast(const Scene& scene, const Vec3 origin, Vec3 d
                                    double maximum_distance, std::uint32_t layer_mask,
                                    const AssetRegistry* assets) {
     CollisionRaycast result;
-    const double length = std::sqrt(direction.x * direction.x + direction.y * direction.y +
-                                    direction.z * direction.z);
-    if (!std::isfinite(origin.x) || !std::isfinite(origin.y) || !std::isfinite(origin.z) ||
-        !std::isfinite(length) || length == 0.0 || !std::isfinite(maximum_distance) ||
-        maximum_distance < 0.0) {
+    double length{};
+    if (!valid_ray(origin, direction, maximum_distance, length)) {
         result.error = "invalid collision ray";
         return result;
     }
@@ -650,29 +756,7 @@ CollisionRaycast collision_raycast(const Scene& scene, const Vec3 origin, Vec3 d
         return result;
     }
     direction = {direction.x / length, direction.y / length, direction.z / length};
-    const JPH::RRayCast ray(to_jolt_position(origin), to_jolt({
-        direction.x * maximum_distance, direction.y * maximum_distance,
-        direction.z * maximum_distance}));
-    JPH::AllHitCollisionCollector<JPH::CastRayCollector> hits;
-    state.system().GetNarrowPhaseQuery().CastRay(ray, {}, hits);
-    float nearest = std::numeric_limits<float>::infinity();
-    for (const auto& hit : hits.mHits) {
-        const auto entity = from_user_data(state.system().GetBodyInterface().GetUserData(hit.mBodyID));
-        const auto* record = scene.get(entity);
-        if (!record || !record->collider || !(record->collider->layer & layer_mask) ||
-            hit.mFraction >= nearest) continue;
-        JPH::BodyLockRead lock(state.system().GetBodyLockInterface(), hit.mBodyID);
-        if (!lock.Succeeded()) continue;
-        nearest = hit.mFraction;
-        result.hit = true;
-        result.entity = entity;
-        result.distance = static_cast<double>(nearest) * maximum_distance;
-        result.point = {origin.x + direction.x * result.distance,
-                        origin.y + direction.y * result.distance,
-                        origin.z + direction.z * result.distance};
-        result.normal = from_jolt(lock.GetBody().GetWorldSpaceSurfaceNormal(
-            hit.mSubShapeID2, ray.GetPointOnRay(hit.mFraction)));
-    }
+    cast_ray(state, scene, origin, direction, maximum_distance, layer_mask, result);
     return result;
 }
 

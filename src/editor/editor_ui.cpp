@@ -1,6 +1,7 @@
 #include "relay/editor/editor_ui.hpp"
 #include "relay/editor/chat_media.hpp"
 
+#include "relay/core/input.hpp"
 #include "relay/core/json.hpp"
 #include "relay/control/generated_protocol.hpp"
 #include "relay/editor/editor_camera.hpp"
@@ -12,6 +13,7 @@
 #include "relay/editor/editor_selection.hpp"
 #include "relay/editor/editor_timeline.hpp"
 #include "relay/editor/editor_theme.hpp"
+#include "relay/platform/sdl_input.hpp"
 #include "relay/render/scene_render.hpp"
 
 #include <ImGuizmo.h>
@@ -450,6 +452,52 @@ struct EditorUi::Impl {
     std::map<std::string, std::vector<AssetEntry>> asset_folders;
     std::set<std::string> expanded_asset_folders;
     std::string asset_selection, asset_delete_pending;
+    // Native gameplay scripts. Run Game asks the engine first and reacts to why it refused.
+    JsonValue script_status;
+    std::string script_status_reply;
+    bool play_after_build{}, open_trust_dialog{}, open_new_script_dialog{};
+    bool auto_build_scripts{true};
+    std::array<char, 129> new_script_name{};
+    std::string attach_new_script_to;
+    // Add Component window, and per-field text buffers for script properties being typed.
+    JsonValue component_catalog;
+    std::array<char, 65> component_query{};
+    std::string component_selected, component_category{"All"};
+    bool open_component_window{};
+    // Add Node window: the node type tree and the project's saved templates.
+    JsonValue node_type_catalog;
+    std::array<char, 65> node_query{};
+    std::array<char, 129> node_name{};
+    std::string node_selected{"Node"}, node_parent;
+    bool open_node_window{}, node_as_child{};
+    // Game Configuration window. The input page edits a working copy and saves each change.
+    bool game_config_open{};
+    int game_config_page{};
+    InputMap input_edit;
+    bool input_file_saved{};
+    JsonValue input_live;
+    std::array<char, 65> new_action_name{}, new_axis_name{};
+    std::map<std::string, std::array<char, 65>> input_name_buffers;
+    struct BindingCapture {
+        enum class Target { action, pair_negative, pair_positive, analog };
+        bool active{};
+        Target target{Target::action};
+        std::size_t index{};
+        std::string negative;
+        std::array<float, 4> zone{};
+    } binding_capture;
+    // During Run Game the viewport owns keyboard and mouse only after a click; Escape returns them.
+    bool game_input_focus{}, game_lock_mouse{}, capture_requested{};
+    std::string last_runtime_mode;
+    std::map<std::string, std::array<char, 1025>> script_text_buffers;
+    // Node templates: built-in creation shortcuts and the project's saved node trees.
+    struct TemplateEntry {
+        std::string id, name, type;
+    };
+    std::vector<TemplateEntry> node_templates;
+    std::string template_save_entity;
+    std::array<char, 65> template_name{};
+    bool open_template_dialog{}, template_replace{};
     bool asset_listing_truncated{}, assets_focused{}, hierarchy_focused{};
     std::string assets_root = "assets";
     std::vector<std::string> undo_labels, redo_labels;
@@ -568,6 +616,126 @@ struct EditorUi::Impl {
             if (const auto revision = response_revision(*result)) scene_revision = *revision;
         }
         return result == nullptr ? JsonValue{} : *result;
+    }
+
+    // Like call(), but returns the engine's refusal message instead of reporting it.
+    std::string call_error(const std::string_view method, const std::string_view fields = {}) {
+        const auto response = request(request_line(method, fields));
+        JsonParser parser{response};
+        const auto parsed = parser.parse();
+        const auto* object = parsed ? parsed->object() : nullptr;
+        if (!object) return "malformed response to " + std::string(method);
+        if (boolean_or(*object, "ok", false)) {
+            refresh_pending = true;
+            return {};
+        }
+        return string_or(*object, "error", "failed");
+    }
+
+    const JsonValue::Object* scripts() const { return script_status.object(); }
+
+    void refresh_game_input() {
+        const auto* status = runtime_status.object();
+        const auto mode = status ? string_or(*status, "mode") : std::string{};
+        if (mode != "game") set_game_input_focus(false);
+        if (mode == "game" && last_runtime_mode != "game") {
+            const auto map = call("input.map", {}, false);
+            const auto* object = map ? map->object() : nullptr;
+            const auto* current = object ? field(*object, "map") : nullptr;
+            game_lock_mouse = current && current->object() &&
+                              boolean_or(*current->object(), "lock_mouse", false);
+            // A first person controller needs relative mouse motion, so it locks the pointer too.
+            for (const auto* entity : entities)
+                if (component(*entity, "first_person_controller")) game_lock_mouse = true;
+        }
+        last_runtime_mode = mode;
+        if (game_config_open && mode == "game") {
+            if (auto state = call("input.state", {}, false)) input_live = std::move(*state);
+        } else {
+            input_live = JsonValue{};
+        }
+    }
+
+    void set_game_input_focus(const bool focus) {
+        if (focus == game_input_focus) return;
+        game_input_focus = focus;
+        if (imgui_context_created) {
+            ImGui::GetIO().ClearInputKeys();
+            ImGui::GetIO().ClearInputMouse();
+        }
+        if (focus) {
+            if (game_lock_mouse) capture_pointer(true, false);
+            return;
+        }
+        capture_pointer(false, false);
+        (void)call("input.release", {}, false);
+    }
+
+    void draw_game_input_hint() {
+        const auto* status = runtime_status.object();
+        if (!viewport_visible || !viewport_draw_list || !status ||
+            string_or(*status, "mode") != "game")
+            return;
+        const char* text = game_input_focus ? "Playing. Esc returns input to the editor."
+                                            : "Click the viewport to give the game input.";
+        const auto size = ImGui::CalcTextSize(text);
+        const ImVec2 corner{viewport_min.x + 10.0F * ui_scale, viewport_min.y + 10.0F * ui_scale};
+        const ImVec2 padding{8.0F * ui_scale, 4.0F * ui_scale};
+        viewport_draw_list->AddRectFilled(
+            ImVec2(corner.x - padding.x, corner.y - padding.y),
+            ImVec2(corner.x + size.x + padding.x, corner.y + size.y + padding.y),
+            IM_COL32(0, 0, 0, 150), 4.0F * ui_scale);
+        viewport_draw_list->AddText(corner, IM_COL32(255, 255, 255, game_input_focus ? 170 : 255),
+                                    text);
+    }
+
+    void refresh_scripts() {
+        if (auto status = call_if_changed("scripts.status", script_status_reply))
+            script_status = std::move(*status);
+        const auto* status = scripts();
+        if (!status) return;
+        const auto state = string_or(*status, "state");
+        if (auto_build_scripts && boolean_or(*status, "trusted", false) &&
+            boolean_or(*status, "stale", false) && state != "building")
+            start_script_build(false);
+        if (!play_after_build || state == "building") return;
+        play_after_build = false;
+        if (state == "failed") {
+            set_status("Script build failed; see Diagnostics", true);
+            panel_open[4] = true;
+        } else {
+            request_play();
+        }
+    }
+
+    void start_script_build(const bool report) {
+        const auto error = call_error("scripts.build");
+        script_status_reply.clear();
+        if (auto status = call_if_changed("scripts.status", script_status_reply))
+            script_status = std::move(*status);
+        if (error.find("already running") != std::string::npos) return;
+        if (!error.empty() && report) set_status("scripts.build: " + error, true);
+        else if (error.empty()) set_status("Building scripts", false);
+    }
+
+    // Run Game, building or asking for script trust first when the engine says it must.
+    void request_play() {
+        const auto error = call_error("runtime.play");
+        if (error.empty()) {
+            set_status("Game running", false);
+            return;
+        }
+        if (error.find("not trusted") != std::string::npos) {
+            open_trust_dialog = true;
+        } else if (error.find("scripts.build") != std::string::npos ||
+                   error.find("still building") != std::string::npos) {
+            if (error.find("still building") == std::string::npos) start_script_build(true);
+            play_after_build = true;
+            set_status("Building scripts before Run Game", false);
+        } else {
+            set_status("runtime.play: " + error, true);
+            if (error.find("script") != std::string::npos) panel_open[4] = true;
+        }
     }
 
     // Every mutation goes through this helper so the panels cannot accidentally grow a second,
@@ -1156,6 +1324,8 @@ struct EditorUi::Impl {
             if (auto logs = call("logs.read", "\"after\":" + std::to_string(last_log_sequence))) {
                 append_logs(*logs);
             }
+            refresh_scripts();
+            refresh_game_input();
             if (auto history = call("scene.history")) {
                 const auto* object = history->object();
                 const auto collect = [&](const std::string_view key, std::vector<std::string>& target) {
@@ -1212,6 +1382,7 @@ struct EditorUi::Impl {
                     if (file.string()) project_files.push_back(*file.string());
         }
         refresh_asset_listing();
+        refresh_templates();
         assets_pending = false;
     }
 
@@ -1643,6 +1814,8 @@ struct EditorUi::Impl {
     }
 
     void capture_pointer(bool capture, bool restore = true) {
+        // Recorded even without a window, so headless tests can see what the editor asked for.
+        capture_requested = capture;
         if (capture == mouse_captured || !sdl_window) return;
         if (capture) mouse_anchor = ImGui::GetIO().MousePos;
         if (!SDL_SetWindowRelativeMouseMode(sdl_window, capture)) return;
@@ -1654,6 +1827,15 @@ struct EditorUi::Impl {
     // Godot-style perspective navigation: MMB orbit, Shift+MMB pan, RMB freelook.
     void update_camera_input() {
         const auto& io = ImGui::GetIO();
+        // While the game has input the pointer is the game's: editor navigation must not release
+        // the lock the game asked for, which it otherwise does every frame it is not flying.
+        if (game_input_focus) {
+            freelook_latched = false;
+            navigating = false;
+            relative_delta = {};
+            capture_pointer(game_lock_mouse, false);
+            return;
+        }
         if (!camera_enabled || io.WantTextInput) {
             freelook_latched = false;
             navigating = false;
@@ -2034,6 +2216,106 @@ struct EditorUi::Impl {
         }
     }
 
+    void refresh_templates() {
+        node_templates.clear();
+        const auto listed = call("templates.list", {}, false);
+        const auto* object = listed ? listed->object() : nullptr;
+        const auto* list = object ? field(*object, "templates") : nullptr;
+        if (!list || !list->array()) return;
+        for (const auto& item : *list->array())
+            if (const auto* entry = item.object())
+                node_templates.push_back({string_or(*entry, "id"), string_or(*entry, "name"),
+                                          string_or(*entry, "type")});
+    }
+
+    // Creates a node from a template under `parent`, optionally at a world position, and selects it.
+    void instantiate_template(const std::string& id, const std::string& parent = {},
+                              std::optional<Vec3> position = {}) {
+        std::string fields = "\"template\":\"" + json_escape(id) + '"';
+        if (!parent.empty()) fields += ",\"parent\":\"" + parent + '"';
+        const auto created = call("templates.instantiate", fields);
+        if (!created || !created->object()) return;
+        const auto handle = string_or(*created->object(), "entity");
+        if (position)
+            (void)call("scene.set_transform", entity_field(handle) + ",\"px\":" +
+                                                  number_text(position->x) + ",\"py\":" +
+                                                  number_text(position->y) + ",\"pz\":" +
+                                                  number_text(position->z));
+        const auto found = std::find_if(node_templates.begin(), node_templates.end(),
+                                        [&](const TemplateEntry& entry) { return entry.id == id; });
+        set_status("Created " + (found != node_templates.end() ? found->name : id), false);
+        refresh_pending = true;
+        refresh();
+        select(handle);
+    }
+
+    // Opens the Add Node window; with a parent, the new node starts as its child.
+    void open_add_node(const std::string& parent) {
+        node_parent = parent;
+        node_as_child = !parent.empty();
+        node_query.fill('\0');
+        node_name.fill('\0');
+        if (!node_type_catalog.object())
+            if (auto types = call("nodes.types")) node_type_catalog = std::move(*types);
+        if (!component_catalog.object())
+            if (auto catalog = call("component.types")) component_catalog = std::move(*catalog);
+        refresh_templates();
+        open_node_window = true;
+    }
+
+    // Creates a node of a built-in type, or a copy of a saved template, and selects it.
+    void create_node_from(const std::string& choice, const std::string& parent,
+                          const std::string& name) {
+        if (choice.starts_with("project:")) {
+            std::string fields = "\"template\":\"" + json_escape(choice) + '"';
+            if (!parent.empty()) fields += ",\"parent\":\"" + parent + '"';
+            if (!name.empty()) fields += ",\"name\":\"" + json_escape(name) + '"';
+            const auto created = call("templates.instantiate", fields);
+            if (!created || !created->object()) return;
+            set_status("Created " + choice.substr(8), false);
+            refresh_pending = true;
+            refresh();
+            select(string_or(*created->object(), "entity"));
+            return;
+        }
+        std::string fields = "\"type\":\"" + json_escape(choice) + '"';
+        if (!parent.empty()) fields += ",\"parent\":\"" + parent + '"';
+        if (!name.empty()) fields += ",\"name\":\"" + json_escape(name) + '"';
+        const auto created = call("scene.create", fields);
+        if (!created || !created->object()) return;
+        set_status("Created " + (name.empty() ? choice : name), false);
+        refresh_pending = true;
+        refresh();
+        select(string_or(*created->object(), "entity"));
+    }
+
+    void begin_save_template(const std::string& handle, const std::string& name) {
+        template_save_entity = handle;
+        template_name.fill('\0');
+        std::string safe;
+        for (const char character : name)
+            if (std::isalnum(static_cast<unsigned char>(character)) || character == ' ' ||
+                character == '-' || character == '_')
+                safe += character;
+        std::copy_n(safe.begin(), std::min<std::size_t>(safe.size(), 64U), template_name.begin());
+        template_replace = false;
+        open_template_dialog = true;
+    }
+
+    // Accepts a dragged template file and returns its template id when dropped.
+    [[nodiscard]] std::optional<std::string> accept_template_drop() {
+        const auto* payload = ImGui::GetDragDropPayload();
+        if (!payload || !payload->IsDataType("relay.asset")) return std::nullopt;
+        const std::string path(static_cast<const char*>(payload->Data));
+        const auto* entry = asset_entry(path);
+        if (!entry || entry->kind != "template" || !path.starts_with("templates/") ||
+            path.find('/', 10U) != std::string::npos)
+            return std::nullopt;
+        if (!ImGui::AcceptDragDropPayload("relay.asset")) return std::nullopt;
+        constexpr std::string_view suffix = ".relay-template.json";
+        return "project:" + entry->name.substr(0, entry->name.size() - suffix.size());
+    }
+
     void create_entity(const std::string& parent) {
         std::string fields = "\"name\":\"Entity\"";
         if (!parent.empty()) fields += ",\"parent\":\"" + parent + '"';
@@ -2082,6 +2364,14 @@ struct EditorUi::Impl {
         note_item("entity:" + handle);
         const auto row_min = ImGui::GetItemRectMin();
         const auto row_max = ImGui::GetItemRectMax();
+        // The node type is derived from its components; plain nodes stay unlabelled.
+        if (const auto type = string_or(*entity, "type", "Node"); !editing && type != "Node") {
+            const auto size = ImGui::CalcTextSize(type.c_str());
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(row_max.x - size.x - 6.0F * ui_scale,
+                       row_min.y + (row_max.y - row_min.y - size.y) * 0.5F),
+                ImGui::GetColorU32(editor_color(editor_palette().text_faint)), type.c_str());
+        }
         if (!editing && ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
             const auto& io = ImGui::GetIO();
             const bool sole = selection == handle && selections.handles.size() == 1U;
@@ -2106,13 +2396,15 @@ struct EditorUi::Impl {
                 }
             }
             if (const auto model = accept_model_drop()) import_model(*model, "scene", handle);
+            if (const auto dropped = accept_template_drop()) instantiate_template(*dropped, handle);
             ImGui::EndDragDropTarget();
         }
 
         if (!editing && ImGui::BeginPopupContextItem()) {
             if (!selections.contains(handle)) select(handle);
-            if (ImGui::MenuItem("Add child")) create_entity(handle);
+            if (ImGui::MenuItem("Add Child Node...")) open_add_node(handle);
             if (ImGui::MenuItem("Duplicate", "Ctrl+D")) duplicate_selection();
+            if (ImGui::MenuItem("Save as template...")) begin_save_template(handle, name);
             if (ImGui::MenuItem("Move to root")) {
                 mutate("scene.set_parent", entity_field(handle) + ",\"parent\":null", "Reparented");
             }
@@ -2179,7 +2471,8 @@ struct EditorUi::Impl {
         hierarchy_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         if (inline_rename.kind == RenameKind::entity && !find_entity(inline_rename.target))
             inline_rename = {};
-        if (begin_region("##tree")) {
+        const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+        if (begin_region("##tree", ImVec2(0.0F, -footer))) {
             for (const auto root : roots)
                 draw_tree_node(root);
             // The space below the rows clears the selection, accepts drops at the root, and
@@ -2196,18 +2489,24 @@ struct EditorUi::Impl {
                            "Reparented");
                 }
                 if (const auto model = accept_model_drop()) import_model(*model);
+                if (const auto dropped = accept_template_drop()) instantiate_template(*dropped);
                 ImGui::EndDragDropTarget();
             }
             if (ImGui::BeginPopupContextItem("##hierarchy_empty")) {
-                if (ImGui::MenuItem("Create empty entity")) create_entity({});
-                if (ImGui::MenuItem("Create child of selection", nullptr, false,
-                                    !selection.empty()))
-                    create_entity(selection);
+                if (ImGui::MenuItem("Add Node...")) open_add_node({});
+                if (ImGui::MenuItem("Add Child of Selection...", nullptr, false, !selection.empty()))
+                    open_add_node(selection);
                 ImGui::EndPopup();
             }
         }
         ImGui::EndChild();
         visible_rows = drawing_rows;
+        ImGui::Separator();
+        if (ImGui::Button("+ Add Node", ImVec2(ImGui::GetContentRegionAvail().x, 0.0F)))
+            open_add_node(selection);
+        note_item("hierarchy:add_node");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(selection.empty() ? "Create a node" : "Create a node; it can go under the selection");
     }
 
     void draw_transform_section(const JsonValue::Object& entity) {
@@ -2237,17 +2536,7 @@ struct EditorUi::Impl {
 
     void draw_camera_section(const JsonValue::Object& entity) {
         const auto* camera = component(entity, "camera");
-        if (!ImGui::CollapsingHeader("Camera",
-                                     camera != nullptr ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
-            return;
-        }
-        if (camera == nullptr) {
-            if (ImGui::Button("Add camera")) {
-                mutate("scene.set_camera", entity_field(selection) + ",\"enabled\":true",
-                       "Camera added");
-            }
-            return;
-        }
+        if (camera == nullptr || !component_header("Camera", "camera")) return;
         auto field_of_view = number_or(*camera, "field_of_view_y_degrees", 60.0);
         auto near_plane = number_or(*camera, "near_plane", 0.1);
         auto far_plane = number_or(*camera, "far_plane", 1000.0);
@@ -2282,19 +2571,11 @@ struct EditorUi::Impl {
         } else if (active) {
             ImGui::TextDisabled("Active camera");
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Remove camera")) {
-            mutate("scene.set_camera", entity_field(selection) + ",\"enabled\":false",
-                   "Camera removed");
-        }
     }
 
     void draw_renderer_section(const JsonValue::Object& entity) {
         const auto* renderer = component(entity, "mesh_renderer");
-        if (!ImGui::CollapsingHeader("Mesh renderer",
-                                     renderer != nullptr ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
-            return;
-        }
+        if (renderer == nullptr || !component_header("Mesh renderer", "mesh_renderer")) return;
         const auto mesh = renderer != nullptr ? string_or(*renderer, "mesh") : std::string{};
         const auto material =
             renderer != nullptr ? string_or(*renderer, "material") : std::string{};
@@ -2325,16 +2606,12 @@ struct EditorUi::Impl {
                        '"',
                    "Renderer updated");
         }
-        if (renderer != nullptr && ImGui::Button("Remove renderer")) {
-            mutate("scene.set_renderer", entity_field(selection) + ",\"enabled\":false",
-                   "Renderer removed");
-        }
     }
 
     void draw_animator_section(const JsonValue::Object& entity) {
         const auto* animator = component(entity, "animator");
         if (animator == nullptr) return;
-        if (!ImGui::CollapsingHeader("Animator", ImGuiTreeNodeFlags_DefaultOpen)) return;
+        if (!component_header("Model animation", "animator", 0, false)) return;
 
         ImGui::Text("Model: %s", string_or(*animator, "model", "<unknown>").c_str());
         auto clip = static_cast<int>(number_or(*animator, "clip", 0.0));
@@ -2420,14 +2697,8 @@ struct EditorUi::Impl {
 
     void draw_keyframes_section(const JsonValue::Object& entity) {
         const auto* animation = component(entity, "transform_animation");
-        if (!ImGui::CollapsingHeader("Transform keyframes")) return;
+        if (!animation || !component_header("Transform keyframes", "keyframes")) return;
         const auto entity_request = entity_field(selection);
-        if (!animation) {
-            if (ImGui::Button("Add first key"))
-                mutate("scene.keyframe.set", entity_request + ",\"time_seconds\":0",
-                       "Transform key added");
-            return;
-        }
         const auto playing = boolean_or(*animation, "playing", false);
         const auto loop = boolean_or(*animation, "loop", true);
         if (ImGui::Button(playing ? "Pause keys" : "Play keys"))
@@ -2514,31 +2785,7 @@ struct EditorUi::Impl {
 
     void draw_light_section(const JsonValue::Object& entity) {
         const auto* light = component(entity, "light");
-        if (!ImGui::CollapsingHeader("Light",
-                                     light != nullptr ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
-            return;
-        }
-        if (light == nullptr) {
-            // Adding a light is a normal editor action, not something only an importer can do.
-            if (ImGui::Button("Add directional")) {
-                mutate("scene.set_light",
-                       entity_field(selection) + ",\"enabled\":true,\"type\":\"directional\"",
-                       "Light added");
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Add point")) {
-                mutate("scene.set_light",
-                       entity_field(selection) + ",\"enabled\":true,\"type\":\"point\"",
-                       "Light added");
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Add spot")) {
-                mutate("scene.set_light",
-                       entity_field(selection) + ",\"enabled\":true,\"type\":\"spot\"",
-                       "Light added");
-            }
-            return;
-        }
+        if (light == nullptr || !component_header("Light", "light")) return;
 
         const auto type = static_cast<unsigned>(number_or(*light, "type", 1));
         static constexpr std::array<const char*, 3> type_names{"directional", "point", "spot"};
@@ -2602,23 +2849,12 @@ struct EditorUi::Impl {
                        "Light attenuation updated");
             }
         }
-
-        if (ImGui::Button("Remove light")) {
-            mutate("scene.set_light", entity_field(selection) + ",\"enabled\":false",
-                   "Light removed");
-        }
     }
 
     void draw_collider_section(const JsonValue::Object& entity) {
         const auto* collider = component(entity, "collider");
-        if (!ImGui::CollapsingHeader("Collider",
-                                     collider ? ImGuiTreeNodeFlags_DefaultOpen : 0)) return;
+        if (!collider || !component_header("Collider", "collider")) return;
         const auto entity_request = entity_field(selection);
-        if (!collider) {
-            if (ImGui::Button("Add collider"))
-                mutate("scene.set_collider", entity_request, "Collider added");
-            return;
-        }
         constexpr std::array<const char*, 5> shape_names{"Box", "Sphere", "Capsule", "Convex hull",
                                                          "Triangle mesh"};
         constexpr std::array<const char*, 5> shape_values{"box", "sphere", "capsule", "convex",
@@ -2695,21 +2931,12 @@ struct EditorUi::Impl {
         if (ImGui::InputScalar("Mask bits", ImGuiDataType_U32, &collision_mask))
             mutate("scene.set_collider", entity_request + ",\"mask\":" +
                    std::to_string(collision_mask), "Collider mask updated");
-        if (ImGui::Button("Remove collider"))
-            mutate("scene.set_collider", entity_request + ",\"attached\":false",
-                   "Collider removed");
     }
 
     void draw_physics_body_section(const JsonValue::Object& entity) {
         const auto* body = component(entity, "physics_body");
-        if (!ImGui::CollapsingHeader("Physics body",
-                                     body ? ImGuiTreeNodeFlags_DefaultOpen : 0)) return;
+        if (!body || !component_header("Physics body", "physics_body")) return;
         const auto body_request = entity_field(selection);
-        if (!body) {
-            if (ImGui::Button("Add dynamic body"))
-                mutate("scene.set_physics_body", body_request, "Physics body added");
-            return;
-        }
         const auto type = static_cast<int>(number_or(*body, "type", 1));
         int selected_type = std::clamp(type, 0, 1);
         if (ImGui::Combo("Body type", &selected_type, "Static\0Dynamic\0"))
@@ -2725,6 +2952,13 @@ struct EditorUi::Impl {
             if (drag_scalar("Gravity scale", gravity, 0.05F) && gravity >= 0.0)
                 mutate("scene.set_physics_body", body_request + ",\"gravity_scale\":" +
                        number_text(gravity), "Physics body gravity updated");
+            bool locked = boolean_or(*body, "lock_rotation", false);
+            if (ImGui::Checkbox("Lock rotation", &locked))
+                mutate("scene.set_physics_body",
+                       body_request + ",\"lock_rotation\":" + (locked ? "true" : "false"),
+                       locked ? "Rotation locked" : "Rotation unlocked");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Collisions move the body but never turn it, as for characters");
         }
         auto restitution = number_or(*body, "restitution", 0.0);
         if (drag_scalar("Bounciness", restitution, 0.01F) &&
@@ -2748,9 +2982,217 @@ struct EditorUi::Impl {
                 mutate("scene.set_physics_body", body_request + ",\"angular_damping\":" +
                        number_text(angular), "Physics body angular damping updated");
         }
-        if (ImGui::Button("Remove physics body"))
-            mutate("scene.set_physics_body", body_request + ",\"attached\":false",
-                   "Physics body removed");
+    }
+
+    void draw_first_person_controller_section(const JsonValue::Object& entity) {
+        const auto* controller = component(entity, "first_person_controller");
+        if (!controller || !component_header("First person controller", "first_person_controller"))
+            return;
+        const auto controller_request = entity_field(selection);
+        const auto set = [&](const std::string& fields, const char* label) {
+            mutate("scene.set_first_person_controller", controller_request + fields, label);
+        };
+        const auto scalar = [&](const char* label, const char* wire, double fallback, float speed) {
+            auto value = number_or(*controller, wire, fallback);
+            if (drag_scalar(label, value, speed, "%.3g") && value >= 0.0)
+                set(std::string{",\""} + wire + "\":" + number_text(value), "Controller updated");
+        };
+        scalar("Walk speed", "walk_speed", 4.0, 0.05F);
+        scalar("Sprint speed", "sprint_speed", 7.0, 0.05F);
+        scalar("Jump speed", "jump_speed", 5.0, 0.05F);
+        scalar("Mouse sensitivity", "mouse_sensitivity", 0.12, 0.005F);
+        scalar("Stick look speed", "stick_look_speed", 150.0, 1.0F);
+        scalar("Ground distance", "ground_distance", 1.0, 0.01F);
+        bool invert = boolean_or(*controller, "invert_y", false);
+        if (ImGui::Checkbox("Invert Y", &invert))
+            set(std::string{",\"invert_y\":"} + (invert ? "true" : "false"), "Controller updated");
+        auto& buffer = script_text_buffers["controller camera " + selection];
+        if (ImGui::GetActiveID() != ImGui::GetID("Camera node")) {
+            buffer.fill('\0');
+            const auto name = string_or(*controller, "camera", "Camera");
+            std::copy_n(name.begin(), std::min<std::size_t>(name.size(), 128U), buffer.begin());
+        }
+        ImGui::InputText("Camera node", buffer.data(), 129U);
+        if (ImGui::IsItemDeactivatedAfterEdit() && buffer[0] != '\0')
+            set(",\"camera\":\"" + json_escape(std::string{buffer.data()}) + '"', "Controller camera set");
+        // Say plainly what is missing; the node type sets all of it up.
+        const auto* body = component(entity, "physics_body");
+        const auto& palette = editor_palette();
+        const auto warn = [&](const char* text) {
+            ImGui::TextColored(editor_color(palette.warning), "%s", text);
+        };
+        if (!body || number_or(*body, "type", 1) != 1)
+            warn("Needs a dynamic physics body to walk.");
+        else if (!boolean_or(*body, "lock_rotation", false))
+            warn("Lock the physics body's rotation so it stays upright.");
+        if (!component(entity, "collider")) warn("Needs a collider to stand on the ground.");
+        bool has_camera = false;
+        const auto camera_name = string_or(*controller, "camera", "Camera");
+        if (const auto found = children.find(selection); found != children.end())
+            for (const auto index : found->second)
+                if (string_or(*entities[index], "name") == camera_name &&
+                    component(*entities[index], "camera"))
+                    has_camera = true;
+        if (!has_camera) warn(("Needs a child node named " + camera_name + " with a camera.").c_str());
+    }
+
+    std::vector<std::string> script_behaviours() const {
+        std::vector<std::string> names;
+        const auto* status = scripts();
+        const auto* list = status ? field(*status, "behaviours") : nullptr;
+        if (list && list->array())
+            for (const auto& item : *list->array())
+                if (const auto* info = item.object()) names.push_back(string_or(*info, "name"));
+        return names;
+    }
+
+    const JsonValue::Object* behaviour_info(const std::string& name) const {
+        const auto* status = scripts();
+        const auto* list = status ? field(*status, "behaviours") : nullptr;
+        if (list && list->array())
+            for (const auto& item : *list->array())
+                if (const auto* info = item.object(); info && string_or(*info, "name") == name)
+                    return info;
+        return nullptr;
+    }
+
+    // A removable component's header carries a close button and a Remove context item; closing
+    // it removes the component through the protocol like any other edit.
+    bool component_header(const char* label, const std::string& id, const std::size_t index = 0,
+                          const bool removable = true) {
+        bool keep = true;
+        const bool open = ImGui::CollapsingHeader(label, removable ? &keep : nullptr,
+                                                  ImGuiTreeNodeFlags_DefaultOpen);
+        note_item("inspector:component:" + id + (id == "script" ? ":" + std::to_string(index) : ""));
+        if (removable && ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem("Remove component")) keep = false;
+            ImGui::EndPopup();
+        }
+        if (keep) return open;
+        mutate("component.remove", entity_field(selection) + ",\"component\":\"" + id + '"' +
+                                       (id == "script" ? ",\"index\":" + std::to_string(index) : ""),
+               "Component removed");
+        return false;
+    }
+
+    void draw_script_property(const std::string& script_request, const JsonValue::Object& declared,
+                              const JsonValue::Object* stored) {
+        const auto name = string_or(declared, "name");
+        const auto type = string_or(declared, "type");
+        const auto* value = field(stored ? *stored : declared, "value");
+        if (!value) return;
+        const auto set = [&](const std::string& json_value) {
+            mutate("scene.set_script_property",
+                   script_request + ",\"property\":\"" + name + "\"," + json_value, "Property updated");
+        };
+        ImGui::PushID(name.c_str());
+        if (type == "boolean") {
+            bool current = value->boolean() && *value->boolean();
+            if (ImGui::Checkbox(name.c_str(), &current))
+                set(std::string{"\"boolean\":"} + (current ? "true" : "false"));
+        } else if (type == "number") {
+            double current = value->number() ? *value->number() : 0.0;
+            if (drag_scalar(name.c_str(), current, 0.05F, "%.4g"))
+                set("\"number\":" + number_text(current));
+        } else if (type == "vector") {
+            const auto parsed = [&](std::size_t axis) {
+                const auto* items = value->array();
+                return items && axis < items->size() && (*items)[axis].number()
+                           ? *(*items)[axis].number() : 0.0;
+            };
+            std::array<double, 3> current{parsed(0), parsed(1), parsed(2)};
+            if (drag_vector3(name.c_str(), current, 0.01F, 72.0F * ui_scale))
+                set("\"vector\":[" + number_text(current[0]) + "," + number_text(current[1]) +
+                    "," + number_text(current[2]) + "]");
+        } else if (type == "text") {
+            auto& buffer = script_text_buffers[script_request + name];
+            // Show the stored value unless the person is typing in this field.
+            if (ImGui::GetActiveID() != ImGui::GetID(name.c_str())) {
+                buffer.fill('\0');
+                const auto text = value->string() ? *value->string() : std::string{};
+                std::copy_n(text.begin(), std::min(text.size(), buffer.size() - 1U), buffer.begin());
+            }
+            ImGui::InputText(name.c_str(), buffer.data(), buffer.size());
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                set("\"text\":\"" + json_escape(std::string{buffer.data()}) + '"');
+        }
+        if (stored) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset"))
+                mutate("scene.set_script_property",
+                       script_request + ",\"property\":\"" + name + "\",\"reset\":true", "Property reset");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Use the default from the script's code");
+        }
+        ImGui::PopID();
+    }
+
+    void draw_script_sections(const JsonValue::Object& entity) {
+        const auto* list = field(entity, "scripts");
+        if (!list || !list->array()) return;
+        const auto& components = *list->array();
+        for (std::size_t index = 0; index < components.size(); ++index) {
+            const auto* script = components[index].object();
+            if (!script) continue;
+            ImGui::PushID(static_cast<int>(index));
+            const auto behaviour = string_or(*script, "behaviour");
+            const auto label = behaviour + " (Script)###script";
+            if (!component_header(label.c_str(), "script", index)) {
+                ImGui::PopID();
+                continue;
+            }
+            const auto script_request = entity_field(selection) + ",\"index\":" + std::to_string(index);
+            bool enabled = boolean_or(*script, "enabled", true);
+            if (ImGui::Checkbox("Enabled", &enabled))
+                mutate("scene.set_script", script_request + ",\"enabled\":" + (enabled ? "true" : "false"),
+                       enabled ? "Script enabled" : "Script disabled");
+            const auto* info = behaviour_info(behaviour);
+            const auto* declared = info ? field(*info, "properties") : nullptr;
+            const auto* stored_list = field(*script, "properties");
+            if (!info) {
+                ImGui::TextDisabled(script_behaviours().empty()
+                                        ? "Build the project's scripts to edit its properties."
+                                        : "The current scripts do not define this behaviour.");
+            } else if (declared && declared->array()) {
+                for (const auto& item : *declared->array()) {
+                    const auto* property = item.object();
+                    if (!property) continue;
+                    const JsonValue::Object* stored = nullptr;
+                    if (stored_list && stored_list->array())
+                        for (const auto& candidate : *stored_list->array())
+                            if (const auto* object = candidate.object();
+                                object && string_or(*object, "name") == string_or(*property, "name") &&
+                                string_or(*object, "type") == string_or(*property, "type"))
+                                stored = object;
+                    draw_script_property(script_request, *property, stored);
+                }
+            }
+            ImGui::PopID();
+        }
+    }
+
+    static std::string lowercase(std::string text) {
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+        return text;
+    }
+
+    // Maps a component id to the key its data uses in scene JSON.
+    static std::string_view component_key(const std::string_view id) {
+        return id == "keyframes" ? std::string_view{"transform_animation"} : id;
+    }
+
+    void draw_add_component() {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        if (ImGui::Button("+ Add Component", ImVec2(ImGui::GetContentRegionAvail().x, 0.0F))) {
+            component_query.fill('\0');
+            component_selected.clear();
+            if (auto catalog = call("component.types")) component_catalog = std::move(*catalog);
+            open_component_window = true;
+        }
+        note_item("inspector:add_component");
     }
 
     void draw_morph_section(const JsonValue::Object& entity) {
@@ -2996,6 +3438,9 @@ struct EditorUi::Impl {
         draw_light_section(*entity);
         draw_collider_section(*entity);
         draw_physics_body_section(*entity);
+        draw_first_person_controller_section(*entity);
+        draw_script_sections(*entity);
+        draw_add_component();
     }
 
     // Pulls the scene revision out of wherever a response carries it: `scene.history` nests it
@@ -3284,7 +3729,9 @@ struct EditorUi::Impl {
                 discarding_action(PendingAction::quit);
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Edit")) {
+        const bool edit_menu = ImGui::BeginMenu("Edit");
+        note_item("menu:edit");
+        if (edit_menu) {
             if (ImGui::MenuItem("Undo", "Ctrl+Z", false, !undo_labels.empty()))
                 mutate("scene.undo", {}, "Undone");
             if (ImGui::MenuItem("Redo", "Ctrl+Shift+Z", false, !redo_labels.empty()))
@@ -3304,42 +3751,19 @@ struct EditorUi::Impl {
             if (ImGui::MenuItem("Clear selection", nullptr, false, !selection.empty()))
                 select({});
             ImGui::Separator();
+            if (ImGui::MenuItem("Game Configuration...")) open_game_config();
+            note_item("menu:edit:game_configuration");
             future_action("Editor preferences...");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Scene")) {
-            if (ImGui::BeginMenu("Add node")) {
-                if (ImGui::MenuItem("Empty node"))
-                    create_node("Empty");
-                if (ImGui::MenuItem("Quad"))
-                    create_node("Quad", "scene.set_renderer",
-                                ",\"mesh\":\"builtin.quad\",\"material\":\"builtin.azure\"");
-                if (ImGui::MenuItem("Triangle"))
-                    create_node("Triangle", "scene.set_renderer",
-                                ",\"mesh\":\"builtin.triangle\",\"material\":\"builtin.azure\"");
-                if (ImGui::MenuItem("Camera"))
-                    create_node("Camera", "scene.set_camera", ",\"active\":false");
-                if (ImGui::MenuItem("Sun light"))
-                    create_node("Sun Light", "scene.set_light", ",\"type\":\"directional\"");
-                if (ImGui::MenuItem("Point light"))
-                    create_node("Point Light", "scene.set_light", ",\"type\":\"point\"");
-                if (ImGui::MenuItem("Spot light"))
-                    create_node("Spot Light", "scene.set_light", ",\"type\":\"spot\"");
-                ImGui::Separator();
-                future_action("Cube");
-                future_action("Audio source");
-                if (ImGui::MenuItem("Physics body")) {
-                    const auto handle = create_node("Physics Body", "scene.set_physics_body");
-                    if (!handle.empty())
-                        mutate("scene.set_collider", entity_field(handle),
-                               "Box collider added");
-                }
-                ImGui::EndMenu();
-            }
+            if (ImGui::MenuItem("Add Node...")) open_add_node(selection);
+            if (ImGui::MenuItem("Save selection as template...", nullptr, false, !selection.empty()))
+                if (const auto* entity = find_entity(selection))
+                    begin_save_template(selection, string_or(*entity, "name"));
             if (ImGui::MenuItem("Frame selection", "F", false, !selection.empty()))
                 focus_selection();
             ImGui::Separator();
-            future_action("Attach script...");
             future_action("Scene settings...");
             ImGui::EndMenu();
         }
@@ -3370,9 +3794,10 @@ struct EditorUi::Impl {
             const auto* status = runtime_status.object();
             const bool game = status && string_or(*status, "mode") == "game";
             const bool paused = status && boolean_or(*status, "paused", false);
-            if (ImGui::MenuItem(game ? "Stop Game" : "Run Game"))
-                mutate(game ? "runtime.stop" : "runtime.play", {},
-                       game ? "Game stopped" : "Game running");
+            if (ImGui::MenuItem(game ? "Stop Game" : "Run Game")) {
+                if (game) mutate("runtime.stop", {}, "Game stopped");
+                else request_play();
+            }
             ImGui::BeginDisabled(!game);
             if (ImGui::MenuItem(paused ? "Resume simulation" : "Pause simulation"))
                 mutate(paused ? "runtime.resume" : "runtime.pause", {},
@@ -3430,7 +3855,904 @@ struct EditorUi::Impl {
         ImGui::EndMainMenuBar();
     }
 
+    void draw_script_dialogs() {
+        if (open_trust_dialog) {
+            ImGui::OpenPopup("Trust project scripts?");
+            open_trust_dialog = false;
+        }
+        if (ImGui::BeginPopupModal("Trust project scripts?", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            const auto* status = project_status.object();
+            const auto name = status ? string_or(*status, "name", "This project") : "This project";
+            ImGui::Text("%s uses gameplay scripts.", name.c_str());
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0F);
+            ImGui::TextUnformatted(
+                "Scripts are native C++ compiled and run by Relay with your full user "
+                "permissions, like any program you install. They can read, change or delete "
+                "your files. Only trust projects whose code you trust, including code written by "
+                "agents in this project.");
+            ImGui::PopTextWrapPos();
+            const bool accepted = ImGui::Button("Trust and run");
+            note_item("dialog:trust:accept");
+            if (accepted) {
+                if (call("scripts.trust", "\"trusted\":true")) {
+                    script_status_reply.clear();
+                    refresh_scripts();
+                    request_play();
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+                ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        if (open_new_script_dialog) {
+            ImGui::OpenPopup("New C++ script");
+            new_script_name.fill('\0');
+            open_new_script_dialog = false;
+        }
+        if (ImGui::BeginPopupModal("New C++ script", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Behaviour class name");
+            if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+            const bool entered = ImGui::InputTextWithHint(
+                "##new_script", "PlayerController", new_script_name.data(), new_script_name.size(),
+                ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsNoBlank);
+            ImGui::TextDisabled("Creates scripts/<name>.cpp");
+            const std::string name = new_script_name.data();
+            ImGui::BeginDisabled(name.empty());
+            if ((ImGui::Button("Create") || entered) && !name.empty()) {
+                if (call("scripts.create", "\"behaviour\":\"" + json_escape(name) + '"')) {
+                    set_status("Created scripts/" + name + ".cpp", false);
+                    if (!attach_new_script_to.empty())
+                        mutate("component.add", entity_field(attach_new_script_to) +
+                                                    ",\"component\":\"script\",\"behaviour\":\"" +
+                                                    json_escape(name) + '"',
+                               "Created scripts/" + name + ".cpp and attached it");
+                    attach_new_script_to.clear();
+                    refresh_asset_listing();
+                    set_asset_folder_open("scripts", true);
+                    asset_selection = "scripts/" + name + ".cpp";
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+                ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+    }
+
+    // A searchable browser: categories on the left, components on the right, details below.
+    void draw_add_component_window() {
+        if (open_component_window) {
+            ImGui::OpenPopup("Add Component");
+            open_component_window = false;
+        }
+        const auto* main_viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(main_viewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5F, 0.5F));
+        ImGui::SetNextWindowSize(ImVec2(640.0F * ui_scale, 460.0F * ui_scale), ImGuiCond_Appearing);
+        bool keep_open = true;
+        if (!ImGui::BeginPopupModal("Add Component", &keep_open, ImGuiWindowFlags_NoSavedSettings))
+            return;
+        const auto* entity = find_entity(selection);
+        if (!entity) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+        const auto& palette = editor_palette();
+        ImGui::TextColored(editor_color(palette.text_dim), "Add to %s",
+                           string_or(*entity, "name", "node").c_str());
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(-1.0F);
+        ImGui::InputTextWithHint("##component_search", "Search components", component_query.data(),
+                                 component_query.size());
+        note_item("component_window:search");
+
+        struct Item {
+            std::string key, name, category, description, fields;
+            bool present{};
+        };
+        std::vector<Item> items;
+        const auto* catalog = component_catalog.object();
+        if (const auto* engine = catalog ? field(*catalog, "engine") : nullptr; engine && engine->array())
+            for (const auto& value : *engine->array()) {
+                const auto* kind = value.object();
+                if (!kind || !boolean_or(*kind, "addable", false)) continue;
+                const auto id = string_or(*kind, "id");
+                if (id == "script") continue;
+                const auto* data = field(*entity, component_key(id));
+                items.push_back({id, string_or(*kind, "name"), string_or(*kind, "category"),
+                                 string_or(*kind, "description"), ",\"component\":\"" + id + '"',
+                                 data && !data->is_null()});
+            }
+        if (const auto* behaviours = catalog ? field(*catalog, "behaviours") : nullptr;
+            behaviours && behaviours->array())
+            for (const auto& value : *behaviours->array()) {
+                const auto* info = value.object();
+                if (!info) continue;
+                const auto name = string_or(*info, "name");
+                std::string description = "C++ behaviour from scripts/.";
+                if (const auto* properties = field(*info, "properties");
+                    properties && properties->array() && !properties->array()->empty()) {
+                    description += " Properties:";
+                    for (const auto& property : *properties->array())
+                        if (const auto* object = property.object())
+                            description += " " + string_or(*object, "name");
+                } else {
+                    description += " No editable properties.";
+                }
+                items.push_back({"script:" + name, name, "Scripts", description,
+                                 ",\"component\":\"script\",\"behaviour\":\"" + name + '"', false});
+            }
+        const auto query = lowercase(component_query.data());
+        const auto visible = [&](const Item& item) {
+            return (component_category == "All" || item.category == component_category) &&
+                   (query.empty() || lowercase(item.name).find(query) != std::string::npos ||
+                    lowercase(item.description).find(query) != std::string::npos);
+        };
+        const Item* chosen = nullptr;
+        for (const auto& item : items)
+            if (item.key == component_selected && visible(item)) chosen = &item;
+        if (!chosen)
+            for (const auto& item : items)
+                if (visible(item) && !item.present) {
+                    chosen = &item;
+                    component_selected = item.key;
+                    break;
+                }
+        bool add_now = false;
+
+        const float footer = ImGui::GetTextLineHeightWithSpacing() * 3.0F +
+                             ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y * 2.0F;
+        if (ImGui::BeginChild("##component_categories", ImVec2(150.0F * ui_scale, -footer),
+                              ImGuiChildFlags_Borders)) {
+            for (const std::string category : {"All", "Rendering", "Physics", "Animation", "Scripts"}) {
+                const auto count = std::count_if(items.begin(), items.end(), [&](const Item& item) {
+                    return category == "All" || item.category == category;
+                });
+                const auto label = category + " (" + std::to_string(count) + ")";
+                if (ImGui::Selectable(label.c_str(), component_category == category))
+                    component_category = category;
+                note_item("component_window:category:" + category);
+            }
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+        if (ImGui::BeginChild("##component_items", ImVec2(0.0F, -footer), ImGuiChildFlags_Borders)) {
+            bool any = false;
+            for (const auto& item : items) {
+                if (!visible(item)) continue;
+                any = true;
+                ImGui::PushID(item.key.c_str());
+                const bool picked = ImGui::Selectable(
+                    item.name.c_str(), chosen == &item,
+                    ImGuiSelectableFlags_AllowDoubleClick |
+                        (item.present ? ImGuiSelectableFlags_Disabled : 0));
+                note_item("component_window:item:" + item.key);
+                const auto tag = item.present ? std::string{"Added"} : item.category;
+                const auto size = ImGui::CalcTextSize(tag.c_str());
+                ImGui::GetWindowDrawList()->AddText(
+                    ImVec2(ImGui::GetItemRectMax().x - size.x - 4.0F * ui_scale, ImGui::GetItemRectMin().y),
+                    palette.text_faint, tag.c_str());
+                if (picked) {
+                    component_selected = item.key;
+                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) add_now = true;
+                }
+                ImGui::PopID();
+            }
+            if (!any)
+                ImGui::TextDisabled(component_category == "Scripts" && query.empty()
+                                        ? "No built behaviours yet. Create one with New C++ script;\n"
+                                          "it appears here once the project's scripts build."
+                                        : "Nothing matches the search.");
+        }
+        ImGui::EndChild();
+
+        if (chosen) {
+            ImGui::TextUnformatted(chosen->name.c_str());
+            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+            ImGui::TextWrapped("%s", chosen->description.c_str());
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::TextDisabled("Choose a component.");
+        }
+        ImGui::SetCursorPosY(ImGui::GetWindowHeight() - ImGui::GetFrameHeightWithSpacing() -
+                             ImGui::GetStyle().WindowPadding.y);
+        if (ImGui::Button("New C++ script...")) {
+            attach_new_script_to = selection;
+            open_new_script_dialog = true;
+            ImGui::CloseCurrentPopup();
+        }
+        const float buttons = ImGui::CalcTextSize("Cancel").x + ImGui::CalcTextSize("Add").x +
+                              ImGui::GetStyle().FramePadding.x * 4.0F +
+                              ImGui::GetStyle().ItemSpacing.x + 24.0F * ui_scale;
+        ImGui::SameLine(ImGui::GetWindowWidth() - buttons - ImGui::GetStyle().WindowPadding.x);
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+            ImGui::CloseCurrentPopup();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!chosen || chosen->present);
+        add_now |= ImGui::Button("Add");
+        note_item("component_window:add");
+        add_now |= ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+        ImGui::EndDisabled();
+        if (add_now && chosen && !chosen->present) {
+            mutate("component.add", entity_field(selection) + chosen->fields, chosen->name + " added");
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    const JsonValue::Object* node_type_info(const std::string& id) const {
+        const auto* catalog = node_type_catalog.object();
+        const auto* types = catalog ? field(*catalog, "types") : nullptr;
+        if (types && types->array())
+            for (const auto& value : *types->array())
+                if (const auto* type = value.object(); type && string_or(*type, "id") == id) return type;
+        return nullptr;
+    }
+
+    std::string component_display_name(const std::string& id) const {
+        const auto* catalog = component_catalog.object();
+        const auto* engine = catalog ? field(*catalog, "engine") : nullptr;
+        if (engine && engine->array())
+            for (const auto& value : *engine->array())
+                if (const auto* kind = value.object(); kind && string_or(*kind, "id") == id)
+                    return string_or(*kind, "name");
+        return id;
+    }
+
+    // One row of the node type tree, with its children beneath it.
+    void draw_node_type_row(const JsonValue::Object& type, bool& create_now) {
+        const auto id = string_or(type, "id");
+        std::vector<const JsonValue::Object*> subtypes;
+        const auto* types = field(*node_type_catalog.object(), "types");
+        for (const auto& value : *types->array())
+            if (const auto* child = value.object(); child && string_or(*child, "parent") == id)
+                subtypes.push_back(child);
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
+                                   ImGuiTreeNodeFlags_DefaultOpen;
+        if (subtypes.empty()) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        if (node_selected == id) flags |= ImGuiTreeNodeFlags_Selected;
+        const bool creatable = boolean_or(type, "creatable", false);
+        if (!creatable) ImGui::PushStyleColor(ImGuiCol_Text, editor_color(editor_palette().text_faint));
+        const bool open = ImGui::TreeNodeEx(id.c_str(), flags, "%s", string_or(type, "name").c_str());
+        if (!creatable) ImGui::PopStyleColor();
+        note_item("node_window:type:" + id);
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            node_selected = id;
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && creatable) create_now = true;
+        }
+        if (open && !subtypes.empty()) {
+            for (const auto* child : subtypes) draw_node_type_row(*child, create_now);
+            ImGui::TreePop();
+        }
+    }
+
+    // Node types as an inheritance tree with the project's templates below; details on the right.
+    void draw_add_node_window() {
+        if (open_node_window) {
+            ImGui::OpenPopup("Add Node");
+            open_node_window = false;
+        }
+        const auto* main_viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(main_viewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5F, 0.5F));
+        ImGui::SetNextWindowSize(ImVec2(680.0F * ui_scale, 480.0F * ui_scale), ImGuiCond_Appearing);
+        bool keep_open = true;
+        if (!ImGui::BeginPopupModal("Add Node", &keep_open, ImGuiWindowFlags_NoSavedSettings)) return;
+        const auto& palette = editor_palette();
+        const auto* parent = node_parent.empty() ? nullptr : find_entity(node_parent);
+        if (parent) {
+            const auto label = "Add as a child of " + string_or(*parent, "name", "the selection");
+            ImGui::Checkbox(label.c_str(), &node_as_child);
+        } else {
+            ImGui::TextColored(editor_color(palette.text_dim), "Adds a node at the top of the scene");
+        }
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(-1.0F);
+        ImGui::InputTextWithHint("##node_search", "Search node types and templates", node_query.data(),
+                                 node_query.size());
+        note_item("node_window:search");
+        const auto query = lowercase(node_query.data());
+        const auto* catalog = node_type_catalog.object();
+        const auto* types = catalog ? field(*catalog, "types") : nullptr;
+        bool create_now = false;
+
+        const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+        if (ImGui::BeginChild("##node_tree", ImVec2(ImGui::GetContentRegionAvail().x * 0.5F, -footer),
+                              ImGuiChildFlags_Borders)) {
+            if (types && types->array()) {
+                if (query.empty()) {
+                    for (const auto& value : *types->array())
+                        if (const auto* type = value.object(); type && string_or(*type, "parent").empty())
+                            draw_node_type_row(*type, create_now);
+                } else {
+                    for (const auto& value : *types->array()) {
+                        const auto* type = value.object();
+                        if (!type || !boolean_or(*type, "creatable", false) ||
+                            lowercase(string_or(*type, "name")).find(query) == std::string::npos)
+                            continue;
+                        const auto id = string_or(*type, "id");
+                        if (ImGui::Selectable(string_or(*type, "name").c_str(), node_selected == id,
+                                              ImGuiSelectableFlags_AllowDoubleClick)) {
+                            node_selected = id;
+                            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) create_now = true;
+                        }
+                        note_item("node_window:type:" + id);
+                    }
+                }
+            }
+            bool heading = false;
+            for (const auto& entry : node_templates) {
+                if (!query.empty() && lowercase(entry.name).find(query) == std::string::npos) continue;
+                if (!heading) ImGui::SeparatorText("Saved templates");
+                heading = true;
+                if (ImGui::Selectable(entry.name.c_str(), node_selected == entry.id,
+                                      ImGuiSelectableFlags_AllowDoubleClick)) {
+                    node_selected = entry.id;
+                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) create_now = true;
+                }
+                note_item("node_window:template:" + entry.name);
+                const auto size = ImGui::CalcTextSize(entry.type.c_str());
+                ImGui::GetWindowDrawList()->AddText(
+                    ImVec2(ImGui::GetItemRectMax().x - size.x - 4.0F * ui_scale, ImGui::GetItemRectMin().y),
+                    palette.text_faint, entry.type.c_str());
+            }
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+
+        const auto template_entry = std::find_if(node_templates.begin(), node_templates.end(),
+            [&](const TemplateEntry& entry) { return entry.id == node_selected; });
+        const auto* type = node_type_info(node_selected);
+        const bool is_template = template_entry != node_templates.end();
+        const bool creatable = is_template || (type && boolean_or(*type, "creatable", false));
+        if (ImGui::BeginChild("##node_details", ImVec2(0.0F, -footer), ImGuiChildFlags_Borders)) {
+            if (is_template) {
+                ImGui::PushFont(fonts.heading, fonts.heading_size * 1.1F);
+                ImGui::TextUnformatted(template_entry->name.c_str());
+                ImGui::PopFont();
+                ImGui::TextColored(editor_color(palette.text_dim), "Saved template, a %s",
+                                   template_entry->type.c_str());
+                ImGui::Spacing();
+                ImGui::TextWrapped("Creates a copy of the saved node and its children. Later "
+                                   "changes to the template do not affect copies.");
+            } else if (type) {
+                ImGui::PushFont(fonts.heading, fonts.heading_size * 1.1F);
+                ImGui::TextUnformatted(string_or(*type, "name").c_str());
+                ImGui::PopFont();
+                // The inheritance chain, root first.
+                std::vector<std::string> chain;
+                for (auto current = string_or(*type, "parent"); !current.empty();) {
+                    const auto* ancestor = node_type_info(current);
+                    if (!ancestor) break;
+                    chain.insert(chain.begin(), string_or(*ancestor, "name"));
+                    current = string_or(*ancestor, "parent");
+                }
+                if (!chain.empty()) {
+                    std::string path;
+                    for (const auto& name : chain) path += (path.empty() ? "" : " > ") + name;
+                    ImGui::TextColored(editor_color(palette.text_dim), "Inherits %s", path.c_str());
+                }
+                ImGui::Spacing();
+                ImGui::TextWrapped("%s", string_or(*type, "description").c_str());
+                ImGui::Spacing();
+                ImGui::SeparatorText("Components");
+                if (const auto* components = field(*type, "components"); components && components->array())
+                    for (const auto& component : *components->array())
+                        if (component.string())
+                            ImGui::BulletText("%s", component_display_name(*component.string()).c_str());
+                if (!creatable)
+                    ImGui::TextDisabled(string_or(*type, "id") == "Model"
+                                            ? "Import a model file to create one."
+                                            : "Choose one of the types below it.");
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::SetNextItemWidth(220.0F * ui_scale);
+        const auto hint = is_template ? template_entry->name
+                                      : (type ? string_or(*type, "name") : std::string{"Name"});
+        ImGui::InputTextWithHint("##node_name", hint.c_str(), node_name.data(), node_name.size());
+        note_item("node_window:name");
+        const float buttons = ImGui::CalcTextSize("Cancel").x + ImGui::CalcTextSize("Create").x +
+                              ImGui::GetStyle().FramePadding.x * 4.0F +
+                              ImGui::GetStyle().ItemSpacing.x + 24.0F * ui_scale;
+        ImGui::SameLine(ImGui::GetWindowWidth() - buttons - ImGui::GetStyle().WindowPadding.x);
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+            ImGui::CloseCurrentPopup();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!creatable);
+        create_now |= ImGui::Button("Create");
+        note_item("node_window:create");
+        create_now |= ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+        ImGui::EndDisabled();
+        if (create_now && creatable) {
+            create_node_from(node_selected, node_as_child && parent ? node_parent : std::string{},
+                             node_name.data());
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    void open_game_config() {
+        game_config_open = true;
+        load_input_edit();
+    }
+
+    void load_input_edit() {
+        const auto map = call("input.map");
+        const auto* object = map ? map->object() : nullptr;
+        const auto* current = object ? field(*object, "map") : nullptr;
+        if (!current) return;
+        std::string error;
+        if (auto parsed = parse_input_map(json_stringify(*current), error))
+            input_edit = std::move(*parsed);
+        input_file_saved = boolean_or(*object, "saved", false);
+        input_name_buffers.clear();
+    }
+
+    void save_input_edit() {
+        if (!call("input.set_map", "\"map\":\"" + json_escape(input_map_json(input_edit)) + '"')) {
+            load_input_edit();
+            return;
+        }
+        input_file_saved = true;
+        game_lock_mouse = input_edit.lock_mouse;
+        set_status("Input map saved", false);
+    }
+
+    static bool analog_input(const std::string& control) {
+        return control == "gamepad:leftx" || control == "gamepad:lefty" ||
+               control == "gamepad:rightx" || control == "gamepad:righty" ||
+               control == "gamepad:left_trigger" || control == "gamepad:right_trigger";
+    }
+
+    // "key:left_shift" reads as "Left Shift", "gamepad:leftx" as "Left Stick X".
+    static std::string control_label(const std::string& control) {
+        const auto colon = control.find(':');
+        if (colon == std::string::npos) return control;
+        const auto device = control.substr(0, colon);
+        const auto name = control.substr(colon + 1U);
+        std::string words;
+        bool start = true;
+        for (const char character : name) {
+            if (character == '_') {
+                words += ' ';
+                start = true;
+                continue;
+            }
+            words += start ? static_cast<char>(std::toupper(static_cast<unsigned char>(character)))
+                           : character;
+            start = false;
+        }
+        if (device == "mouse") return words + " Mouse";
+        if (device == "gamepad") {
+            if (name == "leftx") return "Left Stick X";
+            if (name == "lefty") return "Left Stick Y";
+            if (name == "rightx") return "Right Stick X";
+            if (name == "righty") return "Right Stick Y";
+            return "Gamepad " + words;
+        }
+        return words;
+    }
+
+    void begin_binding_capture(const BindingCapture::Target target, const std::size_t index) {
+        binding_capture = {};
+        binding_capture.active = true;
+        binding_capture.target = target;
+        binding_capture.index = index;
+    }
+
+    void cancel_binding_capture() { binding_capture = {}; }
+
+    // Records a captured control into the entry that asked for it and saves the map.
+    void finish_binding_capture(const std::string& control) {
+        using Target = BindingCapture::Target;
+        auto& capture = binding_capture;
+        // An analog binding waits for a stick or trigger; other controls are ignored.
+        if (capture.target == Target::analog && !analog_input(control)) return;
+        if (capture.target == Target::pair_negative) {
+            capture.negative = control;
+            capture.target = Target::pair_positive;
+            return;
+        }
+        if (capture.target == Target::action) {
+            if (capture.index < input_edit.actions.size()) {
+                auto& bindings = input_edit.actions[capture.index].bindings;
+                if (std::find(bindings.begin(), bindings.end(), control) == bindings.end() &&
+                    bindings.size() < maximum_input_bindings)
+                    bindings.push_back(control);
+            }
+        } else if (capture.index < input_edit.axes.size() &&
+                   input_edit.axes[capture.index].bindings.size() < maximum_input_bindings) {
+            auto& bindings = input_edit.axes[capture.index].bindings;
+            if (capture.target == Target::analog) bindings.push_back({"", "", control, 1.0});
+            else bindings.push_back({capture.negative, control, "", 1.0});
+        }
+        binding_capture = {};
+        save_input_edit();
+    }
+
+    // Row layout that wraps: the next item stays on this line if it fits before `right`.
+    struct Flow {
+        float right{};
+        bool first{true};
+    };
+    static float button_width(const char* label) {
+        return ImGui::CalcTextSize(label, nullptr, true).x + ImGui::GetStyle().FramePadding.x * 2.0F;
+    }
+    static void flow(Flow& row, const float width) {
+        if (!row.first) {
+            ImGui::SameLine();
+            if (ImGui::GetCursorScreenPos().x + width > row.right) ImGui::NewLine();
+        }
+        row.first = false;
+    }
+    static Flow begin_flow() {
+        return {ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x, true};
+    }
+    bool flow_button(Flow& row, const char* label) {
+        flow(row, button_width(label));
+        return ImGui::SmallButton(label);
+    }
+
+    // The prompt a binding capture shows in place of the add buttons; mouse clicks inside it bind.
+    void draw_capture_prompt(Flow& row, const char* text) {
+        flow(row, button_width(text));
+        ImGui::PushStyleColor(ImGuiCol_Button, editor_color(editor_palette().accent_soft));
+        ImGui::SmallButton(text);
+        ImGui::PopStyleColor();
+        const auto minimum = ImGui::GetItemRectMin(), maximum = ImGui::GetItemRectMax();
+        binding_capture.zone = {minimum.x, minimum.y, maximum.x, maximum.y};
+        note_item("config:input:capture");
+        if (flow_button(row, "Cancel")) cancel_binding_capture();
+    }
+
+    // A binding chip: the control's name and a remove button. Returns true when removed.
+    bool binding_chip(Flow& row, const std::string& label, const std::string& id) {
+        flow(row, button_width(label.c_str()) + 2.0F * ui_scale + button_width("x"));
+        ImGui::PushID(id.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Button, editor_color(editor_palette().surface));
+        ImGui::SmallButton(label.c_str());
+        ImGui::PopStyleColor();
+        note_item("config:input:chip:" + label);
+        ImGui::SameLine(0.0F, 2.0F * ui_scale);
+        const bool removed = ImGui::SmallButton("x");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove this binding");
+        ImGui::PopID();
+        return removed;
+    }
+
+    bool input_name_taken(const std::string& name) const {
+        return std::any_of(input_edit.actions.begin(), input_edit.actions.end(),
+                           [&](const InputAction& action) { return action.name == name; }) ||
+               std::any_of(input_edit.axes.begin(), input_edit.axes.end(),
+                           [&](const InputAxis& axis) { return axis.name == name; });
+    }
+
+    // Edits an action or axis name in place, committing when the field is left.
+    bool input_name_field(const std::string& key, std::string& name) {
+        auto& buffer = input_name_buffers[key];
+        if (ImGui::GetActiveID() != ImGui::GetID("##name")) {
+            buffer.fill('\0');
+            std::copy_n(name.begin(), std::min<std::size_t>(name.size(), 64U), buffer.begin());
+        }
+        ImGui::SetNextItemWidth(-1.0F);
+        ImGui::InputText("##name", buffer.data(), buffer.size(), ImGuiInputTextFlags_CharsNoBlank);
+        if (!ImGui::IsItemDeactivatedAfterEdit()) return false;
+        const std::string renamed = buffer.data();
+        if (renamed == name) return false;
+        if (!valid_input_name(renamed)) {
+            set_status("Input names are letters, digits and underscores", true);
+            return false;
+        }
+        if (input_name_taken(renamed)) {
+            set_status("An action or axis is already called " + renamed, true);
+            return false;
+        }
+        name = renamed;
+        return true;
+    }
+
+    // The live input.state entry for an action or axis, while the game runs.
+    const JsonValue::Object* live_entry(const char* list, const std::string& name) const {
+        const auto* object = input_live.object();
+        const auto* entries = object ? field(*object, list) : nullptr;
+        if (entries && entries->array())
+            for (const auto& value : *entries->array())
+                if (const auto* entry = value.object(); entry && string_or(*entry, "name") == name)
+                    return entry;
+        return nullptr;
+    }
+
+    // A name field and button that add an entry; returns the valid new name when pressed.
+    std::optional<std::string> add_input_entry(std::array<char, 65>& buffer, const char* id,
+                                               const char* hint, const char* button) {
+        ImGui::SetNextItemWidth(180.0F * ui_scale);
+        const bool entered = ImGui::InputTextWithHint(
+            id, hint, buffer.data(), buffer.size(),
+            ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsNoBlank);
+        note_item(std::string{"config:input:"} + (id + 2));
+        ImGui::SameLine();
+        const std::string name = buffer.data();
+        ImGui::BeginDisabled(name.empty());
+        const bool pressed = ImGui::Button(button) || entered;
+        ImGui::EndDisabled();
+        note_item(std::string{"config:input:"} + (id + 2) + ":add");
+        if (!pressed || name.empty()) return std::nullopt;
+        if (!valid_input_name(name) || input_name_taken(name)) {
+            set_status(input_name_taken(name) ? "That name is already used"
+                                              : "Input names are letters, digits and underscores",
+                       true);
+            return std::nullopt;
+        }
+        buffer.fill('\0');
+        return name;
+    }
+
+    void draw_input_page() {
+        using Target = BindingCapture::Target;
+        const auto& palette = editor_palette();
+        bool changed = false;
+        const auto* project = project_status.object();
+        if (!project || string_or(*project, "filename").empty())
+            ImGui::TextColored(editor_color(palette.warning),
+                               "Open a project to save its input map.");
+        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+        ImGui::TextWrapped("Scripts read actions, such as jump, with relay::input::pressed, and "
+                           "axes from -1 to 1, such as move_x, with relay::input::axis.");
+        ImGui::PopStyleColor();
+        ImGui::TextColored(editor_color(palette.text_faint), "%s%s",
+                           std::string{input_map_filename}.c_str(),
+                           input_file_saved ? "" : "  (engine defaults until you change something)");
+        if (ImGui::Checkbox("Lock the mouse cursor while the game has input", &input_edit.lock_mouse))
+            changed = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Reset to defaults")) {
+            const bool lock = input_edit.lock_mouse;
+            input_edit = default_input_map();
+            input_edit.lock_mouse = lock;
+            input_name_buffers.clear();
+            cancel_binding_capture();
+            changed = true;
+        }
+        note_item("config:input:reset");
+        const bool live = input_live.object() != nullptr;
+        const auto table_flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                                 ImGuiTableFlags_SizingStretchProp;
+        std::optional<std::size_t> remove_action, remove_axis;
+
+        ImGui::SeparatorText("Actions");
+        if (ImGui::BeginTable("##actions", 4, table_flags)) {
+            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 150.0F * ui_scale);
+            ImGui::TableSetupColumn("Bindings", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Live", ImGuiTableColumnFlags_WidthFixed, 44.0F * ui_scale);
+            ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed, 56.0F * ui_scale);
+            ImGui::TableHeadersRow();
+            for (std::size_t index = 0; index < input_edit.actions.size(); ++index) {
+                auto& action = input_edit.actions[index];
+                ImGui::PushID(static_cast<int>(index));
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                changed |= input_name_field("action:" + std::to_string(index), action.name);
+                ImGui::TableNextColumn();
+                auto row = begin_flow();
+                std::optional<std::size_t> remove_binding;
+                for (std::size_t item = 0; item < action.bindings.size(); ++item)
+                    if (binding_chip(row, control_label(action.bindings[item]), std::to_string(item)))
+                        remove_binding = item;
+                if (remove_binding) {
+                    action.bindings.erase(action.bindings.begin() +
+                                          static_cast<std::ptrdiff_t>(*remove_binding));
+                    changed = true;
+                }
+                if (binding_capture.active && binding_capture.target == Target::action &&
+                    binding_capture.index == index) {
+                    draw_capture_prompt(row, "Press a key or gamepad button, or click here");
+                } else {
+                    if (flow_button(row, "+ Add")) begin_binding_capture(Target::action, index);
+                    note_item("config:input:action:" + action.name + ":add");
+                }
+                ImGui::TableNextColumn();
+                if (live) {
+                    const auto* entry = live_entry("actions", action.name);
+                    const bool held = entry && boolean_or(*entry, "held", false);
+                    ImGui::TextColored(editor_color(held ? palette.success : palette.text_faint),
+                                       held ? "held" : "-");
+                }
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton("Delete")) remove_action = index;
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (const auto name = add_input_entry(new_action_name, "##new_action", "new_action",
+                                              "Add action")) {
+            input_edit.actions.push_back({*name, {}});
+            begin_binding_capture(Target::action, input_edit.actions.size() - 1U);
+            changed = true;
+        }
+
+        ImGui::SeparatorText("Axes");
+        if (ImGui::BeginTable("##axes", 5, table_flags)) {
+            ImGui::TableSetupColumn("Axis", ImGuiTableColumnFlags_WidthFixed, 150.0F * ui_scale);
+            ImGui::TableSetupColumn("Deadzone", ImGuiTableColumnFlags_WidthFixed, 80.0F * ui_scale);
+            ImGui::TableSetupColumn("Bindings", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Live", ImGuiTableColumnFlags_WidthFixed, 64.0F * ui_scale);
+            ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed, 56.0F * ui_scale);
+            ImGui::TableHeadersRow();
+            for (std::size_t index = 0; index < input_edit.axes.size(); ++index) {
+                auto& axis = input_edit.axes[index];
+                ImGui::PushID(static_cast<int>(index) + 100000);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                changed |= input_name_field("axis:" + std::to_string(index), axis.name);
+                ImGui::TableNextColumn();
+                ImGui::SetNextItemWidth(-1.0F);
+                auto deadzone = static_cast<float>(axis.deadzone);
+                if (ImGui::SliderFloat("##deadzone", &deadzone, 0.0F, 0.95F, "%.2f"))
+                    axis.deadzone = deadzone;
+                changed |= ImGui::IsItemDeactivatedAfterEdit();
+                ImGui::TableNextColumn();
+                auto row = begin_flow();
+                std::optional<std::size_t> remove_binding;
+                for (std::size_t item = 0; item < axis.bindings.size(); ++item) {
+                    auto& binding = axis.bindings[item];
+                    const auto label =
+                        binding.analog.empty()
+                            ? control_label(binding.negative) + " / " + control_label(binding.positive)
+                            : control_label(binding.analog) + (binding.scale < 0.0 ? " (inverted)" : "");
+                    if (binding_chip(row, label, std::to_string(item))) remove_binding = item;
+                }
+                if (remove_binding) {
+                    axis.bindings.erase(axis.bindings.begin() +
+                                        static_cast<std::ptrdiff_t>(*remove_binding));
+                    changed = true;
+                }
+                const bool capturing = binding_capture.active && binding_capture.index == index &&
+                                       binding_capture.target != Target::action;
+                if (capturing) {
+                    draw_capture_prompt(row, binding_capture.target == Target::analog
+                                            ? "Move a gamepad stick or trigger"
+                                        : binding_capture.target == Target::pair_negative
+                                            ? "Press the control for -1 (left, down or back)"
+                                            : "Now press the control for +1");
+                } else {
+                    if (flow_button(row, "+ Keys")) begin_binding_capture(Target::pair_negative, index);
+                    note_item("config:input:axis:" + axis.name + ":keys");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Bind two buttons: one pulls towards -1, the other towards +1");
+                    if (flow_button(row, "+ Stick")) begin_binding_capture(Target::analog, index);
+                    note_item("config:input:axis:" + axis.name + ":stick");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bind a gamepad stick or trigger");
+                    bool inverts = false;
+                    for (const auto& binding : axis.bindings) inverts |= !binding.analog.empty();
+                    if (inverts) {
+                        if (flow_button(row, "Invert...")) ImGui::OpenPopup("##invert_menu");
+                        if (ImGui::BeginPopup("##invert_menu")) {
+                            for (auto& binding : axis.bindings) {
+                                if (binding.analog.empty()) continue;
+                                if (ImGui::MenuItem(control_label(binding.analog).c_str(), nullptr,
+                                                    binding.scale < 0.0)) {
+                                    binding.scale = -binding.scale;
+                                    changed = true;
+                                }
+                            }
+                            ImGui::EndPopup();
+                        }
+                    }
+                }
+                ImGui::TableNextColumn();
+                if (live) {
+                    const auto* entry = live_entry("axes", axis.name);
+                    const auto value = entry ? number_or(*entry, "value", 0.0) : 0.0;
+                    char text[16];
+                    std::snprintf(text, sizeof text, "%+.2f", value);
+                    ImGui::ProgressBar(static_cast<float>((value + 1.0) * 0.5), ImVec2(-1.0F, 0.0F),
+                                       text);
+                }
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton("Delete")) remove_axis = index;
+                note_item("config:input:axis:" + axis.name + ":delete");
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (const auto name = add_input_entry(new_axis_name, "##new_axis", "new_axis", "Add axis")) {
+            input_edit.axes.push_back({*name, 0.2, {}});
+            changed = true;
+        }
+        if (remove_action) {
+            input_edit.actions.erase(input_edit.actions.begin() +
+                                     static_cast<std::ptrdiff_t>(*remove_action));
+            cancel_binding_capture();
+            input_name_buffers.clear();
+            changed = true;
+        }
+        if (remove_axis) {
+            input_edit.axes.erase(input_edit.axes.begin() + static_cast<std::ptrdiff_t>(*remove_axis));
+            cancel_binding_capture();
+            input_name_buffers.clear();
+            changed = true;
+        }
+        if (changed) save_input_edit();
+    }
+
+    // Project-wide game settings, one page per area. Input is the first; others follow.
+    void draw_game_config() {
+        if (!game_config_open) {
+            if (binding_capture.active) cancel_binding_capture();
+            return;
+        }
+        ImGui::SetNextWindowSize(ImVec2(900.0F * ui_scale, 680.0F * ui_scale), ImGuiCond_FirstUseEver);
+        const bool visible = ImGui::Begin("Game Configuration", &game_config_open);
+        note_item("config:window");
+        if (!visible) {
+            ImGui::End();
+            return;
+        }
+        if (ImGui::BeginChild("##config_pages", ImVec2(150.0F * ui_scale, 0.0F), ImGuiChildFlags_Borders)) {
+            if (ImGui::Selectable("Input", game_config_page == 0)) game_config_page = 0;
+            note_item("config:page:input");
+            for (const char* page : {"Graphics", "Physics", "Audio"}) {
+                ImGui::BeginDisabled();
+                ImGui::Selectable(page);
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Coming soon");
+            }
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+        if (ImGui::BeginChild("##config_page", ImVec2(0.0F, 0.0F))) draw_input_page();
+        ImGui::EndChild();
+        ImGui::End();
+    }
+
+
+    void draw_template_dialog() {
+        if (open_template_dialog) {
+            ImGui::OpenPopup("Save as template");
+            open_template_dialog = false;
+        }
+        if (!ImGui::BeginPopupModal("Save as template", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+            return;
+        ImGui::TextUnformatted("Template name");
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        const bool entered = ImGui::InputText("##template_name", template_name.data(),
+                                              template_name.size(),
+                                              ImGuiInputTextFlags_EnterReturnsTrue);
+        note_item("dialog:template:name");
+        ImGui::TextDisabled("Saves the node and its children to templates/, for the Create menu.");
+        ImGui::Checkbox("Replace an existing template", &template_replace);
+        const std::string name = template_name.data();
+        ImGui::BeginDisabled(name.empty());
+        const bool save = ImGui::Button("Save") || entered;
+        note_item("dialog:template:save");
+        if (save && !name.empty()) {
+            if (call("templates.save", entity_field(template_save_entity) + ",\"name\":\"" +
+                                           json_escape(name) + "\",\"replace\":" +
+                                           (template_replace ? "true" : "false"))) {
+                set_status("Saved template " + name, false);
+                assets_pending = true;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
     void draw_dialogs() {
+        draw_script_dialogs();
+        draw_template_dialog();
+        draw_add_component_window();
+        draw_add_node_window();
         if (open_discard_dialog) {
             ImGui::OpenPopup("Unsaved changes");
             open_discard_dialog = false;
@@ -3574,10 +4896,13 @@ struct EditorUi::Impl {
         const auto* status = runtime_status.object();
         const bool game = status && string_or(*status, "mode") == "game";
         const bool paused = status && boolean_or(*status, "paused", false);
-        if (toolbar_button("##run_game", game ? ToolIcon::stop : ToolIcon::play, game,
-                           game ? "Stop Game" : "Run Game"))
-            mutate(game ? "runtime.stop" : "runtime.play", {},
-                   game ? "Game stopped" : "Game running");
+        const bool run_pressed = toolbar_button("##run_game", game ? ToolIcon::stop : ToolIcon::play,
+                                                game, game ? "Stop Game" : "Run Game");
+        note_item("toolbar:run");
+        if (run_pressed) {
+            if (game) mutate("runtime.stop", {}, "Game stopped");
+            else request_play();
+        }
         ImGui::BeginDisabled(!game);
         if (toolbar_button("##simulation", paused ? ToolIcon::play : ToolIcon::pause, paused,
                            paused ? "Resume simulation" : "Pause simulation"))
@@ -3850,6 +5175,12 @@ struct EditorUi::Impl {
         if (entry.folder && asset_search_active()) reveal_asset(entry.path);
         else if (entry.folder) set_asset_folder_open(entry.path, !expanded_asset_folders.contains(entry.path));
         else if (entry.importable) import_model(entry.path);
+        else if (entry.kind == "template" && entry.path.starts_with("templates/"))
+            instantiate_template("project:" + entry.name.substr(0, entry.name.size() -
+                                                                     std::string_view{".relay-template.json"}.size()));
+        else if (entry.kind == "script")
+            set_status("Edit " + entry.name + " in your code editor; Relay rebuilds scripts when "
+                       "they change", false);
         else set_status("No editor for " + entry.name + " yet", false);
     }
 
@@ -3916,7 +5247,10 @@ struct EditorUi::Impl {
         if (!ImGui::BeginMenu("Create")) return;
         if (ImGui::MenuItem("Folder")) create_asset_folder(parent);
         ImGui::Separator();
-        future_action("Script");
+        if (ImGui::MenuItem("C++ script...")) {
+            attach_new_script_to.clear();
+            open_new_script_dialog = true;
+        }
         future_action("Text file");
         future_action("Shader");
         future_action("Material");
@@ -4024,8 +5358,9 @@ struct EditorUi::Impl {
         ImGui::EndPopup();
     }
 
-    static constexpr std::array<std::pair<const char*, const char*>, 10> asset_kind_labels{{
-        {"model", "Models"}, {"scene", "Scenes"}, {"image", "Images"}, {"shader", "Shaders"},
+    static constexpr std::array<std::pair<const char*, const char*>, 11> asset_kind_labels{{
+        {"model", "Models"}, {"scene", "Scenes"}, {"template", "Templates"},
+        {"image", "Images"}, {"shader", "Shaders"},
         {"script", "Scripts"}, {"text", "Text"}, {"media", "Audio and video"},
         {"folder", "Folders"}, {"project", "Project files"}, {"other", "Other"}}};
 
@@ -4199,6 +5534,8 @@ struct EditorUi::Impl {
                                               ImGui::GetID("##viewport_drop"))) return;
         if (const auto model = accept_model_drop())
             import_model(*model, "scene", {}, viewport_drop_point(ImGui::GetMousePos()));
+        if (const auto dropped = accept_template_drop())
+            instantiate_template(*dropped, {}, viewport_drop_point(ImGui::GetMousePos()));
         ImGui::EndDragDropTarget();
     }
 
@@ -4265,6 +5602,75 @@ struct EditorUi::Impl {
         ImGui::EndChild();
     }
 
+    void draw_script_diagnostics() {
+        const auto* status = scripts();
+        if (!status || !boolean_or(*status, "project", false)) return;
+        const auto& palette = editor_palette();
+        const auto* diagnostics = field(*status, "diagnostics");
+        const auto* runtime_errors = field(*status, "runtime_errors");
+        const bool problems = (diagnostics && diagnostics->array() && !diagnostics->array()->empty()) ||
+                              (runtime_errors && runtime_errors->array() &&
+                               !runtime_errors->array()->empty());
+        if (!ImGui::CollapsingHeader("Scripts", problems ? ImGuiTreeNodeFlags_DefaultOpen : 0)) return;
+        const bool trusted = boolean_or(*status, "trusted", false);
+        const auto state = string_or(*status, "state", "idle");
+        if (!trusted) {
+            ImGui::TextDisabled("Native scripts are off until you trust this project.");
+            if (ImGui::Button("Trust project scripts...")) open_trust_dialog = true;
+            return;
+        }
+        const auto behaviours = script_behaviours();
+        const auto colour = state == "failed"     ? palette.danger
+                            : state == "building" ? palette.warning
+                                                  : palette.success;
+        ImGui::TextColored(editor_color(colour), "%s", state.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%zu behaviours, build %.0f, %.1f s%s", behaviours.size(),
+                            number_or(*status, "loaded_build", 0.0),
+                            number_or(*status, "build_seconds", 0.0),
+                            boolean_or(*status, "stale", false) ? ", sources changed" : "");
+        ImGui::BeginDisabled(state == "building");
+        if (ImGui::Button("Build scripts")) start_script_build(true);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Checkbox("Build on change", &auto_build_scripts);
+        ImGui::SameLine();
+        if (ImGui::Button("Revoke trust")) {
+            if (call("scripts.trust", "\"trusted\":false")) script_status_reply.clear();
+        }
+        const auto error = string_or(*status, "error");
+        if (state == "failed" && !error.empty())
+            ImGui::TextColored(editor_color(palette.danger), "%s", error.c_str());
+        ImGui::PushFont(fonts.monospace, fonts.monospace_size);
+        if (diagnostics && diagnostics->array())
+            for (const auto& item : *diagnostics->array()) {
+                const auto* diagnostic = item.object();
+                if (!diagnostic) continue;
+                const auto severity = string_or(*diagnostic, "severity");
+                ImGui::TextColored(editor_color(severity == "error"     ? palette.danger
+                                                : severity == "warning" ? palette.warning
+                                                                        : palette.text_faint),
+                                   "%s:%.0f:%.0f", string_or(*diagnostic, "file").c_str(),
+                                   number_or(*diagnostic, "line", 0.0),
+                                   number_or(*diagnostic, "column", 0.0));
+                ImGui::SameLine();
+                ImGui::TextWrapped("%s", string_or(*diagnostic, "message").c_str());
+            }
+        if (runtime_errors && runtime_errors->array())
+            for (const auto& item : *runtime_errors->array()) {
+                const auto* failure = item.object();
+                if (!failure) continue;
+                ImGui::TextColored(editor_color(palette.danger), "%s %s",
+                                   string_or(*failure, "behaviour").c_str(),
+                                   string_or(*failure, "entity").c_str());
+                ImGui::SameLine();
+                ImGui::TextWrapped("%s: %s", string_or(*failure, "callback").c_str(),
+                                   string_or(*failure, "message").c_str());
+            }
+        ImGui::PopFont();
+        ImGui::Separator();
+    }
+
     void draw_diagnostics() {
         const auto& palette = editor_palette();
         if (!status_message.empty()) {
@@ -4272,6 +5678,7 @@ struct EditorUi::Impl {
                                "%s", status_message.c_str());
             ImGui::Dummy(ImVec2(0.0F, 2.0F * ui_scale));
         }
+        draw_script_diagnostics();
         // Log lines are data, so they get the monospaced face and a dimmed severity prefix.
         ImGui::PushFont(fonts.monospace, fonts.monospace_size);
         if (begin_region("##logs")) {
@@ -4301,6 +5708,12 @@ EditorUi::EditorUi(RequestHandler request) : impl_(std::make_unique<Impl>(std::m
 }
 
 void EditorUi::set_attachment_picker(AttachmentPicker picker) { impl_->attachment_picker = std::move(picker); }
+
+bool EditorUi::game_has_input() const { return impl_->game_input_focus; }
+
+bool EditorUi::pointer_locked_for_game() const {
+    return impl_->game_input_focus && impl_->capture_requested;
+}
 
 EditorUi::~EditorUi() {
     // Swapchain recreation preserves the ImGui context and layout; destruction retires them.
@@ -4452,6 +5865,54 @@ bool EditorUi::handle_event(const void* const sdl_event) {
         impl_->discarding_action(Impl::PendingAction::quit);
         return true;
     }
+    // A binding capture in Game Configuration takes the next control before anything else sees it.
+    if (impl_->binding_capture.active) {
+        const auto type = event->type;
+        if (type == SDL_EVENT_KEY_DOWN && event->key.scancode == SDL_SCANCODE_ESCAPE) {
+            impl_->cancel_binding_capture();
+            return true;
+        }
+        if (type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            const auto origin = ImGui::GetMainViewport()->Pos;
+            const float x = event->button.x + origin.x, y = event->button.y + origin.y;
+            const auto& zone = impl_->binding_capture.zone;
+            if (x < zone[0] || y < zone[1] || x > zone[2] || y > zone[3]) {
+                // Clicking elsewhere, including Cancel, abandons the capture and acts normally.
+                impl_->cancel_binding_capture();
+            } else if (const auto control = sdl_binding_control(*event)) {
+                impl_->finish_binding_capture(*control);
+                return true;
+            }
+        } else if (const auto control = sdl_binding_control(*event)) {
+            impl_->finish_binding_capture(*control);
+            return true;
+        }
+        if (impl_->binding_capture.active &&
+            (type == SDL_EVENT_KEY_DOWN || type == SDL_EVENT_KEY_UP || type == SDL_EVENT_TEXT_INPUT))
+            return true;
+    }
+    const bool playing = impl_->runtime_status.object() &&
+                         string_or(*impl_->runtime_status.object(), "mode") == "game";
+    if (playing && impl_->game_input_focus) {
+        if ((event->type == SDL_EVENT_KEY_DOWN && event->key.scancode == SDL_SCANCODE_ESCAPE) ||
+            event->type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+            impl_->set_game_input_focus(false);
+            return event->type == SDL_EVENT_KEY_DOWN;
+        }
+        // While the game has input, the editor does not react to it.
+        switch (event->type) {
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP:
+        case SDL_EVENT_TEXT_INPUT:
+        case SDL_EVENT_MOUSE_MOTION:
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+        case SDL_EVENT_MOUSE_WHEEL:
+            return false;
+        default:
+            break;
+        }
+    }
     if (event->type == SDL_EVENT_MOUSE_MOTION && impl_->mouse_captured) {
         // ImGui stays at the viewport anchor while freelook uses unbounded relative motion.
         impl_->relative_delta.x += event->motion.xrel;
@@ -4472,11 +5933,24 @@ bool EditorUi::handle_event(const void* const sdl_event) {
         if (event->type == SDL_EVENT_DROP_COMPLETE) impl_->drop_hover = false;
         return impl_->drop_hover;
     }
-    if (impl_->headless) return false;
+    // A click on the viewport hands input to the game; until then the editor keeps it.
+    if (playing && event->type == SDL_EVENT_MOUSE_BUTTON_DOWN && impl_->viewport_hovered &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+        impl_->set_game_input_focus(true);
+        return false;
+    }
+    // During Run Game without input focus, keyboard and mouse stay with the editor.
+    const bool withheld = playing && (event->type == SDL_EVENT_KEY_DOWN ||
+                                      event->type == SDL_EVENT_KEY_UP ||
+                                      event->type == SDL_EVENT_MOUSE_MOTION ||
+                                      event->type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                                      event->type == SDL_EVENT_MOUSE_BUTTON_UP ||
+                                      event->type == SDL_EVENT_MOUSE_WHEEL);
+    if (impl_->headless) return withheld;
     ImGui_ImplSDL3_ProcessEvent(event);
     const auto& io = ImGui::GetIO();
-    const bool game = impl_->runtime_status.object() &&
-                      string_or(*impl_->runtime_status.object(), "mode") == "game";
+    const bool game = playing;
+    if (withheld) return true;
     switch (event->type) {
     case SDL_EVENT_MOUSE_MOTION:
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -4619,6 +6093,9 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
                                (impl_->viewport_max.y - impl_->viewport_min.y) / display.y};
             impl_->viewport_visible = impl_->viewport_max.x > impl_->viewport_min.x &&
                                       impl_->viewport_max.y > impl_->viewport_min.y;
+            if (impl_->headless)
+                impl_->headless_items["viewport"] = {impl_->viewport_min.x, impl_->viewport_min.y,
+                                                     impl_->viewport_max.x, impl_->viewport_max.y};
             impl_->viewport_draw_list = ImGui::GetWindowDrawList();
             if (impl_->viewport_visible) {
                 impl_->viewport_draw_list->AddCallback(Impl::draw_scene_callback, impl_.get());
@@ -4631,6 +6108,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         impl_->update_view();
         impl_->draw_collider_wireframes();
         impl_->draw_scene_nodes();
+        impl_->draw_game_input_hint();
         impl_->draw_gizmo();
         impl_->update_selection_input();
         ImGui::End();
@@ -4663,6 +6141,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         ImGui::End();
     }
     impl_->draw_dialogs();
+    impl_->draw_game_config();
 
     impl_->chat_media.draw_viewer(impl_->headless);
     ImGui::Render();

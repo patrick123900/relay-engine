@@ -37,12 +37,15 @@ std::string failure(std::uint64_t id, std::string error) {
 std::string_view file_parameter(std::string_view method) {
     if (method == "scene.save" || method == "scene.load" || method == "assets.import_model" ||
         method == "video.start" || method == "trace.start") return "filename";
-    if (method == "render.capture" || method == "render.capture_async") return "path";
+    if (method == "render.capture" || method == "render.capture_async" ||
+        method == "scripts.read" || method == "scripts.write") return "path";
     return {};
 }
 bool supports_entity(std::string_view method) {
     static const std::set<std::string_view> supported{"scene.inspect", "scene.bounds", "scene.set_transform",
-        "scene.set_morph", "scene.set_light", "scene.set_renderer", "scene.rename"};
+        "scene.set_morph", "scene.set_light", "scene.set_renderer", "scene.rename", "scene.set_script",
+        "scene.set_script_property", "component.add", "component.remove",
+        "scene.set_first_person_controller"};
     return supported.contains(method);
 }
 } // namespace

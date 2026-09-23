@@ -8,11 +8,13 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v29: 105 native methods. Scene v11, project v1, import manifest v3.
+- Protocol schema v35: 127 native methods. Scene v15, project v1, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
-  colliders, Jolt body simulation, and portable project export are implemented. Preserve unrelated working-tree
-  edits and inspect `git diff` before changing them.
+  colliders, Jolt body simulation, a Unity-style component model with derived node types and
+  templates/prefabs, native C++ gameplay scripts, per-project input mapping, a native first
+  person controller, and portable project export are implemented. Preserve unrelated
+  working-tree edits and inspect `git diff` before changing them.
 
 ## Product intent
 
@@ -103,6 +105,9 @@ without blocking simultaneous human editing.
   crossings, not containment. Mirrored scale flips triangle winding so raycasts hit front faces.
   Collision free functions take an optional registry; `Engine` wires its registry into the
   protocol and `PhysicsWorld`.
+- Scene v14 adds `lock_rotation` to physics bodies: dynamic bodies get Jolt translation-only
+  `mAllowedDOFs`, so contacts never rotate them (Inspector "Lock rotation", protocol
+  `lock_rotation`).
 - Scene v8 adds undoable static/dynamic physics bodies with mass, gravity scale, and restitution;
   scene v9 adds friction plus linear and angular damping. Existing v8 files migrate with Jolt's
   default material values. The game-only Jolt 5.6 world provides gravity, full rigid-body contact
@@ -141,6 +146,136 @@ without blocking simultaneous human editing.
   project metadata, member scenes, and non-hidden project assets, including import metadata.
   It excludes private state, captures, traces, and prior exports, and refuses overwrites. The
   project panel exposes the same operation. Save scene changes before packaging.
+
+### Components, node types and templates
+
+- A node is a Transform plus optional components. Engine components keep typed storage in
+  `EntityRecord` (`std::optional` per kind, for speed); scripts are `std::vector<Script>`, each
+  with a behaviour name, enabled flag and property overrides (`ScriptProperty`: boolean, number,
+  vector or text). `src/scene/components.cpp` is the catalog (`engine_components()`: id, name,
+  category, addable, removable, multiple) and the add/remove rules shared by protocol and editor.
+  The Transform and imported model animation (`animator`, which model-node children depend on)
+  cannot be removed. A camera added to a scene without an active camera becomes active.
+- Node types are a tree in `src/scene/node_types.cpp`: Node > Model, PhysicsBody
+  (> FirstPersonController, RigidBody, StaticBody), Camera, Light (> DirectionalLight, PointLight, SpotLight), StaticMesh. Each type
+  adds components to its parent's; `apply_node_type` applies them root first when
+  `scene.create` receives a `type`. Light, PhysicsBody and Model are not creatable (Model comes
+  from import). `node_type()` walks down the tree taking the first child whose own additions the
+  node has, so sibling order is precedence (a lit rigid body is a RigidBody); scripts do not
+  affect it. `scene.list`/`scene.inspect` report it; scene files do not store it
+  (`Scene::list_json(false)`). `nodes.types` returns the tree with inherited component lists.
+- `component.types/add/remove` are the generic protocol; each engine component keeps its own
+  setter (`scene.set_camera` and so on). Script components are edited by index with
+  `scene.set_script` and `scene.set_script_property`; changing a component's behaviour clears its
+  overrides. Scene v13 stores `scripts` arrays; v12's single optional `script` migrates to one
+  component.
+- The First Person Controller is native. `FirstPersonController` (scene v15, component id
+  `first_person_controller`, protocol `scene.set_first_person_controller`) holds walk/sprint/jump
+  speeds, mouse sensitivity, stick look speed, invert Y, ground check distance and the camera
+  child's name. `FirstPersonControllers` (`src/core/first_person.cpp`, owned by `Engine`) starts at
+  Run Game (finds each controller's named camera child and activates the first one), then each
+  game step before scripts turns that camera for look (mouse delta and look_x/look_y, pitch
+  clamped), sets the body's horizontal velocity from move_x/move_y relative to the camera's
+  heading (sprint action), and jumps only when a raycast that ignores the body finds ground.
+  The `FirstPersonController` node type sits under PhysicsBody, adds a 1.8 m capsule (70 kg, no
+  friction or damping, rotation locked), the controller and a child "Camera" at 1.6 m, and
+  places itself 1 m up so it stands on the ground plane. The editor locks the pointer during Run
+  Game when the scene has a controller, even if the input map does not ask for it. The Inspector
+  section warns when the body, rotation lock, collider or camera child is missing.
+- `src/scene/templates.cpp`: project templates are node trees saved as
+  `templates/<name>.relay-template.json` in the ordinary scene format with exactly one root,
+  so loading reuses scene validation and migration. Instantiation copies through
+  `copy_selection`/`paste_selection` in one undoable transaction, so copies are independent and
+  pasted cameras stay inactive. There is no live prefab link or override tracking.
+- The Inspector draws only present components, with a close button and Remove context item on
+  removable headers, and script components as "<Behaviour> (Script)" sections with typed property
+  editors and per-property Reset. **+ Add Component** opens a modal window: category list,
+  component list (present ones disabled and tagged "Added"), description of the selection,
+  search, "New C++ script..." (creates the file and attaches it), Add/Enter and double-click.
+  **+ Add Node** under the Hierarchy (and the Scene and Hierarchy context menus) opens the Add
+  Node window: the type tree (categories dimmed), saved templates, a details pane with the
+  inheritance chain, description and components, an optional name, and "Add as a child of" the
+  selection. The Hierarchy shows the derived type on each row; template files instantiate on
+  double-click, or when dragged onto the viewport (ground point) or a row (child).
+
+### Input
+
+- `InputState` (`src/core/input.cpp`, owned by `Engine`) keeps live control state from platform
+  events and latches it in `begin_step()` at the start of each fixed game step: per control
+  held/pressed/released, a still-down flag so an action with two bindings is not released while
+  one stays down, analog values for sticks and triggers (triggers and sticks read as buttons past
+  half travel), and per-step mouse movement and wheel. Taps shorter than a step still read as one
+  press. `clear_edges()` runs at Run Game.
+- Controls are `key:<name>` (SDL scancode names, so physical positions), `mouse:<left|middle|
+  right|x1|x2>` and `gamepad:<a|b|x|y|...|leftx|...|left_trigger|right_trigger>`. Platform
+  events are produced by `src/platform/sdl_input.cpp` for the Vulkan and CPU windows; it also
+  opens gamepads on connect, without which SDL sent no gamepad events at all (previously the
+  case). Traces from before this change recorded layout-dependent keycodes (`key:down:32`),
+  which no binding matches.
+- `InputMap` holds actions (any bound control) and axes (button pairs or scaled analog bindings,
+  strongest wins, deadzone rescaled), plus `lock_mouse`. Projects store it as
+  `input.relay-input.json` (format `relay.input` v1); without the file the engine defaults apply
+  (move_x/move_y/look_x/look_y, jump, interact, fire, sprint). `Engine::sync_input_map` reloads
+  when the open project changes. Project export includes the file.
+- Protocol: `input.map`, `input.set_map` (validated, saved, applied), `input.state`,
+  `input.simulate` (Run Game only; holds an action or sets an axis for N steps, taking precedence
+  over devices), host-only `input.release` (sends `input:reset`, which traces record), and the
+  older `input.recent` event log. Scripts use the appended `RelayHostApi` input functions through
+  `relay::input` in the SDK. `RelayHostApi` also gained `child` (first direct child by name) and
+  `activate_camera` (a game-time camera switch that Stop Game undoes with the rest of the scene).
+- Editor: during Run Game the game gets keyboard and mouse only after a click on the viewport;
+  Escape or losing window focus returns input and releases held controls, and a viewport label
+  says which state applies. While the game has input, events bypass ImGui entirely, and editor
+  camera navigation stands aside and keeps the pointer locked when the map asks for it (it used
+  to release the lock every frame it was not flying the editor camera, so the cursor stayed
+  free). `EditorUi::game_has_input` and `pointer_locked_for_game` expose the state for tests. **Edit → Game
+  Configuration...** is a page-based window (Input now; Graphics, Physics and Audio listed as
+  upcoming). The Input page edits a local copy with the engine's own parser and serializer and
+  saves every change through `input.set_map`: action and axis tables with renamable names,
+  wrapping binding chips, press-to-bind capture (`sdl_binding_control`; mouse clicks bind only
+  inside the prompt, clicking elsewhere cancels), key-pair and stick bindings, invert, deadzone,
+  live values during Run Game, mouse lock and Reset to defaults.
+
+### Gameplay scripting
+
+- Scripts are C++20 under a project's `scripts/` folder, written against the single SDK header
+  `sdk/relay_script.hpp`. Engine and script library share only the versioned C table in
+  `sdk/relay_script_abi.h` (`RelayHostApi` in, `RelayScriptModule` out, entry
+  `relay_script_module_v1`), so scripts never link against engine internals and C++ exceptions
+  never cross the boundary. `RELAY_BEHAVIOUR(Class)` registers a behaviour by class name.
+- `ScriptSystem` (`src/script/script_system.cpp`, owned by `Engine`) compiles on a background
+  thread with the compiler Relay was built with (`RELAY_SCRIPT_COMPILER` overrides it), up to eight
+  files in parallel, through `run_process` (`src/core/process.cpp`, shared with the Blender
+  adapter). Object files are keyed by toolchain, SDK, all project headers, path and content, so a
+  rebuild only compiles changed files. Output goes to `.relay-cache/scripts/` inside the project
+  (hidden, so browsing and export skip it). Each library has a content-derived name, so `dlopen`
+  never returns a stale mapping; superseded libraries are deleted after a successful load.
+  Compiler output is parsed into file/line diagnostics. Limits: 256 files, 1 MiB each, 120 s per
+  compile, 64 KiB of output.
+- Behaviours declare properties in `properties(relay::Properties&)`. The SDK reads names, types
+  and code defaults once from a fresh instance per behaviour (`property_count`/`property_info`),
+  and the host assigns a node's stored values through `set_property` after construction and
+  before `on_start`, and again after hot reload. Values whose field was renamed or retyped are
+  skipped with a log warning. Instances are per script component; contact callbacks reach every
+  script on both entities.
+- Script components are undoable scene data (see above). `runtime.play` refuses
+  when an enabled script cannot run as authored: no project, untrusted, building, failed build,
+  sources changed since the build, or an undefined behaviour. The editor responds to those
+  refusals by asking for trust or building first, so the engine stays the only source of truth.
+- Frame order: script `on_update`, animation, physics, then contact callbacks from the
+  `physics.contact_events` cursor, delivered to both entities. `on_start` runs after every instance
+  is created; Stop Game calls `on_stop` before restoring the scene. A build that finishes during
+  Run Game destroys instances while the old code is still mapped, recreates them from the new
+  library, and calls `on_reload` (default `on_start`). A thrown exception disables that one
+  instance and is recorded (bounded to 64) with frame, entity, behaviour and callback.
+- Script transform writes teleport the Jolt bodies of the entity and its descendants
+  (`PhysicsWorld::sync_transforms`). Script raycasts use `PhysicsWorld::raycast` against the
+  running world instead of rebuilding one per query, and can ignore the caller's own collider.
+- Trust is per user, outside every project: `trusted-script-projects` in the user config
+  directory (`RELAY_SCRIPT_TRUST_PATH` overrides it; tests use temporary files), keyed by the
+  canonical project folder. `scripts.trust` is host-only; revoking trust unloads the library.
+  Agents can read and write sources (`scripts.read`/`write` are file-scoped on `path`) but cannot
+  make them run in an untrusted project.
 
 ### Rendering and assets
 
@@ -224,6 +359,9 @@ without blocking simultaneous human editing.
   output. Record capture source in status and results.
 - Preserve deterministic tests and captures while extending live rendering.
 - Do not hand-edit generated protocol artifacts. Change the schema and regenerate them.
+- Never build or load project scripts without the user's per-project trust, and never let agents
+  grant it. Keep the script ABI a plain C table: bump `RELAY_SCRIPT_ABI_VERSION` and the entry
+  symbol for incompatible changes, and append new host functions at the end of `RelayHostApi`.
 
 ## Known gaps
 
@@ -243,16 +381,54 @@ without blocking simultaneous human editing.
    desktop smokes (`TREE_FIRST_ROW_Y`, `ASSET_FIRST_ROW`) predate the removed create and import
    rows and need recalibration. The demo scene has not had a real-desktop visual review.
 
+7. Templates copy; they have no live prefab link, nested template references or per-instance
+   override tracking. Built-in meshes are only a flat triangle and quad, so Static Mesh nodes start
+   with a quad until a cube primitive exists; physics body types carry no mesh (as in Godot). The
+   Add Component and Add Node windows, script property editors and template dialog are covered
+   headlessly or by protocol tests, not by a desktop review.
+8. The first person controller is a dynamic rigid body driven by velocity, not a kinematic
+   character controller: it does not step up stairs, has no slope limit, crouch or coyote time,
+   and pushes other dynamic bodies with its full 70 kg. Jolt's CharacterVirtual would handle those
+   and is the next step if characters need them. Its action and axis names are fixed (move_x,
+   move_y, look_x, look_y, jump, sprint). It has simulated-input coverage (landing upright,
+   walking, mouse turn, sprint, grounded-only jump, camera switch and restore), not a desktop
+   play-test.
+9. Input has headless, protocol and compiled-script coverage only. Gamepad input has not been
+   tried with hardware, and viewport focus, mouse lock and binding capture from real SDL events
+   have not been checked on a desktop. Multiple gamepads are merged rather than assigned to
+   players. There is no text input or on-screen cursor API for scripts yet.
+10. Native scripts cannot be contained: a crash or endless loop in a script takes the editor down,
+   and in a trusted project agent-written code runs with the user's privileges. Windows script
+   loading is not implemented (builds report unsupported), and the macOS `.dylib` path has never
+   been run. Scripts cannot create or destroy
+   entities, instantiate templates, or read input yet. A script-driven scale
+   change does not rebuild collider shapes until the next Run Game. The trust prompt and Scripts
+   diagnostics view are covered headlessly only.
+
 ## Next priorities
 
-1. Add gameplay scripting with a lifecycle tied to Run Game and Stop Game, including access to
-   contact events.
-2. Add joints to the Jolt backend.
+1. Add joints to the Jolt backend.
+2. Extend the script API: entity spawn/destroy (including template instantiation) and scene
+   queries such as overlaps. More built-in controllers (third-person, orbit) can follow the first
+   person controller's pattern.
+3. Load scripts on Windows (MSVC or clang-cl flags and `LoadLibraryW`).
 
 ## Verification baseline
 
-The current implementation was verified with development and release builds, all four native
-CTest suites, generated-protocol checks, and 26 ordinary bridge tests. The desktop smokes below
+The current implementation was verified with development and release builds, all five native
+CTest suites (including `relay_script_tests`, which compiles real scripts with the configured
+compiler, including property overrides of every type and scripts reading simulated and raw
+input), generated-protocol checks, and 26 ordinary bridge tests. The workflow suite covers
+component add/remove rules, derived node types, type inheritance and creation of every node type,
+prefab save/instantiate/undo, v12 script migration, the native first person controller (node
+type, settings, v15 save, and play on a floor with simulated input), and input state (taps within a step,
+overlapping bindings, deadzones, inversion, triggers, mouse motion, reset, map validation, saving
+and reloading per project, simulation). The headless editor suite drives the Game Configuration
+input page (press-to-bind actions and key-pair axes, Escape cancel, new actions, reset, wrapping
+that keeps buttons clear of Delete), the Add Component window (categories, add, disabled
+duplicates), section removal, the Add Node tree (indentation, typed creation under the selection,
+non-creatable categories), and the Run Game → trust prompt → build → play flow. The desktop
+smokes below
 predate the asset browser, layout persistence, and frame-pacing changes and were not rerun for
 them; those changes are covered by headless and protocol tests. The live Vulkan shadow and
 visual smokes pass, as does `tests/editor_hdr_upload_smoke.py`: exposure changes captured pixels,
@@ -296,13 +472,16 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Protocol source | `protocol/relay.protocol.json` |
 | Native protocol/session | `src/control/`, `include/relay/control/` |
 | Engine and scene | `src/core/`, `src/scene/` |
+| Components and templates | `src/scene/components.cpp`, `src/scene/templates.cpp` |
 | Demo project and generator | `examples/demo/`, `tools/generate_demo_project.py`, `tools/demo_project/` |
 | Test fixture models | `tests/fixtures/models/` |
 | Physics and collision | `src/physics/`, `include/relay/physics/` |
+| Gameplay scripting | `src/script/`, `include/relay/script/`, `sdk/`, `docs/scripting.md` |
 | Rendering/import | `src/render/`, `shaders/` |
 | Editor | `src/editor/`, `include/relay/editor/` |
 | Agent bridge | `tools/mcp-bridge/src/` |
-| Native tests | `tests/engine_tests.cpp`, `tests/editor_*tests.cpp` |
+| Input | `src/core/input.cpp`, `src/platform/sdl_input.cpp` |
+| Native tests | `tests/engine_tests.cpp`, `tests/script_tests.cpp`, `tests/editor_*tests.cpp` |
 | Bridge tests | `tools/mcp-bridge/tests/` |
 
 When implementation changes, update this present-state summary instead of appending dated logs.

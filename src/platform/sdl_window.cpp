@@ -1,4 +1,5 @@
 #include "relay/platform/sdl_window.hpp"
+#include "relay/platform/sdl_input.hpp"
 
 #include "relay/render/renderer.hpp"
 
@@ -59,24 +60,8 @@ std::string SdlWindow::error() const {
 bool SdlWindow::poll_quit() {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
-        if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
-            impl_->pending_input_events.push_back(
-                std::string{"key:"} + (event.type == SDL_EVENT_KEY_DOWN ? "down:" : "up:") +
-                std::to_string(static_cast<std::int64_t>(event.key.key)));
-        } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
-            impl_->pending_input_events.push_back("mouse_motion:" + std::to_string(event.motion.x) + ':' +
-                                                  std::to_string(event.motion.y));
-        } else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
-            impl_->pending_input_events.push_back("gamepad_axis:" + std::to_string(event.gaxis.which) + ':' +
-                                                  std::to_string(event.gaxis.axis) + ':' +
-                                                  std::to_string(event.gaxis.value));
-        } else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
-                   event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
-            impl_->pending_input_events.push_back(
-                std::string{"gamepad_button:"} +
-                (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? "down:" : "up:") +
-                std::to_string(event.gbutton.which) + ':' + std::to_string(event.gbutton.button));
-        }
+        sdl_track_gamepads(event);
+        if (auto input = sdl_input_event(event)) impl_->pending_input_events.push_back(std::move(*input));
         if (event.type == SDL_EVENT_QUIT) return true;
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE) return true;
     }

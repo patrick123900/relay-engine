@@ -57,7 +57,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_assets_browse{{
 
 constexpr std::array<ProtocolFieldSpec, 2> fields_assets_search{{
     {"query", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 64U, "", ""},
-    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 10U, "^(folder|model|scene|image|shader|script|text|media|project|other)$", ""},
+    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 11U, "^(folder|model|scene|template|image|shader|script|text|media|project|other)$", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_assets_create_folder{{
@@ -82,6 +82,16 @@ constexpr std::array<ProtocolFieldSpec, 2> fields_performance_read{{
     {"limit", ProtocolValueType::integer, false, false, true, true, 1, 240, 0U, 0U, "", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 1> fields_input_set_map{{
+    {"map", ProtocolValueType::string, true, false, false, false, 0, 0, 2U, 262144U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 3> fields_input_simulate{{
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 64U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
+    {"value", ProtocolValueType::number, false, false, true, true, -1, 1, 0U, 0U, "", ""},
+    {"frames", ProtocolValueType::integer, false, false, true, true, 1, 3600, 0U, 0U, "", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 4> fields_video_start{{
     {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.webm$", ""},
     {"fps", ProtocolValueType::integer, false, false, true, true, 1, 60, 0U, 0U, "", ""},
@@ -93,9 +103,10 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scene_inspect{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 2> fields_scene_create{{
+constexpr std::array<ProtocolFieldSpec, 3> fields_scene_create{{
     {"name", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 128U, "", ""},
     {"parent", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "Node|Camera|DirectionalLight|PointLight|SpotLight|FirstPersonController|RigidBody|StaticBody|StaticMesh"},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_scene_destroy{{
@@ -211,7 +222,7 @@ constexpr std::array<ProtocolFieldSpec, 7> fields_physics_apply_impulse{{
     {"point_z", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 9> fields_scene_set_physics_body{{
+constexpr std::array<ProtocolFieldSpec, 10> fields_scene_set_physics_body{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "static|dynamic"},
@@ -221,6 +232,79 @@ constexpr std::array<ProtocolFieldSpec, 9> fields_scene_set_physics_body{{
     {"friction", ProtocolValueType::number, false, false, true, true, 0, 10, 0U, 0U, "", ""},
     {"linear_damping", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
     {"angular_damping", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
+    {"lock_rotation", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 10> fields_scene_set_first_person_controller{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"walk_speed", ProtocolValueType::number, false, false, true, true, 0, 1000, 0U, 0U, "", ""},
+    {"sprint_speed", ProtocolValueType::number, false, false, true, true, 0, 1000, 0U, 0U, "", ""},
+    {"jump_speed", ProtocolValueType::number, false, false, true, true, 0, 1000, 0U, 0U, "", ""},
+    {"mouse_sensitivity", ProtocolValueType::number, false, false, true, true, 0, 10, 0U, 0U, "", ""},
+    {"stick_look_speed", ProtocolValueType::number, false, false, true, true, 0, 3600, 0U, 0U, "", ""},
+    {"invert_y", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"ground_distance", ProtocolValueType::number, false, false, true, true, 0.001, 100, 0U, 0U, "", ""},
+    {"camera", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 128U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_scripts_trust{{
+    {"trusted", ProtocolValueType::boolean, true, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_scripts_read{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9_][A-Za-z0-9._/-]*\\.(cpp|cc|cxx|hpp|h|hh)$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_scripts_write{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9_][A-Za-z0-9._/-]*\\.(cpp|cc|cxx|hpp|h|hh)$", ""},
+    {"source", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 262144U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_scripts_create{{
+    {"behaviour", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 3> fields_component_add{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|first_person_controller|keyframes|script"},
+    {"behaviour", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 3> fields_component_remove{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|first_person_controller|keyframes|script"},
+    {"index", ProtocolValueType::integer, false, false, true, true, 0, 31, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_script{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"index", ProtocolValueType::integer, true, false, true, true, 0, 31, 0U, 0U, "", ""},
+    {"behaviour", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
+    {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 8> fields_scene_set_script_property{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"index", ProtocolValueType::integer, true, false, true, true, 0, 31, 0U, 0U, "", ""},
+    {"property", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
+    {"number", ProtocolValueType::number, false, false, true, true, -1000000000000000.0, 1000000000000000.0, 0U, 0U, "", ""},
+    {"boolean", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"text", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 1024U, "", ""},
+    {"vector", ProtocolValueType::number_array, false, false, false, false, 0, 0, 3U, 3U, "", ""},
+    {"reset", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 3> fields_templates_instantiate{{
+    {"template", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 80U, "^project:[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"parent", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"name", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 128U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 3> fields_templates_save{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"replace", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 13> fields_scene_set_light{{
@@ -426,7 +510,7 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_chat_control{{
     {"provider", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "openai|compatible"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 105> methods{{
+constexpr std::array<ProtocolMethodSpec, 127> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -456,13 +540,18 @@ constexpr std::array<ProtocolMethodSpec, 105> methods{{
     {"logs.read", "logs_read", "Read Relay logs", "Read structured engine log entries newer than a sequence number.", true, false, false, false, false, fields_logs_read},
     {"performance.read", "performance_read", "Read Relay performance", "Read bounded per-frame CPU/GPU timing, draw/resource counts, entities and process memory.", true, false, false, false, false, fields_performance_read},
     {"input.recent", "input_recent", "Read recent Relay input", "Read the bounded normalized keyboard, mouse and gamepad input event history.", true, false, false, false, false, no_fields},
+    {"input.map", "input_map", "Read input map", "Read the project's input map: named actions bound to keys, mouse buttons or gamepad buttons, and axes built from button pairs or gamepad sticks. Also returns the engine defaults. Controls look like key:space, key:left_shift, mouse:left, gamepad:a or gamepad:leftx.", true, false, false, false, false, no_fields},
+    {"input.set_map", "input_set_map", "Replace input map", "Validate, save as input.relay-input.json in the project and apply a complete input map document (format relay.input, version 1) as returned by input.map.", false, true, false, false, false, fields_input_set_map},
+    {"input.state", "input_state", "Inspect game input", "Read the current game step's input: each action's held and pressed state, each axis value, held controls and mouse movement.", true, false, false, false, false, no_fields},
+    {"input.simulate", "input_simulate", "Simulate game input", "Hold an action, or set an axis value, for a number of game steps during Run Game, as if a player pressed it. Use it with runtime.step to play-test scripts.", false, false, false, false, false, fields_input_simulate},
+    {"input.release", "input_release", "Release game input", "Host-only. Release every held control, used when the game viewport loses input focus.", false, false, false, true, false, no_fields},
     {"video.start", "video_start", "Start Relay video", "Record real Vulkan or deterministic CPU frames to WebM with explicit frame drops.", false, false, false, false, false, fields_video_start},
     {"video.capabilities", "video_capabilities", "Inspect video capabilities", "Report whether this Relay build found the FFmpeg WebM encoder.", true, false, false, false, false, no_fields},
     {"video.stop", "video_stop", "Stop Relay video", "Drain pending readbacks and start background WebM finalization; poll video.status for completion and errors.", false, false, false, false, false, no_fields},
     {"video.status", "video_status", "Inspect Relay video", "Read recording state, submitted frames and explicitly reported frame drops.", true, false, false, false, false, no_fields},
     {"scene.list", "scene_list", "List scene entities", "List every live entity with its name, parent and local transform.", true, false, false, false, false, no_fields},
     {"scene.inspect", "scene_inspect", "Inspect scene entity", "Inspect one entity using its stable generation-checked handle.", true, false, false, false, false, fields_scene_inspect},
-    {"scene.create", "scene_create", "Create scene entity", "Create a named entity, optionally parented to another live entity.", false, false, false, false, false, fields_scene_create},
+    {"scene.create", "scene_create", "Create scene node", "Create a node, optionally of a node type from nodes.types (which gives it that type's components, inherited from its ancestors) and optionally parented to another live node.", false, false, false, false, false, fields_scene_create},
     {"scene.destroy", "scene_destroy", "Destroy scene entity", "Destroy an entity and its descendants as one undoable transaction.", false, true, false, false, false, fields_scene_destroy},
     {"scene.duplicate", "scene_duplicate", "Duplicate scene entity", "Copy an entity and its descendants beside the original as one undoable transaction. Components are preserved, a copied camera is never the active one, and a copy of a whole imported model drives its own animation.", false, false, false, false, false, fields_scene_duplicate},
     {"scene.clear", "scene_clear", "Clear the scene", "Destroy every entity as one undoable transaction, leaving an empty scene to start new work in.", false, true, false, false, false, no_fields},
@@ -482,6 +571,23 @@ constexpr std::array<ProtocolMethodSpec, 105> methods{{
     {"physics.contact_events", "physics_contact_events", "Read collision contacts", "Read bounded contact begin and end events from the current game session, using a sequence cursor. Events are cleared on Stop Game.", true, false, false, false, false, fields_physics_contact_events},
     {"physics.apply_impulse", "physics_apply_impulse", "Apply rigid body impulse", "Apply a world-space impulse to a dynamic body during Run Game. Optional world-space point produces torque and angular motion.", false, false, false, false, false, fields_physics_apply_impulse},
     {"scene.set_physics_body", "scene_set_physics_body", "Configure physics body", "Add, edit or remove an undoable static or dynamic physics body. Dynamic bodies use Jolt rigid-body collision, gravity and angular dynamics during Run Game.", false, false, false, false, false, fields_scene_set_physics_body},
+    {"scene.set_first_person_controller", "scene_set_first_person_controller", "Configure first person controller", "Add, edit or remove an undoable first person controller component. During Run Game it looks around with the mouse and look_x/look_y through a child camera node, walks with move_x/move_y relative to the view, sprints and jumps (only on the ground). It needs a dynamic physics body with rotation locked and a collider; scene.create with type FirstPersonController sets all of that up.", false, false, false, false, false, fields_scene_set_first_person_controller},
+    {"scripts.status", "scripts_status", "Inspect gameplay scripts", "Read native C++ script state: project trust, build state, whether sources changed since the last build, registered behaviours, compiler diagnostics with file and line, and runtime errors from behaviour callbacks.", true, false, false, false, false, no_fields},
+    {"scripts.build", "scripts_build", "Build gameplay scripts", "Compile the project's scripts/ C++ files into a native library in the background; unchanged files are reused. Poll scripts.status until the state is ready or failed. A build that finishes during Run Game hot reloads the running behaviours. Requires a project a person has trusted.", false, false, false, false, false, no_fields},
+    {"scripts.trust", "scripts_trust", "Trust project scripts", "Host-only. Allow or forbid building and running this project's native C++ scripts, which run with the editor's full privileges. Stored per user, outside the project.", false, false, false, true, false, fields_scripts_trust},
+    {"scripts.sdk", "scripts_sdk", "Read script SDK", "Return relay_script.hpp, the complete C++ API available to gameplay scripts, with usage notes and frame order. Read it before writing a script.", true, false, false, false, false, no_fields},
+    {"scripts.read", "scripts_read", "Read script source", "Read a C++ source or header from the project's scripts/ folder.", true, false, false, false, false, fields_scripts_read},
+    {"scripts.write", "scripts_write", "Write script source", "Create or replace a C++ source or header in the project's scripts/ folder, creating subfolders. Allowed during Run Game; build afterwards to compile it or hot reload it.", false, true, false, false, false, fields_scripts_write},
+    {"scripts.create", "scripts_create", "Create behaviour script", "Create scripts/<behaviour>.cpp from a starter template defining and registering that behaviour class. Refuses to overwrite.", false, false, false, false, false, fields_scripts_create},
+    {"component.types", "component_types", "List component types", "List every component a node can carry: engine components with their category and whether they can be added, removed or repeated, plus each built script behaviour with its declared properties and code defaults.", true, false, false, false, false, no_fields},
+    {"component.add", "component_add", "Add component", "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.", false, false, false, false, false, fields_component_add},
+    {"component.remove", "component_remove", "Remove component", "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.", false, true, false, false, false, fields_component_remove},
+    {"scene.set_script", "scene_set_script", "Configure script component", "Change the behaviour or enabled state of one of a node's script components, as an undoable transaction.", false, false, false, false, false, fields_scene_set_script},
+    {"scene.set_script_property", "scene_set_script_property", "Set script property", "Store a value for a behaviour property on one script component, or reset it to the code default. Send exactly one of number, boolean, text or vector unless resetting.", false, false, false, false, false, fields_scene_set_script_property},
+    {"nodes.types", "nodes_types", "List node types", "List the node type tree. Each type adds components to its parent's; creatable types can be passed to scene.create. A node's reported type is the deepest type whose components it has.", true, false, false, false, false, no_fields},
+    {"templates.list", "templates_list", "List node templates", "List the project's saved templates (prefabs) with the node type of each root. Built-in node types are listed by nodes.types.", true, false, false, false, false, no_fields},
+    {"templates.instantiate", "templates_instantiate", "Create node from template", "Create a saved node tree from a project template as one undoable transaction and return its root. The result is an independent copy.", false, false, false, false, false, fields_templates_instantiate},
+    {"templates.save", "templates_save", "Save node as template", "Save a node and its children as a project template in templates/<name>.relay-template.json, usable from the Create menu and templates.instantiate.", false, true, false, false, false, fields_templates_save},
     {"scene.set_light", "scene_set_light", "Configure scene light", "Add, update or remove a directional, point or spot light.", false, false, false, false, false, fields_scene_set_light},
     {"scene.rename", "scene_rename", "Rename scene entity", "Change an entity's display name as one undoable transaction.", false, false, false, false, false, fields_scene_rename},
     {"scene.history", "scene_history", "Inspect undo history", "Read the labels currently on the undo and redo stacks, newest first.", true, false, false, false, false, no_fields},

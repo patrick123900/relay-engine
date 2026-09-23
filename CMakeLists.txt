@@ -48,8 +48,11 @@ add_library(relay_engine
     src/control/local_server.cpp
     src/control/protocol_validation.cpp
     src/core/engine.cpp
+    src/core/first_person.cpp
     src/core/hash.cpp
+    src/core/input.cpp
     src/core/log.cpp
+    src/core/process.cpp
     src/physics/collision.cpp
     src/physics/jolt_world.cpp
     src/observe/capture.cpp
@@ -67,15 +70,23 @@ add_library(relay_engine
     src/render/shader_reflection.cpp
     src/render/vulkan_device.cpp
     src/scene/scene.cpp
+    src/scene/components.cpp
+    src/scene/templates.cpp
+    src/scene/node_types.cpp
     src/scene/project.cpp
     src/scene/project_package.cpp
     src/scene/project_files.cpp
     src/scene/scene_edit.cpp
     src/scene/scene_history.cpp
     src/scene/scene_io.cpp
+    src/script/script_system.cpp
 )
 add_library(Relay::Engine ALIAS relay_engine)
-target_link_libraries(relay_engine PRIVATE Jolt)
+target_link_libraries(relay_engine PRIVATE Jolt ${CMAKE_DL_LIBS})
+# Project scripts compile with the same compiler as Relay unless RELAY_SCRIPT_COMPILER overrides it.
+target_compile_definitions(relay_engine PRIVATE
+    RELAY_SCRIPT_DEFAULT_COMPILER="${CMAKE_CXX_COMPILER}"
+    RELAY_SCRIPT_DEFAULT_SDK_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sdk")
 add_dependencies(relay_engine relay_protocol_codegen_check)
 
 target_compile_features(relay_engine PUBLIC cxx_std_20)
@@ -176,7 +187,7 @@ if(RELAY_ENABLE_SDL)
     endif()
 
     if(TARGET SDL3::SDL3)
-        target_sources(relay_demo PRIVATE src/platform/sdl_window.cpp)
+        target_sources(relay_demo PRIVATE src/platform/sdl_window.cpp src/platform/sdl_input.cpp)
         target_link_libraries(relay_demo PRIVATE SDL3::SDL3)
         target_compile_definitions(relay_demo PRIVATE RELAY_HAS_SDL3=1)
 
@@ -371,6 +382,11 @@ if(RELAY_BUILD_TESTS)
         RELAY_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     relay_enable_warnings(relay_workflow_tests)
     add_test(NAME relay_workflow_tests COMMAND relay_workflow_tests)
+    add_executable(relay_script_tests tests/script_tests.cpp)
+    target_link_libraries(relay_script_tests PRIVATE Relay::Engine)
+    relay_enable_warnings(relay_script_tests)
+    add_test(NAME relay_script_tests COMMAND relay_script_tests)
+    set_tests_properties(relay_script_tests PROPERTIES TIMEOUT 600)
     # Regenerates examples/demo; see tools/generate_demo_project.py.
     add_executable(relay_build_demo_project tools/demo_project/build_demo_project.cpp)
     target_link_libraries(relay_build_demo_project PRIVATE Relay::Engine)
@@ -385,7 +401,7 @@ if(RELAY_BUILD_TESTS)
     if(TARGET relay_imgui)
         add_executable(relay_editor_headless_tests tests/editor_headless_tests.cpp
             src/editor/editor_ui.cpp src/editor/editor_theme.cpp src/editor/editor_layout.cpp src/editor/chat_media.cpp
-            src/editor/file_browser.cpp)
+            src/editor/file_browser.cpp src/platform/sdl_input.cpp)
         target_link_libraries(relay_editor_headless_tests PRIVATE Relay::Engine relay_imgui)
         target_compile_definitions(relay_editor_headless_tests PRIVATE RELAY_CHAT_MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat-media")
         relay_enable_warnings(relay_editor_headless_tests)

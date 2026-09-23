@@ -22,7 +22,7 @@ inline constexpr std::size_t maximum_asset_search_results = 512U;
 
 // Coarse file categories for browsing and filtering, decided by name alone.
 enum class AssetKind : std::uint8_t {
-    folder, model, scene, image, shader, script, text, media, project, other
+    folder, model, scene, node_template, image, shader, script, text, media, project, other
 };
 [[nodiscard]] std::string_view asset_kind_name(AssetKind kind);
 [[nodiscard]] std::optional<AssetKind> asset_kind_from_name(std::string_view name);

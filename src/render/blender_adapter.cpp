@@ -1,6 +1,7 @@
 #include "relay/render/blender_adapter.hpp"
 
 #include "relay/core/hash.hpp"
+#include "relay/core/process.hpp"
 #include "relay/core/json.hpp"
 
 #include <algorithm>
@@ -32,198 +33,6 @@ constexpr std::uintmax_t maximum_conversion_bytes = 64U * 1024U * 1024U;
 constexpr std::size_t maximum_diagnostic_bytes = 64U * 1024U;
 constexpr std::string_view adapter_version = "relay-blender-glb-v2";
 
-struct ProcessResult {
-    bool started{};
-    bool timed_out{};
-    int exit_code{-1};
-    std::string output;
-};
-
-void append_bounded(std::string& destination, const char* bytes, const std::size_t size) {
-    const auto available = maximum_diagnostic_bytes > destination.size()
-                               ? maximum_diagnostic_bytes - destination.size() : 0U;
-    destination.append(bytes, std::min(size, available));
-}
-
-#ifdef _WIN32
-std::wstring widen(const std::string& text) {
-    if (text.empty()) return {};
-    const auto length = MultiByteToWideChar(CP_UTF8, 0, text.data(),
-                                             static_cast<int>(text.size()), nullptr, 0);
-    if (length <= 0) return {};
-    std::wstring output(static_cast<std::size_t>(length), L'\0');
-    (void)MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
-                              output.data(), length);
-    return output;
-}
-
-std::wstring quote_windows_argument(const std::string& argument) {
-    const auto value = widen(argument);
-    if (value.find_first_of(L" \t\"") == std::wstring::npos) return value;
-    std::wstring output{L'"'};
-    std::size_t slashes = 0U;
-    for (const auto character : value) {
-        if (character == L'\\') {
-            ++slashes;
-        } else if (character == L'"') {
-            output.append(slashes * 2U + 1U, L'\\');
-            output.push_back(character);
-            slashes = 0U;
-        } else {
-            output.append(slashes, L'\\');
-            output.push_back(character);
-            slashes = 0U;
-        }
-    }
-    output.append(slashes * 2U, L'\\');
-    output.push_back(L'"');
-    return output;
-}
-
-ProcessResult run_process(const std::vector<std::string>& arguments,
-                          const std::chrono::seconds timeout) {
-    ProcessResult result;
-    if (arguments.empty()) return result;
-    SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
-    HANDLE read_pipe = nullptr;
-    HANDLE write_pipe = nullptr;
-    if (CreatePipe(&read_pipe, &write_pipe, &security, 0) == 0) return result;
-    (void)SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
-    std::wstring command;
-    for (const auto& argument : arguments) {
-        if (!command.empty()) command.push_back(L' ');
-        command += quote_windows_argument(argument);
-    }
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdOutput = write_pipe;
-    startup.hStdError = write_pipe;
-    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    PROCESS_INFORMATION process{};
-    result.started = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
-                                    CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr,
-                                    &startup, &process) != 0;
-    CloseHandle(write_pipe);
-    if (!result.started) {
-        CloseHandle(read_pipe);
-        return result;
-    }
-    const auto job = CreateJobObjectW(nullptr, nullptr);
-    bool job_assigned = false;
-    if (job != nullptr) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        (void)SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
-                                      sizeof(limits));
-        job_assigned = AssignProcessToJobObject(job, process.hProcess) != 0;
-    }
-    (void)ResumeThread(process.hThread);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    std::array<char, 4096> buffer{};
-    while (true) {
-        DWORD available = 0U;
-        if (PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr) != 0 && available > 0U) {
-            DWORD read = 0U;
-            if (ReadFile(read_pipe, buffer.data(),
-                         std::min<DWORD>(available, static_cast<DWORD>(buffer.size())),
-                         &read, nullptr) != 0) {
-                append_bounded(result.output, buffer.data(), read);
-            }
-        }
-        if (WaitForSingleObject(process.hProcess, 10U) == WAIT_OBJECT_0) break;
-        if (std::chrono::steady_clock::now() >= deadline) {
-            result.timed_out = true;
-            if (job_assigned) (void)TerminateJobObject(job, 124U);
-            else (void)TerminateProcess(process.hProcess, 124U);
-            (void)WaitForSingleObject(process.hProcess, INFINITE);
-            break;
-        }
-    }
-    DWORD available = 0U;
-    DWORD read = 0U;
-    while (PeekNamedPipe(read_pipe, nullptr, 0U, nullptr, &available, nullptr) != 0 &&
-           available > 0U &&
-           ReadFile(read_pipe, buffer.data(),
-                    std::min<DWORD>(available, static_cast<DWORD>(buffer.size())),
-                    &read, nullptr) != 0 && read > 0U) {
-        append_bounded(result.output, buffer.data(), read);
-    }
-    DWORD exit_code = 1U;
-    (void)GetExitCodeProcess(process.hProcess, &exit_code);
-    result.exit_code = static_cast<int>(exit_code);
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    if (job != nullptr) CloseHandle(job);
-    CloseHandle(read_pipe);
-    return result;
-}
-#else
-ProcessResult run_process(const std::vector<std::string>& arguments,
-                          const std::chrono::seconds timeout) {
-    ProcessResult result;
-    if (arguments.empty()) return result;
-    std::vector<char*> values;
-    values.reserve(arguments.size() + 1U);
-    for (const auto& argument : arguments) {
-        values.push_back(const_cast<char*>(argument.c_str()));
-    }
-    values.push_back(nullptr);
-    std::array<int, 2> output_pipe{};
-    if (pipe(output_pipe.data()) != 0) return result;
-    const auto child = fork();
-    if (child < 0) {
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        return result;
-    }
-    if (child == 0) {
-        (void)setpgid(0, 0);
-        (void)dup2(output_pipe[1], STDOUT_FILENO);
-        (void)dup2(output_pipe[1], STDERR_FILENO);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        const auto null_input = open("/dev/null", O_RDONLY);
-        if (null_input >= 0) {
-            (void)dup2(null_input, STDIN_FILENO);
-            close(null_input);
-        }
-        execvp(values.front(), values.data());
-        _exit(127);
-    }
-    result.started = true;
-    (void)setpgid(child, child);
-    close(output_pipe[1]);
-    const auto flags = fcntl(output_pipe[0], F_GETFL, 0);
-    if (flags >= 0) (void)fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    std::array<char, 4096> buffer{};
-    int status = 0;
-    while (true) {
-        const auto count = read(output_pipe[0], buffer.data(), buffer.size());
-        if (count > 0) append_bounded(result.output, buffer.data(), static_cast<std::size_t>(count));
-        const auto waited = waitpid(child, &status, WNOHANG);
-        if (waited == child) break;
-        if (waited < 0 && errno != EINTR) break;
-        if (std::chrono::steady_clock::now() >= deadline) {
-            result.timed_out = true;
-            (void)kill(-child, SIGKILL);
-            (void)waitpid(child, &status, 0);
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
-    }
-    while (true) {
-        const auto count = read(output_pipe[0], buffer.data(), buffer.size());
-        if (count <= 0) break;
-        append_bounded(result.output, buffer.data(), static_cast<std::size_t>(count));
-    }
-    close(output_pipe[0]);
-    if (WIFEXITED(status)) result.exit_code = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status)) result.exit_code = 128 + WTERMSIG(status);
-    return result;
-}
-#endif
 
 std::filesystem::path selected_executable(const BlenderConversionSettings& settings) {
     if (!settings.executable.empty()) return settings.executable;
@@ -366,7 +175,7 @@ BlenderConversionResult convert_blend_to_glb(const std::filesystem::path& assets
     }
     result.sandboxed = !trusted;
     const auto version = run_process(version_arguments,
-                                     std::chrono::seconds{10});
+                                     std::chrono::seconds{10}, maximum_diagnostic_bytes);
     if (!version.started || version.timed_out || version.exit_code != 0) {
         error = version.timed_out ? "Blender version probe timed out"
                                   : "Blender or its Bubblewrap sandbox could not start; configure "
@@ -390,7 +199,7 @@ BlenderConversionResult convert_blend_to_glb(const std::filesystem::path& assets
         {executable.string(), "--background", "--factory-startup", "--disable-autoexec",
          canonical_source.string(), "--python-exit-code", "1", "--python-expr",
          std::string{dependency_expression}, "--", "relay-dependencies"}, trusted),
-        std::chrono::seconds{settings.timeout_seconds});
+        std::chrono::seconds{settings.timeout_seconds}, maximum_diagnostic_bytes);
     result.diagnostics = preflight.output;
     if (!preflight.started || preflight.timed_out || preflight.exit_code != 0) {
         error = preflight.timed_out ? "Blender dependency preflight timed out"
@@ -485,7 +294,7 @@ BlenderConversionResult convert_blend_to_glb(const std::filesystem::path& assets
         {executable.string(), "--background", "--factory-startup", "--disable-autoexec",
          canonical_source.string(), "--python-exit-code", "1", "--python-expr", expression, "--",
          temporary.string()}, trusted, canonical_cache),
-        std::chrono::seconds{settings.timeout_seconds});
+        std::chrono::seconds{settings.timeout_seconds}, maximum_diagnostic_bytes);
     result.diagnostics = conversion.output;
     if (!conversion.started || conversion.timed_out || conversion.exit_code != 0) {
         std::filesystem::remove(temporary, code);

@@ -1,15 +1,20 @@
 #include "relay/control/control_protocol.hpp"
+#include "relay/core/input.hpp"
+#include "relay/core/json.hpp"
 #include "relay/core/engine.hpp"
 #include "relay/editor/editor_layout.hpp"
 #include "relay/editor/editor_ui.hpp"
 #include "relay/editor/chat_media.hpp"
 #include "relay/editor/wrapped_input.hpp"
 #include "relay/render/scene_render.hpp"
+#include "relay/script/script_system.hpp"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -928,12 +933,297 @@ void media_ui(const std::filesystem::path& fixture) {
 
 } // namespace
 
+void components_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    const auto node = engine.scene().create("Plain");
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize component editor without windows");
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + node.to_string()));
+    frame(ui, 3);
+    check(ui.headless_item_rect("inspector:add_component").has_value(),
+          "Inspector ends with an Add Component button");
+    for (const char* id : {"camera", "mesh_renderer", "light", "collider", "physics_body", "keyframes"})
+        check(!ui.headless_item_rect(std::string{"inspector:component:"} + id),
+              "Inspector shows no section for a component the node lacks");
+    click_center(ui, *ui.headless_item_rect("inspector:add_component"));
+    frame(ui, 2);
+    const auto light = ui.headless_item_rect("component_window:item:light");
+    check(light.has_value() && ui.headless_item_rect("component_window:item:camera") &&
+              ui.headless_item_rect("component_window:category:Physics"),
+          "the Add Component window lists categories and engine components");
+    click_center(ui, *ui.headless_item_rect("component_window:category:Physics"));
+    frame(ui, 2);
+    check(!ui.headless_item_rect("component_window:item:light") &&
+              ui.headless_item_rect("component_window:item:collider"),
+          "choosing a category narrows the list");
+    click_center(ui, *ui.headless_item_rect("component_window:category:All"));
+    click_center(ui, *ui.headless_item_rect("component_window:item:light"));
+    click_center(ui, *ui.headless_item_rect("component_window:add"));
+    frame(ui, 3);
+    check(engine.scene().get(node)->light.has_value(), "choosing a component and Add adds it");
+    check(ui.headless_item_rect("inspector:component:light").has_value(),
+          "an added component gets its Inspector section");
+    click_center(ui, *ui.headless_item_rect("inspector:add_component"));
+    frame(ui, 2);
+    // A present component is drawn disabled, so neither clicking it nor Add does anything.
+    click_center(ui, *ui.headless_item_rect("component_window:item:light"));
+    click_center(ui, *ui.headless_item_rect("component_window:add"));
+    key(ui, ImGuiKey_Escape, false);
+    check(engine.scene().get(node)->light.has_value() && !ui.headless_item_rect("component_window:add"),
+          "a present component cannot be added twice, and Escape closes the window");
+    check(protocol.handle(R"({"id":3,"method":"component.remove","entity":")" + node.to_string() +
+                          R"(","component":"light"})").find("\"ok\":true") != std::string::npos,
+          "remove the light through the protocol");
+    frame(ui, 40);
+    check(!ui.headless_item_rect("inspector:component:light"),
+          "a removed component's section disappears entirely");
+
+    // The Hierarchy's Add Node window creates typed nodes from the inheritance tree.
+    const auto before = engine.scene().entities().size();
+    click_center(ui, *ui.headless_item_rect("hierarchy:add_node"));
+    frame(ui, 2);
+    check(ui.headless_item_rect("node_window:type:Node") && ui.headless_item_rect("node_window:type:RigidBody") &&
+              ui.headless_item_rect("node_window:type:PointLight"),
+          "the Add Node window shows the node type tree");
+    const auto parent = *ui.headless_item_rect("node_window:type:PhysicsBody");
+    const auto child = *ui.headless_item_rect("node_window:type:RigidBody");
+    check(child[0] > parent[0] && child[1] > parent[1], "subtypes are indented under their parent");
+    click(ui, child);
+    click_center(ui, *ui.headless_item_rect("node_window:create"));
+    frame(ui, 3);
+    check(engine.scene().entities().size() == before + 1U, "Create adds one node");
+    relay::Entity created{};
+    for (const auto entity : engine.scene().entities())
+        if (engine.scene().get(entity)->name == "Rigid Body") created = entity;
+    check(created.valid() && engine.scene().get(created)->collider &&
+              engine.scene().get(created)->physics_body &&
+              engine.scene().get(created)->parent == node,
+          "the created node has its type's inherited components, under the selected node");
+    click_center(ui, *ui.headless_item_rect("hierarchy:add_node"));
+    frame(ui, 2);
+    click(ui, *ui.headless_item_rect("node_window:type:PhysicsBody"));
+    click_center(ui, *ui.headless_item_rect("node_window:create"));
+    key(ui, ImGuiKey_Escape, false);
+    check(engine.scene().entities().size() == before + 1U, "category types cannot be created");
+    std::cout << "Headless component Inspector tests passed\n";
+}
+
+void key_event(relay::EditorUi& ui, SDL_Scancode scancode) {
+    SDL_Event event{};
+    event.type = SDL_EVENT_KEY_DOWN;
+    event.key.scancode = scancode;
+    (void)ui.handle_event(&event);
+    event.type = SDL_EVENT_KEY_UP;
+    (void)ui.handle_event(&event);
+    frame(ui, 2);
+}
+
+void game_configuration_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/configured/project.relayproject","name":"Configured"})")
+              .find("\"ok\":true") != std::string::npos, "create configuration project");
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize configuration editor without windows");
+    frame(ui, 5);
+    click_center(ui, *ui.headless_item_rect("menu:edit"));
+    const auto item = ui.headless_item_rect("menu:edit:game_configuration");
+    check(item.has_value(), "the Edit menu offers Game Configuration");
+    click_center(ui, *item);
+    frame(ui, 3);
+    check(ui.headless_item_rect("config:window") && ui.headless_item_rect("config:page:input"),
+          "Game Configuration opens on its Input page");
+    const auto add = ui.headless_item_rect("config:input:action:jump:add");
+    check(add.has_value() && ui.headless_item_rect("config:input:chip:Space"),
+          "the Input page lists default actions with readable bindings");
+    click_center(ui, *add);
+    check(ui.headless_item_rect("config:input:capture").has_value(),
+          "adding a binding waits for a control");
+    key_event(ui, SDL_SCANCODE_Q);
+    const auto jump = [&] {
+        const auto& actions = engine.input().map().actions;
+        return *std::find_if(actions.begin(), actions.end(),
+                             [](const relay::InputAction& action) { return action.name == "jump"; });
+    };
+    check(jump().bindings.back() == "key:q" && !ui.headless_item_rect("config:input:capture"),
+          "pressing a key binds it to the action by physical position");
+    check(std::filesystem::exists("projects/configured/input.relay-input.json"),
+          "a binding change saves the project's input map");
+    click_center(ui, *ui.headless_item_rect("config:input:action:jump:add"));
+    key_event(ui, SDL_SCANCODE_ESCAPE);
+    check(!ui.headless_item_rect("config:input:capture") && jump().bindings.size() == 3U,
+          "Escape cancels a binding capture");
+
+    const auto keys = *ui.headless_item_rect("config:input:axis:move_x:keys");
+    const auto remove = *ui.headless_item_rect("config:input:axis:move_x:delete");
+    check(keys[2] <= remove[0] || keys[1] >= remove[3],
+          "binding buttons wrap inside their column instead of covering Delete");
+    click_center(ui, *ui.headless_item_rect("config:input:axis:move_x:keys"));
+    key_event(ui, SDL_SCANCODE_J);
+    key_event(ui, SDL_SCANCODE_L);
+    const auto& move_x = engine.input().map().axes.front();
+    check(move_x.bindings.back().negative == "key:j" && move_x.bindings.back().positive == "key:l",
+          "a key pair is captured as negative, then positive");
+
+    click_center(ui, *ui.headless_item_rect("config:input:new_action"));
+    type_text(ui, "dash");
+    key(ui, ImGuiKey_Enter, false);
+    check(ui.headless_item_rect("config:input:capture").has_value(),
+          "a new action immediately waits for its first binding");
+    key_event(ui, SDL_SCANCODE_K);
+    const auto& actions = engine.input().map().actions;
+    check(actions.back().name == "dash" && actions.back().bindings == std::vector<std::string>{"key:k"},
+          "a new action is added and bound");
+    frame(ui, 2);
+    click_center(ui, *ui.headless_item_rect("hierarchy:add_node"));
+    frame(ui, 2);
+    const auto controller = ui.headless_item_rect("node_window:type:FirstPersonController");
+    check(controller.has_value(), "the Add Node window offers the First Person Controller type");
+    const auto category = *ui.headless_item_rect("node_window:type:PhysicsBody");
+    check((*controller)[0] > category[0] && (*controller)[1] > category[1],
+          "the controller sits in the node tree under Physics Body");
+    click(ui, *controller);
+    click_center(ui, *ui.headless_item_rect("node_window:create"));
+    frame(ui, 3);
+    bool created = false;
+    for (const auto entity : engine.scene().entities())
+        if (engine.scene().get(entity)->first_person_controller) created = true;
+    check(created && !std::filesystem::exists("projects/configured/scripts"),
+          "creating it adds a native controller without any script files");
+    click_center(ui, *ui.headless_item_rect("config:input:reset"));
+    check(engine.input().map().actions.size() == relay::default_input_map().actions.size(),
+          "Reset to defaults restores the engine's map");
+    std::cout << "Headless Game Configuration tests passed\n";
+}
+
+void game_input_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/locked/project.relayproject","name":"Locked"})")
+              .find("\"ok\":true") != std::string::npos, "create mouse lock project");
+    // The project leaves mouse lock off; a first person controller in the scene turns it on.
+    check(!engine.input().map().lock_mouse, "the project does not ask for mouse lock");
+    check(protocol.handle(R"({"id":2,"method":"scene.create","type":"FirstPersonController"})")
+              .find("\"ok\":true") != std::string::npos, "add a first person controller");
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize game input editor without windows");
+    frame(ui, 5);
+    check(engine.run_game(), "start the game");
+    frame(ui, 40);
+    const auto viewport = ui.headless_item_rect("viewport");
+    check(viewport.has_value(), "the viewport is visible");
+    auto& io = ImGui::GetIO();
+    io.AddMousePosEvent(((*viewport)[0] + (*viewport)[2]) / 2, ((*viewport)[1] + (*viewport)[3]) / 2);
+    frame(ui, 2);
+    check(!ui.game_has_input(), "the game has no input until the viewport is clicked");
+    SDL_Event click{};
+    click.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+    click.button.button = SDL_BUTTON_LEFT;
+    check(!ui.handle_event(&click), "the focusing click also reaches the game");
+    frame(ui, 10);
+    check(ui.game_has_input() && ui.pointer_locked_for_game(),
+          "clicking the viewport gives the game input and keeps the pointer locked across frames");
+    SDL_Event motion{};
+    motion.type = SDL_EVENT_MOUSE_MOTION;
+    check(!ui.handle_event(&motion), "mouse motion goes to the game while it has input");
+    SDL_Event escape{};
+    escape.type = SDL_EVENT_KEY_DOWN;
+    escape.key.scancode = SDL_SCANCODE_ESCAPE;
+    check(ui.handle_event(&escape) && !ui.game_has_input() && !ui.pointer_locked_for_game(),
+          "Escape returns input and the pointer to the editor");
+    check(ui.handle_event(&motion), "without input focus the editor keeps mouse motion from the game");
+    // Pointer movement reaches the editor again after Escape, as it would on a desktop.
+    io.AddMousePosEvent(((*viewport)[0] + (*viewport)[2]) / 2 + 5, ((*viewport)[1] + (*viewport)[3]) / 2);
+    frame(ui, 2);
+    (void)ui.handle_event(&click);
+    frame(ui, 2);
+    check(ui.game_has_input(), "clicking again gives input back");
+    check(engine.stop_game(), "stop the game");
+    frame(ui, 40);
+    check(!ui.game_has_input() && !ui.pointer_locked_for_game(), "stopping the game releases input");
+    std::cout << "Headless game input focus tests passed\n";
+}
+
+void scripts_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/scripted/project.relayproject","name":"Scripted"})")
+              .find("\"ok\":true") != std::string::npos, "create scripted project");
+    std::filesystem::create_directories("projects/scripted/scripts");
+    std::ofstream("projects/scripted/scripts/spin.cpp")
+        << "#include \"relay_script.hpp\"\n"
+           "class Spin : public relay::Behaviour {\n"
+           "public:\n"
+           "    void on_update(double dt) override {\n"
+           "        self().set_rotation(self().rotation() + relay::Vec3{0, 90 * dt, 0});\n"
+           "    }\n"
+           "};\n"
+           "RELAY_BEHAVIOUR(Spin)\n";
+    const auto hero = engine.scene().create("Hero");
+    check(protocol.handle(R"({"id":2,"method":"component.add","entity":")" + hero.to_string() +
+                          R"(","component":"script","behaviour":"Spin"})").find("\"ok\":true") !=
+              std::string::npos,
+          "attach a script before the editor opens");
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize scripts editor without windows");
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + hero.to_string()));
+    frame(ui, 3);
+    check(ui.headless_item_rect("inspector:component:script:0").has_value(),
+          "Inspector shows the script component of the selected entity");
+
+    const auto run = ui.headless_item_rect("toolbar:run");
+    check(run.has_value(), "toolbar exposes Run Game");
+    click_center(ui, *run);
+    frame(ui, 2);
+    check(engine.status().mode == relay::RuntimeMode::editor,
+          "Run Game does not start scripts in an untrusted project");
+    const auto accept = ui.headless_item_rect("dialog:trust:accept");
+    check(accept.has_value(), "Run Game asks the person to trust the project's scripts");
+    click_center(ui, *accept);
+    check(relay::project_scripts_trusted(engine.project()->root()),
+          "accepting the prompt trusts the project");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{240};
+    while (engine.status().mode != relay::RuntimeMode::game &&
+           std::chrono::steady_clock::now() < deadline) {
+        engine.tick();
+        frame(ui, 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    }
+    check(engine.status().mode == relay::RuntimeMode::game,
+          "Run Game builds the scripts and then starts the game");
+    engine.step(30);
+    check(std::abs(engine.scene().get(hero)->transform.rotation_degrees.y - 45.0) < 1e-6,
+          "the built behaviour runs in the game the editor started");
+    click_center(ui, *ui.headless_item_rect("toolbar:run"));
+    check(engine.status().mode == relay::RuntimeMode::editor &&
+              engine.scene().get(hero)->transform.rotation_degrees.y == 0.0,
+          "Stop Game restores the scene the script changed");
+    std::cout << "Headless script editor tests passed\n";
+}
+
 int main() {
     const auto original = std::filesystem::current_path();
     const auto temporary = std::filesystem::temp_directory_path() /
         ("relay-headless-ui-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directory(temporary);
     std::filesystem::current_path(temporary);
+    const auto trust_file = (temporary / "trusted-script-projects").string();
+    setenv("RELAY_SCRIPT_TRUST_PATH", trust_file.c_str(), 1);
     int result = 0;
     // Each scenario starts from the default layout; persisted panels would otherwise carry over.
     const auto fresh = [](auto&& scenario) {
@@ -944,6 +1234,10 @@ int main() {
         fresh(run);
         fresh(project_ui);
         fresh(hierarchy_and_assets_ui);
+        fresh(components_ui);
+        fresh(game_configuration_ui);
+        fresh(game_input_ui);
+        fresh(scripts_ui);
         fresh(layout_persistence_ui);
         fresh(agent_ui);
         fresh(chat_ui);

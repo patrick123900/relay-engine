@@ -2,7 +2,7 @@ import { z } from "zod";
 export function registerGeneratedTools(server, invoke, overrides = {}) {
     server.registerTool("runtime_status", {
         title: "Inspect Relay runtime",
-        description: "Read the current run, pause, frame, simulation time and resolution state.",
+        description: "Read the current editor or game mode, pause, frame, simulation time and resolution state.",
         inputSchema: z.object({}),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     }, async () => {
@@ -11,9 +11,31 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             return override({});
         return invoke("runtime.status", {});
     });
+    server.registerTool("runtime_play", {
+        title: "Run game",
+        description: "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["runtime_play"];
+        if (override)
+            return override({});
+        return invoke("runtime.play", {});
+    });
+    server.registerTool("runtime_stop", {
+        title: "Stop game",
+        description: "Stop the current game session and restore the authored scene without changing undo history.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["runtime_stop"];
+        if (override)
+            return override({});
+        return invoke("runtime.stop", {});
+    });
     server.registerTool("runtime_pause", {
         title: "Pause Relay runtime",
-        description: "Pause automatic simulation so the scene can be inspected deterministically.",
+        description: "Pause a running game so its scene can be inspected deterministically.",
         inputSchema: z.object({}),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
     }, async () => {
@@ -24,7 +46,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("runtime_resume", {
         title: "Resume Relay runtime",
-        description: "Resume automatic simulation after an inspection or controlled frame step.",
+        description: "Resume a paused game after inspection or a controlled frame step.",
         inputSchema: z.object({}),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
     }, async () => {
@@ -35,7 +57,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("runtime_step", {
         title: "Step Relay frames",
-        description: "Advance an exact number of deterministic simulation frames, including while paused.",
+        description: "Advance an exact number of deterministic game frames, including while paused.",
         inputSchema: z.object({
             "frames": z.number().int().min(1).max(10000).default(1).describe("Number of frames to advance")
         }),
@@ -526,6 +548,115 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override(input);
         return invoke("scene.set_morph", { "entity": input["entity"], "target": input["target"], "weight": input["weight"], "reset": input["reset"] });
+    });
+    server.registerTool("scene_set_collider", {
+        title: "Configure box collider",
+        description: "Add, edit or remove an authored box collider. The box follows the entity hierarchy and scene-owned transform animation. Undoable and saved with the scene.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "attached": z.boolean().optional(),
+            "enabled": z.boolean().optional(),
+            "centerX": z.number().finite().min(-1000000).max(1000000).optional(),
+            "centerY": z.number().finite().min(-1000000).max(1000000).optional(),
+            "centerZ": z.number().finite().min(-1000000).max(1000000).optional(),
+            "halfX": z.number().finite().min(1e-06).max(1000000).optional(),
+            "halfY": z.number().finite().min(1e-06).max(1000000).optional(),
+            "halfZ": z.number().finite().min(1e-06).max(1000000).optional(),
+            "layer": z.number().int().min(1).max(4294967295).optional(),
+            "mask": z.number().int().min(0).max(4294967295).optional()
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_collider"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_collider", { "entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "center_x": input["centerX"], "center_y": input["centerY"], "center_z": input["centerZ"], "half_x": input["halfX"], "half_y": input["halfY"], "half_z": input["halfZ"], "layer": input["layer"], "mask": input["mask"] });
+    });
+    server.registerTool("physics_raycast", {
+        title: "Raycast box colliders",
+        description: "Find the nearest enabled authored box collider hit by a world-space ray. Returns hit point and surface normal; does not move objects.",
+        inputSchema: z.object({
+            "originX": z.number().finite().min(-1000000).max(1000000),
+            "originY": z.number().finite().min(-1000000).max(1000000),
+            "originZ": z.number().finite().min(-1000000).max(1000000),
+            "directionX": z.number().finite().min(-1000000).max(1000000),
+            "directionY": z.number().finite().min(-1000000).max(1000000),
+            "directionZ": z.number().finite().min(-1000000).max(1000000),
+            "maximumDistance": z.number().finite().min(0).max(1000000).optional(),
+            "layerMask": z.number().int().min(0).max(4294967295).optional()
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["physics_raycast"];
+        if (override)
+            return override(input);
+        return invoke("physics.raycast", { "origin_x": input["originX"], "origin_y": input["originY"], "origin_z": input["originZ"], "direction_x": input["directionX"], "direction_y": input["directionY"], "direction_z": input["directionZ"], "maximum_distance": input["maximumDistance"], "layer_mask": input["layerMask"] });
+    });
+    server.registerTool("physics_overlaps", {
+        title: "Find overlapping colliders",
+        description: "List up to 128 enabled box colliders overlapping an entity collider. Both colliders must pass their layer masks; reports truncation.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["physics_overlaps"];
+        if (override)
+            return override(input);
+        return invoke("physics.overlaps", { "entity": input["entity"] });
+    });
+    server.registerTool("physics_body_status", {
+        title: "Inspect physics body",
+        description: "Read the current linear and angular velocities of a dynamic body during Run Game.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["physics_body_status"];
+        if (override)
+            return override(input);
+        return invoke("physics.body_status", { "entity": input["entity"] });
+    });
+    server.registerTool("physics_apply_impulse", {
+        title: "Apply rigid body impulse",
+        description: "Apply a world-space impulse to a dynamic body during Run Game. Optional world-space point produces torque and angular motion.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "impulseX": z.number().finite().min(-1000000).max(1000000),
+            "impulseY": z.number().finite().min(-1000000).max(1000000),
+            "impulseZ": z.number().finite().min(-1000000).max(1000000),
+            "pointX": z.number().finite().min(-1000000).max(1000000).optional(),
+            "pointY": z.number().finite().min(-1000000).max(1000000).optional(),
+            "pointZ": z.number().finite().min(-1000000).max(1000000).optional()
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["physics_apply_impulse"];
+        if (override)
+            return override(input);
+        return invoke("physics.apply_impulse", { "entity": input["entity"], "impulse_x": input["impulseX"], "impulse_y": input["impulseY"], "impulse_z": input["impulseZ"], "point_x": input["pointX"], "point_y": input["pointY"], "point_z": input["pointZ"] });
+    });
+    server.registerTool("scene_set_physics_body", {
+        title: "Configure physics body",
+        description: "Add, edit or remove an undoable static or dynamic physics body. Dynamic bodies use Jolt rigid-body collision, gravity and angular dynamics during Run Game.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "attached": z.boolean().optional(),
+            "type": z.enum(["static", "dynamic"]).optional(),
+            "mass": z.number().finite().min(1e-06).max(1000000).optional(),
+            "gravityScale": z.number().finite().min(0).max(100).optional(),
+            "restitution": z.number().finite().min(0).max(1).optional(),
+            "friction": z.number().finite().min(0).max(10).optional(),
+            "linearDamping": z.number().finite().min(0).max(100).optional(),
+            "angularDamping": z.number().finite().min(0).max(100).optional()
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_physics_body"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_physics_body", { "entity": input["entity"], "attached": input["attached"], "type": input["type"], "mass": input["mass"], "gravity_scale": input["gravityScale"], "restitution": input["restitution"], "friction": input["friction"], "linear_damping": input["linearDamping"], "angular_damping": input["angularDamping"] });
     });
     server.registerTool("scene_set_light", {
         title: "Configure scene light",

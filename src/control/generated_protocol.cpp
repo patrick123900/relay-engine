@@ -138,6 +138,61 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_morph{{
     {"reset", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 11> fields_scene_set_collider{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"center_x", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"center_y", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"center_z", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"half_x", ProtocolValueType::number, false, false, true, true, 1e-06, 1000000, 0U, 0U, "", ""},
+    {"half_y", ProtocolValueType::number, false, false, true, true, 1e-06, 1000000, 0U, 0U, "", ""},
+    {"half_z", ProtocolValueType::number, false, false, true, true, 1e-06, 1000000, 0U, 0U, "", ""},
+    {"layer", ProtocolValueType::integer, false, false, true, true, 1, 4294967295, 0U, 0U, "", ""},
+    {"mask", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 8> fields_physics_raycast{{
+    {"origin_x", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"origin_y", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"origin_z", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"direction_x", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"direction_y", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"direction_z", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"maximum_distance", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+    {"layer_mask", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_physics_overlaps{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_physics_body_status{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 7> fields_physics_apply_impulse{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"impulse_x", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"impulse_y", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"impulse_z", ProtocolValueType::number, true, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"point_x", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"point_y", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"point_z", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 9> fields_scene_set_physics_body{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "static|dynamic"},
+    {"mass", ProtocolValueType::number, false, false, true, true, 1e-06, 1000000, 0U, 0U, "", ""},
+    {"gravity_scale", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
+    {"restitution", ProtocolValueType::number, false, false, true, true, 0, 1, 0U, 0U, "", ""},
+    {"friction", ProtocolValueType::number, false, false, true, true, 0, 10, 0U, 0U, "", ""},
+    {"linear_damping", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
+    {"angular_damping", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 13> fields_scene_set_light{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
@@ -341,11 +396,13 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_chat_control{{
     {"provider", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "openai|compatible"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 90> methods{{
-    {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current run, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
-    {"runtime.pause", "runtime_pause", "Pause Relay runtime", "Pause automatic simulation so the scene can be inspected deterministically.", false, false, true, false, false, no_fields},
-    {"runtime.resume", "runtime_resume", "Resume Relay runtime", "Resume automatic simulation after an inspection or controlled frame step.", false, false, true, false, false, no_fields},
-    {"runtime.step", "runtime_step", "Step Relay frames", "Advance an exact number of deterministic simulation frames, including while paused.", false, false, false, false, false, fields_runtime_step},
+constexpr std::array<ProtocolMethodSpec, 99> methods{{
+    {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
+    {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
+    {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
+    {"runtime.pause", "runtime_pause", "Pause Relay runtime", "Pause a running game so its scene can be inspected deterministically.", false, false, true, false, false, no_fields},
+    {"runtime.resume", "runtime_resume", "Resume Relay runtime", "Resume a paused game after inspection or a controlled frame step.", false, false, true, false, false, no_fields},
+    {"runtime.step", "runtime_step", "Step Relay frames", "Advance an exact number of deterministic game frames, including while paused.", false, false, false, false, false, fields_runtime_step},
     {"runtime.quit", "runtime_shutdown", "Shut down Relay runtime", "Request an orderly shutdown of the runtime owned by this MCP bridge.", false, false, true, false, false, no_fields},
     {"editor.camera.status", "editor_camera_status", "Inspect editor camera", "Read the live editor inspection viewpoint used by Vulkan captures. Unavailable without an editor. Does not modify scene cameras.", true, false, false, false, false, no_fields},
     {"editor.camera.set", "editor_camera_set", "Position editor inspection camera", "Set the live inspector camera target, orbit angles in radians and distance for visual confirmation using render_capture source vulkan. View-only: no scene or undo changes.", false, false, false, false, false, fields_editor_camera_set},
@@ -382,6 +439,13 @@ constexpr std::array<ProtocolMethodSpec, 90> methods{{
     {"scene.redo", "scene_redo", "Redo scene change", "Reapply the most recently undone scene transaction.", false, false, false, false, false, no_fields},
     {"scene.set_animation", "scene_set_animation", "Control imported animation", "Configure clip, playback, looping, speed and seek time on an imported model root.", false, false, false, false, false, fields_scene_set_animation},
     {"scene.set_morph", "scene_set_morph", "Set imported morph weight", "Override a mesh morph weight, or reset all overrides to imported defaults and animation.", false, false, false, false, false, fields_scene_set_morph},
+    {"scene.set_collider", "scene_set_collider", "Configure box collider", "Add, edit or remove an authored box collider. The box follows the entity hierarchy and scene-owned transform animation. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_collider},
+    {"physics.raycast", "physics_raycast", "Raycast box colliders", "Find the nearest enabled authored box collider hit by a world-space ray. Returns hit point and surface normal; does not move objects.", true, false, false, false, false, fields_physics_raycast},
+    {"physics.overlaps", "physics_overlaps", "Find overlapping colliders", "List up to 128 enabled box colliders overlapping an entity collider. Both colliders must pass their layer masks; reports truncation.", true, false, false, false, false, fields_physics_overlaps},
+    {"physics.debug_boxes", "physics_debug_boxes", "Inspect collider wireframes", "Read bounded world-space collider boxes for the editor overlay, including disabled colliders.", true, false, false, true, false, no_fields},
+    {"physics.body_status", "physics_body_status", "Inspect physics body", "Read the current linear and angular velocities of a dynamic body during Run Game.", true, false, false, false, false, fields_physics_body_status},
+    {"physics.apply_impulse", "physics_apply_impulse", "Apply rigid body impulse", "Apply a world-space impulse to a dynamic body during Run Game. Optional world-space point produces torque and angular motion.", false, false, false, false, false, fields_physics_apply_impulse},
+    {"scene.set_physics_body", "scene_set_physics_body", "Configure physics body", "Add, edit or remove an undoable static or dynamic physics body. Dynamic bodies use Jolt rigid-body collision, gravity and angular dynamics during Run Game.", false, false, false, false, false, fields_scene_set_physics_body},
     {"scene.set_light", "scene_set_light", "Configure scene light", "Add, update or remove a directional, point or spot light.", false, false, false, false, false, fields_scene_set_light},
     {"scene.rename", "scene_rename", "Rename scene entity", "Change an entity's display name as one undoable transaction.", false, false, false, false, false, fields_scene_rename},
     {"scene.history", "scene_history", "Inspect undo history", "Read the labels currently on the undo and redo stacks, newest first.", true, false, false, false, false, no_fields},

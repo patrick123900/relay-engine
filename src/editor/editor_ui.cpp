@@ -107,7 +107,7 @@ struct EditorUi::Impl {
         return open;
     }
 
-    enum class ToolIcon { previous, restart, loop, snap, play, pause, step, undo, redo, camera, focus, move, rotate, scale, local, world };
+    enum class ToolIcon { previous, restart, loop, snap, play, stop, pause, step, undo, redo, camera, focus, move, rotate, scale, local, world };
     bool toolbar_button(const char* id, ToolIcon icon, bool active, const char* tooltip) {
         const auto& palette = editor_palette();
         if (active) {
@@ -150,6 +150,8 @@ struct EditorUi::Impl {
         } else if (icon == ToolIcon::snap) {
             draw->AddRect(point(9, 6), point(23, 22), color, 2 * ui_scale, 0, 1.6F * ui_scale);
             line(13, 6, 13, 11); line(19, 17, 23, 17); line(13, 6, 13, 22);
+        } else if (icon == ToolIcon::stop) {
+            draw->AddRectFilled(point(10, 8), point(22, 20), color);
         } else if (icon == ToolIcon::pause) {
             draw->AddRectFilled(point(11, 7), point(14, 21), color);
             draw->AddRectFilled(point(18, 7), point(21, 21), color);
@@ -309,6 +311,7 @@ struct EditorUi::Impl {
 
     // Cached runtime state. The editor never touches Scene, SceneHistory or AssetRegistry directly.
     JsonValue scene_list;
+    JsonValue collider_boxes;
     std::vector<const JsonValue::Object*> entities;
     std::map<std::string, std::vector<std::size_t>, std::less<>> children;
     std::vector<std::size_t> roots;
@@ -353,6 +356,11 @@ struct EditorUi::Impl {
     // at mouse rate produces no trace entries.
     bool camera_enabled{true};
     bool grid_enabled{true};
+    bool collider_wireframes_enabled{true};
+    bool node_icons_enabled{true};
+    bool camera_wireframes_enabled{true};
+    struct NodeMarker { std::string handle; std::string label; ImVec2 screen; float depth; float radius; };
+    std::vector<NodeMarker> node_markers;
     EditorCamera navigation_camera;
     bool freelook_latched{false};
     bool navigating{false};
@@ -1070,6 +1078,7 @@ struct EditorUi::Impl {
             scene_list = std::move(*list);
             rebuild_index();
         }
+        if (auto boxes = call("physics.debug_boxes")) collider_boxes = std::move(*boxes);
         animator_playing = false;
         if (const auto* entity = selection.empty() ? nullptr : find_entity(selection)) {
             if (const auto* animator = component(*entity, "animator"))
@@ -1260,6 +1269,234 @@ struct EditorUi::Impl {
         view.camera.far_plane = 5000.0;
     }
 
+    void draw_collider_wireframes() {
+        if (!collider_wireframes_enabled || !camera_enabled || !viewport_visible ||
+            !viewport_draw_list || (runtime_status.object() &&
+            string_or(*runtime_status.object(), "mode") == "game")) return;
+        const auto* result = collider_boxes.object();
+        const auto* values = result ? field(*result, "boxes") : nullptr;
+        const auto* boxes = values ? values->array() : nullptr;
+        if (!boxes) return;
+        const double width = viewport_max.x - viewport_min.x;
+        const double height = viewport_max.y - viewport_min.y;
+        if (width <= 0.0 || height <= 0.0) return;
+        const auto matrix = editor_view(view.position, view.target);
+        const double focal = 1.0 / std::tan(view.camera.field_of_view_y_degrees *
+                                            3.14159265358979323846 / 360.0);
+        const double near = view.camera.near_plane;
+        const auto read_vector = [](const JsonValue* value, Vec3& output) {
+            const auto* array = value ? value->array() : nullptr;
+            if (!array || array->size() != 3) return false;
+            const auto* x = (*array)[0].number();
+            const auto* y = (*array)[1].number();
+            const auto* z = (*array)[2].number();
+            if (!x || !y || !z) return false;
+            output = {*x, *y, *z};
+            return true;
+        };
+        const auto camera_point = [&](const Vec3 point) {
+            return Vec3{
+                matrix[0] * point.x + matrix[4] * point.y + matrix[8] * point.z + matrix[12],
+                matrix[1] * point.x + matrix[5] * point.y + matrix[9] * point.z + matrix[13],
+                matrix[2] * point.x + matrix[6] * point.y + matrix[10] * point.z + matrix[14]};
+        };
+        viewport_draw_list->PushClipRect(viewport_min, viewport_max, true);
+        for (const auto& value : *boxes) {
+            const auto* box = value.object();
+            if (!box) continue;
+            Vec3 center{};
+            std::array<Vec3, 3> edges{};
+            const auto* edge_value = field(*box, "edges");
+            const auto* edge_array = edge_value ? edge_value->array() : nullptr;
+            if (!read_vector(field(*box, "center"), center) || !edge_array ||
+                edge_array->size() != 3 || !read_vector(&(*edge_array)[0], edges[0]) ||
+                !read_vector(&(*edge_array)[1], edges[1]) ||
+                !read_vector(&(*edge_array)[2], edges[2])) continue;
+            std::array<Vec3, 8> corners{};
+            for (unsigned corner = 0; corner < 8; ++corner) {
+                Vec3 point = center;
+                for (unsigned axis = 0; axis < 3; ++axis) {
+                    const double sign = (corner & (1U << axis)) ? 1.0 : -1.0;
+                    point.x += sign * edges[axis].x;
+                    point.y += sign * edges[axis].y;
+                    point.z += sign * edges[axis].z;
+                }
+                corners[corner] = camera_point(point);
+            }
+            const auto selected = string_or(*box, "entity") == selection;
+            const auto enabled = boolean_or(*box, "enabled", true);
+            const ImU32 color = selected ? IM_COL32(255, 194, 67, 255) :
+                                  enabled ? IM_COL32(75, 224, 174, 190) :
+                                            IM_COL32(147, 156, 165, 110);
+            for (unsigned corner = 0; corner < 8; ++corner)
+                for (unsigned axis = 0; axis < 3; ++axis) {
+                    const unsigned other = corner ^ (1U << axis);
+                    if (corner > other) continue;
+                    auto a = corners[corner], b = corners[other];
+                    if (a.z > -near && b.z > -near) continue;
+                    if (a.z > -near || b.z > -near) {
+                        const double fraction = (-near - a.z) / (b.z - a.z);
+                        const Vec3 clipped{a.x + fraction * (b.x - a.x),
+                                           a.y + fraction * (b.y - a.y), -near};
+                        if (a.z > -near) a = clipped; else b = clipped;
+                    }
+                    const auto project = [&](const Vec3 point) {
+                        const double depth = -point.z;
+                        return ImVec2{
+                            static_cast<float>(viewport_min.x + width * 0.5 +
+                                               point.x * focal * height * 0.5 / depth),
+                            static_cast<float>(viewport_min.y + height * 0.5 -
+                                               point.y * focal * height * 0.5 / depth)};
+                    };
+                    const auto first = project(a), last = project(b);
+                    if (!std::isfinite(first.x) || !std::isfinite(first.y) ||
+                        !std::isfinite(last.x) || !std::isfinite(last.y)) continue;
+                    viewport_draw_list->AddLine(first, last, color, selected ? 2.0F : 1.4F);
+                }
+        }
+        viewport_draw_list->PopClipRect();
+    }
+
+    void draw_scene_nodes() {
+        node_markers.clear();
+        if (!camera_enabled || !viewport_visible || !viewport_draw_list ||
+            (runtime_status.object() &&
+             string_or(*runtime_status.object(), "mode") == "game")) return;
+        const double width = viewport_max.x - viewport_min.x;
+        const double height = viewport_max.y - viewport_min.y;
+        if (width <= 0.0 || height <= 0.0) return;
+        const auto eye = editor_view(view.position, view.target);
+        const double focal = 1.0 / std::tan(view.camera.field_of_view_y_degrees *
+                                            3.14159265358979323846 / 360.0);
+        const double near = view.camera.near_plane;
+        const auto eye_point = [&](Vec3 point) {
+            return Vec3{eye[0] * point.x + eye[4] * point.y + eye[8] * point.z + eye[12],
+                        eye[1] * point.x + eye[5] * point.y + eye[9] * point.z + eye[13],
+                        eye[2] * point.x + eye[6] * point.y + eye[10] * point.z + eye[14]};
+        };
+        const auto project = [&](Vec3 point) -> std::optional<ImVec2> {
+            if (point.z > -near + 1e-7 * near) return std::nullopt;
+            const double depth = -point.z;
+            const double x = viewport_min.x + width * 0.5 +
+                             point.x * focal * height * 0.5 / depth;
+            const double y = viewport_min.y + height * 0.5 -
+                             point.y * focal * height * 0.5 / depth;
+            if (!std::isfinite(x) || !std::isfinite(y) || std::abs(x) > 1e7 ||
+                std::abs(y) > 1e7) return std::nullopt;
+            return ImVec2{static_cast<float>(x), static_cast<float>(y)};
+        };
+        const auto line_world = [&](Vec3 first, Vec3 last, ImU32 color, float thickness) {
+            auto a = eye_point(first), b = eye_point(last);
+            if (a.z >= -near && b.z >= -near) return;
+            if (a.z >= -near || b.z >= -near) {
+                const double fraction = (-near - a.z) / (b.z - a.z);
+                const Vec3 clipped{a.x + fraction * (b.x - a.x),
+                                   a.y + fraction * (b.y - a.y), -near};
+                if (a.z >= -near) a = clipped; else b = clipped;
+            }
+            const auto screen_a = project(a), screen_b = project(b);
+            if (screen_a && screen_b)
+                viewport_draw_list->AddLine(*screen_a, *screen_b, color, thickness);
+        };
+        viewport_draw_list->PushClipRect(viewport_min, viewport_max, true);
+        std::size_t drawn = 0;
+        for (const auto* entity : entities) {
+            if (drawn >= 2048U) break;
+            const auto* camera = component(*entity, "camera");
+            const auto* light = component(*entity, "light");
+            if (!camera && !light) continue;
+            ++drawn;
+            const auto handle = string_or(*entity, "entity");
+            const auto name = string_or(*entity, "name", handle);
+            const auto world = visual_world_of(handle);
+            const Vec3 origin{world[12], world[13], world[14]};
+            const bool selected = handle == selection;
+            if (camera && selected && camera_wireframes_enabled) {
+                Camera settings;
+                settings.field_of_view_y_degrees = number_or(*camera, "field_of_view_y_degrees", 60);
+                settings.near_plane = number_or(*camera, "near_plane", 0.1);
+                settings.far_plane = number_or(*camera, "far_plane", 1000);
+                settings.orthographic_height = number_or(*camera, "orthographic_height", 0);
+                const auto corners = editor_camera_guide(settings, width / height, world);
+                constexpr ImU32 color = IM_COL32(98, 204, 255, 215);
+                for (unsigned plane = 0; plane < 2; ++plane) {
+                    const unsigned offset = plane * 4U;
+                    for (unsigned edge = 0; edge < 4; ++edge) {
+                        if (edge < (edge ^ 1U))
+                            line_world(corners[offset + edge], corners[offset + (edge ^ 1U)], color, 1.5F);
+                        if (edge < (edge ^ 2U))
+                            line_world(corners[offset + edge], corners[offset + (edge ^ 2U)], color, 1.5F);
+                    }
+                }
+                for (unsigned corner = 0; corner < 4; ++corner)
+                    line_world(corners[corner], corners[corner + 4U], color, 1.5F);
+            }
+            if (!node_icons_enabled) continue;
+            const auto camera_space = eye_point(origin);
+            const auto center = project(camera_space);
+            if (!center || center->x < viewport_min.x - 20 || center->x > viewport_max.x + 20 ||
+                center->y < viewport_min.y - 20 || center->y > viewport_max.y + 20) continue;
+            const auto draw_icon = [&](ImVec2 at, bool camera_icon, int light_type) {
+                const float radius = camera_icon ? 12.0F : 11.0F;
+                const ImU32 color = camera_icon ? IM_COL32(98, 204, 255, 255) :
+                                    light_type == 0 ? IM_COL32(255, 219, 112, 255) :
+                                    light_type == 2 ? IM_COL32(255, 161, 91, 255) :
+                                                      IM_COL32(255, 235, 130, 255);
+                if (camera_icon) {
+                    viewport_draw_list->AddRectFilled({at.x - radius, at.y - radius},
+                        {at.x + radius, at.y + radius}, IM_COL32(19, 25, 34, 255), 4.0F);
+                    viewport_draw_list->AddRect({at.x - radius, at.y - radius},
+                        {at.x + radius, at.y + radius},
+                        selected ? IM_COL32(255, 194, 67, 255) : color, 4.0F, 0,
+                        selected ? 2.0F : 1.2F);
+                    viewport_draw_list->AddRectFilled({at.x - 8, at.y - 5},
+                        {at.x + 1, at.y + 5}, color, 2.0F);
+                    viewport_draw_list->AddQuadFilled(
+                        {at.x + 1, at.y - 4}, {at.x + 7, at.y - 2},
+                        {at.x + 7, at.y + 2}, {at.x + 1, at.y + 4}, color);
+                } else {
+                    viewport_draw_list->AddCircleFilled(at, radius, IM_COL32(19, 25, 34, 225), 16);
+                    viewport_draw_list->AddCircle(at, radius,
+                        selected ? IM_COL32(255, 194, 67, 255) : color,
+                        16, selected ? 2.0F : 1.2F);
+                }
+                if (!camera_icon && light_type == 0) {
+                    viewport_draw_list->AddCircleFilled(ImVec2(at.x - 4, at.y - 4), 2.2F, color, 8);
+                    for (float offset : {-4.0F, 0.0F, 4.0F})
+                        viewport_draw_list->AddLine(ImVec2(at.x - 1, at.y + offset),
+                                                    ImVec2(at.x + 6, at.y + offset + 3), color, 1.4F);
+                } else if (!camera_icon && light_type == 2) {
+                    viewport_draw_list->AddTriangle(ImVec2(at.x - 6, at.y),
+                        ImVec2(at.x + 5, at.y - 5), ImVec2(at.x + 5, at.y + 5), color, 1.5F);
+                    viewport_draw_list->AddCircleFilled(ImVec2(at.x - 6, at.y), 1.7F, color, 8);
+                } else if (!camera_icon) {
+                    viewport_draw_list->AddCircleFilled(at, 3.0F, color, 12);
+                    for (unsigned ray = 0; ray < 8; ++ray) {
+                        const float angle = static_cast<float>(ray) * 0.78539816F;
+                        const float x = std::cos(angle), y = std::sin(angle);
+                        viewport_draw_list->AddLine(ImVec2(at.x + x * 5, at.y + y * 5),
+                                                    ImVec2(at.x + x * 8, at.y + y * 8), color, 1.3F);
+                    }
+                }
+                const char* kind = camera_icon ? "Camera" : light_type == 0 ? "Directional light" :
+                                   light_type == 2 ? "Spot light" : "Point light";
+                node_markers.push_back({handle, std::string(kind) + ": " + name, at,
+                                        static_cast<float>(-camera_space.z), radius});
+                if (headless) headless_items["node:" + handle + (camera_icon ? ":camera" : ":light")] =
+                    {at.x - radius, at.y - radius, at.x + radius, at.y + radius};
+            };
+            if (camera) draw_icon(*center, true, 0);
+            if (light) {
+                const int type = static_cast<int>(number_or(*light, "type", 1));
+                draw_icon({center->x + (camera ? 23.0F : 0.0F), center->y}, false, type);
+            }
+        }
+        viewport_draw_list->PopClipRect();
+        if (viewport_hovered)
+            if (const auto* marker = marker_at(ImGui::GetIO().MousePos))
+                ImGui::SetTooltip("%s", marker->label.c_str());
+    }
+
     [[nodiscard]] bool pointer_in_viewport() const {
         const auto pointer = ImGui::GetIO().MousePos;
         return pointer.x >= viewport_min.x && pointer.x < viewport_max.x &&
@@ -1322,7 +1559,8 @@ struct EditorUi::Impl {
     void update_selection_input() {
         const auto& io = ImGui::GetIO();
         if (!camera_enabled || !viewport_hovered || !pointer_in_viewport() || navigating) return;
-        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && !gizmo_active && !ImGuizmo::IsOver()) {
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && !gizmo_active &&
+            (!ImGuizmo::IsOver() || marker_at(io.MousePos))) {
             const auto drag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0.0F);
             if (std::abs(drag.x) < 3.0F && std::abs(drag.y) < 3.0F) pick_at(io.MousePos);
         }
@@ -1362,7 +1600,22 @@ struct EditorUi::Impl {
     // Selects whatever the pointer is over by asking the engine to intersect a world-space ray.
     // The ray is built here and sent with the request, so the engine stores no viewpoint and an
     // agent can pick with its own ray without an editor running.
+    [[nodiscard]] const NodeMarker* marker_at(ImVec2 pointer) const {
+        const NodeMarker* nearest = nullptr;
+        for (const auto& marker : node_markers) {
+            const float dx = pointer.x - marker.screen.x;
+            const float dy = pointer.y - marker.screen.y;
+            if (dx * dx + dy * dy > marker.radius * marker.radius) continue;
+            if (!nearest || marker.depth < nearest->depth) nearest = &marker;
+        }
+        return nearest;
+    }
+
     void pick_at(const ImVec2 pointer) {
+        if (const auto* marker = marker_at(pointer)) {
+            click_selection(marker->handle);
+            return;
+        }
         const auto width = viewport_max.x - viewport_min.x;
         const auto height = viewport_max.y - viewport_min.y;
         if (width <= 0.0F || height <= 0.0F) return;
@@ -1408,6 +1661,55 @@ struct EditorUi::Impl {
                               {scale[0], scale[1], scale[2]});
     }
 
+    [[nodiscard]] EditorMatrix visual_local_of(const std::string_view handle) const {
+        const auto* record = find_entity(handle);
+        if (!record) return editor_identity();
+        const auto* transform = component(*record, "transform");
+        if (!transform) return editor_identity();
+        const auto position = editor_vector(*transform, "position", {{0, 0, 0}});
+        const auto rotation = editor_vector(*transform, "rotation_degrees", {{0, 0, 0}});
+        const auto scale = editor_vector(*transform, "scale", {{1, 1, 1}});
+        Transform pose{{position[0], position[1], position[2]},
+                       {rotation[0], rotation[1], rotation[2]},
+                       {scale[0], scale[1], scale[2]}};
+        if (const auto* track = component(*record, "transform_animation")) {
+            const auto* keys_value = field(*track, "keys");
+            const auto* keys = keys_value ? keys_value->array() : nullptr;
+            if (keys && !keys->empty()) {
+                TransformAnimation animation;
+                animation.time_seconds = number_or(*track, "time_seconds", 0);
+                animation.duration_seconds = number_or(*track, "duration_seconds", 1);
+                for (const auto& value : *keys) {
+                    const auto* key = value.object();
+                    if (!key) continue;
+                    const auto key_position = editor_vector(*key, "position", {{0, 0, 0}});
+                    const auto key_rotation = editor_vector(*key, "rotation_degrees", {{0, 0, 0}});
+                    const auto key_scale = editor_vector(*key, "scale", {{1, 1, 1}});
+                    animation.keys.push_back({number_or(*key, "time_seconds", 0),
+                        {{key_position[0], key_position[1], key_position[2]},
+                         {key_rotation[0], key_rotation[1], key_rotation[2]},
+                         {key_scale[0], key_scale[1], key_scale[2]}}});
+                }
+                pose = sample_transform_animation(animation, pose);
+            }
+        }
+        return editor_compose(pose.position, pose.rotation_degrees, pose.scale);
+    }
+
+    [[nodiscard]] EditorMatrix visual_world_of(std::string_view handle) const {
+        std::vector<std::string> chain;
+        while (!handle.empty() && chain.size() < 256U) {
+            const auto* record = find_entity(handle);
+            if (!record) return editor_identity();
+            chain.emplace_back(handle);
+            handle = string_or(*record, "parent");
+        }
+        auto world = editor_identity();
+        for (auto item = chain.rbegin(); item != chain.rend(); ++item)
+            world = editor_multiply(world, visual_local_of(*item));
+        return world;
+    }
+
     // World transform of an entity's parent chain, composed from the cached tree. Imported nodes
     // driven by animation are not accounted for here: the gizmo edits the stored transform, which
     // is what scene.set_transform writes, not the animated pose layered on top of it.
@@ -1433,7 +1735,8 @@ struct EditorUi::Impl {
     void draw_gizmo() {
         const auto width = viewport_max.x - viewport_min.x;
         const auto height = viewport_max.y - viewport_min.y;
-        if (selection.empty() || !camera_enabled || !viewport_visible || width <= 0.0F ||
+        if ((runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game") ||
+            selection.empty() || !camera_enabled || !viewport_visible || width <= 0.0F ||
             height <= 0.0F) {
             gizmo_active = false;
             return;
@@ -2052,6 +2355,98 @@ struct EditorUi::Impl {
         }
     }
 
+    void draw_collider_section(const JsonValue::Object& entity) {
+        const auto* collider = component(entity, "collider");
+        if (!ImGui::CollapsingHeader("Box collider",
+                                     collider ? ImGuiTreeNodeFlags_DefaultOpen : 0)) return;
+        const auto entity_request = entity_field(selection);
+        if (!collider) {
+            if (ImGui::Button("Add box collider"))
+                mutate("scene.set_collider", entity_request, "Box collider added");
+            return;
+        }
+        auto enabled = boolean_or(*collider, "enabled", true);
+        if (ImGui::Checkbox("Enabled##collider", &enabled))
+            mutate("scene.set_collider", entity_request +
+                   ",\"enabled\":" + (enabled ? "true" : "false"), "Collider updated");
+        auto center = editor_vector(*collider, "center", {0, 0, 0});
+        if (const auto mask = drag_vector3("Center", center, 0.05F, 84.0F * ui_scale))
+            mutate("scene.set_collider", entity_request +
+                   vector_fields(center, {"center_x", "center_y", "center_z"}, mask),
+                   "Collider center updated");
+        auto extents = editor_vector(*collider, "half_extents", {0.5, 0.5, 0.5});
+        if (const auto mask = drag_vector3("Half extents", extents, 0.05F, 84.0F * ui_scale)) {
+            for (auto& value : extents) value = std::max(value, 0.000001);
+            mutate("scene.set_collider", entity_request +
+                   vector_fields(extents, {"half_x", "half_y", "half_z"}, mask),
+                   "Collider size updated");
+        }
+        auto layer = static_cast<std::uint32_t>(number_or(*collider, "layer", 1));
+        if (ImGui::InputScalar("Layer bits", ImGuiDataType_U32, &layer) && layer != 0U)
+            mutate("scene.set_collider", entity_request + ",\"layer\":" + std::to_string(layer),
+                   "Collider layer updated");
+        auto collision_mask = static_cast<std::uint32_t>(number_or(*collider, "mask", 0xffffffffU));
+        if (ImGui::InputScalar("Mask bits", ImGuiDataType_U32, &collision_mask))
+            mutate("scene.set_collider", entity_request + ",\"mask\":" +
+                   std::to_string(collision_mask), "Collider mask updated");
+        if (ImGui::Button("Remove box collider"))
+            mutate("scene.set_collider", entity_request + ",\"attached\":false",
+                   "Box collider removed");
+    }
+
+    void draw_physics_body_section(const JsonValue::Object& entity) {
+        const auto* body = component(entity, "physics_body");
+        if (!ImGui::CollapsingHeader("Physics body",
+                                     body ? ImGuiTreeNodeFlags_DefaultOpen : 0)) return;
+        const auto body_request = entity_field(selection);
+        if (!body) {
+            if (ImGui::Button("Add dynamic body"))
+                mutate("scene.set_physics_body", body_request, "Physics body added");
+            return;
+        }
+        const auto type = static_cast<int>(number_or(*body, "type", 1));
+        int selected_type = std::clamp(type, 0, 1);
+        if (ImGui::Combo("Body type", &selected_type, "Static\0Dynamic\0"))
+            mutate("scene.set_physics_body", body_request +
+                   (selected_type == 0 ? ",\"type\":\"static\"" : ",\"type\":\"dynamic\""),
+                   "Physics body type updated");
+        if (selected_type == 1) {
+            auto mass = number_or(*body, "mass", 1.0);
+            if (drag_scalar("Mass", mass, 0.05F) && mass > 0.0)
+                mutate("scene.set_physics_body", body_request + ",\"mass\":" + number_text(mass),
+                       "Physics body mass updated");
+            auto gravity = number_or(*body, "gravity_scale", 1.0);
+            if (drag_scalar("Gravity scale", gravity, 0.05F) && gravity >= 0.0)
+                mutate("scene.set_physics_body", body_request + ",\"gravity_scale\":" +
+                       number_text(gravity), "Physics body gravity updated");
+        }
+        auto restitution = number_or(*body, "restitution", 0.0);
+        if (drag_scalar("Bounciness", restitution, 0.01F) &&
+            restitution >= 0.0 && restitution <= 1.0)
+            mutate("scene.set_physics_body", body_request + ",\"restitution\":" +
+                   number_text(restitution), "Physics body bounciness updated");
+        auto friction = number_or(*body, "friction", 0.2);
+        if (drag_scalar("Friction", friction, 0.01F) &&
+            friction >= 0.0 && friction <= 10.0)
+            mutate("scene.set_physics_body", body_request + ",\"friction\":" +
+                   number_text(friction), "Physics body friction updated");
+        if (selected_type == 1) {
+            auto linear = number_or(*body, "linear_damping", 0.05);
+            if (drag_scalar("Linear damping", linear, 0.01F) &&
+                linear >= 0.0 && linear <= 100.0)
+                mutate("scene.set_physics_body", body_request + ",\"linear_damping\":" +
+                       number_text(linear), "Physics body linear damping updated");
+            auto angular = number_or(*body, "angular_damping", 0.05);
+            if (drag_scalar("Angular damping", angular, 0.01F) &&
+                angular >= 0.0 && angular <= 100.0)
+                mutate("scene.set_physics_body", body_request + ",\"angular_damping\":" +
+                       number_text(angular), "Physics body angular damping updated");
+        }
+        if (ImGui::Button("Remove physics body"))
+            mutate("scene.set_physics_body", body_request + ",\"attached\":false",
+                   "Physics body removed");
+    }
+
     void draw_morph_section(const JsonValue::Object& entity) {
         const auto* renderer = component(entity, "mesh_renderer");
         if (renderer == nullptr) return;
@@ -2293,6 +2688,8 @@ struct EditorUi::Impl {
         draw_keyframes_section(*entity);
         draw_morph_section(*entity);
         draw_light_section(*entity);
+        draw_collider_section(*entity);
+        draw_physics_body_section(*entity);
     }
 
     // Pulls the scene revision out of wherever a response carries it: `scene.history` nests it
@@ -2523,10 +2920,11 @@ struct EditorUi::Impl {
         action_filename[length] = '\0';
     }
 
-    void create_node(const char* name, const char* component = nullptr, const char* fields = "") {
+    std::string create_node(const char* name, const char* component = nullptr,
+                            const char* fields = "") {
         auto created = call("scene.create", "\"name\":\"" + json_escape(name) + '\"');
         if (!created || !created->object())
-            return;
+            return {};
         const auto handle = string_or(*created->object(), "entity");
         const bool component_ok =
             !component || mutate(component, entity_field(handle) + fields, "Component added");
@@ -2534,6 +2932,7 @@ struct EditorUi::Impl {
         select(handle);
         if (component_ok)
             set_status(std::string("Created ") + name, false);
+        return component_ok ? handle : std::string{};
     }
 
     static void future_action(const char* label) {
@@ -2619,7 +3018,12 @@ struct EditorUi::Impl {
                 ImGui::Separator();
                 future_action("Cube");
                 future_action("Audio source");
-                future_action("Physics body");
+                if (ImGui::MenuItem("Physics body")) {
+                    const auto handle = create_node("Physics Body", "scene.set_physics_body");
+                    if (!handle.empty())
+                        mutate("scene.set_collider", entity_field(handle),
+                               "Box collider added");
+                }
                 ImGui::EndMenu();
             }
             if (ImGui::MenuItem("Frame selection", "F", false, !selection.empty()))
@@ -2645,18 +3049,27 @@ struct EditorUi::Impl {
                 ImGui::MenuItem(names[i], nullptr, &panel_open[i]);
             ImGui::Separator();
             ImGui::MenuItem("Ground grid", nullptr, &grid_enabled);
+            ImGui::MenuItem("Collider wireframes", nullptr, &collider_wireframes_enabled);
+            ImGui::MenuItem("Camera and light icons", nullptr, &node_icons_enabled);
+            ImGui::MenuItem("Camera view wireframe", nullptr, &camera_wireframes_enabled);
             future_action("Wireframe");
             future_action("Lighting debug");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Run")) {
             const auto* status = runtime_status.object();
+            const bool game = status && string_or(*status, "mode") == "game";
             const bool paused = status && boolean_or(*status, "paused", false);
+            if (ImGui::MenuItem(game ? "Stop Game" : "Run Game"))
+                mutate(game ? "runtime.stop" : "runtime.play", {},
+                       game ? "Game stopped" : "Game running");
+            ImGui::BeginDisabled(!game);
             if (ImGui::MenuItem(paused ? "Resume simulation" : "Pause simulation"))
                 mutate(paused ? "runtime.resume" : "runtime.pause", {},
                        paused ? "Resumed" : "Paused");
             if (ImGui::MenuItem("Step one frame"))
                 mutate("runtime.step", "\"frames\":1", "Stepped one frame");
+            ImGui::EndDisabled();
             ImGui::Separator();
             future_action("Run standalone game");
             future_action("Build project...");
@@ -2849,12 +3262,19 @@ struct EditorUi::Impl {
 
     void draw_toolbar() {
         const auto* status = runtime_status.object();
+        const bool game = status && string_or(*status, "mode") == "game";
         const bool paused = status && boolean_or(*status, "paused", false);
+        if (toolbar_button("##run_game", game ? ToolIcon::stop : ToolIcon::play, game,
+                           game ? "Stop Game" : "Run Game"))
+            mutate(game ? "runtime.stop" : "runtime.play", {},
+                   game ? "Game stopped" : "Game running");
+        ImGui::BeginDisabled(!game);
         if (toolbar_button("##simulation", paused ? ToolIcon::play : ToolIcon::pause, paused,
                            paused ? "Resume simulation" : "Pause simulation"))
             mutate(paused ? "runtime.resume" : "runtime.pause", {}, paused ? "Resumed" : "Paused");
-        if (toolbar_button("##step", ToolIcon::step, false, "Advance exactly one simulation frame"))
+        if (toolbar_button("##step", ToolIcon::step, false, "Advance exactly one game frame"))
             mutate("runtime.step", "\"frames\":1", "Stepped one frame");
+        ImGui::EndDisabled();
         ImGui::TextColored(editor_color(editor_palette().text_faint), "%.0f FPS",
                            ImGui::GetIO().Framerate);
         ImGui::SameLine();
@@ -3225,6 +3645,8 @@ bool EditorUi::handle_event(const void* const sdl_event) {
     if (impl_->headless) return false;
     ImGui_ImplSDL3_ProcessEvent(event);
     const auto& io = ImGui::GetIO();
+    const bool game = impl_->runtime_status.object() &&
+                      string_or(*impl_->runtime_status.object(), "mode") == "game";
     switch (event->type) {
     case SDL_EVENT_MOUSE_MOTION:
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -3232,14 +3654,14 @@ bool EditorUi::handle_event(const void* const sdl_event) {
     case SDL_EVENT_MOUSE_WHEEL:
         // Editor-view pointer input belongs to navigation, selection and gizmos. Scene-camera mode
         // leaves viewport input available to the game while panels still capture their own events.
-        return io.WantCaptureMouse || impl_->camera_enabled;
+        return io.WantCaptureMouse || (impl_->camera_enabled && !game);
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const auto key = event->key.key;
         if (event->type == SDL_EVENT_KEY_UP && impl_->editor_keys.erase(key)) return true;
         // Editor view is an authoring surface. Scene-camera mode forwards gameplay keys;
         // track owned releases so switching modes mid-press cannot leave the game with half a key.
-        const bool owned = impl_->camera_enabled;
+        const bool owned = impl_->camera_enabled && !game;
         if (owned && event->type == SDL_EVENT_KEY_DOWN) impl_->editor_keys.insert(key);
         return io.WantCaptureKeyboard || owned;
     }
@@ -3370,6 +3792,8 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         impl_->update_camera_input();
         if (!impl_->chat_media.viewer_open()) impl_->update_shortcuts();
         impl_->update_view();
+        impl_->draw_collider_wireframes();
+        impl_->draw_scene_nodes();
         impl_->draw_gizmo();
         impl_->update_selection_input();
         ImGui::End();
@@ -3452,18 +3876,27 @@ std::optional<std::array<float, 4>> EditorUi::headless_item_rect(std::string_vie
 
 std::vector<Entity> EditorUi::selected_entities() const {
     std::vector<Entity> result;
-    if (impl_->camera_enabled)
+    if (impl_->camera_enabled &&
+        (!impl_->runtime_status.object() ||
+         string_or(*impl_->runtime_status.object(), "mode") != "game"))
         for (const auto& handle : impl_->selections.handles)
             if (const auto entity = Entity::parse(handle)) result.push_back(*entity);
     return result;
 }
 
-bool EditorUi::ground_grid_visible() const { return impl_->camera_enabled && impl_->grid_enabled; }
+bool EditorUi::ground_grid_visible() const {
+    return impl_->camera_enabled && impl_->grid_enabled &&
+           (!impl_->runtime_status.object() ||
+            string_or(*impl_->runtime_status.object(), "mode") != "game");
+}
 
 EditorViewport EditorUi::scene_viewport() const { return impl_->viewport; }
 
 const ViewOverride* EditorUi::view_override() const {
-    return impl_->camera_enabled ? &impl_->view : nullptr;
+    return impl_->camera_enabled &&
+                   (!impl_->runtime_status.object() ||
+                    string_or(*impl_->runtime_status.object(), "mode") != "game")
+               ? &impl_->view : nullptr;
 }
 
 void EditorUi::record(const VkCommandBuffer commands, const std::function<void()>& draw_scene) {

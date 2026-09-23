@@ -3,6 +3,7 @@
 
 #include "relay/core/engine.hpp"
 #include "relay/core/json.hpp"
+#include "relay/physics/collision.hpp"
 #include "relay/editor/editor_math.hpp"
 #include "relay/scene/scene_edit.hpp"
 #include "relay/scene/project.hpp"
@@ -182,6 +183,12 @@ std::string ControlProtocol::handle(const std::string_view request) {
     if (!validate_protocol_request(request, method, validation_error)) {
         return error_response(id, validation_error);
     }
+    const auto* const specification = find_protocol_method(method);
+    const bool read_only = specification != nullptr && specification->read_only;
+    if (engine_.game_session_active() && !read_only &&
+        (method.starts_with("scene.") || method.starts_with("project.") ||
+         method.starts_with("assets.") || method == "trace.replay"))
+        return error_response(id, "stop the game before editing or saving the authored scene");
     if (method.starts_with("session.") || method.starts_with("chat.") || method.starts_with("bridge."))
         return session_dispatch(request);
     if (method == "project.open" || method == "project.create" || method == "project.close") {
@@ -198,8 +205,6 @@ std::string ControlProtocol::handle(const std::string_view request) {
     // Traces exist to reproduce state changes, so read-only queries are not recorded. The editor
     // polls scene.list, logs.read and friends continuously; tracing those would bury the operations
     // that actually changed the scene and make trace files grow with idle time rather than work.
-    const auto* const specification = find_protocol_method(method);
-    const bool read_only = specification != nullptr && specification->read_only;
     if (!method.starts_with("trace.") && !read_only) {
         engine_.record_trace_event("command", std::string(request));
     }
@@ -214,6 +219,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         std::ostringstream result;
         result << response_prefix(id) << "{\"running\":" << (status.running ? "true" : "false")
                << ",\"paused\":" << (status.paused ? "true" : "false")
+               << ",\"mode\":\"" << (status.mode == RuntimeMode::editor ? "editor" : "game") << '"'
                << ",\"frame\":" << status.frame_index
                << ",\"elapsed_seconds\":" << status.elapsed_seconds
                << ",\"fixed_delta_seconds\":" << engine_.fixed_delta_seconds()
@@ -221,15 +227,32 @@ std::string ControlProtocol::handle(const std::string_view request) {
                << ",\"width\":" << status.width << ",\"height\":" << status.height << "}}";
         return result.str();
     }
+    if (method == "runtime.play") {
+        if (!engine_.run_game()) return error_response(id, "game can only start from editor mode");
+        return response_prefix(id) + "{\"mode\":\"game\",\"paused\":false}}";
+    }
+    if (method == "runtime.stop") {
+        if (!engine_.stop_game()) return error_response(id, "no editor game session is running");
+        const auto size = scoped_grants_.size();
+        std::erase_if(scoped_grants_, [](const ScopedGrant& grant) { return grant.kind == "entity"; });
+        if (scoped_grants_.size() != size) policy_audit("session.entity_revoked", true);
+        return response_prefix(id) + "{\"mode\":\"editor\",\"paused\":false}}";
+    }
     if (method == "runtime.pause") {
+        if (engine_.status().mode != RuntimeMode::game)
+            return error_response(id, "run the game before pausing simulation");
         engine_.pause();
         return response_prefix(id) + "{\"paused\":true}}";
     }
     if (method == "runtime.resume") {
+        if (engine_.status().mode != RuntimeMode::game)
+            return error_response(id, "run the game before resuming simulation");
         engine_.resume();
         return response_prefix(id) + "{\"paused\":false}}";
     }
     if (method == "runtime.step") {
+        if (engine_.status().mode != RuntimeMode::game)
+            return error_response(id, "run the game before stepping simulation");
         const auto requested_frames = unsigned_field(request, "frames", 1);
         const auto frames = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(requested_frames, 1, 10000));
         engine_.step(frames);
@@ -527,6 +550,110 @@ std::string ControlProtocol::handle(const std::string_view request) {
             output += '\"' + escape_json(files[i]) + '\"';
         }
         return response_prefix(id) + output + "]}}";
+    }
+    if (method == "physics.raycast") {
+        const auto number = [&](const char* key) { return number_field(request, key).value_or(0.0); };
+        const Vec3 origin{number("origin_x"), number("origin_y"), number("origin_z")};
+        const Vec3 direction{number("direction_x"), number("direction_y"),
+                             number("direction_z")};
+        const auto result = collision_raycast(
+            engine_.scene(), origin, direction,
+            number_field(request, "maximum_distance").value_or(1'000'000.0),
+            static_cast<std::uint32_t>(unsigned_field(request, "layer_mask", 0xffffffffU)));
+        if (!result.error.empty()) return error_response(id, result.error);
+        if (!result.hit) return response_prefix(id) + "{\"entity\":null,\"distance\":null,\"point\":null,\"normal\":null}}";
+        std::ostringstream output;
+        output << std::setprecision(std::numeric_limits<double>::max_digits10)
+               << "{\"entity\":\"" << result.entity.to_string() << "\",\"distance\":"
+               << result.distance << ",\"point\":[" << result.point.x << ',' << result.point.y
+               << ',' << result.point.z << "],\"normal\":[" << result.normal.x << ','
+               << result.normal.y << ',' << result.normal.z << "]}";
+        return response_prefix(id) + output.str() + '}';
+    }
+    if (method == "physics.debug_boxes") {
+        const auto result = collision_debug_boxes(engine_.scene());
+        std::ostringstream output;
+        output << std::setprecision(std::numeric_limits<double>::max_digits10)
+               << "{\"boxes\":[";
+        const auto vector = [&](const Vec3 value) {
+            output << '[' << value.x << ',' << value.y << ',' << value.z << ']';
+        };
+        for (std::size_t index = 0; index < result.boxes.size(); ++index) {
+            const auto& box = result.boxes[index];
+            if (index) output << ',';
+            output << "{\"entity\":\"" << box.entity.to_string() << "\",\"enabled\":"
+                   << (box.enabled ? "true" : "false") << ",\"center\":";
+            vector(box.center);
+            output << ",\"edges\":[";
+            for (std::size_t edge = 0; edge < 3; ++edge) {
+                if (edge) output << ',';
+                vector(box.edges[edge]);
+            }
+            output << "]}";
+        }
+        output << "],\"truncated\":" << (result.truncated ? "true" : "false") << '}';
+        return response_prefix(id) + output.str() + '}';
+    }
+    if (method == "physics.body_status") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        const auto* record = engine_.scene().get(*entity);
+        if (!record->physics_body) return error_response(id, "entity has no physics body");
+        const auto velocity = engine_.status().mode == RuntimeMode::game
+            ? engine_.physics().velocity(engine_.scene(), *entity) : std::nullopt;
+        const auto angular_velocity = engine_.status().mode == RuntimeMode::game
+            ? engine_.physics().angular_velocity(engine_.scene(), *entity) : std::nullopt;
+        std::ostringstream output;
+        output << std::setprecision(std::numeric_limits<double>::max_digits10)
+               << "{\"type\":\""
+               << (record->physics_body->type == PhysicsBody::Type::dynamic ? "dynamic" : "static")
+               << "\",\"velocity\":";
+        if (velocity)
+            output << '[' << velocity->x << ',' << velocity->y << ',' << velocity->z << ']';
+        else output << "null";
+        output << ",\"angular_velocity\":";
+        if (angular_velocity)
+            output << '[' << angular_velocity->x << ',' << angular_velocity->y << ','
+                   << angular_velocity->z << ']';
+        else output << "null";
+        output << '}';
+        return response_prefix(id) + output.str() + '}';
+    }
+    if (method == "physics.apply_impulse") {
+        if (engine_.status().mode != RuntimeMode::game)
+            return error_response(id, "game is not running");
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity) return error_response(id, "invalid body entity");
+        const auto x = number_field(request, "impulse_x");
+        const auto y = number_field(request, "impulse_y");
+        const auto z = number_field(request, "impulse_z");
+        if (!x || !y || !z) return error_response(id, "invalid impulse");
+        std::optional<Vec3> point;
+        const auto px = number_field(request, "point_x");
+        const auto py = number_field(request, "point_y");
+        const auto pz = number_field(request, "point_z");
+        if (px || py || pz) {
+            if (!px || !py || !pz) return error_response(id, "incomplete impulse point");
+            point = Vec3{*px, *py, *pz};
+        }
+        if (!engine_.physics().apply_impulse(engine_.scene(), *entity, {*x, *y, *z}, point))
+            return error_response(id, "entity has no dynamic physics body");
+        return response_prefix(id) + "{\"applied\":true}}";
+    }
+    if (method == "physics.overlaps") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity) return error_response(id, "invalid collider entity");
+        const auto result = collision_overlaps(engine_.scene(), *entity);
+        if (!result.error.empty()) return error_response(id, result.error);
+        std::string output = "{\"entities\":[";
+        for (const auto hit : result.entities) {
+            if (output.back() != '[') output += ',';
+            output += '"' + hit.to_string() + '"';
+        }
+        output += "],\"truncated\":";
+        output += result.truncated ? "true}" : "false}";
+        return response_prefix(id) + output + '}';
     }
     if (method == "scene.pick") {
         const auto component = [&](const std::string_view key) {
@@ -996,6 +1123,60 @@ std::string ControlProtocol::handle(const std::string_view request) {
                 [&](Scene& scene) { return scene.set_transform_animation(*entity, animation); },
                 unsigned_field(request, "gesture", 0U)))
             return error_response(id, "invalid transform animation values or keyframe limit");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.set_physics_body") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::optional<PhysicsBody> body;
+        if (boolean_field(request, "attached", true)) {
+            body = engine_.scene().get(*entity)->physics_body.value_or(PhysicsBody{});
+            const auto type = string_field(request, "type");
+            if (!type.empty())
+                body->type = type == "static" ? PhysicsBody::Type::static_body
+                                              : PhysicsBody::Type::dynamic;
+            if (const auto value = number_field(request, "mass")) body->mass = *value;
+            if (const auto value = number_field(request, "gravity_scale"))
+                body->gravity_scale = *value;
+            if (const auto value = number_field(request, "restitution"))
+                body->restitution = *value;
+            if (const auto value = number_field(request, "friction"))
+                body->friction = *value;
+            if (const auto value = number_field(request, "linear_damping"))
+                body->linear_damping = *value;
+            if (const auto value = number_field(request, "angular_damping"))
+                body->angular_damping = *value;
+        }
+        if (!engine_.scene_history().execute("Configure physics body " + entity->to_string(),
+                [&](Scene& scene) { return scene.set_physics_body(*entity, body); }))
+            return error_response(id, "invalid physics body values");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.set_collider") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::optional<BoxCollider> collider;
+        if (boolean_field(request, "attached", true)) {
+            collider = engine_.scene().get(*entity)->collider.value_or(BoxCollider{});
+            collider->enabled = boolean_field(request, "enabled", collider->enabled);
+            if (const auto value = number_field(request, "center_x")) collider->center.x = *value;
+            if (const auto value = number_field(request, "center_y")) collider->center.y = *value;
+            if (const auto value = number_field(request, "center_z")) collider->center.z = *value;
+            if (const auto value = number_field(request, "half_x")) collider->half_extents.x = *value;
+            if (const auto value = number_field(request, "half_y")) collider->half_extents.y = *value;
+            if (const auto value = number_field(request, "half_z")) collider->half_extents.z = *value;
+            collider->layer = static_cast<std::uint32_t>(
+                unsigned_field(request, "layer", collider->layer));
+            collider->mask = static_cast<std::uint32_t>(
+                unsigned_field(request, "mask", collider->mask));
+        }
+        if (!engine_.scene_history().execute("Configure box collider " + entity->to_string(),
+                [&](Scene& scene) { return scene.set_collider(*entity, collider); }))
+            return error_response(id, "invalid box collider values");
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }

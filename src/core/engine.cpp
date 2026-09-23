@@ -9,6 +9,7 @@ namespace relay {
 
 Engine::Engine(EngineConfig config)
     : config_(config), renderer_(config.width, config.height), scene_history_(scene_) {
+    mode_ = config.editor_mode ? RuntimeMode::editor : RuntimeMode::game;
     std::ostringstream message;
     message << "Relay runtime initialized at " << config_.width << 'x' << config_.height;
     logs_.write(LogLevel::info, message.str());
@@ -23,13 +24,43 @@ Engine::~Engine() {
 }
 
 void Engine::tick() {
-    if (running_ && !paused_) {
+    if (running_ && mode_ == RuntimeMode::game && !paused_) {
         advance_one_frame();
     }
 }
 
+bool Engine::run_game() {
+    if (!running_ || mode_ != RuntimeMode::editor) return false;
+    authored_scene_ = scene_.capture_state();
+    physics_.reset();
+    mode_ = RuntimeMode::game;
+    paused_ = false;
+    frame_index_ = 0;
+    elapsed_seconds_ = 0.0;
+    logs_.write(LogLevel::info, "Game started");
+    return true;
+}
+
+bool Engine::stop_game() {
+    if (!authored_scene_ || mode_ != RuntimeMode::game) return false;
+    if (video_.status().recording) {
+        std::string error;
+        if (!stop_video(error)) return false;
+    }
+    scene_.restore_state(std::move(*authored_scene_));
+    physics_.reset();
+    authored_scene_.reset();
+    mode_ = RuntimeMode::editor;
+    paused_ = false;
+    frame_index_ = 0;
+    elapsed_seconds_ = 0.0;
+    renderer_.render(frame_index_, elapsed_seconds_);
+    logs_.write(LogLevel::info, "Game stopped; authored scene restored");
+    return true;
+}
+
 void Engine::step(const std::uint32_t frame_count) {
-    if (!running_) {
+    if (!running_ || mode_ != RuntimeMode::game) {
         return;
     }
     for (std::uint32_t index = 0; index < frame_count; ++index) {
@@ -38,11 +69,13 @@ void Engine::step(const std::uint32_t frame_count) {
 }
 
 void Engine::pause() {
+    if (mode_ != RuntimeMode::game) return;
     paused_ = true;
     logs_.write(LogLevel::info, "Runtime paused");
 }
 
 void Engine::resume() {
+    if (mode_ != RuntimeMode::game) return;
     paused_ = false;
     logs_.write(LogLevel::info, "Runtime resumed");
 }
@@ -128,7 +161,7 @@ TraceRecorder& Engine::trace() { return trace_; }
 
 EngineStatus Engine::status() const {
     return EngineStatus{
-        running_, paused_, frame_index_, elapsed_seconds_, config_.width, config_.height,
+        running_, paused_, mode_, frame_index_, elapsed_seconds_, config_.width, config_.height,
     };
 }
 
@@ -204,6 +237,7 @@ void Engine::advance_one_frame() {
             animator.time_seconds = std::clamp(animator.time_seconds, 0.0, duration);
         }
     }
+    physics_.step(scene_, config_.fixed_delta_seconds);
     renderer_.render(frame_index_, elapsed_seconds_);
     if (video_.status().recording && video_.status().source == "vulkan") {
         if (video_.sample_due()) {

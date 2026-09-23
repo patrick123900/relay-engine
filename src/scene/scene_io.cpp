@@ -465,6 +465,80 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                 slot.record.transform_animation = std::move(animation);
             }
         }
+        if (result.source_version >= 7U) {
+            const auto* collider_value = field(*entity_object, "collider");
+            if (!collider_value) {
+                result.error = "version 7 entity requires collider";
+                return result;
+            }
+            if (!collider_value->is_null()) {
+                const auto* collider_object = collider_value->object();
+                BoxCollider collider;
+                const auto* enabled = collider_object ? field(*collider_object, "enabled") : nullptr;
+                if (!collider_object ||
+                    !read_vec3(field(*collider_object, "center"), collider.center) ||
+                    !read_vec3(field(*collider_object, "half_extents"), collider.half_extents) ||
+                    !enabled || !enabled->boolean() ||
+                    !read_integer(field(*collider_object, "layer"), collider.layer) ||
+                    !read_integer(field(*collider_object, "mask"), collider.mask)) {
+                    result.error = "invalid box collider";
+                    return result;
+                }
+                collider.enabled = *enabled->boolean();
+                Scene validator;
+                const auto handle = validator.create();
+                if (!validator.set_collider(handle, collider)) {
+                    result.error = "box collider values outside valid ranges";
+                    return result;
+                }
+                slot.record.collider = collider;
+            }
+        }
+        if (result.source_version >= 8U) {
+            const auto* body_value = field(*entity_object, "physics_body");
+            if (!body_value) {
+                result.error = "version 8 entity requires physics_body";
+                return result;
+            }
+            if (!body_value->is_null()) {
+                const auto* body_object = body_value->object();
+                std::uint32_t type{};
+                PhysicsBody body;
+                const auto* mass = body_object ? field(*body_object, "mass") : nullptr;
+                const auto* gravity = body_object ? field(*body_object, "gravity_scale") : nullptr;
+                const auto* restitution = body_object ? field(*body_object, "restitution") : nullptr;
+                if (!body_object || !read_integer(field(*body_object, "type"), type) ||
+                    !mass || !mass->number() || !gravity || !gravity->number() ||
+                    !restitution || !restitution->number() || type > 1U) {
+                    result.error = "invalid physics body";
+                    return result;
+                }
+                body.type = static_cast<PhysicsBody::Type>(type);
+                body.mass = *mass->number();
+                body.gravity_scale = *gravity->number();
+                body.restitution = *restitution->number();
+                if (result.source_version >= 9U) {
+                    const auto* friction = field(*body_object, "friction");
+                    const auto* linear = field(*body_object, "linear_damping");
+                    const auto* angular = field(*body_object, "angular_damping");
+                    if (!friction || !friction->number() || !linear || !linear->number() ||
+                        !angular || !angular->number()) {
+                        result.error = "invalid physics body material or damping";
+                        return result;
+                    }
+                    body.friction = *friction->number();
+                    body.linear_damping = *linear->number();
+                    body.angular_damping = *angular->number();
+                }
+                Scene validator;
+                const auto handle = validator.create();
+                if (!validator.set_physics_body(handle, body)) {
+                    result.error = "physics body values outside valid ranges";
+                    return result;
+                }
+                slot.record.physics_body = body;
+            }
+        }
         ++result.entity_count;
     }
 

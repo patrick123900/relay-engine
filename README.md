@@ -31,11 +31,14 @@ in control of the same project.
   Vulkan viewport, inspect the image, and iterate.
 - **HDR lighting** — a floating-point scene target, camera exposure, procedural environment
   lighting, and tone mapping produce the final SDR viewport and captures.
-- **One typed API** — 90 versioned native methods cover scene editing, rendering, projects,
+- **One typed API** — 99 versioned native methods cover scene editing, rendering, projects,
   observability, capture, and session authorization. A generated MCP bridge exposes the supported
   model-facing subset.
 - **Deterministic core** — fixed-step simulation, transactional undo/redo, strict scene validation,
   and a CPU renderer used as a headless test oracle.
+- **Editor and game modes** — the editor does not advance simulation. **Run Game** starts a
+  temporary scene session; **Stop Game** restores the authored scene. Pause and single-frame step
+  remain available while the game runs.
 - **Practical asset pipeline** — glTF/GLB, OBJ, FBX, DAE, and sandboxed Blender conversion on Linux,
   with PBR materials, animation, skinning, morph targets, cameras, punctual lights, stabilized
   cascaded directional shadows, spot shadows, and point-light cubemap shadows.
@@ -43,12 +46,36 @@ in control of the same project.
   and transfer-queue mip generation when a dedicated queue is available.
 - **Scene authoring and export** — editable, undoable transform keyframes and portable project tar
   packages of saved scenes and assets.
+- **Jolt physics** — authored box colliders support oriented overlap checks and raycasts.
+  Static and dynamic rigid bodies provide gravity, momentum, friction, bounce, and angular motion
+  during Run Game. Runtime impulses can be applied at a world-space point through the protocol.
 
 Select an entity and open **Transform keyframes** in the Inspector to add, edit, scrub, or play
 position, rotation, and scale keys. To share a project, save its scenes, then use **Export saved
 project** in the Project panel. Relay writes an uncompressed `.tar` under that project's `exports/`
 folder, containing the project metadata, member scenes, and non-hidden assets. Export refuses to
 overwrite an existing package.
+
+Use **Run Game** from the toolbar or Run menu to test the current scene. The game viewport uses the
+active scene camera. Scene edits and saves are unavailable during the run; **Stop Game** restores
+the scene as it was when the run began. Pause and frame step control the running game only.
+Select an entity and open **Box collider** in the Inspector to add a collider independent of its
+visible mesh. Its layer and mask determine which other colliders it can overlap; raycasts can also
+filter by layer. The queries report intersections without changing objects. The editor camera
+shows collider wireframes in the viewport: selected colliders are amber, enabled colliders are
+green, and disabled colliders are gray. Toggle them with **View → Collider wireframes**.
+The editor viewport also shows clickable camera and light icons. Directional, point, and spot
+lights have distinct markers; selecting a camera shows a compact perspective or orthographic
+view guide. The guide preserves the camera's field of view and aspect but caps its display size.
+These guides can be toggled from **View** and stay out of Run Game.
+Open **Physics body** in the Inspector to make an object static or dynamic. Dynamic bodies fall
+under gravity and respond to enabled box colliders during Run Game. A collider without a body is
+static. Mass, gravity scale, bounciness, friction, and linear/angular damping are editable;
+Stop Game restores authored positions. Jolt uses continuous collision detection for dynamic
+bodies. An off-center `physics.apply_impulse` command adds rotation as well as linear motion.
+Bodies with transform keyframes follow those keys rather than dynamic simulation.
+Setting a box-collider size axis to zero currently crashes the engine; use a small positive
+thickness for flat surfaces such as floors until this is fixed.
 
 ## Built-in agent workspace
 
@@ -73,11 +100,14 @@ scene workflow, import pipeline, control protocol, MCP bridge, and embedded agen
 functional. APIs and file formats may still change. Windows and macOS renderer parity, broader
 import sandboxing, and sustained live-provider validation remain in progress.
 
+The next engine work is collision contact begin/end events, followed by gameplay scripting tied
+to Run Game and Stop Game. Joints and additional collider shapes follow those foundations.
+
 ## Build
 
 You need CMake 3.25+, Ninja, Python 3.10+, and a C++20 compiler. The graphical editor additionally
-needs SDL3, Vulkan, and `glslc`. CMake fetches pinned Dear ImGui and ImGuizmo sources when the editor
-is enabled.
+needs SDL3, Vulkan, and `glslc`. CMake fetches pinned Jolt 5.6 sources for physics, plus Dear ImGui
+and ImGuizmo sources when the editor is enabled.
 
 ```sh
 cmake --preset dev

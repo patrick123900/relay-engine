@@ -49,9 +49,10 @@ void click(relay::EditorUi& ui, const std::array<float, 4>& rect, bool ctrl = fa
 }
 
 void run() {
-    relay::Engine engine;
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
     engine.scene().clear();
-    engine.pause();
     relay::ControlProtocol protocol(engine);
     relay::ModelAsset model;
     model.name = "headless.model";
@@ -64,12 +65,22 @@ void run() {
     const auto first = engine.scene().create("First");
     const auto second = engine.scene().create("Second");
     const auto third = engine.scene().create("Third");
+    check(engine.scene().set_collider(first, relay::BoxCollider{}), "attach headless box collider");
     check(engine.scene().set_animator(first, relay::Animator{model.name}) &&
               engine.scene().set_animator(second, relay::Animator{model.name}), "attach animators");
     relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
     std::string error;
     check(ui.initialize_headless(error), "CPU-only editor initializes");
     frame(ui, 5);
+    const auto* viewport_window = ImGui::FindWindowByName("Viewport");
+    check(viewport_window, "headless viewport exists");
+    const auto wire_color = IM_COL32(75, 224, 174, 190);
+    const auto has_wireframe = [&] {
+        for (const auto& vertex : viewport_window->DrawList->VtxBuffer)
+            if (vertex.col == wire_color) return true;
+        return false;
+    };
+    check(has_wireframe(), "editor viewport draws collider wireframe without a desktop");
     const auto row = [&](relay::Entity entity) {
         const auto rect = ui.headless_item_rect("entity:" + entity.to_string());
         check(rect.has_value(), "visible hierarchy row is recorded");
@@ -138,10 +149,98 @@ void run() {
           "native quit shows unsaved guard instead of shutting down");
     key(ui, ImGuiKey_Escape, false);
     check(engine.status().running, "cancel close keeps runtime alive");
+    check(protocol.handle(R"({"id":1001,"method":"runtime.play"})").find("\"ok\":true") != std::string::npos,
+          "headless editor can start a game session");
+    frame(ui, 40);
+    check(!has_wireframe(), "game viewport does not show editor collider wireframes");
+    check(!ui.view_override() && !ui.ground_grid_visible() && ui.selected_entities().empty(),
+          "game viewport uses scene camera and hides editor overlays");
+    check(protocol.handle(R"({"id":1002,"method":"runtime.stop"})").find("\"ok\":true") != std::string::npos,
+          "headless editor can stop the game session");
+    frame(ui, 40);
+    check(ui.view_override() && ui.ground_grid_visible(),
+          "stopping restores the editor inspection view");
+    const auto camera_entity = engine.scene().create("Editor camera marker");
+    const auto directional = engine.scene().create("Directional marker");
+    const auto point = engine.scene().create("Point marker");
+    const auto spot = engine.scene().create("Spot marker");
+    relay::Light directional_light;
+    directional_light.type = relay::Light::Type::directional;
+    relay::Light point_light;
+    point_light.type = relay::Light::Type::point;
+    relay::Light spot_light;
+    spot_light.type = relay::Light::Type::spot;
+    check(engine.scene().set_camera(camera_entity, relay::Camera{}) &&
+              engine.scene().set_light(directional, directional_light) &&
+              engine.scene().set_light(point, point_light) &&
+              engine.scene().set_light(spot, spot_light) &&
+              engine.scene().set_transform(directional,
+                  relay::Transform{{-2, 0, 0}, {}, {1, 1, 1}}) &&
+              engine.scene().set_transform(point,
+                  relay::Transform{{0, 2, 0}, {}, {1, 1, 1}}) &&
+              engine.scene().set_transform(spot,
+                  relay::Transform{{2, 0, 0}, {}, {1, 1, 1}}),
+          "camera and light marker fixtures are valid");
+    frame(ui, 40);
+    check(ui.headless_item_rect("node:" + camera_entity.to_string() + ":camera") &&
+              ui.headless_item_rect("node:" + directional.to_string() + ":light") &&
+              ui.headless_item_rect("node:" + point.to_string() + ":light") &&
+              ui.headless_item_rect("node:" + spot.to_string() + ":light"),
+          "editor viewport draws distinct camera and light node markers");
+    const auto has_icon_color = [&](ImU32 color) {
+        for (const auto& vertex : viewport_window->DrawList->VtxBuffer)
+            if (vertex.col == color) return true;
+        return false;
+    };
+    check(has_icon_color(IM_COL32(98, 204, 255, 255)) &&
+              has_icon_color(IM_COL32(255, 219, 112, 255)) &&
+              has_icon_color(IM_COL32(255, 235, 130, 255)) &&
+              has_icon_color(IM_COL32(255, 161, 91, 255)),
+          "camera, directional, point and spot markers use distinct viewport colors");
+    const auto marker = *ui.headless_item_rect("node:" + camera_entity.to_string() + ":camera");
+    auto& marker_io = ImGui::GetIO();
+    marker_io.AddMousePosEvent((marker[0] + marker[2]) * 0.5F,
+                               (marker[1] + marker[3]) * 0.5F);
+    frame(ui);
+    marker_io.AddMouseButtonEvent(0, true);
+    frame(ui);
+    marker_io.AddMouseButtonEvent(0, false);
+    frame(ui, 2);
+    check(!ui.selected_entities().empty() && ui.selected_entities().front() == camera_entity,
+          "clicking an invisible node's camera icon selects it in the editor");
+    const auto frustum_color = IM_COL32(98, 204, 255, 215);
+    bool has_frustum = false;
+    for (const auto& vertex : viewport_window->DrawList->VtxBuffer)
+        has_frustum |= vertex.col == frustum_color;
+    check(has_frustum, "selected camera draws its view wireframe in the editor viewport");
+    relay::TransformAnimation camera_keys;
+    camera_keys.duration_seconds = 2.0;
+    camera_keys.keys = {{0.0, relay::Transform{}},
+                        {2.0, relay::Transform{{2, 0, 0}, {}, {1, 1, 1}}}};
+    check(engine.scene().set_transform_animation(camera_entity, camera_keys),
+          "camera marker accepts authored transform keys");
+    frame(ui, 40);
+    const auto before_animation = ui.headless_item_rect("node:" + camera_entity.to_string() + ":camera");
+    camera_keys.time_seconds = 1.0;
+    check(engine.scene().set_transform_animation(camera_entity, camera_keys),
+          "camera marker can scrub authored transform keys");
+    frame(ui, 40);
+    const auto after_animation = ui.headless_item_rect("node:" + camera_entity.to_string() + ":camera");
+    check(before_animation && after_animation && (*after_animation)[0] > (*before_animation)[0] + 5.0F,
+          "camera marker follows the sampled scene-owned transform track");
+    check(protocol.handle(R"({"id":1003,"method":"runtime.play"})").find("\"ok\":true") != std::string::npos,
+          "game session starts with node markers present");
+    frame(ui, 40);
+    check(!ui.headless_item_rect("node:" + camera_entity.to_string() + ":camera"),
+          "game viewport hides editor-only node markers");
+    check(protocol.handle(R"({"id":1004,"method":"runtime.stop"})").find("\"ok\":true") != std::string::npos,
+          "game session with node markers stops");
     std::cout << "Headless editor input tests passed without SDL windows or OS input\n";
 }
 void project_ui() {
-    relay::Engine engine;
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
     relay::ControlProtocol protocol(engine);
     const auto created = protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/headless/project.relayproject","name":"Headless"})");
     check(created.find("\"ok\":true") != std::string::npos, "create background project fixture");
@@ -172,7 +271,9 @@ void project_ui() {
     std::cout << "Headless project save/browser tests passed\n";
 }
 void agent_ui() {
-    relay::Engine engine;
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
     relay::ControlProtocol protocol(engine);
     const auto target = engine.scene().create("Approved target");
     const auto other = engine.scene().create("Denied target");
@@ -223,7 +324,9 @@ void agent_ui() {
 }
 
 void chat_ui() {
-    relay::Engine engine;
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
     relay::ControlProtocol protocol(engine);
     const auto revision = engine.scene_history().revision();
     const auto* configured = std::getenv("RELAY_BRIDGE_TOKEN");

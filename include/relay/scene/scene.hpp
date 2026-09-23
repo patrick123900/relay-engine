@@ -102,6 +102,26 @@ struct Light {
     auto operator<=>(const Light &) const = default;
 };
 
+struct BoxCollider {
+    Vec3 center{};
+    Vec3 half_extents{0.5, 0.5, 0.5};
+    bool enabled{true};
+    std::uint32_t layer{1};
+    std::uint32_t mask{0xffffffffU};
+    auto operator<=>(const BoxCollider&) const = default;
+};
+
+struct PhysicsBody {
+    enum class Type : std::uint8_t { static_body, dynamic } type{Type::dynamic};
+    double mass{1.0};
+    double gravity_scale{1.0};
+    double restitution{0.0};
+    double friction{0.2};
+    double linear_damping{0.05};
+    double angular_damping{0.05};
+    auto operator<=>(const PhysicsBody&) const = default;
+};
+
 enum class ReflectedFieldType { string, entity, vec3, number, boolean, number_array, object_array };
 
 struct ReflectedField {
@@ -125,6 +145,8 @@ struct EntityRecord {
     std::optional<TransformAnimation> transform_animation{};
     std::optional<ModelNode> model_node{};
     std::optional<Light> light{};
+    std::optional<BoxCollider> collider{};
+    std::optional<PhysicsBody> physics_body{};
 };
 
 struct SceneSlotState {
@@ -165,6 +187,8 @@ public:
     [[nodiscard]] bool set_transform_animation(Entity entity,
                                                std::optional<TransformAnimation> animation);
     [[nodiscard]] bool set_light(Entity entity, std::optional<Light> light);
+    [[nodiscard]] bool set_collider(Entity entity, std::optional<BoxCollider> collider);
+    [[nodiscard]] bool set_physics_body(Entity entity, std::optional<PhysicsBody> body);
     [[nodiscard]] std::optional<Entity> active_camera() const;
 
     [[nodiscard]] SceneState capture_state() const;

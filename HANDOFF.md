@@ -8,10 +8,11 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v19: 90 native methods. Scene v6, project v1, import manifest v3.
+- Protocol schema v24: 99 native methods. Scene v9, project v1, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
-- HDR rendering, bounded asynchronous uploads, transform keyframes, and portable project export
-  are implemented. Preserve unrelated working-tree edits and inspect `git diff` before changing them.
+- HDR rendering, bounded asynchronous uploads, transform keyframes, box colliders, Jolt body
+  simulation, and portable project export are implemented. Preserve unrelated working-tree
+  edits and inspect `git diff` before changing them.
 
 ## Product intent
 
@@ -26,6 +27,11 @@ without blocking simultaneous human editing.
 ### Runtime, scene, and editor
 
 - Fixed deterministic timestep; generation-checked entities; hierarchy and reflected components.
+- Live editor sessions start in Editor mode, where ticks and frame steps do not advance simulation.
+  `runtime.play` snapshots authored scene state and starts a temporary game session; `runtime.stop`
+  restores it without changing undo history. During a run, scene/project/asset mutations and trace
+  replay are rejected through the control protocol. Pause and step apply only in Game mode. The
+  game viewport uses the active scene camera rather than the editor inspection camera.
 - Transactional undo/redo, multi-selection, clipboard workflows, strict loading, migration, and
   atomic saves.
 - Folder projects with contained `scenes/`, `assets/`, `captures/`, and traces.
@@ -35,6 +41,29 @@ without blocking simultaneous human editing.
 - Scene-owned transform keys interpolate position, Euler rotation, and scale. The inspector and
   protocol can add, edit, delete, scrub, play, and loop keys with undo/redo. Scene v6 saves keys;
   older scenes load without them. Imported animation channels remain read-only.
+- Scene v7 adds undoable, editable box colliders with local center/half extents, enable flag, and
+  32-bit collision layer/mask fields. They save independently of mesh geometry. The `physics.raycast`
+  and `physics.overlaps` read-only protocol methods test oriented boxes under entity hierarchy and
+  scene-owned transform keys. Queries cap active colliders at 4096 and overlap results at 128.
+  Colliders on imported model nodes currently follow the authored entity hierarchy, not imported
+  animation node poses.
+- Scene v8 adds undoable static/dynamic physics bodies with mass, gravity scale, and restitution;
+  scene v9 adds friction plus linear and angular damping. Existing v8 files migrate with Jolt's
+  default material values. The game-only Jolt 5.6 world provides gravity, full rigid-body contact
+  response, angular motion, friction, restitution, and linear-cast continuous collision detection.
+  Colliders without bodies are static. Linear/angular velocities are runtime state, cleared on Run
+  Game and Stop Game, and observable through `physics.body_status`; `physics.apply_impulse` accepts
+  an optional world-space point to generate torque. Paused games advance only via frame step.
+  Dynamic bodies with authored transform keys are kinematic. Authored collider types currently
+  comprise boxes; joints and persistent contact events remain future work.
+- The editor camera overlays world-space collider wireframes from the same shape computation as
+  physics queries. Selected boxes are amber, enabled boxes green, disabled boxes gray. The View
+  menu toggles them. The host-only read-only `physics.debug_boxes` method caps output at 4096.
+- The editor viewport overlays clickable camera and directional/point/spot light icons, with type
+  labels on hover. Selected cameras show a compact perspective or orthographic view guide; its
+  display depth is capped independently of the authored far clipping plane. Markers follow
+  scene-owned transform keys and parent transforms, can be toggled in View, and are hidden during
+  Run Game.
 - `project.package` writes a bounded uncompressed tar under `exports/` containing normalized
   project metadata, member scenes, and non-hidden project assets, including import metadata.
   It excludes private state, captures, traces, and prior exports, and refuses overwrites. The
@@ -137,10 +166,15 @@ without blocking simultaneous human editing.
    queue, so that queue branch still has compile and headless checks only.
 5. Agent sessions are designed for one local human/editor workflow; multi-client identities and a
    tamper-proof continuous audit store are not implemented.
+6. Setting any box-collider size axis to zero currently crashes the engine (reported in the editor,
+   for example when making a floor). Use a small positive thickness until this is fixed.
 
 ## Next priorities
 
-1. Expand authoring to additional editable animation tracks and richer export formats.
+1. Add persistent contact begin/end events to the Jolt backend so games can react to collisions.
+2. Add gameplay scripting with a lifecycle tied to Run Game and Stop Game, including access to
+   contact events.
+3. Add joints and more collider shapes to the Jolt backend.
 
 ## Verification baseline
 

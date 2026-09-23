@@ -5,6 +5,7 @@
 #include "relay/observe/capture.hpp"
 #include "relay/observe/performance.hpp"
 #include "relay/observe/trace.hpp"
+#include "relay/physics/collision.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/render/renderer.hpp"
 #include "relay/scene/scene.hpp"
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <optional>
 #include <string>
 
 namespace relay {
@@ -24,11 +26,15 @@ struct EngineConfig {
     std::uint32_t height{720};
     double fixed_delta_seconds{1.0 / 60.0};
     std::uint64_t random_seed{0x52454C4159ULL};
+    bool editor_mode{false};
 };
+
+enum class RuntimeMode { editor, game };
 
 struct EngineStatus {
     bool running{true};
     bool paused{false};
+    RuntimeMode mode{RuntimeMode::game};
     std::uint64_t frame_index{0};
     double elapsed_seconds{0.0};
     std::uint32_t width{};
@@ -41,6 +47,9 @@ public:
     ~Engine();
 
     void tick();
+    [[nodiscard]] bool run_game();
+    [[nodiscard]] bool stop_game();
+    [[nodiscard]] bool game_session_active() const { return authored_scene_.has_value(); }
     void step(std::uint32_t frame_count = 1);
     void pause();
     void resume();
@@ -75,6 +84,8 @@ public:
     [[nodiscard]] const LogBuffer& logs() const;
     [[nodiscard]] Scene& scene();
     [[nodiscard]] const Scene& scene() const;
+    [[nodiscard]] PhysicsWorld& physics() { return physics_; }
+    [[nodiscard]] const PhysicsWorld& physics() const { return physics_; }
     [[nodiscard]] SceneHistory& scene_history();
     [[nodiscard]] SceneClipboard& clipboard() { return clipboard_; }
     [[nodiscard]] std::optional<Project>& project() { return project_; }
@@ -89,6 +100,7 @@ private:
     SoftwareRenderer renderer_;
     LogBuffer logs_;
     Scene scene_;
+    PhysicsWorld physics_;
     SceneHistory scene_history_;
     SceneClipboard clipboard_;
     std::optional<Project> project_;
@@ -102,6 +114,8 @@ private:
     std::deque<std::string> recent_input_events_;
     bool running_{true};
     bool paused_{false};
+    RuntimeMode mode_{RuntimeMode::game};
+    std::optional<SceneState> authored_scene_;
     std::uint64_t frame_index_{0};
     double elapsed_seconds_{0.0};
 };

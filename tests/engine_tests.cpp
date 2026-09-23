@@ -5,6 +5,7 @@
 #include "relay/editor/editor_state.hpp"
 #include "relay/editor/editor_viewport.hpp"
 #include "relay/core/engine.hpp"
+#include "relay/physics/collision.hpp"
 #include "relay/render/scene_render.hpp"
 #include "relay/render/asset_manifest.hpp"
 #include "relay/render/assets.hpp"
@@ -128,6 +129,38 @@ std::string textured_external_gltf(const std::string& buffer_uri) {
 } // namespace
 
 int main() {
+    {
+        relay::Camera camera;
+        camera.field_of_view_y_degrees = 90.0;
+        camera.near_plane = 1.0;
+        camera.far_plane = 4.0;
+        const auto world = relay::editor_compose({3, 4, 5}, {}, {1, 1, 1});
+        const auto perspective = relay::editor_camera_frustum(camera, 2.0, world);
+        expect(std::abs(perspective[0].x - 1.0) < 0.0001 &&
+                   std::abs(perspective[0].z - 4.0) < 0.0001 &&
+                   std::abs(perspective[4].x + 5.0) < 0.0001 &&
+                   std::abs(perspective[4].z - 1.0) < 0.0001,
+               "perspective camera wireframe follows near/far planes and field of view");
+        camera.orthographic_height = 4.0;
+        const auto orthographic = relay::editor_camera_frustum(camera, 2.0, world);
+        expect(std::abs(orthographic[0].x + 1.0) < 0.0001 &&
+                   std::abs(orthographic[4].x + 1.0) < 0.0001 &&
+                   std::abs(orthographic[0].z - 4.0) < 0.0001 &&
+                   std::abs(orthographic[4].z - 1.0) < 0.0001,
+               "orthographic camera wireframe has parallel near/far planes");
+        camera.orthographic_height = 0.0;
+        camera.far_plane = 1000.0;
+        const auto perspective_guide = relay::editor_camera_guide(camera, 2.0, world);
+        expect(std::abs(perspective_guide[4].z - 4.5) < 0.0001 &&
+                   std::abs(perspective_guide[4].x - 2.0) < 0.0001 &&
+                   std::abs(perspective_guide[0].z - 4.9) < 0.0001,
+               "camera guide caps display depth while retaining perspective angle");
+        camera.orthographic_height = 100.0;
+        const auto orthographic_guide = relay::editor_camera_guide(camera, 2.0, world);
+        expect(std::abs(orthographic_guide[4].z - 3.5) < 0.0001 &&
+                   std::abs(orthographic_guide[4].x - 2.0) < 0.0001,
+               "orthographic camera guide caps its display footprint");
+    }
     {
         relay::Scene scene;
         const auto entity = scene.create("Editor decoding");
@@ -1168,16 +1201,16 @@ int main() {
            "camera accepts exposure compensation within its valid range");
     const auto exposure_path = scene_test_directory / "exposure.relay.json";
     expect(relay::save_scene_file_atomic(exposure_scene, exposure_path, scene_file_error),
-           "version 6 scene with exposure saves");
+           "version 9 scene with exposure saves");
     const auto exposure_loaded = relay::load_scene_file(exposure_path);
-    expect(exposure_loaded && exposure_loaded.source_version == 6U &&
+    expect(exposure_loaded && exposure_loaded.source_version == 9U &&
                exposure_loaded.state->slots[exposure_entity.index].record.camera->exposure_ev == 2.25,
-           "camera exposure survives the version 6 scene round trip");
+           "camera exposure survives the version 9 scene round trip");
     auto legacy_exposure_json = exposure_scene.serialize_json();
-    const auto version_position = legacy_exposure_json.find("\"version\":6");
+    const auto version_position = legacy_exposure_json.find("\"version\":9");
     const auto exposure_position = legacy_exposure_json.find(",\"exposure_ev\":2.25");
     expect(version_position != std::string::npos && exposure_position != std::string::npos,
-           "version 6 serialization includes camera exposure");
+           "version 9 serialization includes camera exposure");
     if (version_position != std::string::npos && exposure_position != std::string::npos) {
         legacy_exposure_json.replace(version_position, 11U, "\"version\":4");
         legacy_exposure_json.erase(exposure_position, std::string(",\"exposure_ev\":2.25").size());
@@ -1245,6 +1278,408 @@ int main() {
     expect(!invalid_scene && invalid_scene.error.find("missing or stale parent") != std::string::npos,
            "loader rejects unresolved hierarchy references");
 
+    {
+        relay::EngineConfig editor_config{64, 48, 1.0 / 60.0};
+        editor_config.editor_mode = true;
+        relay::Engine editor_engine(editor_config);
+        relay::ControlProtocol editor_protocol(editor_engine);
+        const auto authored = editor_engine.scene().create("Authored");
+        relay::TransformAnimation authored_animation;
+        authored_animation.playing = true;
+        expect(editor_engine.scene().set_transform_animation(authored, authored_animation),
+               "authored scene can contain a playing animation");
+        const auto revision = editor_engine.scene_history().revision();
+        editor_engine.tick();
+        editor_engine.step(1);
+        expect(editor_engine.status().mode == relay::RuntimeMode::editor &&
+                   editor_engine.status().frame_index == 0 &&
+                   editor_engine.scene().get(authored)->transform_animation->time_seconds == 0.0,
+               "editor mode does not advance simulation automatically or by step");
+        expect(editor_protocol.handle(R"({"id":9001,"method":"runtime.pause"})").find("\"ok\":false") != std::string::npos,
+               "pause requires a running game");
+        expect(editor_protocol.handle(R"({"id":9002,"method":"runtime.play"})").find("\"ok\":true") != std::string::npos,
+               "protocol starts game mode from the authored scene");
+        editor_engine.tick();
+        expect(editor_engine.status().frame_index == 1 &&
+                   editor_engine.scene().get(authored)->transform_animation->time_seconds > 0.0 &&
+                   editor_protocol.handle(R"({"id":9003,"method":"runtime.status"})").find(R"("mode":"game")") != std::string::npos,
+               "run game advances frames and reports its mode");
+        expect(editor_protocol.handle(R"({"id":9004,"method":"runtime.pause"})").find("\"ok\":true") != std::string::npos,
+               "running game can pause");
+        editor_engine.tick();
+        expect(editor_engine.status().frame_index == 1,
+               "paused game does not advance on tick");
+        expect(editor_protocol.handle(R"({"id":9005,"method":"runtime.step","frames":1})").find("\"ok\":true") != std::string::npos &&
+                   editor_engine.status().frame_index == 2,
+               "paused game advances one requested frame");
+        expect(editor_protocol.handle(R"({"id":9006,"method":"scene.create","name":"Temporary"})").find("\"ok\":false") != std::string::npos &&
+                   editor_protocol.handle(R"({"id":9007,"method":"scene.save","filename":"game.relay.json"})").find("\"ok\":false") != std::string::npos,
+               "game mode rejects authoring and saving through the protocol");
+        (void)editor_engine.scene().create("Runtime only");
+        expect(editor_protocol.handle(R"({"id":9008,"method":"runtime.stop"})").find("\"ok\":true") != std::string::npos &&
+                   editor_engine.scene().contains(authored) &&
+                   editor_engine.scene().entities().size() == 1U &&
+                   editor_engine.scene().get(authored)->transform_animation->time_seconds == 0.0 &&
+                   editor_engine.scene_history().revision() == revision &&
+                   editor_engine.status().mode == relay::RuntimeMode::editor,
+               "stop restores authored scene and preserves undo history");
+        editor_engine.tick();
+        expect(editor_engine.status().frame_index == 0,
+               "stopped game leaves editor simulation idle");
+        expect(editor_protocol.handle(R"({"id":9009,"method":"scene.create","name":"After run"})").find("\"ok\":true") != std::string::npos &&
+                   editor_engine.scene_history().undo_depth() == 1U,
+               "authoring and undo history continue after stopping the game");
+    }
+
+    {
+        relay::Engine collision_engine({64, 48, 1.0 / 60.0});
+        relay::ControlProtocol collision_protocol(collision_engine);
+        const auto parent = collision_engine.scene().create("Rotated parent");
+        const auto box = collision_engine.scene().create("Box", parent);
+        const auto other = collision_engine.scene().create("Other");
+        expect(collision_engine.scene().set_transform(parent,
+                   relay::Transform{{1, 0, 0}, {0, 0, 90}, {1, 1, 1}}) &&
+               collision_engine.scene().set_transform(box,
+                   relay::Transform{{2, 0, 0}, {}, {1, 1, 1}}) &&
+               collision_engine.scene().set_transform(other,
+                   relay::Transform{{1, 2.5, 0}, {}, {1, 1, 1}}),
+               "collider fixtures use parent rotation and child transforms");
+        const auto box_request = "{\"id\":9101,\"method\":\"scene.set_collider\",\"entity\":\"" +
+                                 box.to_string() + "\",\"half_x\":1,\"half_y\":0.5,\"layer\":2,\"mask\":4}";
+        const auto other_request = "{\"id\":9102,\"method\":\"scene.set_collider\",\"entity\":\"" +
+                                   other.to_string() + "\",\"layer\":4,\"mask\":2}";
+        expect(collision_protocol.handle(box_request).find("\"ok\":true") != std::string::npos &&
+               collision_protocol.handle(other_request).find("\"ok\":true") != std::string::npos,
+               "box colliders are authored through the control protocol");
+        const auto debug_boxes = relay::collision_debug_boxes(collision_engine.scene());
+        const auto debug_box = std::find_if(debug_boxes.boxes.begin(), debug_boxes.boxes.end(),
+            [&](const relay::CollisionDebugBox& item) { return item.entity == box; });
+        expect(debug_box != debug_boxes.boxes.end() && debug_box->enabled &&
+                   std::abs(debug_box->center.x - 1.0) < 0.001 &&
+                   std::abs(debug_box->center.y - 2.0) < 0.001 &&
+                   std::abs(debug_box->edges[0].x) < 0.001 &&
+                   std::abs(debug_box->edges[0].y - 1.0) < 0.001,
+               "debug box uses the collision query's rotated world-space half edges");
+        const auto debug_response =
+            collision_protocol.handle(R"({"id":9110,"method":"physics.debug_boxes"})");
+        expect(debug_response.find("\"entity\":\"" + box.to_string() + "\"") != std::string::npos &&
+                   debug_response.find("\"edges\":[") != std::string::npos,
+               "editor can query bounded world-space collider wireframes");
+        const auto ray = relay::collision_raycast(collision_engine.scene(), {1, 5, 0},
+                                                  {0, -1, 0}, 10, 2);
+        expect(ray.hit && ray.entity == box && std::abs(ray.distance - 2.0) < 0.001 &&
+                   std::abs(ray.normal.y - 1.0) < 0.001,
+               "raycast respects parent rotation and returns first surface normal");
+        expect(!relay::collision_raycast(collision_engine.scene(), {1, 5, 0},
+                                         {0, -1, 0}, 1.0, 2).hit &&
+                   !relay::collision_raycast(collision_engine.scene(), {1, 5, 0},
+                                              {0, -1, 0}, 10.0, 1).hit,
+               "raycast respects distance and layer mask");
+        const auto overlap = relay::collision_overlaps(collision_engine.scene(), box);
+        expect(overlap.error.empty() && overlap.entities.size() == 1U &&
+                   overlap.entities.front() == other,
+               "overlap query finds boxes using reciprocal layer masks");
+        const auto ray_response = collision_protocol.handle(
+            R"({"id":9103,"method":"physics.raycast","origin_x":1,"origin_y":5,"origin_z":0,"direction_x":0,"direction_y":-1,"direction_z":0,"layer_mask":2})");
+        expect(ray_response.find("\"entity\":\"" + box.to_string() + "\"") != std::string::npos &&
+                   ray_response.find("\"distance\":") != std::string::npos,
+               "protocol raycast reports collider, distance, point and normal");
+        expect(collision_protocol.handle(
+                   R"({"id":9108,"method":"physics.raycast","origin_x":0,"origin_y":0,"origin_z":0,"direction_x":0,"direction_y":0,"direction_z":0})")
+                   .find("\"ok\":false") != std::string::npos &&
+                   collision_protocol.handle("{\"id\":9109,\"method\":\"scene.set_collider\",\"entity\":\"" +
+                       box.to_string() + "\",\"half_x\":0}").find("\"ok\":false") != std::string::npos,
+               "collision protocol rejects zero ray directions and invalid box sizes");
+        const auto overlap_response = collision_protocol.handle(
+            "{\"id\":9104,\"method\":\"physics.overlaps\",\"entity\":\"" + box.to_string() + "\"}");
+        expect(overlap_response.find("\"" + other.to_string() + "\"") != std::string::npos,
+               "protocol overlap query exposes touching entities");
+        const auto collision_path = scene_test_directory / "colliders.relay.json";
+        std::string collision_error;
+        expect(relay::save_scene_file_atomic(collision_engine.scene(), collision_path,
+                                             collision_error), "scene with colliders saves");
+        const auto loaded_colliders = relay::load_scene_file(collision_path);
+        expect(loaded_colliders && loaded_colliders.source_version == 9U &&
+                   loaded_colliders.state->slots[box.index].record.collider &&
+                   loaded_colliders.state->slots[box.index].record.collider->layer == 2U,
+               "colliders survive scene version 9 round trip");
+        relay::Scene pre_collider_scene;
+        const auto legacy_entity = pre_collider_scene.create("Older scene");
+        auto legacy_json = pre_collider_scene.serialize_json();
+        const auto version = legacy_json.find("\"version\":9");
+        const auto absent_collider = legacy_json.find(",\"collider\":null");
+        expect(version != std::string::npos && absent_collider != std::string::npos,
+               "version 9 serializer includes an explicit collider slot");
+        if (version != std::string::npos && absent_collider != std::string::npos) {
+            legacy_json.replace(version, 11U, "\"version\":6");
+            legacy_json.erase(absent_collider, std::string(",\"collider\":null").size());
+            const auto pre_collider_path = scene_test_directory / "pre-collider.relay.json";
+            write_file(pre_collider_path, legacy_json);
+            const auto migrated = relay::load_scene_file(pre_collider_path);
+            expect(migrated && migrated.migrated &&
+                       !migrated.state->slots[legacy_entity.index].record.collider,
+                   "version 6 scenes load without collider components");
+            std::filesystem::remove(pre_collider_path);
+        }
+        expect(collision_protocol.handle("{\"id\":9105,\"method\":\"scene.set_collider\",\"entity\":\"" +
+                   other.to_string() + "\",\"mask\":0}").find("\"ok\":true") != std::string::npos &&
+                   relay::collision_overlaps(collision_engine.scene(), box).entities.empty(),
+               "reciprocal collision masks filter overlaps");
+        expect(collision_protocol.handle("{\"id\":9106,\"method\":\"scene.set_collider\",\"entity\":\"" +
+                   box.to_string() + "\",\"enabled\":false}").find("\"ok\":true") != std::string::npos &&
+                   !relay::collision_raycast(collision_engine.scene(), {1, 5, 0},
+                                              {0, -1, 0}, 10, 2).hit,
+               "disabled colliders are excluded from raycasts");
+        expect(collision_protocol.handle(R"({"id":9107,"method":"scene.undo"})").find("\"ok\":true") != std::string::npos &&
+                   relay::collision_raycast(collision_engine.scene(), {1, 5, 0},
+                                              {0, -1, 0}, 10, 2).hit,
+               "undo restores collider configuration");
+        std::filesystem::remove(collision_path);
+    }
+
+    {
+        relay::Scene collision_scene;
+        const auto thin = collision_scene.create("Thin rotated box");
+        const auto corner = collision_scene.create("Broadphase corner");
+        expect(collision_scene.set_transform(thin, relay::Transform{{}, {0, 0, 45}, {1, 1, 1}}) &&
+                   collision_scene.set_transform(corner, relay::Transform{{1.3, 0, 0}, {}, {1, 1, 1}}),
+               "rotated overlap fixture transforms are valid");
+        relay::BoxCollider long_box;
+        long_box.half_extents = {2, 0.1, 0.1};
+        relay::BoxCollider small_box;
+        small_box.half_extents = {0.1, 0.1, 0.1};
+        expect(collision_scene.set_collider(thin, long_box) && collision_scene.set_collider(corner, small_box) &&
+                   relay::collision_overlaps(collision_scene, thin).entities.empty(),
+               "oriented overlap test rejects an AABB-only false positive");
+        const auto animated = collision_scene.create("Animated collider");
+        relay::TransformAnimation animation;
+        animation.time_seconds = 1.0;
+        animation.keys = {{0.0, relay::Transform{}},
+                          {1.0, relay::Transform{{4, 0, 0}, {}, {1, 1, 1}}}};
+        expect(collision_scene.set_transform_animation(animated, animation) &&
+                   collision_scene.set_collider(animated, relay::BoxCollider{}),
+               "animated collider fixture is valid");
+        const auto animated_hit = relay::collision_raycast(collision_scene, {4, 0, 3},
+                                                            {0, 0, -1}, 10);
+        expect(animated_hit.hit && animated_hit.entity == animated &&
+                   std::abs(animated_hit.distance - 2.5) < 0.001,
+               "collider queries sample scene-owned transform keys");
+    }
+
+    {
+        relay::Engine physics_engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+        relay::ControlProtocol physics_protocol(physics_engine);
+        const auto floor = physics_engine.scene().create("Floor");
+        const auto falling = physics_engine.scene().create("Falling box");
+        relay::BoxCollider floor_box;
+        floor_box.half_extents = {5, 0.5, 5};
+        expect(physics_engine.scene().set_transform(floor,
+                   relay::Transform{{0, -0.5, 0}, {}, {1, 1, 1}}) &&
+               physics_engine.scene().set_collider(floor, floor_box) &&
+               physics_engine.scene().set_transform(falling,
+                   relay::Transform{{0, 3, 0}, {}, {1, 1, 1}}) &&
+               physics_engine.scene().set_collider(falling, relay::BoxCollider{}),
+               "physics floor and falling box fixtures are valid");
+        const auto add_body = physics_protocol.handle(
+            "{\"id\":9301,\"method\":\"scene.set_physics_body\",\"entity\":\"" +
+            falling.to_string() +
+            "\",\"type\":\"dynamic\",\"mass\":2,\"friction\":0.7,\"linear_damping\":0.1,\"angular_damping\":0.2}");
+        expect(add_body.find("\"ok\":true") != std::string::npos,
+               "dynamic body is authored through the control protocol");
+        const auto body_path = scene_test_directory / "physics-body.relay.json";
+        std::string body_error;
+        expect(relay::save_scene_file_atomic(physics_engine.scene(), body_path, body_error),
+               "physics body saves in scene version 9");
+        const auto body_scene = relay::load_scene_file(body_path);
+        expect(body_scene && body_scene.source_version == 9U &&
+                   body_scene.state->slots[falling.index].record.physics_body &&
+                   body_scene.state->slots[falling.index].record.physics_body->mass == 2.0 &&
+                   body_scene.state->slots[falling.index].record.physics_body->friction == 0.7 &&
+                   body_scene.state->slots[falling.index].record.physics_body->linear_damping == 0.1 &&
+                   body_scene.state->slots[falling.index].record.physics_body->angular_damping == 0.2,
+               "physics body settings round trip");
+        auto old_body_json = physics_engine.scene().serialize_json();
+        const auto old_body_version = old_body_json.find("\"version\":9");
+        const auto material_start = old_body_json.find(",\"friction\":");
+        if (old_body_version != std::string::npos && material_start != std::string::npos) {
+            old_body_json.replace(old_body_version, 11, "\"version\":8");
+            old_body_json.erase(material_start, old_body_json.find('}', material_start) - material_start);
+            const auto old_body_path = scene_test_directory / "v8-physics.relay.json";
+            write_file(old_body_path, old_body_json);
+            const auto old_body = relay::load_scene_file(old_body_path);
+            expect(old_body && old_body.migrated &&
+                       old_body.state->slots[falling.index].record.physics_body->friction == 0.2 &&
+                       old_body.state->slots[falling.index].record.physics_body->angular_damping == 0.05,
+                   "version 8 physics bodies migrate with Jolt material defaults");
+            std::filesystem::remove(old_body_path);
+        }
+        auto prior_version = physics_engine.scene().serialize_json();
+        const auto version_field = prior_version.find("\"version\":9");
+        const auto body_field = prior_version.find(",\"physics_body\":null");
+        expect(version_field != std::string::npos && body_field != std::string::npos,
+               "version 9 scene has an explicit optional body field");
+        if (version_field != std::string::npos && body_field != std::string::npos) {
+            prior_version.replace(version_field, 11, "\"version\":7");
+            prior_version.erase(body_field, std::string(",\"physics_body\":null").size());
+            const auto prior_path = scene_test_directory / "pre-physics.relay.json";
+            write_file(prior_path, prior_version);
+            const auto previous = relay::load_scene_file(prior_path);
+            expect(previous && previous.migrated &&
+                       !previous.state->slots[floor.index].record.physics_body,
+                   "version 7 scene without bodies migrates");
+            std::filesystem::remove(prior_path);
+        }
+        physics_engine.tick();
+        expect(physics_engine.scene().get(falling)->transform.position.y == 3.0,
+               "editor mode does not simulate physics");
+        expect(physics_protocol.handle(R"({"id":9302,"method":"runtime.play"})")
+                   .find("\"ok\":true") != std::string::npos,
+               "game session starts physics");
+        physics_engine.pause();
+        physics_engine.tick();
+        expect(physics_engine.scene().get(falling)->transform.position.y == 3.0,
+               "paused game does not integrate bodies");
+        physics_engine.step(120);
+        const auto resting = physics_engine.scene().get(falling)->transform.position.y;
+        expect(resting >= 0.47 && resting <= 0.51,
+               "falling dynamic box rests on static floor after collision response");
+        const auto velocity_response = physics_protocol.handle(
+            "{\"id\":9303,\"method\":\"physics.body_status\",\"entity\":\"" +
+            falling.to_string() + "\"}");
+        expect(velocity_response.find("\"velocity\":[") != std::string::npos,
+               "physics body velocity is observable during game");
+        expect(velocity_response.find("\"angular_velocity\":[") != std::string::npos,
+               "Jolt angular velocity is observable during game");
+        expect(physics_protocol.handle(
+                   "{\"id\":9305,\"method\":\"physics.apply_impulse\",\"entity\":\"" +
+                   falling.to_string() +
+                   "\",\"impulse_x\":2,\"impulse_y\":0,\"impulse_z\":0,\"point_x\":0,\"point_y\":1.5,\"point_z\":0}")
+                   .find("\"applied\":true") != std::string::npos,
+               "control protocol applies an off-center Jolt impulse during Run Game");
+        const auto impulsed_angular = physics_engine.physics().angular_velocity(
+            physics_engine.scene(), falling);
+        expect(impulsed_angular && std::abs(impulsed_angular->z) > 0.01,
+               "protocol impulse generates angular velocity");
+        expect(physics_protocol.handle(R"({"id":9304,"method":"runtime.stop"})")
+                   .find("\"ok\":true") != std::string::npos &&
+                   physics_engine.scene().get(falling)->transform.position.y == 3.0,
+               "stopping game restores authored body transform");
+        std::filesystem::remove(body_path);
+    }
+    {
+        relay::Scene impulse_scene;
+        const auto box = impulse_scene.create("Impulse box");
+        relay::PhysicsBody body;
+        body.gravity_scale = 0.0;
+        expect(impulse_scene.set_collider(box, relay::BoxCollider{}) &&
+                   impulse_scene.set_physics_body(box, body),
+               "Jolt impulse fixture is valid");
+        relay::PhysicsWorld world;
+        expect(world.apply_impulse(impulse_scene, box, {2, 0, 0}, relay::Vec3{0, 1, 0}),
+               "off-center Jolt impulse applies to a dynamic body");
+        for (unsigned frame = 0; frame < 60; ++frame) world.step(impulse_scene, 1.0 / 60.0);
+        const auto velocity = world.velocity(impulse_scene, box);
+        const auto angular = world.angular_velocity(impulse_scene, box);
+        expect(velocity && velocity->x > 0.1 && angular && std::abs(angular->z) > 0.1 &&
+                   std::abs(impulse_scene.get(box)->transform.rotation_degrees.z) > 1.0,
+               "Jolt preserves linear momentum and integrates angular motion");
+    }
+    {
+        relay::Scene distant_scene;
+        const auto box = distant_scene.create("Distant box");
+        relay::PhysicsBody body;
+        body.gravity_scale = 0.0;
+        expect(distant_scene.set_transform(box,
+                   relay::Transform{{999999.75, 0, 0}, {}, {1, 1, 1}}) &&
+                   distant_scene.set_collider(box, relay::BoxCollider{}) &&
+                   distant_scene.set_physics_body(box, body),
+               "large-coordinate Jolt fixture is valid");
+        const auto hit = relay::collision_raycast(distant_scene, {999997.25, 0, 0},
+                                                  {1, 0, 0}, 10);
+        expect(hit.hit && hit.entity == box && std::abs(hit.distance - 2.0) < 0.001,
+               "Jolt raycast preserves small collider dimensions near a million units");
+        relay::PhysicsWorld world;
+        expect(world.apply_impulse(distant_scene, box, {1, 0, 0}),
+               "Jolt accepts a distant dynamic body");
+        world.step(distant_scene, 1.0 / 60.0);
+        expect(distant_scene.get(box)->transform.position.x > 999999.75,
+               "double-precision Jolt position records small distant motion");
+    }
+    {
+        relay::Scene ccd_scene;
+        const auto floor = ccd_scene.create("Thin floor");
+        const auto box = ccd_scene.create("Fast box");
+        relay::BoxCollider thin;
+        thin.half_extents = {5, 0.1, 5};
+        relay::PhysicsBody body;
+        body.gravity_scale = 0.0;
+        expect(ccd_scene.set_collider(floor, thin) &&
+                   ccd_scene.set_transform(box, relay::Transform{{0, 3, 0}, {}, {1, 1, 1}}) &&
+                   ccd_scene.set_collider(box, relay::BoxCollider{}) &&
+                   ccd_scene.set_physics_body(box, body),
+               "continuous collision fixture is valid");
+        relay::PhysicsWorld world;
+        expect(world.apply_impulse(ccd_scene, box, {0, -1000, 0}),
+               "fast dynamic body receives a downward impulse");
+        world.step(ccd_scene, 1.0 / 60.0);
+        expect(ccd_scene.get(box)->transform.position.y > 0.5,
+               "Jolt linear-cast CCD stops a fast body at a thin floor");
+    }
+    {
+        relay::Scene no_collider_scene;
+        const auto body_entity = no_collider_scene.create("Colliderless body");
+        expect(no_collider_scene.set_physics_body(body_entity, relay::PhysicsBody{}),
+               "colliderless dynamic body fixture is valid");
+        relay::PhysicsWorld world;
+        world.step(no_collider_scene, 1.0 / 60.0);
+        expect(no_collider_scene.get(body_entity)->transform.position.y < 0.0,
+               "dynamic bodies without colliders still respond to gravity");
+    }
+    {
+        relay::Scene pair_scene;
+        const auto left = pair_scene.create("Left");
+        const auto right = pair_scene.create("Right");
+        relay::PhysicsBody body;
+        body.gravity_scale = 0.0;
+        expect(pair_scene.set_collider(left, relay::BoxCollider{}) &&
+               pair_scene.set_collider(right, relay::BoxCollider{}) &&
+               pair_scene.set_physics_body(left, body) &&
+               pair_scene.set_physics_body(right, body) &&
+               pair_scene.set_transform(right,
+                   relay::Transform{{0.6, 0, 0}, {}, {1, 1, 1}}),
+               "dynamic pair fixture is valid");
+        relay::PhysicsWorld world;
+        for (unsigned frame = 0; frame < 120; ++frame) world.step(pair_scene, 1.0 / 60.0);
+        const auto distance = pair_scene.get(right)->transform.position.x -
+                              pair_scene.get(left)->transform.position.x;
+        expect(distance >= 0.95, "two dynamic boxes separate under Jolt contact resolution");
+        auto filtered = *pair_scene.get(right)->collider;
+        filtered.mask = 0;
+        expect(pair_scene.set_collider(right, filtered) &&
+               pair_scene.set_transform(left, relay::Transform{}) &&
+               pair_scene.set_transform(right,
+                   relay::Transform{{0.6, 0, 0}, {}, {1, 1, 1}}),
+               "masked pair fixture is valid");
+        world.reset();
+        world.step(pair_scene, 1.0 / 60.0);
+        expect(std::abs(pair_scene.get(right)->transform.position.x - 0.6) < 0.0001,
+               "collision response respects layer masks");
+
+        relay::Scene parent_scene;
+        const auto parent = parent_scene.create("Rotated");
+        const auto child = parent_scene.create("Dynamic child", parent);
+        expect(parent_scene.set_transform(parent,
+                   relay::Transform{{0, 0, 0}, {0, 0, 90}, {2, 1, 1}}) &&
+               parent_scene.set_collider(child, relay::BoxCollider{}) &&
+               parent_scene.set_physics_body(child, relay::PhysicsBody{}),
+               "parented body fixture is valid");
+        relay::PhysicsWorld parent_world;
+        parent_world.step(parent_scene, 1.0 / 60.0);
+        const auto boxes = relay::collision_debug_boxes(parent_scene);
+        expect(!boxes.boxes.empty() && boxes.boxes.front().center.y < -0.001,
+               "parented dynamic body moves downward in world space");
+    }
+
     relay::Engine engine({64, 48, 1.0 / 60.0});
     expect(engine.status().frame_index == 0, "engine starts at frame zero");
     engine.tick();
@@ -1256,7 +1691,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 19U && relay::protocol_methods().size() == 90U,
+    expect(relay::protocol_schema_version == 24U && relay::protocol_methods().size() == 99U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");

@@ -8,6 +8,31 @@ option(RELAY_ENABLE_EDITOR_UI "Build the Dear ImGui human editor interface" ON)
 option(RELAY_FETCH_VULKAN_HEADERS "Fetch pinned Khronos headers when the system only has a loader" ON)
 
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+include(FetchContent)
+set(OVERRIDE_CXX_FLAGS OFF CACHE BOOL "" FORCE)
+set(INTERPROCEDURAL_OPTIMIZATION OFF CACHE BOOL "" FORCE)
+set(GENERATE_DEBUG_SYMBOLS OFF CACHE BOOL "" FORCE)
+set(ENABLE_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(JPH_USE_VK OFF CACHE BOOL "" FORCE)
+set(JPH_USE_DX12 OFF CACHE BOOL "" FORCE)
+set(JPH_USE_MTL OFF CACHE BOOL "" FORCE)
+set(CROSS_PLATFORM_DETERMINISTIC ON CACHE BOOL "" FORCE)
+set(DOUBLE_PRECISION ON CACHE BOOL "" FORCE)
+set(USE_SSE4_1 OFF CACHE BOOL "" FORCE)
+set(USE_SSE4_2 OFF CACHE BOOL "" FORCE)
+set(USE_AVX OFF CACHE BOOL "" FORCE)
+set(USE_AVX2 OFF CACHE BOOL "" FORCE)
+set(USE_LZCNT OFF CACHE BOOL "" FORCE)
+set(USE_TZCNT OFF CACHE BOOL "" FORCE)
+set(USE_F16C OFF CACHE BOOL "" FORCE)
+set(USE_FMADD OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(JoltPhysics
+    URL https://github.com/jrouwe/JoltPhysics/archive/refs/tags/v5.6.0.tar.gz
+    URL_HASH SHA256=6e069ee0172478cc78182047aac87e5310ba14a67a53348ae14cc37801fd3f8e
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SOURCE_SUBDIR Build)
+FetchContent_MakeAvailable(JoltPhysics)
 add_custom_target(relay_protocol_codegen_check ALL
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_protocol.py" --check
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -24,6 +49,8 @@ add_library(relay_engine
     src/core/engine.cpp
     src/core/hash.cpp
     src/core/log.cpp
+    src/physics/collision.cpp
+    src/physics/jolt_world.cpp
     src/observe/capture.cpp
     src/observe/performance.cpp
     src/observe/trace.cpp
@@ -46,6 +73,7 @@ add_library(relay_engine
     src/scene/scene_io.cpp
 )
 add_library(Relay::Engine ALIAS relay_engine)
+target_link_libraries(relay_engine PRIVATE Jolt)
 add_dependencies(relay_engine relay_protocol_codegen_check)
 
 target_compile_features(relay_engine PUBLIC cxx_std_20)

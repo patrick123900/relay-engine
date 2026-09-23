@@ -195,6 +195,49 @@ inline EditorMatrix editor_projection(const double field_of_view_y_degrees, cons
     return result;
 }
 
+// Camera-space -Z is forward. The first four corners belong to the near plane, followed by
+// the far plane. Within each plane, bit 0 selects right and bit 1 selects top.
+inline std::array<Vec3, 8> editor_camera_frustum(const Camera& camera, double aspect,
+                                                  const EditorMatrix& world) {
+    constexpr double radians = 3.14159265358979323846 / 180.0;
+    aspect = std::max(aspect, 0.001);
+    std::array<Vec3, 8> corners{};
+    for (unsigned plane = 0; plane < 2; ++plane) {
+        const double distance = plane == 0 ? camera.near_plane : camera.far_plane;
+        const double half_height = camera.orthographic_height > 0.0
+            ? camera.orthographic_height * 0.5
+            : distance * std::tan(camera.field_of_view_y_degrees * 0.5 * radians);
+        const double half_width = half_height * aspect;
+        for (unsigned corner = 0; corner < 4; ++corner) {
+            const double x = corner & 1U ? half_width : -half_width;
+            const double y = corner & 2U ? half_height : -half_height;
+            corners[plane * 4U + corner] = {
+                world[0] * x + world[4] * y - world[8] * distance + world[12],
+                world[1] * x + world[5] * y - world[9] * distance + world[13],
+                world[2] * x + world[6] * y - world[10] * distance + world[14]};
+        }
+    }
+    return corners;
+}
+
+// A camera's far clip can be thousands of units away. Keep the editor guide close to the node
+// while retaining the projection's perspective angle or orthographic aspect.
+inline std::array<Vec3, 8> editor_camera_guide(const Camera& camera, double aspect,
+                                               const EditorMatrix& world) {
+    Camera guide = camera;
+    aspect = std::max(aspect, 0.001);
+    guide.far_plane = std::min(camera.far_plane, 1.5);
+    if (camera.orthographic_height > 0.0) {
+        guide.orthographic_height = std::min(camera.orthographic_height, 2.0 / aspect);
+    } else {
+        constexpr double radians = 3.14159265358979323846 / 180.0;
+        const double tangent = std::tan(camera.field_of_view_y_degrees * 0.5 * radians);
+        guide.far_plane = std::min(guide.far_plane, 1.0 / (tangent * aspect));
+    }
+    guide.near_plane = std::min(camera.near_plane, guide.far_plane * 0.2);
+    return editor_camera_frustum(guide, aspect, world);
+}
+
 // Ray through normalized viewport coordinates, shared with picking tests. The same camera basis
 // drives rendering and gizmos; horizontal/vertical range from -1 to +1, with +Y at screen top.
 inline Vec3 editor_screen_ray(const Vec3& eye, const Vec3& target, double field_of_view,

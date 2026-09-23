@@ -256,7 +256,9 @@ struct LiveInputState {
 // installs the human editor. They are independent because a human and an agent are expected to
 // operate the same runtime, and because both paths must issue identical ControlProtocol requests.
 int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& reader_detached) {
-    relay::Engine engine;
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
     relay::VulkanWindow window(with_ui ? "Relay Editor" : "Relay Live Editor", 1280, 720,
                                engine.assets(), with_ui);
     if (!window.valid()) {

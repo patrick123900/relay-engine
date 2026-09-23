@@ -125,6 +125,27 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
                << ",\"range\":" << l.range << '}';
     } else
         output << "null";
+    output << ",\"collider\":";
+    if (record.collider) {
+        const auto& collider = *record.collider;
+        output << "{\"center\":";
+        append_vec3(output, collider.center);
+        output << ",\"half_extents\":";
+        append_vec3(output, collider.half_extents);
+        output << ",\"enabled\":" << (collider.enabled ? "true" : "false")
+               << ",\"layer\":" << collider.layer << ",\"mask\":" << collider.mask << '}';
+    } else output << "null";
+    output << ",\"physics_body\":";
+    if (record.physics_body) {
+        const auto& body = *record.physics_body;
+        output << "{\"type\":" << static_cast<unsigned>(body.type)
+               << ",\"mass\":" << body.mass
+               << ",\"gravity_scale\":" << body.gravity_scale
+               << ",\"restitution\":" << body.restitution
+               << ",\"friction\":" << body.friction
+               << ",\"linear_damping\":" << body.linear_damping
+               << ",\"angular_damping\":" << body.angular_damping << '}';
+    } else output << "null";
     output << '}';
 }
 
@@ -380,6 +401,42 @@ bool Scene::set_light(const Entity entity, std::optional<Light> light) {
     return true;
 }
 
+bool Scene::set_collider(const Entity entity, std::optional<BoxCollider> collider) {
+    auto* record = get(entity);
+    if (!record) return false;
+    if (collider) {
+        const auto valid_center = [](const double value) {
+            return std::isfinite(value) && std::abs(value) <= 1'000'000.0;
+        };
+        const auto valid_extent = [](const double value) {
+            return std::isfinite(value) && value > 0.0 && value <= 1'000'000.0;
+        };
+        if (!valid_center(collider->center.x) || !valid_center(collider->center.y) ||
+            !valid_center(collider->center.z) || !valid_extent(collider->half_extents.x) ||
+            !valid_extent(collider->half_extents.y) || !valid_extent(collider->half_extents.z) ||
+            collider->layer == 0U) return false;
+    }
+    record->collider = std::move(collider);
+    return true;
+}
+
+bool Scene::set_physics_body(const Entity entity, std::optional<PhysicsBody> body) {
+    auto* record = get(entity);
+    if (!record) return false;
+    if (body && (static_cast<unsigned>(body->type) > 1U ||
+                 !std::isfinite(body->mass) || body->mass <= 0.0 || body->mass > 1'000'000.0 ||
+                 !std::isfinite(body->gravity_scale) || body->gravity_scale < 0.0 ||
+                 body->gravity_scale > 100.0 || !std::isfinite(body->restitution) ||
+                 body->restitution < 0.0 || body->restitution > 1.0 ||
+                 !std::isfinite(body->friction) || body->friction < 0.0 ||
+                 body->friction > 10.0 || !std::isfinite(body->linear_damping) ||
+                 body->linear_damping < 0.0 || body->linear_damping > 100.0 ||
+                 !std::isfinite(body->angular_damping) || body->angular_damping < 0.0 ||
+                 body->angular_damping > 100.0)) return false;
+    record->physics_body = std::move(body);
+    return true;
+}
+
 void Scene::clear() {
     // Destroying each survivor keeps the generation bump, so handles taken before the clear stay
     // stale rather than aliasing whatever is created next.
@@ -602,6 +659,17 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
           {"inner_cone", ReflectedFieldType::number},
           {"outer_cone", ReflectedFieldType::number},
           {"range", ReflectedFieldType::number}}},
+        {"BoxCollider", 0x0aU,
+         {{"center", ReflectedFieldType::vec3},
+          {"half_extents", ReflectedFieldType::vec3},
+          {"enabled", ReflectedFieldType::boolean},
+          {"layer", ReflectedFieldType::number},
+          {"mask", ReflectedFieldType::number}}},
+        {"PhysicsBody", 0x0bU,
+         {{"type", ReflectedFieldType::number},
+          {"mass", ReflectedFieldType::number},
+          {"gravity_scale", ReflectedFieldType::number},
+          {"restitution", ReflectedFieldType::number}}},
     };
     return descriptors;
 }

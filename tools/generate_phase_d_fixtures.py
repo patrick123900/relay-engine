@@ -11,7 +11,7 @@ import bpy
 
 destination = pathlib.Path(sys.argv[sys.argv.index("--") + 1]).resolve()
 destination.mkdir(parents=True, exist_ok=True)
-source = pathlib.Path(__file__).resolve().parent.parent / "assets" / "relay-dynamic-golden.gltf"
+source = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "models" / "relay-dynamic-golden.gltf"
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
 bpy.context.preferences.filepaths.save_version = 0

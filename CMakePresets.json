@@ -14,7 +14,8 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "RELAY_BUILD_TESTS": "ON"
+        "RELAY_BUILD_TESTS": "ON",
+        "RELAY_OPEN_DEMO_PROJECT": "ON"
       }
     },
     {

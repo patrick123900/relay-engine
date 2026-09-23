@@ -20,6 +20,7 @@
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <atomic>
@@ -164,11 +165,16 @@ int run_vulkan_capture(const std::string_view path_text) {
     return 0;
 }
 
+// Model smoke modes read the repository's test fixtures, independent of the working directory.
+std::filesystem::path fixture_models() {
+    return std::filesystem::path(RELAY_SOURCE_ROOT) / "tests/fixtures/models";
+}
+
 int run_vulkan_model_smoke(const std::string_view filename) {
     relay::Engine engine;
     std::string error;
     const auto imported =
-        relay::import_model_asset("assets", filename, engine.assets(), &engine.scene(), error);
+        relay::import_model_asset(fixture_models(), filename, engine.assets(), &engine.scene(), error);
     if (!imported.imported) {
         std::cerr << error << '\n';
         return 1;
@@ -210,7 +216,7 @@ int run_vulkan_model_smoke(const std::string_view filename) {
 int run_vulkan_async_smoke(const std::string& filename) {
     relay::Engine engine;
     std::string error;
-    const auto imported = relay::import_model_asset("assets", filename, engine.assets(), &engine.scene(), error);
+    const auto imported = relay::import_model_asset(fixture_models(), filename, engine.assets(), &engine.scene(), error);
     if (!imported.imported) { std::cerr << error << '\n'; return 1; }
     auto animator = *engine.scene().get(imported.roots.front())->animator;
     animator.playing = true;
@@ -295,6 +301,16 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
         protocol.set_editor_camera_handler([&editor](std::string_view request) { return editor->handle_camera_request(request); });
         editor->set_panel_visible("Agent", true);
         window.set_overlay(editor.get());
+#ifdef RELAY_DEMO_PROJECT
+        // Development builds start on the showcase project. RELAY_OPEN_DEMO_PROJECT=0 opts out,
+        // and the project is skipped when the editor was not started from the repository root.
+        const char* demo_setting = std::getenv("RELAY_OPEN_DEMO_PROJECT");
+        std::error_code missing;
+        if ((!demo_setting || std::string_view(demo_setting) != "0") &&
+            std::filesystem::is_regular_file(RELAY_DEMO_PROJECT, missing) &&
+            !editor->open_project(RELAY_DEMO_PROJECT))
+            std::cerr << "Could not open the demo project " << RELAY_DEMO_PROJECT << '\n';
+#endif
     }
 #else
     if (with_ui) {
@@ -323,8 +339,15 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
     }
     using namespace std::chrono_literals;
     bool window_closed = false;
+    // The display paces frames through vsync presentation. The game advances at its fixed step from
+    // real elapsed time, so neither the frame rate nor the game speed depends on the monitor.
+    auto previous_frame = std::chrono::steady_clock::now();
+    double unsimulated_seconds = 0.0;
     while (engine.status().running && !window_closed) {
         const auto frame_start = std::chrono::steady_clock::now();
+        unsimulated_seconds +=
+            std::min(std::chrono::duration<double>(frame_start - previous_frame).count(), 0.25);
+        previous_frame = frame_start;
         window_closed = window.poll_quit();
         for (auto& input : window.drain_input_events()) engine.apply_input_event(std::move(input));
 
@@ -347,7 +370,16 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
             if (input_state->reached_eof.load() && queue_empty) break;
         }
 
-        engine.tick();
+        const double step = engine.fixed_delta_seconds();
+        for (int steps = 0; unsimulated_seconds >= step; ++steps) {
+            // Drop time rather than fall ever further behind after a long frame.
+            if (steps == 4) {
+                unsimulated_seconds = 0.0;
+                break;
+            }
+            engine.tick();
+            unsimulated_seconds -= step;
+        }
         if (!window.draw(engine.scene(), engine.status().elapsed_seconds)) {
             std::cerr << "Live editor Vulkan draw failed: " << window.error() << '\n';
             engine.request_shutdown();
@@ -358,7 +390,9 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
 #endif
         engine.record_render_performance(window.gpu_frame_milliseconds(), window.draw_call_count(),
                                          window.render_resource_count());
-        std::this_thread::sleep_until(frame_start + 16ms);
+        // Presentation normally blocks until vsync; this only bounds the loop while nothing is
+        // presented, such as a minimized window.
+        std::this_thread::sleep_until(frame_start + 4ms);
     }
 
     engine.request_shutdown();

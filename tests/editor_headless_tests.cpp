@@ -1,5 +1,6 @@
 #include "relay/control/control_protocol.hpp"
 #include "relay/core/engine.hpp"
+#include "relay/editor/editor_layout.hpp"
 #include "relay/editor/editor_ui.hpp"
 #include "relay/editor/chat_media.hpp"
 #include "relay/editor/wrapped_input.hpp"
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <fstream>
 #include <stdexcept>
 #include <thread>
 
@@ -305,6 +307,257 @@ void project_ui() {
           "project browser opens saved scene through guarded protocol workflow");
     std::cout << "Headless project save/browser tests passed\n";
 }
+void click_center(relay::EditorUi& ui, const std::array<float, 4>& rect) {
+    auto& io = ImGui::GetIO();
+    io.AddMousePosEvent((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2);
+    frame(ui);
+    io.AddMouseButtonEvent(0, true);
+    frame(ui);
+    io.AddMouseButtonEvent(0, false);
+    frame(ui, 2);
+}
+
+void double_click(relay::EditorUi& ui, const std::array<float, 4>& rect) {
+    auto& io = ImGui::GetIO();
+    io.AddMousePosEvent(rect[0] + 60, (rect[1] + rect[3]) / 2);
+    frame(ui);
+    for (int press = 0; press < 2; ++press) {
+        io.AddMouseButtonEvent(0, true);
+        frame(ui);
+        io.AddMouseButtonEvent(0, false);
+        frame(ui);
+    }
+    frame(ui, 2);
+}
+
+void type_text(relay::EditorUi& ui, const char* text) {
+    ImGui::GetIO().AddInputCharactersUTF8(text);
+    frame(ui, 2);
+}
+
+void hierarchy_and_assets_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/browser/project.relayproject","name":"Browser"})")
+              .find("\"ok\":true") != std::string::npos, "create asset browser project");
+    std::filesystem::create_directories("projects/browser/models");
+    std::ofstream("projects/browser/models/tri.obj") << "o tri\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    std::ofstream("projects/browser/readme.txt") << "readme";
+    const auto alpha = engine.scene().create("Alpha");
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize browser editor without windows");
+    frame(ui, 5);
+    check(!ui.headless_item_rect("rename:entity"), "hierarchy has no standing create or rename field");
+
+    const auto alpha_row = ui.headless_item_rect("entity:" + alpha.to_string());
+    check(alpha_row.has_value(), "hierarchy shows the entity row");
+    click(ui, *alpha_row);
+    key(ui, ImGuiKey_F2, false);
+    const auto field = ui.headless_item_rect("rename:entity");
+    check(field.has_value() && std::abs((*field)[1] - (*alpha_row)[1]) < 2.0F,
+          "F2 opens the rename field on the entity's own row");
+    type_text(ui, "Renamed");
+    key(ui, ImGuiKey_Enter, false);
+    check(engine.scene().get(alpha)->name == "Renamed" && !ui.headless_item_rect("rename:entity"),
+          "Enter commits the inline entity rename");
+    key(ui, ImGuiKey_F2, false);
+    type_text(ui, "Discarded");
+    key(ui, ImGuiKey_Escape, false);
+    check(engine.scene().get(alpha)->name == "Renamed", "Escape cancels the inline rename");
+    // A second, slow click on the selected row renames it once the double-click time passes.
+    click(ui, *ui.headless_item_rect("entity:" + alpha.to_string()));
+    frame(ui, 30);
+    check(ui.headless_item_rect("rename:entity").has_value(), "slow second click starts renaming");
+    key(ui, ImGuiKey_Escape, false);
+    double_click(ui, *ui.headless_item_rect("entity:" + alpha.to_string()));
+    frame(ui, 30);
+    check(!ui.headless_item_rect("rename:entity"), "a quick double click does not rename");
+
+    frame(ui, 40);
+    const auto models = ui.headless_item_rect("asset:models");
+    check(models.has_value() && ui.headless_item_rect("asset:readme.txt") &&
+              ui.headless_item_rect("asset:project.relayproject"),
+          "asset tree lists the project root folder");
+    check(!ui.headless_item_rect("asset:models/tri.obj"), "folders start collapsed");
+    double_click(ui, *models);
+    const auto model = ui.headless_item_rect("asset:models/tri.obj");
+    check(model.has_value() && ui.headless_item_rect("asset:readme.txt") &&
+              (*model)[0] > (*models)[0] && (*model)[1] > (*models)[1],
+          "double-clicking a folder expands it in place, indented below its row");
+    const auto before = engine.scene().entities().size();
+    // The model row sits where the folder was; wait out the double-click window first.
+    frame(ui, 30);
+    double_click(ui, *model);
+    check(engine.scene().entities().size() > before, "double-clicking a model imports it into the scene");
+    frame(ui, 30);
+    click(ui, *ui.headless_item_rect("asset:models/tri.obj"));
+    key(ui, ImGuiKey_F2, false);
+    check(ui.headless_item_rect("rename:asset").has_value(), "F2 renames the selected asset in place");
+    type_text(ui, "triangle.obj");
+    key(ui, ImGuiKey_Enter, false);
+    frame(ui, 3);
+    check(std::filesystem::exists("projects/browser/models/triangle.obj") &&
+              !std::filesystem::exists("projects/browser/models/tri.obj") &&
+              ui.headless_item_rect("asset:models/triangle.obj"),
+          "asset rename moves the file and keeps its folder expanded");
+    check(!ui.headless_item_rect("assets:up"), "the tree has no parent-folder button");
+    click(ui, *ui.headless_item_rect("assets:search"));
+    type_text(ui, "TRI");
+    check(ui.headless_item_rect("asset:models/triangle.obj").has_value() &&
+              !ui.headless_item_rect("asset:models"),
+          "typing in the asset search lists nested matches without expanding folders");
+    key(ui, ImGuiKey_Escape, false);
+    frame(ui, 2);
+    check(ui.headless_item_rect("asset:models").has_value(), "Escape clears the search back to the tree");
+    click(ui, *ui.headless_item_rect("assets:empty"));
+    click_center(ui, *ui.headless_item_rect("assets:filter"));
+    const auto models_filter = ui.headless_item_rect("assets:filter:model");
+    check(models_filter.has_value(), "the filter button opens the category menu");
+    click(ui, *models_filter);
+    check(ui.headless_item_rect("assets:filter:scene").has_value() &&
+              ui.headless_item_rect("asset:models/triangle.obj").has_value() &&
+              !ui.headless_item_rect("asset:readme.txt"),
+          "choosing a category filters the list and keeps the menu open");
+    click(ui, *ui.headless_item_rect("assets:filter:model"));
+    click(ui, *ui.headless_item_rect("assets:empty"));
+    check(!ui.headless_item_rect("assets:filter:model") && ui.headless_item_rect("asset:models"),
+          "clearing the only category and clicking away returns to the tree");
+    std::vector<std::pair<std::filesystem::path, bool>> shown;
+    ui.set_file_browser_handler([&](const std::filesystem::path& path, bool directory) {
+        shown.emplace_back(path, directory);
+    });
+    {
+        auto& io = ImGui::GetIO();
+        const auto row = *ui.headless_item_rect("asset:models");
+        io.AddMousePosEvent(row[0] + 60, (row[1] + row[3]) / 2);
+        frame(ui);
+        io.AddMouseButtonEvent(1, true);
+        frame(ui);
+        io.AddMouseButtonEvent(1, false);
+        frame(ui, 2);
+    }
+    const auto open_item = ui.headless_item_rect("assets:menu:file_browser");
+    check(open_item.has_value(), "the asset context menu offers Open in file browser");
+    click(ui, *open_item);
+    check(shown.size() == 1U && shown.front().second &&
+              shown.front().first == std::filesystem::path("projects/browser") / "models",
+          "Open in file browser opens the folder through the host file browser");
+    frame(ui, 30);
+    double_click(ui, *ui.headless_item_rect("asset:models"));
+    check(!ui.headless_item_rect("asset:models/triangle.obj") &&
+              ui.headless_item_rect("asset:models").has_value(),
+          "double-clicking an expanded folder collapses it");
+    {
+        auto& io = ImGui::GetIO();
+        const auto from = *ui.headless_item_rect("asset:readme.txt");
+        const auto to = *ui.headless_item_rect("asset:models");
+        io.AddMousePosEvent(from[0] + 60, (from[1] + from[3]) / 2);
+        frame(ui);
+        io.AddMouseButtonEvent(0, true);
+        frame(ui);
+        for (int step = 1; step <= 8; ++step) {
+            io.AddMousePosEvent(from[0] + 60, from[1] + (to[1] - from[1]) * static_cast<float>(step) / 8.0F + 8);
+            frame(ui);
+        }
+        io.AddMouseButtonEvent(0, false);
+        frame(ui, 3);
+    }
+    check(std::filesystem::exists("projects/browser/models/readme.txt") &&
+              ui.headless_item_rect("asset:models/readme.txt").has_value(),
+          "dragging a file onto a folder moves it there and expands the folder");
+    std::cout << "Headless hierarchy rename and asset browser tests passed\n";
+}
+
+void layout_persistence_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    std::string error;
+    {
+        relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+        check(ui.initialize_headless(error), "first layout session initializes");
+        frame(ui, 3);
+        check(!ui.panel_visible("History") && ui.panel_visible("Hierarchy"),
+              "a fresh layout uses the default panels");
+        ui.set_panel_visible("History", true);
+        ui.set_panel_visible("Hierarchy", false);
+        frame(ui, 3);
+    }
+    std::ifstream saved(".relay/headless-layout.ini");
+    const std::string text{std::istreambuf_iterator<char>(saved), {}};
+    check(text.find("[Relay][Preferences]") != std::string::npos &&
+              text.find("panel.History=1") != std::string::npos &&
+              text.find("panel.Hierarchy=0") != std::string::npos,
+          "closing the editor saves panel visibility with the dock layout");
+    {
+        relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+        check(ui.initialize_headless(error), "second layout session initializes");
+        ui.set_panel_visible("Hierarchy", true); // A host default applied before the first frame.
+        frame(ui, 3);
+        check(ui.panel_visible("History") && !ui.panel_visible("Hierarchy"),
+              "reopening restores saved panels over host defaults");
+    }
+#if !defined(_WIN32) && !defined(__APPLE__)
+    {
+        // Without an override the layout lives in the user config directory, independent of the
+        // build and working directory, and an older per-workspace layout is carried over once.
+        const auto* previous = std::getenv("XDG_CONFIG_HOME");
+        const std::string restore = previous ? previous : "";
+        const auto config_home = std::filesystem::absolute("user-config");
+        setenv("XDG_CONFIG_HOME", config_home.c_str(), 1);
+        std::filesystem::create_directories(".relay");
+        std::ofstream(".relay/editor-layout.ini") << "[Relay][Preferences]\npanel.History=1\n";
+        const auto path = relay::default_editor_layout_path();
+        check(std::filesystem::path(path) == config_home / "relay-engine" / "editor-layout.ini" &&
+                  std::filesystem::exists(path),
+              "the default layout path is per user and migrates the old workspace layout");
+        std::ofstream(".relay/editor-layout.ini") << "stale";
+        std::ifstream migrated(path);
+        const std::string contents{std::istreambuf_iterator<char>(migrated), {}};
+        check(relay::default_editor_layout_path() == path &&
+                  contents.find("panel.History=1") != std::string::npos,
+              "an existing user layout is never replaced by the old workspace copy");
+        if (previous) setenv("XDG_CONFIG_HOME", restore.c_str(), 1);
+        else unsetenv("XDG_CONFIG_HOME");
+    }
+#endif
+    {
+        // The selected tab in each shared dock node survives a restart.
+        std::filesystem::remove(".relay/headless-layout.ini");
+        const auto selected = [](const char* name) {
+            const auto* window = ImGui::FindWindowByName(name);
+            return window && window->DockNode && window->DockNode->TabBar &&
+                   window->DockNode->TabBar->SelectedTabId == window->TabId;
+        };
+        {
+            relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+            check(ui.initialize_headless(error), "tab session initializes");
+            ui.set_panel_visible("Agent", true);
+            ui.set_panel_visible("History", true);
+            ui.set_panel_visible("Timeline", true);
+            frame(ui, 3);
+            ImGui::SetWindowFocus("Inspector");
+            frame(ui, 2);
+            ImGui::SetWindowFocus("History");
+            frame(ui, 2);
+            ImGui::SetWindowFocus("Viewport");
+            frame(ui, 2);
+            check(selected("Inspector") && selected("History"), "tabs are selected before closing");
+        }
+        relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+        check(ui.initialize_headless(error), "tab session reopens");
+        ui.set_panel_visible("Agent", true);
+        frame(ui, 5);
+        check(selected("Inspector") && selected("History"),
+              "reopening restores the selected tab in each dock node, even under the Agent default");
+    }
+    std::cout << "Headless layout persistence tests passed\n";
+}
+
 void agent_ui() {
     relay::EngineConfig config;
     config.editor_mode = true;
@@ -682,7 +935,20 @@ int main() {
     std::filesystem::create_directory(temporary);
     std::filesystem::current_path(temporary);
     int result = 0;
-    try { run(); project_ui(); agent_ui(); chat_ui(); media_ui(RELAY_CHAT_MEDIA_FIXTURES); }
+    // Each scenario starts from the default layout; persisted panels would otherwise carry over.
+    const auto fresh = [](auto&& scenario) {
+        std::filesystem::remove(".relay/headless-layout.ini");
+        scenario();
+    };
+    try {
+        fresh(run);
+        fresh(project_ui);
+        fresh(hierarchy_and_assets_ui);
+        fresh(layout_persistence_ui);
+        fresh(agent_ui);
+        fresh(chat_ui);
+        fresh([] { media_ui(RELAY_CHAT_MEDIA_FIXTURES); });
+    }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
     std::filesystem::current_path(original);
     std::filesystem::remove_all(temporary);

@@ -8,7 +8,7 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v27: 100 native methods. Scene v11, project v1, import manifest v3.
+- Protocol schema v29: 105 native methods. Scene v11, project v1, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation, and portable project export are implemented. Preserve unrelated working-tree
@@ -37,6 +37,45 @@ without blocking simultaneous human editing.
 - Folder projects with contained `scenes/`, `assets/`, `captures/`, and traces.
 - Dockable hierarchy, inspector, viewport, transform gizmos, asset browser, animation timeline,
   history, diagnostics, and project/save workflows.
+- `EditorLayout` persists the ImGui dock layout plus a `[Relay][Preferences]` section (panel
+  visibility and View toggles bound with `EditorLayout::bind`) in the user config directory
+  (`$XDG_CONFIG_HOME/relay-engine`, `%APPDATA%\Relay`, `~/Library/Application Support/Relay`),
+  so dev and release builds and any working directory share it. A legacy
+  `.relay/editor-layout.ini` is copied once. Saved panels override host defaults such as the
+  Agent panel; the old optional-panel docking migration runs only for layouts without the
+  preferences section. `RELAY_EDITOR_LAYOUT_PATH` overrides the path (smoke tests use temporary
+  files); headless tests use `.relay/headless-layout.ini`, reset per scenario.
+  Each dock node's selected tab is restored from the ini. Panels skip focus-on-appearing during
+  the first two frames, because a panel focused as it appears becomes its node's selected tab.
+- Hierarchy and asset entries rename in place (F2, context menu, or a slow second click on the only
+  selected row). Entity creation lives in context menus and the Create menu; the hierarchy has no
+  standing text field. The Assets panel is a lazily listed tree over `assets.browse`,
+  `assets.create_folder`, `assets.move`, and `assets.delete` (protocol-visible, so agents can do
+  the same). Paths are workspace-checked; moves never overwrite and re-point import-manifest
+  entries; deletes move into the hidden `.relay-trash`; the project file and member scenes, and
+  folders containing them, are protected. Only the root and expanded folders are listed; expanded
+  state and the selection follow moves and renames. Entries carry a name-based `kind`
+  (`AssetKind` in `project_files.hpp`); `assets.search` walks the whole tree (hidden and symlinked
+  entries skipped, 65,536 visited, 512 results) for a case-insensitive name fragment and optional
+  kinds. The panel's search box and Filter popup switch it to a flat result list with folder
+  paths and removable filter chips. The filter menu keeps itself open while toggling categories.
+  **Open in file browser** is an editor-only host action (`show_in_file_browser` in
+  `src/editor/file_browser.cpp`: FreeDesktop FileManager1 over `gdbus`, falling back to
+  `xdg-open`; `explorer /select` on Windows; `open -R` on macOS), not a protocol method, so agents
+  cannot open desktop windows. Headless editors install no handler; tests inject one. The
+  platform launch itself has not been exercised on a desktop. Models import by double-click, context
+  menu, or drag onto the viewport (ground-plane placement) or a hierarchy row (child). The
+  Create menu lists future file types (scripts, text, shaders, materials) as disabled
+  placeholders.
+- Development builds (`RELAY_OPEN_DEMO_PROJECT`, on in the dev preset) open
+  `examples/demo/demo.relayproject` when the UI editor starts from the repository root, unless
+  `RELAY_OPEN_DEMO_PROJECT=0`. Smoke tests set that override. `tools/generate_demo_project.py`
+  writes `models/primitives.glb` and runs `relay_build_demo_project`, which authors the showcase
+  scene through the trusted protocol; commit the regenerated project, including
+  `.relay-imports.json`. `relay_workflow_tests` opens the committed demo, resolves every asset,
+  builds every collider, and simulates it.
+- Importer fixtures live in `tests/fixtures/models/`. Without a project, the protocol still uses
+  the ignored scratch folder `assets/`; the desktop smoke launcher copies the fixtures there.
 - Human editor mutations use the same versioned control protocol as tests and agents.
 - Scene-owned transform keys interpolate position, Euler rotation, and scale. The inspector and
   protocol can add, edit, delete, scrub, play, and loop keys with undo/redo. Scene v6 saves keys;
@@ -76,6 +115,17 @@ without blocking simultaneous human editing.
   begin/end events in a bounded, sequence-cursor stream exposed by `physics.contact_events`.
   The stream resets on Run Game and Stop Game, and reports the oldest retained sequence for
   detecting missed events.
+- The live editor presents with FIFO (vsync) and advances the fixed 60 Hz game step from real
+  elapsed time (at most four steps per frame), so frame rate and game speed are independent of
+  the monitor. Mailbox presentation with a fixed 16 ms loop sleep previously dropped a frame
+  about 2.5 times per second on 60 Hz displays.
+- The editor refreshes panels every 0.5 s, spread over four consecutive frames (scene state,
+  collider outlines, Agent panel, assets); refreshes right after an edit still run all at once.
+  Large periodic replies (`scene.list`, `physics.debug_boxes`, `session.review`,
+  `session.audit`) are compared as text and parsed only when changed, and outlines are
+  fetched only while the overlay can be drawn. Convex hull outlines are built once per mesh in
+  collider-local space and transformed per call. On the demo scene this took Debug-build refresh
+  frames from about 33 ms to under 3 ms headlessly, with the Agent panel open.
 - The editor camera overlays world-space collider outlines from the same shape computation as
   physics queries: boxes, three great circles for spheres, rings and arcs for capsules, Jolt hull
   edges for convex colliders, and unique triangle edges for meshes. Selected colliders are amber,
@@ -189,6 +239,9 @@ without blocking simultaneous human editing.
    queue, so that queue branch still has compile and headless checks only.
 5. Agent sessions are designed for one local human/editor workflow; multi-client identities and a
    tamper-proof continuous audit store are not implemented.
+6. The hierarchy and asset browser changes are covered headlessly only. The coordinate-based
+   desktop smokes (`TREE_FIRST_ROW_Y`, `ASSET_FIRST_ROW`) predate the removed create and import
+   rows and need recalibration. The demo scene has not had a real-desktop visual review.
 
 ## Next priorities
 
@@ -199,7 +252,9 @@ without blocking simultaneous human editing.
 ## Verification baseline
 
 The current implementation was verified with development and release builds, all four native
-CTest suites, generated-protocol checks, and 26 ordinary bridge tests. The live Vulkan shadow and
+CTest suites, generated-protocol checks, and 26 ordinary bridge tests. The desktop smokes below
+predate the asset browser, layout persistence, and frame-pacing changes and were not rerun for
+them; those changes are covered by headless and protocol tests. The live Vulkan shadow and
 visual smokes pass, as does `tests/editor_hdr_upload_smoke.py`: exposure changes captured pixels,
 keyframe scrubbing changes the image, a model import submits another GPU upload, and a package
 containing the saved keys and imported asset opens as a tar. The legacy coordinate-based
@@ -241,6 +296,8 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Protocol source | `protocol/relay.protocol.json` |
 | Native protocol/session | `src/control/`, `include/relay/control/` |
 | Engine and scene | `src/core/`, `src/scene/` |
+| Demo project and generator | `examples/demo/`, `tools/generate_demo_project.py`, `tools/demo_project/` |
+| Test fixture models | `tests/fixtures/models/` |
 | Physics and collision | `src/physics/`, `include/relay/physics/` |
 | Rendering/import | `src/render/`, `shaders/` |
 | Editor | `src/editor/`, `include/relay/editor/` |

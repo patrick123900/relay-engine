@@ -17,6 +17,7 @@ import os
 import re
 from pathlib import Path
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,12 +52,24 @@ def xdo(*args):
     return subprocess.run(["xdotool", *args], capture_output=True, text=True, timeout=10).stdout.strip()
 
 
+def stage_fixture_models():
+    """Project-less imports read ROOT/assets, an ignored scratch folder; seed it with fixtures."""
+    target = Path(ROOT) / "assets"
+    target.mkdir(exist_ok=True)
+    for source in (Path(ROOT) / "tests" / "fixtures" / "models").iterdir():
+        if source.is_file() and not (target / source.name).exists():
+            shutil.copyfile(source, target / source.name)
+
+
 class Editor:
     def __init__(self, layout_path=None):
+        stage_fixture_models()
         self.layout_directory = tempfile.TemporaryDirectory(prefix="relay-editor-layout-") if layout_path is None else None
         self.layout_path = Path(layout_path) if layout_path is not None else Path(self.layout_directory.name) / "layout.ini"
         env = dict(os.environ, SDL_VIDEODRIVER="x11")
         env["RELAY_EDITOR_LAYOUT_PATH"] = str(self.layout_path)
+        # Smoke scenarios start from an empty scene rather than the dev-build demo project.
+        env["RELAY_OPEN_DEMO_PROJECT"] = "0"
         self.process = subprocess.Popen(
             ["./build/dev/relay_demo", "--editor-ui-stdio"],
             cwd=ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

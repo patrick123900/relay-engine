@@ -51,6 +51,28 @@ constexpr std::array<ProtocolFieldSpec, 3> fields_assets_import_model{{
     {"preset", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "scene|static_mesh"},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 1> fields_assets_browse{{
+    {"directory", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^([A-Za-z0-9][A-Za-z0-9._ /-]*)?$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_assets_search{{
+    {"query", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 64U, "", ""},
+    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 10U, "^(folder|model|scene|image|shader|script|text|media|project|other)$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_assets_create_folder{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9][A-Za-z0-9._ /-]*$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_assets_move{{
+    {"from", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9][A-Za-z0-9._ /-]*$", ""},
+    {"to", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9][A-Za-z0-9._ /-]*$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_assets_delete{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9][A-Za-z0-9._ /-]*$", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 1> fields_logs_read{{
     {"after", ProtocolValueType::integer, false, false, true, false, 0, 0, 0U, 0U, "", ""},
 }};
@@ -404,7 +426,7 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_chat_control{{
     {"provider", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "openai|compatible"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 100> methods{{
+constexpr std::array<ProtocolMethodSpec, 105> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -426,6 +448,11 @@ constexpr std::array<ProtocolMethodSpec, 100> methods{{
     {"render.assets", "render_assets", "Inspect render assets", "List built-in and imported meshes, materials and textures currently available to scene renderer components.", true, false, false, false, false, no_fields},
     {"assets.formats", "asset_import_formats", "Inspect model import formats", "Report model formats and feature coverage available in this Relay build, including Godot-compatible interchange paths.", true, false, false, false, false, no_fields},
     {"assets.import_model", "asset_import_model", "Import project model", "Import a model from the project-local assets directory using a content-addressed identity and optionally instantiate its node hierarchy.", false, false, false, false, false, fields_assets_import_model},
+    {"assets.browse", "asset_browse", "Browse project files", "List the folders and files in one project folder, folders first, with each entry's asset kind. Hidden entries and symlinks are omitted; importable models are marked.", true, false, false, false, false, fields_assets_browse},
+    {"assets.search", "asset_search", "Search project files", "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries and symlinks are skipped; at most 512 results.", true, false, false, false, false, fields_assets_search},
+    {"assets.create_folder", "asset_create_folder", "Create project folder", "Create a new, empty folder inside an existing project folder.", false, false, false, false, false, fields_assets_create_folder},
+    {"assets.move", "asset_move", "Rename or move project file", "Rename or move a project file or folder without overwriting. Import records follow moved models; project scene files and the project file cannot move.", false, false, false, false, false, fields_assets_move},
+    {"assets.delete", "asset_delete", "Delete project file", "Move a project file or folder into the hidden .relay-trash folder, where it can be recovered by hand. Project scene files and the project file cannot be deleted.", false, true, false, false, false, fields_assets_delete},
     {"logs.read", "logs_read", "Read Relay logs", "Read structured engine log entries newer than a sequence number.", true, false, false, false, false, fields_logs_read},
     {"performance.read", "performance_read", "Read Relay performance", "Read bounded per-frame CPU/GPU timing, draw/resource counts, entities and process memory.", true, false, false, false, false, fields_performance_read},
     {"input.recent", "input_recent", "Read recent Relay input", "Read the bounded normalized keyboard, mouse and gamepad input event history.", true, false, false, false, false, no_fields},

@@ -458,7 +458,7 @@ int main() {
 #ifdef RELAY_TEST_SOURCE_DIR
     relay::Scene imported_scene;
     std::string import_error;
-    const std::filesystem::path assets_root = std::filesystem::path{RELAY_TEST_SOURCE_DIR} / "assets";
+    const std::filesystem::path assets_root = std::filesystem::path{RELAY_TEST_SOURCE_DIR} / "tests/fixtures/models";
     const auto asset_revision = registry.revision();
     const auto imported = relay::import_model_asset(assets_root, "relay-test-triangle.gltf",
                                                     registry, &imported_scene, import_error);
@@ -1762,6 +1762,29 @@ int main() {
                    hull_outline->lines.size() >= 12U && !hull_outline->lines_truncated &&
                    std::abs(hull_outline->edges[0].x - 1.0) < 1e-6,
                "convex outline lists hull edges and world bounds");
+        {
+            // Off-centre hulls: Jolt stores hull points about the centre of mass, so the outline
+            // must add it back to line up with the mesh.
+            relay::Scene offset_scene;
+            const auto offset_hull = offset_scene.create("Offset hull");
+            relay::BoxCollider offset_collider;
+            offset_collider.type = relay::BoxCollider::Type::convex;
+            offset_collider.mesh = "test.collision.cube";
+            offset_collider.center = {1.5, 0, 0};
+            expect(offset_scene.set_collider(offset_hull, offset_collider) &&
+                       offset_scene.set_transform(offset_hull,
+                           relay::Transform{{0, 3, 0}, {}, {2, 1, 1}}),
+                   "off-centre convex fixture is valid");
+            const auto offset_outlines =
+                relay::collision_debug_boxes(offset_scene, false, &mesh_engine.assets());
+            bool inside = !offset_outlines.boxes.empty() && !offset_outlines.boxes[0].lines.empty();
+            for (const auto& line : inside ? offset_outlines.boxes[0].lines
+                                           : std::vector<std::array<relay::Vec3, 2>>{})
+                for (const auto& point : line)
+                    inside &= point.x > 1.999 && point.x < 4.001 && point.y > 2.499 &&
+                              point.y < 3.501 && std::abs(point.z) < 0.501;
+            expect(inside, "convex outline follows an off-centre hull instead of its centre of mass");
+        }
         expect(floor_outline && floor_outline->lines.size() == 5U &&
                    std::abs(floor_outline->edges[2].z - 5.5) < 1e-5,
                "mesh outline lists each unique triangle edge once");
@@ -1974,7 +1997,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 27U && relay::protocol_methods().size() == 100U,
+    expect(relay::protocol_schema_version == 29U && relay::protocol_methods().size() == 105U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");

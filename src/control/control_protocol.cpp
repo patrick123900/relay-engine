@@ -7,6 +7,7 @@
 #include "relay/editor/editor_math.hpp"
 #include "relay/scene/scene_edit.hpp"
 #include "relay/scene/project.hpp"
+#include "relay/scene/project_files.hpp"
 #include "relay/render/vulkan_device.hpp"
 #include "relay/render/asset_manifest.hpp"
 #include "relay/render/assets.hpp"
@@ -526,6 +527,94 @@ std::string ControlProtocol::handle(const std::string_view request) {
         }
         output += "],\"state\":" + history_json(history) + '}';
         return response_prefix(id) + output + '}';
+    }
+    if (method == "assets.browse" || method == "assets.search" || method == "assets.create_folder" ||
+        method == "assets.move" || method == "assets.delete") {
+        const auto root = engine_.project() ? engine_.project()->root() : std::filesystem::path{"assets"};
+        // The project file and member scenes are owned by the project, not the asset browser.
+        const auto protected_path = [&](const std::string& path) {
+            if (!engine_.project()) return false;
+            const auto project_file =
+                std::filesystem::path(engine_.project()->filename).filename().generic_string();
+            if (path == project_file) return true;
+            for (const auto& scene : engine_.project()->scenes) {
+                const auto member = "scenes/" + scene;
+                if (member == path || member.starts_with(path + '/')) return true;
+            }
+            return false;
+        };
+        std::string error;
+        const auto entries_json = [&](const AssetDirectoryListing& listing) {
+            std::string output = "\"entries\":[";
+            for (std::size_t index = 0; index < listing.entries.size(); ++index) {
+                const auto& entry = listing.entries[index];
+                if (index) output += ',';
+                output += "{\"name\":\"" + escape_json(entry.name) + "\",\"path\":\"" +
+                          escape_json(entry.path) + "\",\"type\":\"" +
+                          (entry.directory ? "folder" : "file") + "\",\"kind\":\"" +
+                          std::string(asset_kind_name(entry.kind)) + "\",\"size\":" +
+                          std::to_string(entry.size) + ",\"importable\":" +
+                          (!entry.directory && safe_model_filename(entry.path) ? "true" : "false") +
+                          ",\"protected\":" + (protected_path(entry.path) ? "true" : "false") + '}';
+            }
+            return output + "],\"truncated\":" + (listing.truncated ? "true" : "false");
+        };
+        if (method == "assets.browse") {
+            const auto directory = string_field(request, "directory");
+            const auto listing = list_asset_directory(root, directory, error);
+            if (!listing) return error_response(id, error);
+            return response_prefix(id) + "{\"root\":\"" + escape_json(root.generic_string()) +
+                   "\",\"directory\":\"" + escape_json(directory) + "\"," + entries_json(*listing) +
+                   "}}";
+        }
+        if (method == "assets.search") {
+            std::vector<AssetKind> kinds;
+            JsonParser parser(request);
+            const auto parsed = parser.parse();
+            if (const auto* list = parsed && parsed->object() ? field(*parsed->object(), "kinds") : nullptr;
+                list && list->array())
+                for (const auto& value : *list->array())
+                    if (const auto kind = value.string() ? asset_kind_from_name(*value.string())
+                                                         : std::nullopt)
+                        kinds.push_back(*kind);
+            const auto query = string_field(request, "query");
+            const auto listing = search_assets(root, query, kinds);
+            return response_prefix(id) + "{\"root\":\"" + escape_json(root.generic_string()) +
+                   "\",\"query\":\"" + escape_json(query) + "\"," + entries_json(listing) + "}}";
+        }
+        if (method == "assets.create_folder") {
+            const auto path = string_field(request, "path");
+            if (!create_asset_folder(root, path, error)) return error_response(id, error);
+            engine_.logs().write(LogLevel::info, "Created folder " + path);
+            return response_prefix(id) + "{\"path\":\"" + escape_json(path) + "\"}}";
+        }
+        if (method == "assets.move") {
+            const auto from = string_field(request, "from");
+            const auto to = string_field(request, "to");
+            if (protected_path(from))
+                return error_response(id, "project files and member scenes cannot be moved");
+            if (!move_asset(root, from, to, error)) return error_response(id, error);
+            ImportManifest manifest;
+            std::string manifest_error;
+            if (manifest.load(root, manifest_error)) {
+                if (manifest.move_sources(from, to) && !manifest.save(root, manifest_error))
+                    engine_.logs().write(LogLevel::warning,
+                                         "Import manifest not updated: " + manifest_error);
+            } else {
+                engine_.logs().write(LogLevel::warning, "Import manifest not updated: " + manifest_error);
+            }
+            engine_.logs().write(LogLevel::info, "Moved " + from + " to " + to);
+            return response_prefix(id) + "{\"from\":\"" + escape_json(from) + "\",\"to\":\"" +
+                   escape_json(to) + "\"}}";
+        }
+        const auto path = string_field(request, "path");
+        if (protected_path(path))
+            return error_response(id, "project files and member scenes cannot be deleted");
+        const auto trashed = delete_asset(root, path, error);
+        if (!trashed) return error_response(id, error);
+        engine_.logs().write(LogLevel::info, "Moved " + path + " to " + *trashed);
+        return response_prefix(id) + "{\"path\":\"" + escape_json(path) + "\",\"trash\":\"" +
+               escape_json(*trashed) + "\"}}";
     }
     if (method == "assets.available") {
         std::vector<std::string> names, files;

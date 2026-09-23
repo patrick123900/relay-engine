@@ -247,6 +247,19 @@ void ImportManifest::record(ImportManifestEntry entry) {
     *found = std::move(entry);
 }
 
+std::size_t ImportManifest::move_sources(const std::string_view from, const std::string_view to) {
+    const std::string prefix = std::string(from) + '/';
+    std::size_t changed{};
+    for (auto& entry : entries_) {
+        if (entry.source == from) entry.source = std::string(to);
+        else if (entry.source.starts_with(prefix))
+            entry.source = std::string(to) + entry.source.substr(from.size());
+        else continue;
+        ++changed;
+    }
+    return changed;
+}
+
 const std::vector<ImportManifestEntry>& ImportManifest::entries() const { return entries_; }
 
 ImportReloadReport reload_imported_assets(const std::filesystem::path& assets_root,

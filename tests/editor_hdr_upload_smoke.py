@@ -68,7 +68,7 @@ def main():
             assert left.size == right.size and left.tobytes() != right.tobytes()
         print("PASS: scene-owned transform keys change the live Vulkan image", flush=True)
 
-        shutil.copyfile(Path(ROOT) / "assets/relay-dynamic-golden.glb",
+        shutil.copyfile(Path(ROOT) / "tests/fixtures/models/relay-dynamic-golden.glb",
                         project_root / "model.glb")
         editor.result("assets.import_model", filename="model.glb")
         time.sleep(1)

@@ -554,8 +554,9 @@ std::vector<std::array<Vec3, 2>> detail::convex_hull_edges(const std::vector<Vec
                 truncated = true;
                 return result;
             }
-            const auto a = from_jolt(hull->GetPoint(edge.first));
-            const auto b = from_jolt(hull->GetPoint(edge.second));
+            // Hull points are stored about the centre of mass, not the input origin.
+            const auto a = from_jolt(hull->GetPoint(edge.first) + hull->GetCenterOfMass());
+            const auto b = from_jolt(hull->GetPoint(edge.second) + hull->GetCenterOfMass());
             result.push_back({Vec3{a.x + origin.x, a.y + origin.y, a.z + origin.z},
                               Vec3{b.x + origin.x, b.y + origin.y, b.z + origin.z}});
         }

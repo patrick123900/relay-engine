@@ -6,6 +6,10 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <string>
+#include <tuple>
 #include <optional>
 #include <set>
 #include <utility>
@@ -67,7 +71,37 @@ struct Shape {
     double radius{};
     Vec3 axis{};
     std::optional<detail::ColliderMeshData> mesh; // World-space points for convex and mesh.
+    Affine affine{};
 };
+
+// Hull outlines cost a Jolt hull build, too slow for the editor's periodic overlay refresh. An affine
+// map of a hull is the hull of the mapped points, so each mesh's hull is built once in collider-local
+// space and later calls only transform its edges.
+struct HullOutline {
+    std::vector<std::array<Vec3, 2>> edges;
+    bool truncated{};
+};
+using HullKey = std::tuple<const AssetRegistry*, std::uint64_t, std::string, Vec3>;
+
+HullOutline local_hull_outline(const EntityRecord& record, const AssetRegistry& assets) {
+    static std::mutex mutex;
+    static std::map<HullKey, HullOutline> cache;
+    const auto& mesh = !record.collider->mesh.empty() ? record.collider->mesh
+                       : record.mesh_renderer ? record.mesh_renderer->mesh : std::string{};
+    HullKey key{&assets, assets.revision(), mesh, record.collider->center};
+    {
+        std::scoped_lock lock(mutex);
+        if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    }
+    HullOutline outline;
+    if (const auto local = detail::collider_mesh(record, assets))
+        outline.edges = detail::convex_hull_edges(local->points, maximum_outline_lines,
+                                                  outline.truncated);
+    std::scoped_lock lock(mutex);
+    if (cache.size() >= 256U) cache.clear();
+    cache.emplace(std::move(key), outline);
+    return outline;
+}
 
 std::optional<Affine> affine_for(const Scene& scene, const Entity entity) {
     std::vector<const EntityRecord*> ancestors;
@@ -105,6 +139,7 @@ std::optional<Shape> shape_for(const Scene& scene, const Entity entity,
     const auto affine = affine_for(scene, entity);
     if (!affine) return std::nullopt;
     Shape shape;
+    shape.affine = *affine;
     shape.entity = entity;
     shape.collider = *record->collider;
     shape.center = add(affine->position, transform_direction(*affine, shape.collider.center));
@@ -224,7 +259,13 @@ CollisionDebugBoxes collision_debug_boxes(const Scene& scene, bool enabled_only,
             const auto limit = std::min(maximum_outline_lines, line_budget);
             const auto& points = shape->mesh->points;
             if (shape->collider.type == BoxCollider::Type::convex) {
-                box.lines = detail::convex_hull_edges(points, limit, box.lines_truncated);
+                const auto outline = local_hull_outline(*record, *assets);
+                box.lines_truncated = outline.truncated || outline.edges.size() > limit;
+                const auto& affine = shape->affine;
+                for (std::size_t index = 0; index < std::min(limit, outline.edges.size()); ++index)
+                    box.lines.push_back(
+                        {add(affine.position, transform_direction(affine, outline.edges[index][0])),
+                         add(affine.position, transform_direction(affine, outline.edges[index][1]))});
             } else {
                 std::set<std::pair<std::uint32_t, std::uint32_t>> seen;
                 for (const auto& triangle : shape->mesh->triangles) {

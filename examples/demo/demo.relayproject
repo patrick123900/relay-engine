@@ -1,0 +1,1 @@
+{"format":"relay.project","version":1,"filename":"examples/demo/demo.relayproject","root":"examples/demo","name":"Relay Demo","assets_directory":".","scenes_directory":"scenes","scenes":["showcase.relay.json"],"startup_scene":"showcase.relay.json"}

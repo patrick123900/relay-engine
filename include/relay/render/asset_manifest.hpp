@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -54,6 +55,9 @@ public:
 
     // Replaces any existing entry with the same source filename.
     void record(ImportManifestEntry entry);
+    // Re-points entries whose source is `from`, or lies inside the folder `from`, after the file or
+    // folder moved to `to`. Returns the number of entries changed.
+    std::size_t move_sources(std::string_view from, std::string_view to);
 
     [[nodiscard]] const std::vector<ImportManifestEntry>& entries() const;
 

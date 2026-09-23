@@ -10,6 +10,7 @@
 
 #include "relay/editor/editor_overlay.hpp"
 
+#include <filesystem>
 #include <functional>
 #include <array>
 #include <optional>
@@ -23,6 +24,9 @@ class EditorUi : public EditorOverlay {
 public:
     // Handles one request line and returns one response line, matching ControlProtocol::handle.
     using RequestHandler = std::function<std::string(std::string_view)>;
+    // Shows a project file (or opens a folder) in the OS file manager. Headless editors start with
+    // none installed.
+    using FileBrowserHandler = std::function<void(const std::filesystem::path&, bool directory)>;
 
     using AttachmentPicker = std::function<void(std::function<void(std::vector<std::string>)>)>;
     explicit EditorUi(RequestHandler request);
@@ -39,6 +43,10 @@ public:
     [[nodiscard]] std::optional<std::array<float, 4>> headless_item_rect(std::string_view key) const;
     // Changes editor view state without mutating the scene.
     void set_panel_visible(std::string_view name, bool visible);
+    [[nodiscard]] bool panel_visible(std::string_view name) const;
+    void set_file_browser_handler(FileBrowserHandler handler);
+    // Opens a workspace-relative project and its startup scene, as the Project panel does.
+    bool open_project(std::string_view filename);
     // Host seam: invoked only after native protocol validation and agent authorization.
     [[nodiscard]] std::string handle_camera_request(std::string_view request);
     void invalidate() override;

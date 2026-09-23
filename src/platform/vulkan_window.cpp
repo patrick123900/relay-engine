@@ -1450,15 +1450,12 @@ struct VulkanWindow::Impl {
         vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, nullptr);
         std::vector<VkSurfaceFormatKHR> formats(format_count);
         vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, formats.data());
-        std::uint32_t mode_count = 0;
-        vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &mode_count, nullptr);
-        std::vector<VkPresentModeKHR> modes(mode_count);
-        vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &mode_count, modes.data());
 
         const auto format = choose_surface_format(formats);
-        const auto mailbox = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR);
-        const auto present_mode = mailbox != modes.end() ? VK_PRESENT_MODE_MAILBOX_KHR
-                                                         : VK_PRESENT_MODE_FIFO_KHR;
+        // FIFO is vsync and always available. Mailbox let a loop that is not locked to the display
+        // run slightly faster than it, discarding a frame a few times per second as visible
+        // stutter.
+        const auto present_mode = VK_PRESENT_MODE_FIFO_KHR;
         const auto extent = choose_extent(capabilities);
         if (extent.width == 0 || extent.height == 0) return true;
         auto image_count = capabilities.minImageCount + 1U;

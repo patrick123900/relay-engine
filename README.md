@@ -31,7 +31,7 @@ in control of the same project.
   Vulkan viewport, inspect the image, and iterate.
 - **HDR lighting** — a floating-point scene target, camera exposure, procedural environment
   lighting, and tone mapping produce the final SDR viewport and captures.
-- **One typed API** — 100 versioned native methods cover scene editing, rendering, projects,
+- **One typed API** — 105 versioned native methods cover scene editing, rendering, projects,
   observability, capture, and session authorization. A generated MCP bridge exposes the supported
   model-facing subset.
 - **Deterministic core** — fixed-step simulation, transactional undo/redo, strict scene validation,
@@ -50,6 +50,33 @@ in control of the same project.
   overlap checks and raycasts.
   Static and dynamic rigid bodies provide gravity, momentum, friction, bounce, and angular motion
   during Run Game. Runtime impulses can be applied at a world-space point through the protocol.
+
+The editor remembers its layout between sessions and builds: docked and floating panels, which
+panels are open, and the **View** menu toggles. They are saved per user in
+`~/.config/relay-engine/editor-layout.ini` on Linux (`%APPDATA%\Relay` on Windows,
+`~/Library/Application Support/Relay` on macOS). **Layout → Reset layout** restores the default
+arrangement, and `RELAY_EDITOR_LAYOUT_PATH` points the editor at another file.
+
+The **Hierarchy** lists the scene's entities. Right-click empty space to create an entity, or a row
+to add a child, duplicate, move, rename, or destroy it. Rename in place with **F2**, **Rename** in
+the context menu, or a second, slower click on the selected row; **Enter** or clicking away
+commits and **Escape** cancels. Drag rows onto each other to reparent them.
+
+The **Assets** panel shows the open project folder as a tree. Expand a folder with its arrow, a
+double-click, or the arrow keys. Right-click empty space to create a folder at the top level, or a
+folder to create one inside it; right-click any entry to rename or delete it. **F2** and **Delete**
+also work. Deleting moves the entry into the project's hidden `.relay-trash` folder, where it can
+be recovered by hand. Drag entries onto a folder to move them there, or onto the empty space below
+the tree to move them to the top level. Type in the search box (**Ctrl+F** while the panel is
+focused) to find assets by name anywhere in the project, and use the funnel button to show only
+models, scenes, images, shaders, scripts, text, audio and video, folders, project files, or other
+files; the menu stays open so several categories can be ticked at once. Right-click an entry and
+choose **Open in file browser** to show it in your system file manager.
+Results list each match with its folder; double-click a folder result or choose **Show in
+folder** to jump back to the tree there. **Escape** clears the search. The project file and the project's member
+scenes cannot be moved or deleted from here. To bring a model into the scene, double-click it,
+drag it into the viewport (it lands on the ground under the pointer) or onto a hierarchy row
+(it becomes a child), or right-click it and choose **Import to scene**.
 
 Select an entity and open **Transform keyframes** in the Inspector to add, edit, scrub, or play
 position, rotation, and scale keys. To share a project, save its scenes, then use **Export saved
@@ -123,7 +150,14 @@ cmake --build --preset dev
 ./build/dev/relay_demo
 ```
 
-The command above opens the SDL/Vulkan demo. For a display-free runtime:
+The command above opens the SDL/Vulkan demo. In the development build, the editor opens the demo
+project in [`examples/demo`](examples/demo) when started from the repository root. Its showcase
+scene has PBR materials, cascaded sun, point, and spot shadows, keyframed animation, and a physics
+playground to try with **Run Game**. Set `RELAY_OPEN_DEMO_PROJECT=0` to start with an empty scene
+instead; release builds always do. `python3 tools/generate_demo_project.py` rebuilds the demo from
+code after a dev build.
+
+For a display-free runtime:
 
 ```sh
 ./build/dev/relay_demo --headless

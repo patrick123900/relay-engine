@@ -4,6 +4,8 @@
 #include "relay/editor/editor_math.hpp"
 #include "relay/editor/editor_selection.hpp"
 #include "relay/editor/editor_timeline.hpp"
+#include "relay/physics/collision.hpp"
+#include "relay/render/asset_manifest.hpp"
 #include "relay/scene/project.hpp"
 #include "relay/scene/scene_edit.hpp"
 
@@ -405,6 +407,131 @@ void projects() {
                                     "projects/linked.relayproject");
     (void)request(protocol, "project.open", "\"filename\":\"projects/linked.relayproject\"", false);
 }
+
+void asset_files() {
+    relay::Engine engine({1280, 720, 1.0 / 60.0, 0x52454C4159ULL, true});
+    relay::ControlProtocol protocol(engine);
+    (void)request(protocol, "project.create",
+                  "\"filename\":\"projects/files/project.relayproject\",\"name\":\"Files\"");
+    (void)engine.scene().create("Member");
+    (void)request(protocol, "scene.save", "\"filename\":\"main.relay.json\"");
+    (void)request(protocol, "project.add_scene", "\"scene_file\":\"main.relay.json\"");
+    std::ofstream("projects/files/robot.obj") << "o robot\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    std::ofstream("projects/files/notes.txt") << "notes";
+    std::ofstream("projects/files/.hidden") << "hidden";
+    const auto names = [&](const std::string& directory) {
+        const auto listing = request(protocol, "assets.browse",
+                                     "\"directory\":\"" + directory + "\"");
+        std::vector<std::string> result;
+        for (const auto& entry : *relay::field(*listing.object(), "entries")->array()) {
+            const auto& object = *entry.object();
+            auto label = *relay::field(object, "name")->string();
+            if (*relay::field(object, "type")->string() == "folder") label += '/';
+            if (*relay::field(object, "importable")->boolean()) label += '*';
+            if (*relay::field(object, "protected")->boolean()) label += '!';
+            result.push_back(label);
+        }
+        return result;
+    };
+    check(names("") == std::vector<std::string>{"scenes/!", "notes.txt", "project.relayproject!",
+                                                "robot.obj*"},
+          "browse lists folders first, marks models, protects project-owned files, hides dot files");
+    check(names("scenes") == std::vector<std::string>{"main.relay.json!"},
+          "browse marks project member scenes as protected");
+    (void)request(protocol, "assets.create_folder", "\"path\":\"models\"");
+    (void)request(protocol, "assets.create_folder", "\"path\":\"models\"", false);
+    (void)request(protocol, "assets.create_folder", "\"path\":\"missing/child\"", false);
+    (void)request(protocol, "assets.create_folder", "\"path\":\"../escape\"", false);
+    (void)request(protocol, "assets.import_model",
+                  "\"filename\":\"robot.obj\",\"instantiate\":false");
+    (void)request(protocol, "assets.move", "\"from\":\"robot.obj\",\"to\":\"models/robot.obj\"");
+    relay::ImportManifest manifest;
+    std::string manifest_error;
+    check(manifest.load("projects/files", manifest_error) && manifest.entries().size() == 1U &&
+              manifest.entries().front().source == "models/robot.obj",
+          "moving a model re-points its import record");
+    (void)request(protocol, "assets.move", "\"from\":\"models\",\"to\":\"meshes\"");
+    check(manifest.load("projects/files", manifest_error) &&
+              manifest.entries().front().source == "meshes/robot.obj" &&
+              names("meshes") == std::vector<std::string>{"robot.obj*"},
+          "renaming a folder moves its contents and their import records");
+    (void)request(protocol, "assets.move", "\"from\":\"meshes\",\"to\":\"meshes/inner\"", false);
+    (void)request(protocol, "assets.move", "\"from\":\"notes.txt\",\"to\":\"meshes/robot.obj\"", false);
+    (void)request(protocol, "assets.move",
+                  "\"from\":\"project.relayproject\",\"to\":\"renamed.relayproject\"", false);
+    (void)request(protocol, "assets.move", "\"from\":\"scenes\",\"to\":\"levels\"", false);
+    (void)request(protocol, "assets.delete", "\"path\":\"scenes/main.relay.json\"", false);
+    const auto deleted = request(protocol, "assets.delete", "\"path\":\"notes.txt\"");
+    const auto trash = *relay::field(*deleted.object(), "trash")->string();
+    check(!std::filesystem::exists("projects/files/notes.txt") &&
+              std::filesystem::exists("projects/files/" + trash) && trash.starts_with(".relay-trash/"),
+          "deleting moves the file into the hidden project trash");
+    check(names("") == std::vector<std::string>{"meshes/", "scenes/!", "project.relayproject!"},
+          "trash stays hidden from the browser");
+    (void)request(protocol, "assets.browse", "\"directory\":\"gone\"", false);
+    std::filesystem::create_directories("projects/files/textures/wood");
+    std::ofstream("projects/files/textures/wood/Oak.PNG") << "png";
+    std::ofstream("projects/files/meshes/robot-notes.md") << "notes";
+    const auto search = [&](const std::string& fields) {
+        const auto found = request(protocol, "assets.search", fields);
+        std::vector<std::string> result;
+        for (const auto& entry : *relay::field(*found.object(), "entries")->array())
+            result.push_back(*relay::field(*entry.object(), "path")->string() + ':' +
+                             *relay::field(*entry.object(), "kind")->string());
+        return result;
+    };
+    check(search("\"query\":\"ROBOT\"") ==
+              std::vector<std::string>{"meshes/robot-notes.md:text", "meshes/robot.obj:model"},
+          "search matches names case-insensitively in nested folders");
+    check(search("\"kinds\":[\"image\"]") == std::vector<std::string>{"textures/wood/Oak.PNG:image"},
+          "a kind filter alone lists every asset of that kind");
+    check(search("\"query\":\"o\",\"kinds\":[\"folder\",\"scene\"]") ==
+              std::vector<std::string>{"scenes/main.relay.json:scene", "textures/wood:folder"},
+          "query and kinds combine, sorted by path");
+    check(search("\"query\":\"notes.txt\"").empty(), "search skips the hidden trash");
+    (void)request(protocol, "assets.search", "\"kinds\":[\"bogus\"]", false);
+    check(engine.run_game(), "asset test game session starts");
+    (void)request(protocol, "assets.create_folder", "\"path\":\"during-game\"", false);
+    check(engine.stop_game(), "asset test game session stops");
+}
+
+void demo_project() {
+    // The committed dev-build demo must open, resolve every asset and simulate.
+    std::filesystem::create_directories("examples");
+    std::filesystem::copy(std::filesystem::path{RELAY_TEST_SOURCE_DIR} / "examples/demo",
+                          "examples/demo", std::filesystem::copy_options::recursive);
+    relay::Engine engine({1280, 720, 1.0 / 60.0, 0x52454C4159ULL, true});
+    relay::ControlProtocol protocol(engine);
+    const auto opened = request(protocol, "project.open",
+                                "\"filename\":\"examples/demo/demo.relayproject\"");
+    check(*relay::field(*opened.object(), "scene_file")->string() == "showcase.relay.json",
+          "demo project opens its showcase startup scene");
+    std::size_t renderers = 0, colliders = 0, bodies = 0;
+    relay::Entity wrecking_ball{};
+    for (const auto entity : engine.scene().entities()) {
+        const auto& record = *engine.scene().get(entity);
+        if (record.mesh_renderer) {
+            ++renderers;
+            check(engine.assets().find_mesh(record.mesh_renderer->mesh) &&
+                      engine.assets().find_material(record.mesh_renderer->material),
+                  "every demo renderer resolves its imported mesh and material");
+        }
+        colliders += record.collider.has_value();
+        bodies += record.physics_body.has_value();
+        if (record.name == "Wrecking ball") wrecking_ball = entity;
+    }
+    check(renderers >= 25U && bodies >= 10U && wrecking_ball.valid(),
+          "demo scene showcases rendering and physics");
+    check(relay::collision_debug_boxes(engine.scene(), true, &engine.assets()).boxes.size() == colliders,
+          "every demo collider, including convex and mesh shapes, builds");
+    const double start = engine.scene().get(wrecking_ball)->transform.position.y;
+    check(engine.run_game(), "demo scene runs");
+    engine.step(120);
+    check(engine.scene().get(wrecking_ball)->transform.position.y < start - 2.0 &&
+              !engine.physics().contact_events().events.empty(),
+          "demo bodies fall and collide during Run Game");
+    check(engine.stop_game(), "demo game session stops");
+}
 } // namespace
 
 int main() {
@@ -421,6 +548,8 @@ int main() {
         clipboard_and_groups();
         selections_and_timeline();
         projects();
+        asset_files();
+        demo_project();
         std::cout << "Background editor workflow tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

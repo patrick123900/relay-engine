@@ -6,6 +6,7 @@
 #include "relay/editor/editor_camera.hpp"
 #include "relay/editor/wrapped_input.hpp"
 #include "relay/editor/editor_layout.hpp"
+#include "relay/editor/file_browser.hpp"
 #include "relay/editor/editor_math.hpp"
 #include "relay/editor/editor_state.hpp"
 #include "relay/editor/editor_selection.hpp"
@@ -314,6 +315,10 @@ struct EditorUi::Impl {
     // Cached runtime state. The editor never touches Scene, SceneHistory or AssetRegistry directly.
     JsonValue scene_list;
     JsonValue collider_boxes;
+    std::string scene_list_reply, collider_boxes_reply, agent_review_reply, agent_audit_reply;
+    static constexpr int refresh_stages = 4;
+    int startup_frames{}; // Frames built since the ImGui context and saved layout were created.
+    int refresh_stage{-1}; // Next periodic refresh stage, or -1 between refreshes.
     std::vector<const JsonValue::Object*> entities;
     std::map<std::string, std::vector<std::size_t>, std::less<>> children;
     std::vector<std::size_t> roots;
@@ -411,14 +416,43 @@ struct EditorUi::Impl {
     std::string window_title;
     [[nodiscard]] bool scene_modified() const { return scene_revision != saved_revision; }
 
-    std::array<char, 129> model_filename{"relay-pbr-golden.glb"};
-    std::array<char, 129> create_name{"Entity"};
-    std::string renaming;
-    std::array<char, 129> rename_buffer{};
-    std::vector<std::string> available_models, available_files;
+    std::array<char, 129> model_filename{};
+    // One inline rename at a time, drawn in place of a hierarchy row or asset entry label.
+    enum class RenameKind { none, entity, asset };
+    struct InlineRename {
+        RenameKind kind{RenameKind::none};
+        std::string target;
+        std::array<char, 129> buffer{};
+        int frames{};
+        bool activated{};
+    } inline_rename;
+    // A second, slower click on the only selected row renames it once the double-click time passes.
+    struct SlowClick {
+        RenameKind kind{RenameKind::none};
+        std::string target;
+        double time{};
+    } slow_click;
+    struct AssetEntry {
+        std::string name, path, kind;
+        bool folder{}, importable{}, locked{};
+    };
+    // Search and kind filters. While either is active the panel lists matches flat, not the tree.
+    std::array<char, 65> asset_query{};
+    std::set<std::string> asset_kind_filters;
+    std::vector<AssetEntry> asset_results;
+    bool asset_results_truncated{}, asset_search_focus{};
+    EditorUi::FileBrowserHandler file_browser = show_in_file_browser;
+
+    void open_in_file_browser(const std::string& path, const bool directory) {
+        if (file_browser) file_browser(std::filesystem::path(assets_root) / path, directory);
+    }
+    // Listings of the project root ("") and every expanded folder, keyed by folder path.
+    std::map<std::string, std::vector<AssetEntry>> asset_folders;
+    std::set<std::string> expanded_asset_folders;
+    std::string asset_selection, asset_delete_pending;
+    bool asset_listing_truncated{}, assets_focused{}, hierarchy_focused{};
     std::string assets_root = "assets";
     std::vector<std::string> undo_labels, redo_labels;
-    int import_preset{0};
     std::array<bool, 9> panel_open{true, true, true, false, true, true, false, false, false};
     JsonValue agent_review, agent_audit, chat_status;
     std::array<char, 4001> chat_message{};
@@ -483,16 +517,36 @@ struct EditorUi::Impl {
         return true;
     }
 
-    std::optional<JsonValue> call(const std::string_view method,
-                                  const std::string_view fields = {}) {
+    std::string request_line(const std::string_view method, const std::string_view fields) {
         std::string line = "{\"id\":" + std::to_string(next_request_id++) + ",\"method\":\"" +
                            std::string(method) + '"';
         if (!fields.empty()) {
             line += ',';
             line += fields;
         }
-        line += '}';
-        const auto response = request(line);
+        return line + '}';
+    }
+
+    std::optional<JsonValue> call(const std::string_view method,
+                                  const std::string_view fields = {},
+                                  const bool report_errors = true) {
+        return parse_response(method, request(request_line(method, fields)), report_errors);
+    }
+
+    // For large periodic reads: returns nothing when the reply matches `previous`, so an unchanged
+    // scene listing or collider overlay is not parsed again every refresh.
+    std::optional<JsonValue> call_if_changed(const std::string_view method, std::string& previous) {
+        const auto response = request(request_line(method, {}));
+        const auto body = response.find(",\"ok\":");
+        const auto key = body == std::string::npos ? response : response.substr(body);
+        if (key == previous) return std::nullopt;
+        auto result = parse_response(method, response, true);
+        previous = result ? key : std::string{};
+        return result;
+    }
+
+    std::optional<JsonValue> parse_response(const std::string_view method,
+                                            const std::string& response, const bool report_errors) {
         JsonParser parser{response};
         auto parsed = parser.parse();
         if (!parsed) {
@@ -505,7 +559,8 @@ struct EditorUi::Impl {
             return std::nullopt;
         }
         if (!boolean_or(*object, "ok", false)) {
-            set_status(std::string(method) + ": " + string_or(*object, "error", "failed"), true);
+            if (report_errors)
+                set_status(std::string(method) + ": " + string_or(*object, "error", "failed"), true);
             return std::nullopt;
         }
         const auto* result = field(*object, "result");
@@ -1062,87 +1117,102 @@ struct EditorUi::Impl {
         return "\"entity\":\"" + std::string(handle) + '"';
     }
 
+    // Refreshes every panel at once, as needed straight after an edit.
     void refresh() {
         refresh_pending = false;
-        seconds_since_refresh = 0.0;
+        refresh_stage = -1;
+        for (int stage = 0; stage < refresh_stages; ++stage) refresh_part(stage);
+    }
+
+    // Periodic refreshes are spread over consecutive frames so that no single frame pays for
+    // every panel read, which showed as a regular hitch in the viewport.
+    void advance_refresh() {
+        if (refresh_stage < 0) refresh_stage = 0;
+        refresh_part(refresh_stage);
+        if (++refresh_stage == refresh_stages) refresh_stage = -1;
+    }
+
+    void refresh_part(const int stage) {
+        if (stage == 0) {
+            seconds_since_refresh = 0.0;
+            if (auto status = call("runtime.status")) runtime_status = std::move(*status);
+            if (auto project = call("project.status")) project_status = std::move(*project);
+            if (auto clipboard = call("scene.clipboard"); clipboard && clipboard->object())
+                clipboard_ready = number_or(*clipboard->object(), "entities", 0) > 0;
+            if (auto list = call_if_changed("scene.list", scene_list_reply)) {
+                scene_list = std::move(*list);
+                rebuild_index();
+            }
+            animator_playing = false;
+            if (const auto* entity = selection.empty() ? nullptr : find_entity(selection)) {
+                if (const auto* animator = component(*entity, "animator"))
+                    animator_playing = boolean_or(*animator, "playing", false);
+            }
+            if (panel_open[6])
+                for (const auto& target : animation_targets())
+                    if (const auto* entity = find_entity(target))
+                        if (const auto* animator = component(*entity, "animator"))
+                            animator_playing |= boolean_or(*animator, "playing", false);
+            if (auto logs = call("logs.read", "\"after\":" + std::to_string(last_log_sequence))) {
+                append_logs(*logs);
+            }
+            if (auto history = call("scene.history")) {
+                const auto* object = history->object();
+                const auto collect = [&](const std::string_view key, std::vector<std::string>& target) {
+                    target.clear();
+                    if (object == nullptr) return;
+                    const auto* value = field(*object, key);
+                    if (value == nullptr || value->array() == nullptr) return;
+                    for (const auto& item : *value->array()) {
+                        if (const auto* text = item.string()) target.push_back(*text);
+                    }
+                };
+                collect("undo", undo_labels);
+                collect("redo", redo_labels);
+                if (object != nullptr) {
+                    if (const auto* state = field(*object, "state"); state && state->object())
+                        scene_revision =
+                            static_cast<std::uint64_t>(number_or(*state->object(), "revision", 0.0));
+                }
+            }
+            return;
+        }
+        if (stage == 1) {
+            // The overlay is fetched only while it can be drawn.
+            if (collider_wireframes_enabled && panel_open[5] && camera_enabled &&
+                !(runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game")) {
+                if (auto boxes = call_if_changed("physics.debug_boxes", collider_boxes_reply))
+                    collider_boxes = std::move(*boxes);
+            } else {
+                collider_boxes_reply.clear();
+                collider_boxes = JsonValue{};
+            }
+            return;
+        }
+        if (stage == 2) {
+            if (!panel_open[8]) return;
+            if (auto result = call_if_changed("session.review", agent_review_reply))
+                agent_review = std::move(*result);
+            if (auto result = call_if_changed("session.audit", agent_audit_reply))
+                agent_audit = std::move(*result);
+            if (auto result = call("chat.status")) chat_status = std::move(*result);
+            return;
+        }
+        // Assets are refreshed on a cadence rather than only after a UI-driven import, because an
+        // agent sharing this runtime can import a model at any time and the human's mesh and
+        // material lists must reflect that.
         const bool periodic = seconds_since_assets >= refresh_interval_seconds;
         if (periodic) seconds_since_assets = 0.0;
-        if (panel_open[8]) {
-            if (auto result = call("session.review")) agent_review = std::move(*result);
-            if (auto result = call("session.audit")) agent_audit = std::move(*result);
-            if (auto result = call("chat.status")) chat_status = std::move(*result);
+        if (!periodic && !assets_pending) return;
+        refresh_assets();
+        if (auto projects = call("project.list"); projects && projects->object()) {
+            project_files.clear();
+            if (const auto* list = field(*projects->object(), "projects"); list && list->array())
+                for (const auto& file : *list->array())
+                    if (file.string()) project_files.push_back(*file.string());
         }
-        if (auto status = call("runtime.status")) runtime_status = std::move(*status);
-        if (auto project = call("project.status")) project_status = std::move(*project);
-        if (auto clipboard = call("scene.clipboard"); clipboard && clipboard->object())
-            clipboard_ready = number_or(*clipboard->object(), "entities", 0) > 0;
-        if (auto list = call("scene.list")) {
-            scene_list = std::move(*list);
-            rebuild_index();
-        }
-        if (auto boxes = call("physics.debug_boxes")) collider_boxes = std::move(*boxes);
-        animator_playing = false;
-        if (const auto* entity = selection.empty() ? nullptr : find_entity(selection)) {
-            if (const auto* animator = component(*entity, "animator"))
-                animator_playing = boolean_or(*animator, "playing", false);
-        }
-        if (panel_open[6])
-            for (const auto& target : animation_targets())
-                if (const auto* entity = find_entity(target))
-                    if (const auto* animator = component(*entity, "animator"))
-                        animator_playing |= boolean_or(*animator, "playing", false);
-        if (auto logs = call("logs.read", "\"after\":" + std::to_string(last_log_sequence))) {
-            append_logs(*logs);
-        }
-        // Assets are refreshed on the same cadence rather than only after a UI-driven import,
-        // because an agent sharing this runtime can import a model at any time and the human's
-        // mesh and material lists must reflect that.
-        if (periodic || assets_pending) {
-            refresh_assets();
-            if (auto projects = call("project.list"); projects && projects->object()) {
-                project_files.clear();
-                if (const auto* list = field(*projects->object(), "projects"); list && list->array())
-                    for (const auto& file : *list->array())
-                        if (file.string()) project_files.push_back(*file.string());
-            }
-        }
-        if (auto history = call("scene.history")) {
-            const auto* object = history->object();
-            const auto collect = [&](const std::string_view key, std::vector<std::string>& target) {
-                target.clear();
-                if (object == nullptr) return;
-                const auto* value = field(*object, key);
-                if (value == nullptr || value->array() == nullptr) return;
-                for (const auto& item : *value->array()) {
-                    if (const auto* text = item.string()) target.push_back(*text);
-                }
-            };
-            collect("undo", undo_labels);
-            collect("redo", redo_labels);
-            if (object != nullptr) {
-                if (const auto* state = field(*object, "state"); state && state->object())
-                    scene_revision =
-                        static_cast<std::uint64_t>(number_or(*state->object(), "revision", 0.0));
-            }
-        }
-        if (periodic || assets_pending) {
-            if (auto models = call("assets.available")) {
-                available_models.clear();
-                available_files.clear();
-                if (const auto* object = models->object()) {
-                    assets_root = string_or(*object, "root");
-                    if (const auto* files = field(*object, "files"); files && files->array())
-                        for (const auto& item : *files->array())
-                            if (item.string()) available_files.push_back(*item.string());
-                    if (const auto* value = field(*object, "models"); value && value->array()) {
-                        for (const auto& item : *value->array()) {
-                            if (const auto* text = item.string()) available_models.push_back(*text);
-                        }
-                    }
-                }
-            }
-            assets_pending = false;
-        }
+        refresh_asset_listing();
+        assets_pending = false;
     }
 
     void rebuild_index() {
@@ -1885,12 +1955,117 @@ struct EditorUi::Impl {
         gizmo_active = using_gizmo;
     }
 
+    // Rename helpers shared by the hierarchy and the asset browser.
+    // Panel visibility and View menu toggles persist with the dock layout.
+    void bind_preferences() {
+        constexpr std::array<const char*, 9> names{"Hierarchy", "Inspector", "Assets", "History",
+                                                   "Diagnostics", "Viewport", "Timeline", "Project",
+                                                   "Agent"};
+        for (std::size_t index = 0; index < names.size(); ++index)
+            layout.bind(std::string("panel.") + names[index], &panel_open[index]);
+        layout.bind("view.ground_grid", &grid_enabled);
+        layout.bind("view.collider_wireframes", &collider_wireframes_enabled);
+        layout.bind("view.node_icons", &node_icons_enabled);
+        layout.bind("view.camera_wireframes", &camera_wireframes_enabled);
+    }
+
+    void begin_rename(const RenameKind kind, const std::string& target, const std::string& name) {
+        inline_rename = {};
+        inline_rename.kind = kind;
+        inline_rename.target = target;
+        const auto length = std::min(name.size(), inline_rename.buffer.size() - 1U);
+        std::copy_n(name.begin(), length, inline_rename.buffer.begin());
+        inline_rename.buffer[length] = '\0';
+        slow_click = {};
+    }
+
+    [[nodiscard]] bool renaming(const RenameKind kind, const std::string& target) const {
+        return inline_rename.kind == kind && inline_rename.target == target;
+    }
+
+    enum class RenameResult { editing, commit, cancel };
+    // Draws the rename field at the cursor. Enter or clicking away commits; Escape cancels.
+    RenameResult rename_field(const std::string& item_name, const float width) {
+        if (inline_rename.frames++ == 0) ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(std::max(width, 40.0F * ui_scale));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(ImGui::GetStyle().FramePadding.x * 0.5F, 0.0F));
+        const bool entered = ImGui::InputText("##inline_rename", inline_rename.buffer.data(),
+                                              inline_rename.buffer.size(),
+                                              ImGuiInputTextFlags_EnterReturnsTrue |
+                                                  ImGuiInputTextFlags_AutoSelectAll);
+        ImGui::PopStyleVar();
+        note_item(item_name);
+        if (entered) return RenameResult::commit;
+        if (ImGui::IsItemActive()) {
+            inline_rename.activated = true;
+            return RenameResult::editing;
+        }
+        if (inline_rename.activated)
+            return ImGui::IsKeyPressed(ImGuiKey_Escape, false) ? RenameResult::cancel
+                                                               : RenameResult::commit;
+        // Focus lands a frame after the request; give up if it never arrives.
+        return inline_rename.frames > 3 ? RenameResult::cancel : RenameResult::editing;
+    }
+
+    void note_slow_click(const RenameKind kind, const std::string& target, const bool eligible) {
+        if (eligible && !ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            slow_click = {kind, target, ImGui::GetTime()};
+        else
+            slow_click = {};
+    }
+
+    void update_slow_click() {
+        if (slow_click.kind == RenameKind::none) return;
+        const auto& io = ImGui::GetIO();
+        if (ImGui::GetTime() - slow_click.time < static_cast<double>(io.MouseDoubleClickTime) ||
+            ImGui::IsMouseDown(ImGuiMouseButton_Left)) return;
+        const auto pending = slow_click;
+        slow_click = {};
+        const float threshold = io.MouseDragThreshold;
+        if (io.MouseDragMaxDistanceSqr[0] > threshold * threshold) return;
+        if (pending.kind == RenameKind::entity && selection == pending.target &&
+            selections.handles.size() == 1U) {
+            if (const auto* entity = find_entity(pending.target))
+                begin_rename(RenameKind::entity, pending.target, string_or(*entity, "name"));
+        } else if (pending.kind == RenameKind::asset && asset_selection == pending.target) {
+            if (const auto* entry = asset_entry(pending.target); entry && !entry->locked)
+                begin_rename(RenameKind::asset, pending.target, entry->name);
+        }
+    }
+
+    void create_entity(const std::string& parent) {
+        std::string fields = "\"name\":\"Entity\"";
+        if (!parent.empty()) fields += ",\"parent\":\"" + parent + '"';
+        const auto created = call("scene.create", fields);
+        if (!created || !created->object()) return;
+        set_status("Entity created", false);
+        refresh_pending = true;
+        refresh();
+        const auto handle = string_or(*created->object(), "entity");
+        if (handle.empty()) return;
+        select(handle);
+        begin_rename(RenameKind::entity, handle, "Entity");
+    }
+
+    // Accepts a dragged importable asset. Returns its path when dropped.
+    [[nodiscard]] std::optional<std::string> accept_model_drop() {
+        const auto* payload = ImGui::GetDragDropPayload();
+        if (!payload || !payload->IsDataType("relay.asset")) return std::nullopt;
+        const std::string path(static_cast<const char*>(payload->Data));
+        const auto* entry = asset_entry(path);
+        if (!entry || !entry->importable) return std::nullopt;
+        if (!ImGui::AcceptDragDropPayload("relay.asset")) return std::nullopt;
+        return path;
+    }
+
     void draw_tree_node(const std::size_t index) {
         const auto* entity = entities[index];
         const auto handle = string_or(*entity, "entity");
         const auto name = string_or(*entity, "name", "Entity");
         const auto found = children.find(handle);
         const bool has_children = found != children.end() && !found->second.empty();
+        const bool editing = renaming(RenameKind::entity, handle);
 
         ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
                                    ImGuiTreeNodeFlags_SpanAvailWidth |
@@ -1902,15 +2077,22 @@ struct EditorUi::Impl {
 
         // Hierarchy highlights meet edge-to-edge; other controls keep normal spacing.
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0F));
-        const bool open = ImGui::TreeNodeEx(handle.c_str(), flags, "%s", name.c_str());
+        const bool open = ImGui::TreeNodeEx(handle.c_str(), flags, "%s", editing ? "" : name.c_str());
         ImGui::PopStyleVar();
         note_item("entity:" + handle);
-        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) click_selection(handle, true);
+        const auto row_min = ImGui::GetItemRectMin();
+        const auto row_max = ImGui::GetItemRectMax();
+        if (!editing && ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            const auto& io = ImGui::GetIO();
+            const bool sole = selection == handle && selections.handles.size() == 1U;
+            click_selection(handle, true);
+            note_slow_click(RenameKind::entity, handle, sole && !io.KeyCtrl && !io.KeyShift);
+        }
 
         // Dragging one row onto another reparents it. The drop target rejects its own subtree
         // implicitly: scene.set_parent refuses cycles, and the failure surfaces as a status
-        // message.
-        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
+        // message. Dropping a model file imports it as a child.
+        if (!editing && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
             ImGui::SetDragDropPayload("relay.entity", handle.c_str(), handle.size() + 1U);
             ImGui::Text("Reparent %s", name.c_str());
             ImGui::EndDragDropSource();
@@ -1923,29 +2105,40 @@ struct EditorUi::Impl {
                            entity_field(dragged) + ",\"parent\":\"" + handle + '"', "Reparented");
                 }
             }
+            if (const auto model = accept_model_drop()) import_model(*model, "scene", handle);
             ImGui::EndDragDropTarget();
         }
 
-        if (ImGui::BeginPopupContextItem()) {
+        if (!editing && ImGui::BeginPopupContextItem()) {
             if (!selections.contains(handle)) select(handle);
-            if (ImGui::MenuItem("Add child")) {
-                mutate("scene.create", "\"name\":\"Entity\",\"parent\":\"" + handle + '"',
-                       "Entity created");
-            }
+            if (ImGui::MenuItem("Add child")) create_entity(handle);
             if (ImGui::MenuItem("Duplicate", "Ctrl+D")) duplicate_selection();
             if (ImGui::MenuItem("Move to root")) {
                 mutate("scene.set_parent", entity_field(handle) + ",\"parent\":null", "Reparented");
             }
-            if (ImGui::MenuItem("Rename")) {
-                renaming = handle;
-                const auto length = std::min(name.size(), rename_buffer.size() - 1U);
-                std::copy_n(name.begin(), length, rename_buffer.begin());
-                rename_buffer[length] = '\0';
-            }
-            if (ImGui::MenuItem("Destroy")) {
+            if (ImGui::MenuItem("Rename", "F2")) begin_rename(RenameKind::entity, handle, name);
+            if (ImGui::MenuItem("Destroy", "Del")) {
                 mutate("scene.destroy", entity_field(handle), "Entity destroyed");
             }
             ImGui::EndPopup();
+        }
+        if (editing) {
+            // The field replaces the label on the row itself, after the arrow.
+            const float x = row_min.x + ImGui::GetTreeNodeToLabelSpacing();
+            ImGui::SameLine(0.0F, 0.0F);
+            ImGui::SetCursorScreenPos(ImVec2(x, row_min.y));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                                ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0F));
+            const auto result = rename_field("rename:entity", row_max.x - x);
+            ImGui::PopStyleVar();
+            if (result == RenameResult::commit) {
+                const std::string renamed = inline_rename.buffer.data();
+                if (!renamed.empty() && renamed != name)
+                    mutate("scene.rename",
+                           entity_field(handle) + ",\"name\":\"" + json_escape(renamed) + '"',
+                           "Entity renamed");
+            }
+            if (result != RenameResult::editing) inline_rename = {};
         }
         if (open && has_children) {
             for (const auto child : found->second)
@@ -1983,43 +2176,35 @@ struct EditorUi::Impl {
 
     void draw_hierarchy() {
         drawing_rows.clear();
-        ImGui::SetNextItemWidth(-88.0F * ui_scale);
-        ImGui::InputTextWithHint("##createname", "new entity name", create_name.data(),
-                                 create_name.size());
-        ImGui::SameLine();
-        if (ImGui::Button("Create", ImVec2(80.0F * ui_scale, 0.0F))) {
-            std::string fields = "\"name\":\"" + json_escape(create_name.data()) + '"';
-            if (!selection.empty()) fields += ",\"parent\":\"" + selection + '"';
-            if (const auto created = call("scene.create", fields)) {
-                set_status("Entity created", false);
-                refresh_pending = true;
-                refresh();
-                if (const auto* object = created->object()) {
-                    const auto handle = string_or(*object, "entity");
-                    if (!handle.empty()) select(handle);
-                }
-            }
-        }
-        if (!renaming.empty()) {
-            ImGui::Separator();
-            ImGui::SetNextItemWidth(-90.0F);
-            const bool submitted =
-                ImGui::InputText("##rename", rename_buffer.data(), rename_buffer.size(),
-                                 ImGuiInputTextFlags_EnterReturnsTrue);
-            ImGui::SameLine();
-            const bool confirmed = ImGui::Button("Rename", ImVec2(80.0F, 0.0F));
-            if (submitted || confirmed) {
-                mutate("scene.rename",
-                       entity_field(renaming) + ",\"name\":\"" + json_escape(rename_buffer.data()) +
-                           '"',
-                       "Entity renamed");
-                renaming.clear();
-            }
-        }
-        ImGui::Dummy(ImVec2(0.0F, 2.0F * ui_scale));
+        hierarchy_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        if (inline_rename.kind == RenameKind::entity && !find_entity(inline_rename.target))
+            inline_rename = {};
         if (begin_region("##tree")) {
             for (const auto root : roots)
                 draw_tree_node(root);
+            // The space below the rows clears the selection, accepts drops at the root, and
+            // offers entity creation.
+            const auto available = ImGui::GetContentRegionAvail();
+            ImGui::Dummy(ImVec2(std::max(available.x, 1.0F),
+                                std::max(available.y, ImGui::GetFrameHeight())));
+            note_item("hierarchy:empty");
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::GetIO().KeyCtrl) select({});
+            if (ImGui::BeginDragDropTarget()) {
+                if (const auto* payload = ImGui::AcceptDragDropPayload("relay.entity")) {
+                    const std::string dragged(static_cast<const char*>(payload->Data));
+                    mutate("scene.set_parent", entity_field(dragged) + ",\"parent\":null",
+                           "Reparented");
+                }
+                if (const auto model = accept_model_drop()) import_model(*model);
+                ImGui::EndDragDropTarget();
+            }
+            if (ImGui::BeginPopupContextItem("##hierarchy_empty")) {
+                if (ImGui::MenuItem("Create empty entity")) create_entity({});
+                if (ImGui::MenuItem("Create child of selection", nullptr, false,
+                                    !selection.empty()))
+                    create_entity(selection);
+                ImGui::EndPopup();
+            }
         }
         ImGui::EndChild();
         visible_rows = drawing_rows;
@@ -2881,6 +3066,10 @@ struct EditorUi::Impl {
         if (scene_has_file) set_scene_filename(scene);
         saved_revision = scene_revision;
         select({});
+        asset_folders.clear();
+        expanded_asset_folders.clear();
+        asset_selection.clear();
+        inline_rename = {};
         assets_pending = refresh_pending = true;
         if (auto project = call("project.status")) project_status = std::move(*project);
         set_status(create ? "Project created" : "Project opened", false);
@@ -3443,6 +3632,12 @@ struct EditorUi::Impl {
             ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
             return;
         const auto& shortcuts = ImGui::GetIO();
+        if (update_asset_shortcuts()) return;
+        if (!assets_focused && ImGui::IsKeyPressed(ImGuiKey_F2, false) && panel_open[0] &&
+            selections.handles.size() == 1U) {
+            if (const auto* entity = find_entity(selection))
+                begin_rename(RenameKind::entity, selection, string_or(*entity, "name"));
+        }
         if (shortcuts.KeyCtrl && shortcuts.KeyShift && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
             panel_open[8] = true; agent_expand_pending = true; return;
         }
@@ -3474,7 +3669,7 @@ struct EditorUi::Impl {
             gizmo_operation = ImGuizmo::SCALE;
         if (!shortcuts.KeyCtrl && !ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F, false))
             focus_selection();
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && !selection.empty()) {
+        if (!assets_focused && ImGui::IsKeyPressed(ImGuiKey_Delete, false) && !selection.empty()) {
             group_operation("scene.destroy_many", "Deleted selection");
         }
         const auto& io = ImGui::GetIO();
@@ -3484,64 +3679,559 @@ struct EditorUi::Impl {
         }
     }
 
-    void draw_assets() {
-        // Preset and import share one row so the list itself gets the panel's height.
-        ImGui::SetNextItemWidth(-116.0F * ui_scale);
-        ImGui::Combo("##preset", &import_preset, "scene\0static_mesh\0");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("scene keeps animation, cameras and lights; static_mesh strips them");
+    // Asset browser: a tree over the project folder, backed by the assets.* file methods. Only the
+    // root and expanded folders are listed.
+    static std::string parent_path_of(const std::string& path) {
+        const auto slash = path.rfind('/');
+        return slash == std::string::npos ? std::string{} : path.substr(0, slash);
+    }
+    static std::string join_path(const std::string& directory, const std::string& name) {
+        return directory.empty() ? name : directory + '/' + name;
+    }
+    static std::string base_name(const std::string& path) {
+        const auto slash = path.rfind('/');
+        return slash == std::string::npos ? path : path.substr(slash + 1U);
+    }
+    static bool within(const std::string& path, const std::string& folder) {
+        return path == folder || path.starts_with(folder + '/');
+    }
+
+    [[nodiscard]] const AssetEntry* asset_entry(const std::string& path) const {
+        if (const auto folder = asset_folders.find(parent_path_of(path)); folder != asset_folders.end())
+            for (const auto& entry : folder->second)
+                if (entry.path == path) return &entry;
+        for (const auto& entry : asset_results)
+            if (entry.path == path) return &entry;
+        return nullptr;
+    }
+
+    [[nodiscard]] bool asset_search_active() const {
+        return asset_query[0] != '\0' || !asset_kind_filters.empty();
+    }
+
+    void run_asset_search() {
+        asset_results.clear();
+        asset_results_truncated = false;
+        if (!asset_search_active()) return;
+        std::string kinds = "[";
+        for (const auto& kind : asset_kind_filters) {
+            if (kinds.size() > 1) kinds += ',';
+            kinds += '"' + kind + '"';
+        }
+        const auto found = call("assets.search", "\"query\":\"" + json_escape(asset_query.data()) +
+                                                     "\",\"kinds\":" + kinds + ']', false);
+        const auto* object = found ? found->object() : nullptr;
+        if (!object) return;
+        asset_results_truncated = boolean_or(*object, "truncated", false);
+        if (const auto* values = field(*object, "entries"); values && values->array())
+            for (const auto& value : *values->array())
+                if (const auto* entry = value.object())
+                    asset_results.push_back({string_or(*entry, "name"), string_or(*entry, "path"),
+                                             string_or(*entry, "kind"),
+                                             string_or(*entry, "type") == "folder",
+                                             boolean_or(*entry, "importable", false),
+                                             boolean_or(*entry, "protected", false)});
+    }
+
+    void clear_asset_search() {
+        asset_query.fill('\0');
+        asset_kind_filters.clear();
+        asset_results.clear();
+    }
+
+    // Leaves the search and shows `path` in the tree, expanding its folders.
+    void reveal_asset(const std::string& path) {
+        clear_asset_search();
+        for (auto folder = parent_path_of(path); !folder.empty(); folder = parent_path_of(folder))
+            expanded_asset_folders.insert(folder);
+        if (asset_entry(path) == nullptr || asset_entry(path)->folder)
+            expanded_asset_folders.insert(path);
+        refresh_asset_listing();
+        asset_selection = path;
+    }
+
+    // Lists one folder. Returns false when it no longer exists.
+    bool list_asset_folder(const std::string& directory) {
+        const auto listing = call("assets.browse",
+                                  "\"directory\":\"" + json_escape(directory) + '"', false);
+        const auto* object = listing ? listing->object() : nullptr;
+        if (!object) {
+            asset_folders.erase(directory);
+            return false;
+        }
+        if (directory.empty()) assets_root = string_or(*object, "root", assets_root);
+        asset_listing_truncated |= boolean_or(*object, "truncated", false);
+        auto& entries = asset_folders[directory];
+        entries.clear();
+        if (const auto* values = field(*object, "entries"); values && values->array())
+            for (const auto& value : *values->array())
+                if (const auto* entry = value.object())
+                    entries.push_back({string_or(*entry, "name"), string_or(*entry, "path"),
+                                       string_or(*entry, "kind"),
+                                       string_or(*entry, "type") == "folder",
+                                       boolean_or(*entry, "importable", false),
+                                       boolean_or(*entry, "protected", false)});
+        return true;
+    }
+
+    void refresh_asset_listing() {
+        asset_listing_truncated = false;
+        asset_folders.clear();
+        list_asset_folder({});
+        // Parents come before children in the ordered set, so a vanished folder's descendants
+        // are dropped when their parent listing no longer contains them.
+        for (auto folder = expanded_asset_folders.begin(); folder != expanded_asset_folders.end();) {
+            const auto* entry = asset_entry(*folder);
+            if (entry && entry->folder && list_asset_folder(*folder)) ++folder;
+            else folder = expanded_asset_folders.erase(folder);
+        }
+        run_asset_search();
+        if (!asset_selection.empty() && !asset_entry(asset_selection)) asset_selection.clear();
+        if (inline_rename.kind == RenameKind::asset && !asset_entry(inline_rename.target))
+            inline_rename = {};
+    }
+
+    void set_asset_folder_open(const std::string& folder, const bool open) {
+        if (open == expanded_asset_folders.contains(folder)) return;
+        if (open) {
+            expanded_asset_folders.insert(folder);
+            list_asset_folder(folder);
+        } else {
+            std::erase_if(expanded_asset_folders,
+                          [&](const std::string& path) { return within(path, folder); });
+        }
+    }
+
+    // After a move or rename, expanded folders and the selection follow the entry's new path.
+    void follow_asset_move(const std::string& from, const std::string& to) {
+        std::set<std::string> expanded;
+        for (const auto& path : expanded_asset_folders)
+            expanded.insert(within(path, from) ? to + path.substr(from.size()) : path);
+        expanded_asset_folders = std::move(expanded);
+        if (within(asset_selection, from)) asset_selection = to + asset_selection.substr(from.size());
+    }
+
+    bool move_asset(const std::string& from, const std::string& to) {
+        if (!call("assets.move", "\"from\":\"" + json_escape(from) + "\",\"to\":\"" +
+                                     json_escape(to) + '"'))
+            return false;
+        follow_asset_move(from, to);
+        refresh_asset_listing();
+        return true;
+    }
+
+    void move_asset_into(const std::string& path, const std::string& folder) {
+        if (path == folder || parent_path_of(path) == folder || within(folder, path)) return;
+        if (move_asset(path, join_path(folder, base_name(path)))) {
+            if (!folder.empty()) set_asset_folder_open(folder, true);
+            set_status("Moved " + base_name(path) + " to " + (folder.empty() ? "project root" : folder),
+                       false);
+        }
+    }
+
+    void create_asset_folder(const std::string& parent) {
+        if (!parent.empty()) set_asset_folder_open(parent, true);
+        const auto listed = asset_folders.find(parent);
+        const auto taken = [&](const std::string& name) {
+            return listed != asset_folders.end() &&
+                   std::any_of(listed->second.begin(), listed->second.end(),
+                               [&](const AssetEntry& entry) { return entry.name == name; });
+        };
+        std::string name = "New folder";
+        for (int suffix = 2; taken(name); ++suffix) name = "New folder " + std::to_string(suffix);
+        const auto path = join_path(parent, name);
+        if (!call("assets.create_folder", "\"path\":\"" + json_escape(path) + '"')) return;
+        refresh_asset_listing();
+        asset_selection = path;
+        begin_rename(RenameKind::asset, path, name);
+    }
+
+    void open_asset(const AssetEntry& entry) {
+        if (entry.folder && asset_search_active()) reveal_asset(entry.path);
+        else if (entry.folder) set_asset_folder_open(entry.path, !expanded_asset_folders.contains(entry.path));
+        else if (entry.importable) import_model(entry.path);
+        else set_status("No editor for " + entry.name + " yet", false);
+    }
+
+    // Folder targets accept any dragged asset entry and move it inside.
+    void asset_folder_drop_target(const std::string& folder) {
+        if (!ImGui::BeginDragDropTarget()) return;
+        if (const auto* payload = ImGui::AcceptDragDropPayload("relay.asset")) {
+            const std::string dragged(static_cast<const char*>(payload->Data));
+            move_asset_into(dragged, folder);
+        }
+        ImGui::EndDragDropTarget();
+    }
+
+    void draw_asset_icon(const ImVec2 at, const float size, const AssetEntry& entry) {
+        auto* list = ImGui::GetWindowDrawList();
+        const auto& palette = editor_palette();
+        const float inset = size * 0.14F;
+        const ImVec2 low{at.x + inset, at.y + inset * 1.6F};
+        const ImVec2 high{at.x + size - inset, at.y + size - inset};
+        if (entry.folder) {
+            const ImU32 color = IM_COL32(222, 172, 76, 255);
+            list->AddRectFilled(low, ImVec2(low.x + (high.x - low.x) * 0.45F, low.y + size * 0.16F),
+                                color, size * 0.08F);
+            list->AddRectFilled(ImVec2(low.x, low.y + size * 0.12F), high, color, size * 0.1F);
+            return;
+        }
+        const ImU32 color = entry.importable ? palette.accent : palette.text_faint;
+        const ImVec2 page_low{at.x + size * 0.22F, low.y - inset * 0.6F};
+        list->AddRect(page_low, high, color, size * 0.08F, 0, std::max(1.0F, size * 0.08F));
+        if (entry.importable)
+            list->AddRectFilled(ImVec2(page_low.x + size * 0.14F, high.y - size * 0.3F),
+                                ImVec2(high.x - size * 0.14F, high.y - size * 0.14F), color);
+    }
+
+    void draw_asset_context_menu(const AssetEntry& entry) {
+        if (!ImGui::BeginPopupContextItem()) return;
+        asset_selection = entry.path;
+        if (asset_search_active()) {
+            if (ImGui::MenuItem("Show in folder")) reveal_asset(entry.path);
+            ImGui::Separator();
+        }
+        if (entry.importable) {
+            if (ImGui::MenuItem("Import to scene")) import_model(entry.path);
+            if (ImGui::MenuItem("Import to scene as static mesh"))
+                import_model(entry.path, "static_mesh");
+            ImGui::Separator();
+        }
+        if (entry.folder) {
+            draw_asset_create_menu(entry.path);
+            ImGui::Separator();
+        }
+        if (ImGui::MenuItem("Open in file browser")) open_in_file_browser(entry.path, entry.folder);
+        note_item("assets:menu:file_browser");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Rename", "F2", false, !entry.locked))
+            begin_rename(RenameKind::asset, entry.path, entry.name);
+        if (ImGui::MenuItem("Delete", "Del", false, !entry.locked))
+            asset_delete_pending = entry.path;
+        if (entry.locked) ImGui::TextDisabled("Owned by the project");
+        ImGui::EndPopup();
+    }
+
+    void draw_asset_create_menu(const std::string& parent) {
+        if (!ImGui::BeginMenu("Create")) return;
+        if (ImGui::MenuItem("Folder")) create_asset_folder(parent);
+        ImGui::Separator();
+        future_action("Script");
+        future_action("Text file");
+        future_action("Shader");
+        future_action("Material");
+        ImGui::EndMenu();
+    }
+
+    // Draws a tree row, or with `flat` a search result row that shows its folder instead of children.
+    void draw_asset_node(const AssetEntry& entry, const bool flat = false) {
+        ImGui::PushID(entry.path.c_str());
+        const bool editing = renaming(RenameKind::asset, entry.path);
+        const bool expanded = !flat && entry.folder && expanded_asset_folders.contains(entry.path);
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
+                                   ImGuiTreeNodeFlags_SpanAvailWidth;
+        if (!entry.folder || flat) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        if (asset_selection == entry.path) flags |= ImGuiTreeNodeFlags_Selected;
+        if (entry.folder) ImGui::SetNextItemOpen(expanded, ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0F));
+        const bool open = ImGui::TreeNodeEx("##asset", flags);
+        ImGui::PopStyleVar();
+        note_item("asset:" + entry.path);
+        const auto row_min = ImGui::GetItemRectMin();
+        const auto row_max = ImGui::GetItemRectMax();
+        if (!editing) {
+            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+                const bool sole = asset_selection == entry.path;
+                asset_selection = entry.path;
+                note_slow_click(RenameKind::asset, entry.path, sole && !entry.locked);
+            }
+            const bool activated = (!entry.folder || flat) && ImGui::IsItemHovered() &&
+                                   ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+            if (ImGui::BeginDragDropSource()) {
+                ImGui::SetDragDropPayload("relay.asset", entry.path.c_str(), entry.path.size() + 1U);
+                ImGui::Text(entry.importable ? "Import or move %s" : "Move %s", entry.name.c_str());
+                ImGui::EndDragDropSource();
+            }
+            if (entry.folder) asset_folder_drop_target(entry.path);
+            draw_asset_context_menu(entry);
+            if (activated) open_asset(entry);
+        }
+        if (!flat && entry.folder && open != expanded) set_asset_folder_open(entry.path, open);
+
+        // The icon and name, or the rename field, sit where the tree node's label would.
+        const float icon = ImGui::GetTextLineHeight();
+        const float label_x = row_min.x + ImGui::GetTreeNodeToLabelSpacing();
+        draw_asset_icon(ImVec2(label_x, row_min.y), icon, entry);
+        ImGui::SameLine(0.0F, 0.0F);
+        const float text_x = label_x + icon + ImGui::GetStyle().ItemInnerSpacing.x;
+        ImGui::SetCursorScreenPos(ImVec2(text_x, row_min.y));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0F));
+        if (editing) {
+            const auto result = rename_field("rename:asset", row_max.x - text_x);
+            if (result == RenameResult::commit) {
+                const std::string renamed = inline_rename.buffer.data();
+                const auto destination = join_path(parent_path_of(entry.path), renamed);
+                inline_rename = {};
+                if (!renamed.empty() && renamed != entry.name && move_asset(entry.path, destination))
+                    set_status("Renamed " + entry.name + " to " + renamed, false);
+            }
+            if (result != RenameResult::editing) inline_rename = {};
+        } else if (entry.folder || entry.importable) {
+            ImGui::TextUnformatted(entry.name.c_str());
+        } else {
+            ImGui::TextColored(editor_color(editor_palette().text_dim), "%s", entry.name.c_str());
+        }
+        if (flat && !editing) {
+            const auto folder = parent_path_of(entry.path);
+            ImGui::SameLine();
+            ImGui::TextColored(editor_color(editor_palette().text_faint), "%s",
+                               folder.empty() ? "project root" : folder.c_str());
+        }
+        ImGui::PopStyleVar();
+        if (!flat && entry.folder && open) {
+            // Drawn from a copy: a move or rename inside may replace the listing.
+            if (const auto listing = asset_folders.find(entry.path); listing != asset_folders.end())
+                for (const auto& child : std::vector<AssetEntry>(listing->second))
+                    draw_asset_node(child);
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+
+    void draw_asset_delete_dialog() {
+        if (asset_delete_pending.empty()) return;
+        if (!ImGui::IsPopupOpen("Delete asset?")) ImGui::OpenPopup("Delete asset?");
+        if (!ImGui::BeginPopupModal("Delete asset?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            asset_delete_pending.clear();
+            return;
+        }
+        ImGui::Text("Delete %s?", base_name(asset_delete_pending).c_str());
+        ImGui::TextDisabled("It moves to the project's hidden .relay-trash folder.");
+        if (ImGui::Button("Delete") || ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
+            if (call("assets.delete", "\"path\":\"" + json_escape(asset_delete_pending) + '"')) {
+                set_status("Deleted " + base_name(asset_delete_pending), false);
+                if (within(asset_selection, asset_delete_pending)) asset_selection.clear();
+                refresh_asset_listing();
+            }
+            asset_delete_pending.clear();
+            ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Import", ImVec2(-1.0F, 0.0F)))
-            import_model(model_filename.data());
-        ImGui::Dummy(ImVec2(0.0F, 2.0F * ui_scale));
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            asset_delete_pending.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 
-        const float footer = ImGui::GetTextLineHeightWithSpacing();
-        if (begin_region("##models", ImVec2(0.0F, -footer))) {
-            if (available_files.empty()) {
-                ImGui::TextColored(editor_color(editor_palette().text_faint),
-                                   "No files in the project folder.");
+    static constexpr std::array<std::pair<const char*, const char*>, 10> asset_kind_labels{{
+        {"model", "Models"}, {"scene", "Scenes"}, {"image", "Images"}, {"shader", "Shaders"},
+        {"script", "Scripts"}, {"text", "Text"}, {"media", "Audio and video"},
+        {"folder", "Folders"}, {"project", "Project files"}, {"other", "Other"}}};
+
+    void draw_asset_search_bar() {
+        const auto& style = ImGui::GetStyle();
+        const float button = ImGui::GetFrameHeight();
+        if (asset_search_focus) {
+            ImGui::SetKeyboardFocusHere();
+            asset_search_focus = false;
+        }
+        ImGui::SetNextItemWidth(-(button + style.ItemSpacing.x));
+        if (ImGui::InputTextWithHint("##asset_search", "Search assets", asset_query.data(),
+                                     asset_query.size()))
+            run_asset_search();
+        note_item("assets:search");
+        if (ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Escape, false) && asset_query[0]) {
+            asset_query.fill('\0');
+            run_asset_search();
+        }
+        ImGui::SameLine();
+        const bool filtering = !asset_kind_filters.empty();
+        if (filtering) ImGui::PushStyleColor(ImGuiCol_Button, editor_palette().accent_soft);
+        if (ImGui::Button("##asset_filter", ImVec2(button, button))) ImGui::OpenPopup("##asset_filters");
+        if (filtering) ImGui::PopStyleColor();
+        note_item("assets:filter");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(filtering ? "Filter by type (%zu active)" : "Filter by type",
+                              asset_kind_filters.size());
+        {
+            // A funnel: a wide top narrowing to a short stem.
+            auto* list = ImGui::GetWindowDrawList();
+            const auto low = ImGui::GetItemRectMin(), high = ImGui::GetItemRectMax();
+            const float size = high.x - low.x;
+            const float cx = low.x + size * 0.5F, top = low.y + size * 0.28F;
+            const float neck = low.y + size * 0.55F, bottom = low.y + size * 0.74F;
+            const ImU32 color = filtering ? editor_palette().accent : editor_palette().text_dim;
+            const ImVec2 funnel[]{{low.x + size * 0.24F, top}, {high.x - size * 0.24F, top},
+                                  {cx + size * 0.07F, neck}, {cx + size * 0.07F, bottom},
+                                  {cx - size * 0.07F, bottom + size * 0.05F}, {cx - size * 0.07F, neck}};
+            list->AddConvexPolyFilled(funnel, 6, color);
+        }
+        if (ImGui::BeginPopup("##asset_filters")) {
+            // Toggling a category keeps the menu open so several can be picked in one go.
+            ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
+            for (const auto& [kind, label] : asset_kind_labels) {
+                bool enabled = asset_kind_filters.contains(kind);
+                if (ImGui::MenuItem(label, nullptr, &enabled)) {
+                    if (enabled) asset_kind_filters.insert(kind);
+                    else asset_kind_filters.erase(kind);
+                    run_asset_search();
+                }
+                note_item(std::string("assets:filter:") + kind);
             }
-            for (const auto& model : available_files) {
-                const bool importable = std::find(available_models.begin(), available_models.end(), model) != available_models.end();
-                if (!importable) { ImGui::TextDisabled("%s", model.c_str()); continue; }
-                const bool selected = model == std::string(model_filename.data());
-                if (ImGui::Selectable(model.c_str(), selected)) {
-                    const auto length = std::min(model.size(), model_filename.size() - 1U);
-                    std::copy_n(model.begin(), length, model_filename.begin());
-                    model_filename[length] = '\0';
+            ImGui::PopItemFlag();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear filters", nullptr, false, !asset_kind_filters.empty())) {
+                asset_kind_filters.clear();
+                run_asset_search();
+            }
+            ImGui::EndPopup();
+        }
+        // Active filters as removable chips.
+        if (!asset_kind_filters.empty()) {
+            bool first = true;
+            for (const auto& [kind, label] : asset_kind_labels) {
+                if (!asset_kind_filters.contains(kind)) continue;
+                const std::string chip = std::string(label) + "  x##chip_" + kind;
+                const float width = ImGui::CalcTextSize(chip.c_str(), nullptr, true).x +
+                                    style.FramePadding.x * 2.0F;
+                if (!first && ImGui::GetContentRegionAvail().x > width + style.ItemSpacing.x)
+                    ImGui::SameLine();
+                first = false;
+                if (ImGui::SmallButton(chip.c_str())) {
+                    asset_kind_filters.erase(kind);
+                    run_asset_search();
+                    break;
                 }
-                // Double-clicking imports straight away, which is the common case.
-                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                    import_model(model);
-                }
+            }
+        }
+    }
+
+    void draw_assets() {
+        assets_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        draw_asset_search_bar();
+        if (begin_region("##asset_files")) {
+            const auto root = asset_folders.find({});
+            if (asset_search_active()) {
+                if (asset_results.empty())
+                    ImGui::TextColored(editor_color(editor_palette().text_faint), "No matching assets.");
+                for (const auto& entry : std::vector<AssetEntry>(asset_results)) draw_asset_node(entry, true);
+                if (asset_results_truncated)
+                    ImGui::TextColored(editor_color(editor_palette().text_faint),
+                                       "More matches not shown; refine the search.");
+            } else if (root == asset_folders.end() || root->second.empty())
+                ImGui::TextColored(editor_color(editor_palette().text_faint),
+                                   "Empty project. Right-click to create a folder.");
+            else
+                for (const auto& entry : std::vector<AssetEntry>(root->second)) draw_asset_node(entry);
+            // Space below the tree clears the selection, takes drops into the project root, and
+            // offers creation there.
+            const auto available = ImGui::GetContentRegionAvail();
+            ImGui::Dummy(ImVec2(std::max(available.x, 1.0F),
+                                std::max(available.y, ImGui::GetFrameHeight())));
+            note_item("assets:empty");
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) asset_selection.clear();
+            asset_folder_drop_target({});
+            if (ImGui::BeginPopupContextItem("##assets_empty")) {
+                draw_asset_create_menu({});
+                if (ImGui::MenuItem("Open in file browser")) open_in_file_browser({}, true);
+                if (ImGui::MenuItem("Refresh")) refresh_asset_listing();
+                ImGui::EndPopup();
             }
         }
         ImGui::EndChild();
-        ImGui::TextColored(editor_color(editor_palette().text_faint), "%zu meshes   %zu materials",
-                           mesh_names.size(), material_names.size());
+        draw_asset_delete_dialog();
     }
 
-    void import_model(const std::string& filename) {
-        const std::string preset = import_preset == 0 ? "scene" : "static_mesh";
+    // Keys for the focused asset browser. Returns true when it consumed the key press.
+    bool update_asset_shortcuts() {
+        if (!assets_focused) return false;
+        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+            asset_search_focus = true;
+            return true;
+        }
+        const auto* entry = asset_selection.empty() ? nullptr : asset_entry(asset_selection);
+        if (!entry) return ImGui::IsKeyPressed(ImGuiKey_Delete, false);
+        if (ImGui::IsKeyPressed(ImGuiKey_F2, false) && !entry->locked) {
+            begin_rename(RenameKind::asset, entry->path, entry->name);
+            return true;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+            if (!entry->locked) asset_delete_pending = entry->path;
+            return true;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
+            open_asset(AssetEntry(*entry));
+            return true;
+        }
+        if (entry->folder && (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false) ||
+                              ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))) {
+            set_asset_folder_open(entry->path, ImGui::IsKeyPressed(ImGuiKey_RightArrow, false));
+            return true;
+        }
+        return false;
+    }
+
+    // Where a model dropped on the viewport lands: the ground plane under the pointer, or a short
+    // distance along the pointer ray when the ground is not in view.
+    [[nodiscard]] Vec3 viewport_drop_point(const ImVec2 pointer) const {
+        const auto width = viewport_max.x - viewport_min.x;
+        const auto height = viewport_max.y - viewport_min.y;
+        if (width <= 0.0F || height <= 0.0F) return {};
+        const double horizontal =
+            2.0 * static_cast<double>(pointer.x - viewport_min.x) / static_cast<double>(width) - 1.0;
+        const double vertical =
+            1.0 - 2.0 * static_cast<double>(pointer.y - viewport_min.y) / static_cast<double>(height);
+        const auto direction = editor_screen_ray(view.position, view.target,
+                                                 view.camera.field_of_view_y_degrees,
+                                                 static_cast<double>(width) / height, horizontal,
+                                                 vertical);
+        double distance = 10.0;
+        if (direction.y < -1e-4) distance = std::min(-view.position.y / direction.y, 200.0);
+        if (distance <= 0.0) distance = 10.0;
+        return {view.position.x + direction.x * distance, view.position.y + direction.y * distance,
+                view.position.z + direction.z * distance};
+    }
+
+    void draw_viewport_drop_target() {
+        if (!viewport_visible) return;
+        if (!ImGui::BeginDragDropTargetCustom(ImRect(viewport_min, viewport_max),
+                                              ImGui::GetID("##viewport_drop"))) return;
+        if (const auto model = accept_model_drop())
+            import_model(*model, "scene", {}, viewport_drop_point(ImGui::GetMousePos()));
+        ImGui::EndDragDropTarget();
+    }
+
+    // Imports into the scene, optionally under `parent` or at a world `position`, then selects it.
+    void import_model(const std::string& filename, const std::string& preset = "scene",
+                      const std::string& parent = {}, std::optional<Vec3> position = {}) {
         const auto imported =
             call("assets.import_model", "\"filename\":\"" + json_escape(filename) +
                                             "\",\"instantiate\":true,\"preset\":\"" + preset + '"');
         if (!imported)
             return;
-        set_status("Imported " + filename, false);
+        std::vector<std::string> imported_handles;
+        if (const auto* object = imported->object())
+            if (const auto* list = field(*object, "roots"); list && list->array())
+                for (const auto& value : *list->array())
+                    if (const auto* handle = value.string()) imported_handles.push_back(*handle);
+        for (const auto& handle : imported_handles) {
+            if (!parent.empty())
+                (void)call("scene.set_parent", entity_field(handle) + ",\"parent\":\"" + parent + '"');
+            if (position)
+                (void)call("scene.set_transform", entity_field(handle) + ",\"px\":" +
+                                                      number_text(position->x) + ",\"py\":" +
+                                                      number_text(position->y) + ",\"pz\":" +
+                                                      number_text(position->z));
+        }
+        set_status("Imported " + base_name(filename), false);
         assets_pending = true;
         refresh_pending = true;
         refresh();
-        // Select and frame the imported root, so an import is immediately editable.
-        if (const auto* object = imported->object()) {
-            if (const auto* imported_roots = field(*object, "roots");
-                imported_roots && imported_roots->array() && !imported_roots->array()->empty()) {
-                if (const auto* handle = imported_roots->array()->front().string()) {
-                    select(*handle);
-                    focus_selection();
-                }
-            }
+        // Select the imported root so it is immediately editable; frame it unless it was placed.
+        if (!imported_handles.empty()) {
+            select(imported_handles.front());
+            if (!position) focus_selection();
         }
     }
 
@@ -3638,6 +4328,9 @@ bool EditorUi::initialize_headless(std::string& error) {
     ImGui::CreateContext();
     impl_->imgui_context_created = impl_->headless = true;
     impl_->layout.initialize(".relay/headless-layout.ini");
+    // Headless editors never reach the desktop; tests install their own handler to observe calls.
+    impl_->file_browser = {};
+    impl_->bind_preferences();
     impl_->fonts = load_editor_fonts(1.0F);
     apply_editor_theme(1.0F);
     ImGui::GetStyle().FontSizeBase = impl_->fonts.body_size;
@@ -3668,6 +4361,7 @@ bool EditorUi::initialize(const OverlayContext& context, std::string& error) {
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         impl_->layout.initialize();
+        impl_->bind_preferences();
         impl_->fonts = load_editor_fonts(1.0F);
         apply_editor_theme(1.0F);
         ImGui::GetStyle().FontSizeBase = impl_->fonts.body_size;
@@ -3715,6 +4409,21 @@ void EditorUi::set_panel_visible(const std::string_view name, const bool visible
     constexpr std::array<std::string_view, 9> names{"Hierarchy", "Inspector", "Assets", "History", "Diagnostics", "Viewport", "Timeline", "Project", "Agent"};
     for (std::size_t i = 0; i < names.size(); ++i)
         if (names[i] == name) impl_->panel_open[i] = visible;
+}
+
+void EditorUi::set_file_browser_handler(FileBrowserHandler handler) {
+    impl_->file_browser = std::move(handler);
+}
+
+bool EditorUi::panel_visible(const std::string_view name) const {
+    constexpr std::array<std::string_view, 9> names{"Hierarchy", "Inspector", "Assets", "History", "Diagnostics", "Viewport", "Timeline", "Project", "Agent"};
+    for (std::size_t i = 0; i < names.size(); ++i)
+        if (names[i] == name) return impl_->panel_open[i];
+    return false;
+}
+
+bool EditorUi::open_project(const std::string_view filename) {
+    return impl_->open_or_create_project(false, std::string(filename));
 }
 
 void EditorUi::invalidate() {
@@ -3829,9 +4538,9 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     const auto delta = static_cast<double>(ImGui::GetIO().DeltaTime);
     impl_->seconds_since_refresh += delta;
     impl_->seconds_since_assets += delta;
-    if (impl_->refresh_pending || impl_->seconds_since_refresh >= impl_->refresh_interval()) {
-        impl_->refresh();
-    }
+    if (impl_->refresh_pending) impl_->refresh();
+    else if (impl_->refresh_stage >= 0 || impl_->seconds_since_refresh >= impl_->refresh_interval())
+        impl_->advance_refresh();
 
     (void)width;
     (void)height;
@@ -3846,12 +4555,18 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         impl_->draw_toolbar();
     ImGui::End();
     impl_->layout.build(impl_->ui_scale);
-    constexpr ImGuiWindowFlags panel_flags = ImGuiWindowFlags_NoCollapse;
+    // Panels appearing at startup would each take focus, and a focused docked panel becomes its
+    // node's selected tab, overriding the saved one. Only panels opened later take focus.
+    const ImGuiWindowFlags panel_flags =
+        ImGuiWindowFlags_NoCollapse |
+        (impl_->startup_frames < 2 ? ImGuiWindowFlags_NoFocusOnAppearing : ImGuiWindowFlags_None);
+    if (impl_->startup_frames < 2) ++impl_->startup_frames;
     const auto panel = [&](const char* name, std::size_t index) {
         ImGui::SetNextWindowSizeConstraints(
             ImVec2(160.0F * impl_->ui_scale, 80.0F * impl_->ui_scale), ImVec2(FLT_MAX, FLT_MAX));
         return ImGui::Begin(name, &impl_->panel_open[index], panel_flags);
     };
+    impl_->update_slow_click();
     if (impl_->panel_open[0]) {
         if (panel("Hierarchy", 0)) {
             impl_->draw_hierarchy();
@@ -3910,6 +4625,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
                 impl_->viewport_draw_list->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
             }
         }
+        impl_->draw_viewport_drop_target();
         impl_->update_camera_input();
         if (!impl_->chat_media.viewer_open()) impl_->update_shortcuts();
         impl_->update_view();

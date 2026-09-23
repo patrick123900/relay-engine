@@ -354,6 +354,93 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "asset_browse",
+    {
+      title: "Browse project files",
+      description: "List the folders and files in one project folder, folders first, with each entry's asset kind. Hidden entries and symlinks are omitted; importable models are marked.",
+      inputSchema: z.object({
+        "directory": z.string().max(128).regex(new RegExp("^([A-Za-z0-9][A-Za-z0-9._ /-]*)?$")).default("").describe("Project-relative folder; empty lists the project root")
+      }),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["asset_browse"];
+        if (override) return override(input as JsonObject);
+        return invoke("assets.browse", {"directory": input["directory"]});
+      },
+  );
+
+  server.registerTool(
+    "asset_search",
+    {
+      title: "Search project files",
+      description: "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries and symlinks are skipped; at most 512 results.",
+      inputSchema: z.object({
+        "query": z.string().max(64).default("").describe("Case-insensitive name fragment; empty matches every name"),
+        "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|image|shader|script|text|media|project|other)$"))).max(10).optional().describe("Asset kinds to include; omitted or empty includes all")
+      }),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["asset_search"];
+        if (override) return override(input as JsonObject);
+        return invoke("assets.search", {"query": input["query"], "kinds": input["kinds"]});
+      },
+  );
+
+  server.registerTool(
+    "asset_create_folder",
+    {
+      title: "Create project folder",
+      description: "Create a new, empty folder inside an existing project folder.",
+      inputSchema: z.object({
+        "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._ /-]*$")).describe("Project-relative path of the new folder")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["asset_create_folder"];
+        if (override) return override(input as JsonObject);
+        return invoke("assets.create_folder", {"path": input["path"]});
+      },
+  );
+
+  server.registerTool(
+    "asset_move",
+    {
+      title: "Rename or move project file",
+      description: "Rename or move a project file or folder without overwriting. Import records follow moved models; project scene files and the project file cannot move.",
+      inputSchema: z.object({
+        "from": z.string().max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._ /-]*$")).describe("Existing project-relative path"),
+        "to": z.string().max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._ /-]*$")).describe("New project-relative path; its folder must exist")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["asset_move"];
+        if (override) return override(input as JsonObject);
+        return invoke("assets.move", {"from": input["from"], "to": input["to"]});
+      },
+  );
+
+  server.registerTool(
+    "asset_delete",
+    {
+      title: "Delete project file",
+      description: "Move a project file or folder into the hidden .relay-trash folder, where it can be recovered by hand. Project scene files and the project file cannot be deleted.",
+      inputSchema: z.object({
+        "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._ /-]*$")).describe("Project-relative file or folder")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["asset_delete"];
+        if (override) return override(input as JsonObject);
+        return invoke("assets.delete", {"path": input["path"]});
+      },
+  );
+
+  server.registerTool(
     "logs_read",
     {
       title: "Read Relay logs",

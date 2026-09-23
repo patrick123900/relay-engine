@@ -6,6 +6,7 @@ option(RELAY_BUILD_TESTS "Build Relay's tests" ON)
 option(RELAY_ENABLE_SDL "Build the SDL-powered human window" ON)
 option(RELAY_ENABLE_EDITOR_UI "Build the Dear ImGui human editor interface" ON)
 option(RELAY_FETCH_VULKAN_HEADERS "Fetch pinned Khronos headers when the system only has a loader" ON)
+option(RELAY_OPEN_DEMO_PROJECT "Open examples/demo when the editor starts (dev builds)" OFF)
 
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 include(FetchContent)
@@ -68,6 +69,7 @@ add_library(relay_engine
     src/scene/scene.cpp
     src/scene/project.cpp
     src/scene/project_package.cpp
+    src/scene/project_files.cpp
     src/scene/scene_edit.cpp
     src/scene/scene_history.cpp
     src/scene/scene_io.cpp
@@ -155,6 +157,9 @@ endif()
 
 add_executable(relay_demo apps/relay_demo/main.cpp)
 target_compile_definitions(relay_demo PRIVATE RELAY_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+if(RELAY_OPEN_DEMO_PROJECT)
+    target_compile_definitions(relay_demo PRIVATE RELAY_DEMO_PROJECT="examples/demo/demo.relayproject")
+endif()
 target_link_libraries(relay_demo PRIVATE Relay::Engine)
 relay_enable_warnings(relay_demo)
 
@@ -321,7 +326,8 @@ if(RELAY_ENABLE_SDL)
                 endif()
 
                 target_sources(relay_demo PRIVATE src/editor/editor_ui.cpp src/editor/editor_theme.cpp
-                    src/editor/editor_layout.cpp src/editor/chat_media.cpp)
+                    src/editor/editor_layout.cpp src/editor/chat_media.cpp
+                    src/editor/file_browser.cpp)
                 find_package(PkgConfig QUIET)
                 if(PkgConfig_FOUND)
                     pkg_check_modules(CHAT_VIDEO QUIET IMPORTED_TARGET libavformat libavcodec libswscale libavutil)
@@ -361,8 +367,14 @@ if(RELAY_BUILD_TESTS)
     add_test(NAME relay_tests COMMAND relay_tests)
     add_executable(relay_workflow_tests tests/editor_workflow_tests.cpp)
     target_link_libraries(relay_workflow_tests PRIVATE Relay::Engine)
+    target_compile_definitions(relay_workflow_tests PRIVATE
+        RELAY_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     relay_enable_warnings(relay_workflow_tests)
     add_test(NAME relay_workflow_tests COMMAND relay_workflow_tests)
+    # Regenerates examples/demo; see tools/generate_demo_project.py.
+    add_executable(relay_build_demo_project tools/demo_project/build_demo_project.cpp)
+    target_link_libraries(relay_build_demo_project PRIVATE Relay::Engine)
+    relay_enable_warnings(relay_build_demo_project)
     add_executable(relay_session_test_host tests/session_test_host.cpp)
     target_link_libraries(relay_session_test_host PRIVATE Relay::Engine)
     relay_enable_warnings(relay_session_test_host)
@@ -372,7 +384,8 @@ if(RELAY_BUILD_TESTS)
     set_tests_properties(relay_session_protocol_tests PROPERTIES TIMEOUT 30)
     if(TARGET relay_imgui)
         add_executable(relay_editor_headless_tests tests/editor_headless_tests.cpp
-            src/editor/editor_ui.cpp src/editor/editor_theme.cpp src/editor/editor_layout.cpp src/editor/chat_media.cpp)
+            src/editor/editor_ui.cpp src/editor/editor_theme.cpp src/editor/editor_layout.cpp src/editor/chat_media.cpp
+            src/editor/file_browser.cpp)
         target_link_libraries(relay_editor_headless_tests PRIVATE Relay::Engine relay_imgui)
         target_compile_definitions(relay_editor_headless_tests PRIVATE RELAY_CHAT_MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat-media")
         relay_enable_warnings(relay_editor_headless_tests)

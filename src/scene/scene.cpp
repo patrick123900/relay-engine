@@ -175,19 +175,7 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
         }
         output << "]}";
     }
-    output << "],\"first_person_controller\":";
-    if (record.first_person_controller) {
-        const auto& controller = *record.first_person_controller;
-        output << "{\"walk_speed\":" << controller.walk_speed
-               << ",\"sprint_speed\":" << controller.sprint_speed
-               << ",\"jump_speed\":" << controller.jump_speed
-               << ",\"mouse_sensitivity\":" << controller.mouse_sensitivity
-               << ",\"stick_look_speed\":" << controller.stick_look_speed
-               << ",\"invert_y\":" << (controller.invert_y ? "true" : "false")
-               << ",\"ground_distance\":" << controller.ground_distance << ",\"camera\":\""
-               << escape_json(controller.camera) << "\"}";
-    } else output << "null";
-    output << '}';
+    output << "]}";
 }
 
 std::string_view field_type_name(const ReflectedFieldType type) {
@@ -521,27 +509,6 @@ bool valid_script(const Script& script) {
     return true;
 }
 
-bool Scene::set_first_person_controller(const Entity entity,
-                                        std::optional<FirstPersonController> controller) {
-    auto* record = get(entity);
-    if (!record) return false;
-    if (controller) {
-        const auto within = [](double value, double minimum, double maximum) {
-            return std::isfinite(value) && value >= minimum && value <= maximum;
-        };
-        if (!within(controller->walk_speed, 0.0, 1000.0) ||
-            !within(controller->sprint_speed, 0.0, 1000.0) ||
-            !within(controller->jump_speed, 0.0, 1000.0) ||
-            !within(controller->mouse_sensitivity, 0.0, 10.0) ||
-            !within(controller->stick_look_speed, 0.0, 3600.0) ||
-            !within(controller->ground_distance, 0.001, 100.0) || controller->camera.empty() ||
-            controller->camera.size() > 128U)
-            return false;
-    }
-    record->first_person_controller = std::move(controller);
-    return true;
-}
-
 bool Scene::set_scripts(const Entity entity, std::vector<Script> scripts) {
     auto* record = get(entity);
     if (!record || scripts.size() > maximum_scripts_per_entity ||
@@ -790,15 +757,6 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
           {"gravity_scale", ReflectedFieldType::number},
           {"restitution", ReflectedFieldType::number},
           {"lock_rotation", ReflectedFieldType::boolean}}},
-        {"FirstPersonController", 0x0dU,
-         {{"walk_speed", ReflectedFieldType::number},
-          {"sprint_speed", ReflectedFieldType::number},
-          {"jump_speed", ReflectedFieldType::number},
-          {"mouse_sensitivity", ReflectedFieldType::number},
-          {"stick_look_speed", ReflectedFieldType::number},
-          {"invert_y", ReflectedFieldType::boolean},
-          {"ground_distance", ReflectedFieldType::number},
-          {"camera", ReflectedFieldType::string}}},
         {"Scripts", 0x0cU,
          {{"behaviour", ReflectedFieldType::string},
           {"enabled", ReflectedFieldType::boolean},

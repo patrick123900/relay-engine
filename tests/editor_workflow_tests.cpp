@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 
 namespace {
@@ -813,109 +814,84 @@ void input_mapping() {
     check(engine.stop_game(), "input test game stops");
 }
 
-void first_person_controller() {
+// The demo's First Person Controller is a custom template driven by a project script, not a
+// native node type: it sits under Rigid Body in the type tree and is refused in untrusted projects.
+void demo_first_person_template() {
+    check(!relay::find_node_type("FirstPersonController"), "there is no native first person node type");
     relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
     relay::ControlProtocol protocol(engine);
-    const auto player = created_entity(
-        request(protocol, "scene.create", "\"type\":\"FirstPersonController\""));
+    request(protocol, "project.open", "\"filename\":\"examples/demo/demo.relayproject\"");
+    const auto listed = request(protocol, "templates.list");
+    const relay::JsonValue::Object* controller = nullptr;
+    for (const auto& value : *relay::field(*listed.object(), "templates")->array())
+        if (*relay::field(*value.object(), "name")->string() == "First Person Controller")
+            controller = value.object();
+    check(controller && *relay::field(*controller, "type")->string() == "RigidBody",
+          "the demo lists its First Person Controller template under Rigid Body");
+    const auto& behaviours = *relay::field(*controller, "behaviours")->array();
+    const auto& components = *relay::field(*controller, "components")->array();
+    check(behaviours.size() == 1U && *behaviours.front().string() == "FirstPersonController" &&
+              components.size() == 3U && *components[0].string() == "transform" &&
+              *components[1].string() == "collider" && *components[2].string() == "physics_body",
+          "templates.list reports the template root's components and script");
+    check(std::filesystem::is_regular_file("examples/demo/scripts/FirstPersonController.cpp"),
+          "the controller script is editable project source");
+
+    const auto player = created_entity(request(
+        protocol, "templates.instantiate", "\"template\":\"project:First Person Controller\""));
     const auto* record = engine.scene().get(player);
-    check(node_type_of(protocol, player) == "FirstPersonController" &&
-              record->collider->type == relay::BoxCollider::Type::capsule &&
+    check(record->collider->type == relay::BoxCollider::Type::capsule &&
               record->physics_body->type == relay::PhysicsBody::Type::dynamic &&
-              record->physics_body->lock_rotation && record->first_person_controller &&
-              record->scripts.empty() && record->transform.position.y == 1.0,
-          "the node type is an upright capsule body with a native controller and no script");
+              record->physics_body->lock_rotation && record->scripts.size() == 1U &&
+              record->scripts.front().behaviour == "FirstPersonController" &&
+              record->transform.position.y == 1.0 && record->name == "First Person Controller",
+          "the template is an upright capsule body running the controller script");
     relay::Entity camera{};
     for (const auto entity : engine.scene().entities())
         if (engine.scene().get(entity)->parent == player) camera = entity;
     check(camera.valid() && engine.scene().get(camera)->name == "Camera" &&
               engine.scene().get(camera)->camera && !engine.scene().get(camera)->camera->active,
-          "the controller gets a child camera, inactive until the game starts");
-    const auto inherited = relay::node_type_components("FirstPersonController");
-    check(inherited == std::vector<std::string_view>{"transform", "collider", "physics_body",
-                                                     "first_person_controller"},
-          "the controller type inherits Physics Body's collider");
+          "the template has a child camera, inactive until the script activates it");
+    check(engine.input().map().lock_mouse, "the demo's input map locks the mouse for looking");
+    const auto refused = protocol.handle(R"({"id":1,"method":"runtime.play"})");
+    check(refused.find("\"ok\":false") != std::string::npos,
+          "a scene using the controller script needs a trusted, built project");
+}
 
-    const auto field = "\"entity\":\"" + player.to_string() + '"';
-    request(protocol, "scene.set_first_person_controller", field + ",\"walk_speed\":5,\"invert_y\":true");
-    check(engine.scene().get(player)->first_person_controller->walk_speed == 5.0 &&
-              engine.scene().get(player)->first_person_controller->invert_y,
-          "controller settings are edited through the protocol");
-    request(protocol, "scene.set_first_person_controller", field + ",\"camera\":\"\"", false);
-    request(protocol, "scene.undo");
-    request(protocol, "component.remove", field + ",\"component\":\"first_person_controller\"");
-    check(node_type_of(protocol, player) == "RigidBody", "without the controller it is a Rigid Body");
-    request(protocol, "scene.undo");
-    check(engine.scene().get(player)->first_person_controller.has_value(), "removal is undoable");
-
-    // Scene v15 keeps the controller and the body's rotation lock.
-    relay::Scene saved;
-    saved.restore_state(engine.scene().capture_state());
+// Scene v15 stored a native first person controller; loading turns it into the script component.
+void first_person_migration() {
+    relay::Scene scene;
+    const auto player = scene.create("Player");
     std::string error;
-    check(relay::save_scene_file_atomic(saved, "controller.relay.json", error), "save controller scene");
-    const auto loaded = relay::load_scene_file("controller.relay.json");
-    check(loaded && loaded.state->slots[player.index].record.first_person_controller ==
-                        engine.scene().get(player)->first_person_controller &&
-              loaded.state->slots[player.index].record.physics_body->lock_rotation,
-          "version 15 scenes save the controller and rotation lock");
-
-    const auto floor = engine.scene().create("Ground");
-    (void)engine.scene().set_transform(floor, {{0, -0.5, 0}, {}, {1, 1, 1}});
-    relay::BoxCollider ground;
-    ground.half_extents = {50, 0.5, 50};
-    (void)engine.scene().set_collider(floor, ground);
-    (void)engine.scene().set_physics_body(floor, relay::PhysicsBody{relay::PhysicsBody::Type::static_body});
-    const auto overview = created_entity(request(protocol, "scene.create", "\"type\":\"Camera\""));
-    (void)request(protocol, "scene.set_camera", "\"entity\":\"" + overview.to_string() + "\",\"active\":true");
-    request(protocol, "scene.set_first_person_controller", field + ",\"walk_speed\":4,\"invert_y\":false");
-
-    check(engine.run_game(), "the first person scene runs without scripts or trust");
-    check(engine.scene().get(camera)->camera->active && !engine.scene().get(overview)->camera->active,
-          "the controller looks through its own camera during the game");
-    engine.step(60);
-    const auto rest = engine.scene().get(player)->transform;
-    check(std::abs(rest.position.y - 0.9) < 0.05 && rest.rotation_degrees == relay::Vec3{},
-          "the capsule lands on the ground and stays upright");
-    request(protocol, "input.simulate", "\"name\":\"move_y\",\"value\":1,\"frames\":60");
-    engine.step(60);
-    auto walked = engine.scene().get(player)->transform;
-    check(walked.position.z < rest.position.z - 3.5 && std::abs(walked.position.x - rest.position.x) < 0.05 &&
-              walked.rotation_degrees == relay::Vec3{},
-          "move_y walks forward along -Z at walking speed");
-    engine.apply_input_event("mouse_motion:0:0:750:0");
-    engine.step(1);
-    check(std::abs(engine.scene().get(camera)->transform.rotation_degrees.y + 90.0) < 1e-6,
-          "moving the mouse right turns the view right");
-    const auto turned = engine.scene().get(player)->transform.position;
-    request(protocol, "input.simulate", "\"name\":\"move_y\",\"value\":1,\"frames\":30");
-    engine.step(30);
-    walked = engine.scene().get(player)->transform;
-    check(walked.position.x > turned.x + 1.5 && std::abs(walked.position.z - turned.z) < 0.1,
-          "walking follows the direction the camera faces");
-    request(protocol, "input.simulate", "\"name\":\"move_y\",\"value\":1,\"frames\":30");
-    request(protocol, "input.simulate", "\"name\":\"sprint\",\"frames\":30");
-    const auto before_sprint = engine.scene().get(player)->transform.position.x;
-    engine.step(30);
-    check(engine.scene().get(player)->transform.position.x - before_sprint > 3.2,
-          "sprint moves faster than walking");
-    engine.step(20);
-    const auto grounded = engine.scene().get(player)->transform.position.y;
-    request(protocol, "input.simulate", "\"name\":\"jump\"");
-    engine.step(10);
-    check(engine.scene().get(player)->transform.position.y > grounded + 0.3,
-          "jump lifts the player off the ground");
-    const auto rising = engine.physics().velocity(engine.scene(), player)->y;
-    request(protocol, "input.simulate", "\"name\":\"jump\"");
-    engine.step(1);
-    check(rising > 2.0 && engine.physics().velocity(engine.scene(), player)->y < rising,
-          "jumping again in mid-air does nothing");
-    engine.step(90);
-    check(std::abs(engine.scene().get(player)->transform.position.y - grounded) < 0.05,
-          "the player lands again");
-    check(engine.stop_game() && engine.scene().get(overview)->camera->active &&
-              !engine.scene().get(camera)->camera->active &&
-              engine.scene().get(player)->transform.position.y == 1.0,
-          "Stop Game restores the scene's camera and the controller's place");
+    check(relay::save_scene_file_atomic(scene, "player.relay.json", error), "save player scene");
+    std::ifstream input("player.relay.json");
+    std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    input.close();
+    const auto replace = [&](const std::string& from, const std::string& to) {
+        const auto at = text.find(from);
+        check(at != std::string::npos, "the v16 file has the expected shape");
+        text.replace(at, from.size(), to);
+    };
+    replace("\"version\":16", "\"version\":15");
+    replace("\"scripts\":[]}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
+                               "\"sprint_speed\":8,\"jump_speed\":4,\"mouse_sensitivity\":0.2,"
+                               "\"stick_look_speed\":120,\"invert_y\":true,\"ground_distance\":1.1,"
+                               "\"camera\":\"Eyes\"}}");
+    std::ofstream("player.relay.json", std::ios::trunc) << text;
+    const auto loaded = relay::load_scene_file("player.relay.json");
+    check(loaded && loaded.migrated, "a v15 scene with a native controller loads");
+    const auto& scripts = loaded.state->slots[player.index].record.scripts;
+    check(scripts.size() == 1U && scripts.front().behaviour == "FirstPersonController" &&
+              scripts.front().enabled && scripts.front().properties.size() == 8U,
+          "the native controller becomes a FirstPersonController script component");
+    const auto property = [&](const char* name) {
+        for (const auto& item : scripts.front().properties)
+            if (item.name == name) return item;
+        throw std::runtime_error(std::string{"missing migrated property "} + name);
+    };
+    check(property("walk_speed").number == 5.0 && property("ground_distance").number == 1.1 &&
+              property("invert_y").boolean && property("camera_name").text == "Eyes",
+          "the script component keeps the controller's settings");
 }
 
 int main() {
@@ -936,7 +912,8 @@ int main() {
         demo_project();
         components_and_templates();
         input_mapping();
-        first_person_controller();
+        demo_first_person_template();
+        first_person_migration();
         std::cout << "Background editor workflow tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

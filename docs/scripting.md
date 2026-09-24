@@ -80,24 +80,83 @@ void on_update(double dt) override {
   rebind them.
 - Unknown action or axis names read as released and zero.
 
+## Example: a first person controller
+
+The demo project in [`examples/demo`](../examples/demo) has a **First Person Controller**
+template. Find it in the Add Node window under **Physics Body › Rigid Body**, marked with a palette
+icon like every custom template. It is an upright capsule with a dynamic, rotation-locked physics
+body, a child **Camera** at eye height, and a `FirstPersonController` script component from
+[`scripts/FirstPersonController.cpp`](../examples/demo/scripts/FirstPersonController.cpp). The
+script looks around with the mouse and `look_x`/`look_y`, walks with `move_x`/`move_y` relative to
+the view, sprints, and jumps only when a raycast finds ground. `fire` (left mouse button or right
+trigger) shoots: it instantiates the demo's **Ball** template just in front of the camera and sets
+its velocity along the view, plus the player's own motion. Balls sit on collider layer 2, which
+the player's collider mask leaves out, so they never knock into the shooter, and their
+[`Projectile`](../examples/demo/scripts/Projectile.cpp) script destroys them after six seconds. Its
+speeds, mouse sensitivity, camera name, ball template and ball speed are Inspector properties. Edit the script to change how the player moves, or copy the
+file and the template into another project. The demo's input map locks the mouse while the game
+has input.
+
 ## Callbacks
 
-## Built-in gameplay
-
-Some gameplay is built into the engine as components, so it needs no script: **Node › Physics Body
-› First Person Controller** in the Add Node window is a ready player you can walk around with.
-Scripts can still read and adjust it: the controller runs each step before `on_update`.
-
 A behaviour can override `on_start`, `on_update(dt)`, `on_contact_begin(other)`,
-`on_contact_end(other)`, `on_stop` and `on_reload`. Scripts can find a child node by name (`self().child("Camera")`), make a
-camera the one the game renders through (`camera.make_active_camera()`, restored by Stop Game),
-read and set local transforms,
-read world positions, set velocities, apply impulses, raycast against the live physics world, find
-entities by name and log to the editor. The header documents each call.
+`on_contact_end(other)`, `on_destroy`, `on_stop` and `on_reload`. Scripts can find a child node by
+name (`self().child("Camera")`) or list them all (`children()`), make a camera the one the game
+renders through (`camera.make_active_camera()`, restored by Stop Game), read and set local
+transforms, read world positions, set velocities, apply impulses, raycast and test overlaps
+against the live physics world, find entities by name, spawn and destroy entities, and log to the
+editor. The header documents each call.
 
 Each frame runs every `on_update`, then animation and physics, then the contact callbacks for that
 step. Stop Game calls `on_stop` and restores the authored scene, so scripts can change the scene
 freely during a run.
+
+## Spawning and destroying
+
+```cpp
+void on_update(double) override {
+    if (relay::input::pressed("fire")) {
+        const auto muzzle = self().world_position() + relay::Vec3{0, 1.5, 0};
+        const auto shot = relay::world::instantiate("Bullet", muzzle);
+        shot.set_velocity({0, 0, -30});
+    }
+}
+void on_contact_begin(relay::Entity) override { self().destroy(); }
+```
+
+- `relay::world::instantiate("Name")` copies the project template
+  `templates/Name.relay-template.json`, made with **Save as template...** in the editor. Pass a
+  position (and optionally a rotation) to place it, and a parent entity to put it under one;
+  positions are relative to the parent. Without a position the copy keeps the template's saved
+  transform. A missing template gives an empty `Entity` and one warning in the log. Templates are
+  read once per run, so spawning the same one repeatedly is cheap.
+- `entity.clone()` copies an entity and its descendants beside the original, with the same name,
+  components and script values; physics velocities start at zero.
+- `relay::world::create("Name", parent)` makes an empty node, useful for grouping spawned
+  entities.
+- New entities exist immediately, with physics bodies, so you can move them or set their velocity
+  straight away. Their scripts run `on_start` before their first `on_update`, at the end of the
+  step they were spawned in.
+- `entity.destroy()` removes an entity and its descendants once the current round of callbacks
+  finishes: after every `on_update` has run, or after the step's contact callbacks. Their scripts
+  get `on_destroy` first, while they are still in the scene. A behaviour can destroy its own
+  entity. Anything touching a destroyed body gets `on_contact_end` with a handle that is no
+  longer `alive()`.
+- Stop Game removes everything the run spawned and restores everything it destroyed. A scene holds
+  at most 100000 entities; spawning beyond that fails with a warning.
+
+## Scene queries
+
+- `relay::world::raycast(origin, direction, distance)` returns the nearest hit.
+- `entity.overlaps()` lists the enabled colliders touching the entity's own enabled collider,
+  including ones resting against it (within Jolt's 2 cm contact distance). Each side's layer must
+  be in the other's mask.
+- `relay::world::overlap_sphere(center, radius, layer_mask, ignore)` lists the enabled colliders
+  on those layers inside a sphere, for explosions, pickups and area checks.
+- `relay::world::find("Name")` and `entity.child("Name")` find entities by name;
+  `entity.children()` lists direct children.
+
+All queries use the running physics world, including spawned bodies and excluding destroyed ones.
 
 ## Trust
 
@@ -142,7 +201,7 @@ The compiler is the one Relay was built with. Set `RELAY_SCRIPT_COMPILER` to use
 - Register behaviours with unqualified class names.
 - Collider shapes keep the scale they had when Run Game started, even if a script rescales the
   entity.
-- Scripts cannot yet create or destroy entities, instantiate templates, or read input.
+- Scripts cannot yet add or remove components, or change an entity's parent.
 - Scripts are verified on Linux. The macOS path (`.dylib`, `dlopen`) exists but is untested, and
   Windows reports scripts as unsupported for now.
 

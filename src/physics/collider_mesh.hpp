@@ -2,6 +2,7 @@
 
 // Internal geometry shared by collision queries, the Jolt world and the editor overlay.
 
+#include "relay/physics/collision.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/scene/scene.hpp"
 
@@ -29,6 +30,10 @@ struct ColliderMeshData {
 // registry. Returns nothing for a missing, empty or oversized mesh.
 [[nodiscard]] std::optional<ColliderMeshData> collider_mesh(const EntityRecord& record,
                                                             const AssetRegistry& assets);
+
+// World-space box, sphere or capsule geometry of one enabled collider, as collision_debug_boxes
+// reports it. Nothing for disabled, convex or mesh colliders, or degenerate transforms.
+[[nodiscard]] std::optional<CollisionDebugBox> collider_geometry(const Scene& scene, Entity entity);
 
 // World-space edges of the convex hull Jolt builds from these points, at most `limit` of them.
 [[nodiscard]] std::vector<std::array<Vec3, 2>> convex_hull_edges(const std::vector<Vec3>& points,

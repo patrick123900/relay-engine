@@ -1,4 +1,5 @@
-// Native gameplay scripts: trust, background builds, lifecycle, contacts, errors and hot reload.
+// Native gameplay scripts: trust, background builds, lifecycle, contacts, errors, hot reload and
+// the demo project's first person controller.
 // These compile real C++ with the configured compiler, so they take a few seconds.
 #include "relay/control/control_protocol.hpp"
 #include "relay/control/generated_protocol.hpp"
@@ -401,6 +402,311 @@ void compile_errors(relay::Engine& engine, relay::ControlProtocol& protocol) {
            "revoking trust unloads the script library");
 }
 
+// The demo project's First Person Controller: a template running scripts/FirstPersonController.cpp,
+// play-tested with simulated input on a flat floor.
+void demo_first_person(relay::Engine& engine, relay::ControlProtocol& protocol) {
+    std::filesystem::create_directories("examples");
+    std::filesystem::copy(std::filesystem::path{RELAY_TEST_SOURCE_DIR} / "examples/demo", "examples/demo",
+                          std::filesystem::copy_options::recursive);
+    std::filesystem::remove_all("examples/demo/.relay-cache");
+    expect(ok(request(protocol, "project.open", "\"filename\":\"examples/demo/demo.relayproject\"")),
+           "open a copy of the demo project");
+    expect(ok(request(protocol, "scripts.trust", "\"trusted\":true")), "trust the demo project");
+    expect(ok(request(protocol, "scripts.build")), "build the demo's scripts");
+    const auto status = wait_for_build(engine, protocol);
+    expect(status.find("\"state\":\"ready\"") != std::string::npos &&
+               status.find("{\"name\":\"FirstPersonController\"") != std::string::npos,
+           "the demo's FirstPersonController script builds: " + status.substr(0, 600));
+    expect(ok(request(protocol, "scene.clear")), "start from an empty scene");
+
+    const auto floor = engine.scene().create("Ground");
+    (void)engine.scene().set_transform(floor, {{0, -0.5, 0}, {}, {1, 1, 1}});
+    relay::BoxCollider ground;
+    ground.half_extents = {50, 0.5, 50};
+    (void)engine.scene().set_collider(floor, ground);
+    (void)engine.scene().set_physics_body(floor, relay::PhysicsBody{relay::PhysicsBody::Type::static_body});
+    const auto overview = engine.scene().create("Overview");
+    relay::Camera overview_camera;
+    overview_camera.active = true;
+    (void)engine.scene().set_camera(overview, overview_camera);
+    const auto player = entity_from(request(protocol, "templates.instantiate",
+                                            "\"template\":\"project:First Person Controller\""));
+    relay::Entity camera{};
+    for (const auto entity : engine.scene().entities())
+        if (engine.scene().get(entity)->parent == player) camera = entity;
+    if (!engine.scene().contains(player) || !camera.valid() || !engine.scene().get(camera)->camera) {
+        expect(false, "the template creates a player with a child camera");
+        return;
+    }
+
+    expect(engine.run_game(), "the first person scene runs once its script is built");
+    expect(engine.scene().get(camera)->camera->active && !engine.scene().get(overview)->camera->active,
+           "the controller looks through its own camera during the game");
+    engine.step(60);
+    const auto rest = engine.scene().get(player)->transform;
+    expect(std::abs(rest.position.y - 0.9) < 0.05 && rest.rotation_degrees == relay::Vec3{},
+           "the capsule lands on the ground and stays upright");
+    (void)request(protocol, "input.simulate", "\"name\":\"move_y\",\"value\":1,\"frames\":60");
+    engine.step(60);
+    auto walked = engine.scene().get(player)->transform;
+    expect(walked.position.z < rest.position.z - 3.5 &&
+               std::abs(walked.position.x - rest.position.x) < 0.05 &&
+               walked.rotation_degrees == relay::Vec3{},
+           "move_y walks forward along -Z at walking speed");
+    engine.apply_input_event("mouse_motion:0:0:750:0");
+    engine.step(1);
+    expect(std::abs(engine.scene().get(camera)->transform.rotation_degrees.y + 90.0) < 1e-6,
+           "moving the mouse right turns the view right");
+    const auto turned = engine.scene().get(player)->transform.position;
+    (void)request(protocol, "input.simulate", "\"name\":\"move_y\",\"value\":1,\"frames\":30");
+    engine.step(30);
+    walked = engine.scene().get(player)->transform;
+    expect(walked.position.x > turned.x + 1.5 && std::abs(walked.position.z - turned.z) < 0.1,
+           "walking follows the direction the camera faces");
+    (void)request(protocol, "input.simulate", "\"name\":\"move_y\",\"value\":1,\"frames\":30");
+    (void)request(protocol, "input.simulate", "\"name\":\"sprint\",\"frames\":30");
+    const auto before_sprint = engine.scene().get(player)->transform.position.x;
+    engine.step(30);
+    expect(engine.scene().get(player)->transform.position.x - before_sprint > 3.2,
+           "sprint moves faster than walking");
+    engine.step(20);
+    const auto grounded = engine.scene().get(player)->transform.position.y;
+    (void)request(protocol, "input.simulate", "\"name\":\"jump\"");
+    engine.step(10);
+    expect(engine.scene().get(player)->transform.position.y > grounded + 0.3,
+           "jump lifts the player off the ground");
+    const auto rising = engine.physics().velocity(engine.scene(), player)->y;
+    (void)request(protocol, "input.simulate", "\"name\":\"jump\"");
+    engine.step(1);
+    expect(rising > 2.0 && engine.physics().velocity(engine.scene(), player)->y < rising,
+           "jumping again in mid-air does nothing");
+    engine.step(90);
+    expect(std::abs(engine.scene().get(player)->transform.position.y - grounded) < 0.05,
+           "the player lands again");
+
+    // Shooting: fire launches a Ball template along the view, which is turned to face +X.
+    const auto balls = [&] {
+        std::vector<relay::Entity> found;
+        for (const auto entity : engine.scene().entities())
+            if (engine.scene().get(entity)->name == "Ball") found.push_back(entity);
+        return found;
+    };
+    const auto shooter = engine.scene().get(player)->transform.position;
+    (void)request(protocol, "input.simulate", "\"name\":\"fire\"");
+    engine.step(1);
+    auto shots = balls();
+    expect(shots.size() == 1U, "fire spawns one ball");
+    if (shots.size() == 1U) {
+        const auto velocity = engine.physics().velocity(engine.scene(), shots.front());
+        const auto at = engine.scene().get(shots.front())->transform.position;
+        expect(velocity && velocity->x > 18.0 && std::abs(velocity->z) < 0.5 &&
+                   std::abs(velocity->y) < 1.0 && at.x > shooter.x + 0.3,
+               "the ball starts in front of the camera and flies where it looks");
+    }
+    engine.apply_input_event("mouse_motion:0:0:0:-250");
+    engine.step(1);
+    (void)request(protocol, "input.simulate", "\"name\":\"fire\"");
+    engine.step(1);
+    const auto first_shot = shots.empty() ? relay::Entity{} : shots.front();
+    shots = balls();
+    std::optional<relay::Vec3> rising_ball;
+    for (const auto shot : shots)
+        if (shot != first_shot) rising_ball = engine.physics().velocity(engine.scene(), shot);
+    expect(shots.size() == 2U && rising_ball && rising_ball->y > 8.0 && rising_ball->x > 15.0,
+           "looking up 30 degrees shoots the ball upward");
+    const auto standing = engine.scene().get(player)->transform.position;
+    engine.step(30);
+    expect(std::abs(engine.scene().get(player)->transform.position.x - standing.x) < 0.05,
+           "the player's own balls pass through it");
+    engine.step(400);
+    expect(balls().empty(), "balls remove themselves after their lifetime");
+    expect(engine.stop_game() && engine.scene().get(overview)->camera->active &&
+               !engine.scene().get(camera)->camera->active &&
+               engine.scene().get(player)->transform.position.y == 1.0,
+           "Stop Game restores the scene's camera and the player's place");
+}
+
+const char* spawn_source = R"(#include "relay_script.hpp"
+#include <string>
+
+// Falls for `lifetime` updates, then destroys itself.
+class Bullet : public relay::Behaviour {
+public:
+    void properties(relay::Properties& p) override { p.add("lifetime", lifetime); }
+    void on_start() override { relay::world::log("bullet start after " + std::to_string(updates)); }
+    void on_update(double) override {
+        if (++updates == lifetime) self().destroy();
+    }
+    void on_destroy() override {
+        relay::world::log("bullet destroyed after " + std::to_string(updates) + " updates");
+    }
+private:
+    int lifetime = 30;
+    int updates = 0;
+};
+RELAY_BEHAVIOUR(Bullet)
+
+class Pad : public relay::Behaviour {
+public:
+    void on_contact_begin(relay::Entity other) override { relay::world::log("pad touched by " + other.name()); }
+    void on_contact_end(relay::Entity other) override {
+        relay::world::log(std::string{"pad released a "} + (other.alive() ? "live" : "destroyed") + " entity");
+    }
+};
+RELAY_BEHAVIOUR(Pad)
+
+class Spawner : public relay::Behaviour {
+public:
+    void on_start() override {
+        const auto missing = relay::world::instantiate("Missing");
+        relay::world::log(missing ? "missing template spawned" : "missing template gives no entity");
+        (void)relay::world::instantiate("Missing");
+        group = relay::world::create("Bullets", self());
+        crate = relay::world::find("Crate");
+        relay::world::log("spawner children " + std::to_string(self().children().size()));
+    }
+    void on_update(double) override {
+        const auto frame = relay::world::frame();
+        if (frame == 2) {
+            bullet = relay::world::instantiate("Bullet", {0, 5, 0}, std::nullopt, group);
+            relay::world::log("spawned " + bullet.name() + " under " + bullet.parent().name());
+        } else if (frame == 3) {
+            const auto copy = bullet.clone();
+            copy.set_position({2, 5, 0});
+            relay::world::log("cloned " + copy.name() + ", bullets " +
+                              std::to_string(group.children().size()));
+        } else if (frame == 20) {
+            std::string touching;
+            for (const auto other : crate.overlaps()) touching += " " + other.name();
+            relay::world::log("crate overlaps" + touching);
+            std::string nearby;
+            for (const auto other : relay::world::overlap_sphere(crate.world_position(), 1.0, 0xffffffffu, crate))
+                nearby += " " + other.name();
+            relay::world::log("sphere finds" + nearby);
+            crate.destroy();
+            relay::world::log(std::string{"crate alive until the updates finish: "} + (crate.alive() ? "yes" : "no"));
+        }
+    }
+private:
+    relay::Entity group, bullet, crate;
+};
+RELAY_BEHAVIOUR(Spawner)
+)";
+
+std::size_t count_logged(const relay::Engine& engine, const std::string& text) {
+    std::size_t count = 0;
+    for (const auto& entry : engine.logs().read_after(0))
+        count += entry.message.find(text) != std::string::npos;
+    return count;
+}
+
+std::size_t named(const relay::Engine& engine, const std::string& name) {
+    std::size_t count = 0;
+    for (const auto entity : engine.scene().entities())
+        count += engine.scene().get(entity)->name == name;
+    return count;
+}
+
+// Scripts spawn templates, clones and empty nodes, query overlaps, and destroy entities.
+void spawning(relay::Engine& engine, relay::ControlProtocol& protocol) {
+    expect(ok(write_script(protocol, "spawn/spawner.cpp", spawn_source)), "spawn scripts are written");
+    expect(ok(request(protocol, "scripts.build")), "spawn scripts build");
+    const auto status = wait_for_build(engine, protocol);
+    expect(status.find("\"state\":\"ready\"") != std::string::npos,
+           "spawn scripts compile: " + status.substr(0, 600));
+    auto& scene = engine.scene();
+    const auto earlier = scene.capture_state();
+    expect(ok(request(protocol, "scene.clear")), "start the spawn scene empty");
+
+    // The Bullet template: a small falling sphere running the Bullet behaviour.
+    const auto prototype = scene.create("Bullet");
+    relay::BoxCollider sphere;
+    sphere.type = relay::BoxCollider::Type::sphere;
+    sphere.radius = 0.25;
+    (void)scene.set_collider(prototype, sphere);
+    (void)scene.set_physics_body(prototype, relay::PhysicsBody{});
+    expect(ok(add_script(protocol, prototype, "Bullet")) &&
+               ok(request(protocol, "templates.save",
+                          "\"entity\":\"" + prototype.to_string() + "\",\"name\":\"Bullet\"")),
+           "save the Bullet template");
+    (void)scene.destroy(prototype);
+
+    const auto floor = scene.create("Floor");
+    (void)scene.set_transform(floor, {{0, -0.5, 0}, {}, {1, 1, 1}});
+    relay::BoxCollider ground;
+    ground.half_extents = {50, 0.5, 50};
+    (void)scene.set_collider(floor, ground);
+    const auto pad = scene.create("Pad");
+    (void)scene.set_transform(pad, {{10, 0.25, 0}, {}, {1, 1, 1}});
+    relay::BoxCollider slab;
+    slab.half_extents = {1, 0.25, 1};
+    (void)scene.set_collider(pad, slab);
+    expect(ok(add_script(protocol, pad, "Pad")), "the pad reports contacts");
+    const auto crate = scene.create("Crate");
+    (void)scene.set_transform(crate, {{10, 0.8, 0}, {}, {1, 1, 1}});
+    relay::BoxCollider box;
+    box.half_extents = {0.25, 0.25, 0.25};
+    (void)scene.set_collider(crate, box);
+    (void)scene.set_physics_body(crate, relay::PhysicsBody{});
+    const auto spawner = scene.create("Spawner");
+    expect(ok(add_script(protocol, spawner, "Spawner")), "attach the spawner");
+    const auto authored = scene.entities().size();
+
+    expect(engine.run_game(), "the spawning scene runs");
+    expect(logged(engine, "missing template gives no entity") &&
+               count_logged(engine, "instantiate Missing: project template not found") == 1U,
+           "a missing template spawns nothing and is reported once");
+    expect(named(engine, "Bullets") == 1U && logged(engine, "spawner children 1"),
+           "world::create makes an empty child node at once");
+    engine.step(2);
+    relay::Entity bullet{};
+    for (const auto entity : scene.entities())
+        if (scene.get(entity)->name == "Bullet") bullet = entity;
+    expect(bullet.valid() && logged(engine, "spawned Bullet under Bullets") &&
+               scene.get(scene.get(bullet)->parent)->parent == spawner,
+           "instantiate places the template under the given parent, keeping its name");
+    expect(logged(engine, "bullet start after 0"), "a spawned script starts before its first update");
+    engine.step(1);
+    expect(named(engine, "Bullet") == 2U && logged(engine, "cloned Bullet, bullets 2"),
+           "clone copies an entity beside the original with the same name");
+    engine.step(16); // Frame 19: the crate has landed on the pad and is still awake.
+    const auto falling = engine.physics().velocity(scene, bullet);
+    expect(falling && falling->y < -1.5 && scene.get(bullet)->transform.position.y < 5.0,
+           "spawned dynamic bodies fall under gravity");
+    const auto before = engine.physics().raycast(scene, {10, 5, 0}, {0, -1, 0}, 10);
+    expect(before.hit && before.entity == crate && logged(engine, "pad touched by Crate") &&
+               !logged(engine, "pad released"),
+           "the crate rests on the pad");
+    engine.step(1); // Frame 20.
+    std::string sphere_line;
+    for (const auto& entry : engine.logs().read_after(0))
+        if (entry.message.find("sphere finds") != std::string::npos) sphere_line = entry.message;
+    expect(logged(engine, "crate overlaps Pad") && sphere_line.find(" Pad") != std::string::npos &&
+               sphere_line.find(" Floor") != std::string::npos &&
+               sphere_line.find("Crate") == std::string::npos,
+           "overlaps counts a resting neighbour, and overlap_sphere finds nearby colliders "
+           "except the ignored one");
+    expect(logged(engine, "crate alive until the updates finish: yes") && !scene.contains(crate),
+           "destroy waits for the round of updates, then removes the entity");
+    const auto after = engine.physics().raycast(scene, {10, 5, 0}, {0, -1, 0}, 10);
+    expect(after.hit && after.entity == pad, "a destroyed entity's body leaves the physics world");
+    expect(logged(engine, "pad released a destroyed entity"),
+           "destroying a touching body ends its contacts");
+
+    engine.step(19); // Frame 39; both bullets reached 30 updates by frame 33.
+    expect(count_logged(engine, "bullet destroyed after 30 updates") == 2U &&
+               named(engine, "Bullet") == 0U && !scene.contains(bullet),
+           "behaviours destroy their own entity after on_destroy");
+    const auto instances_after = request(protocol, "scripts.status");
+    expect(instances_after.find("\"instances\":2") != std::string::npos,
+           "destroyed entities' script instances are removed: " + instances_after.substr(0, 300));
+
+    expect(engine.stop_game() && scene.entities().size() == authored && scene.contains(crate) &&
+               named(engine, "Bullets") == 0U,
+           "Stop Game removes spawned entities and restores destroyed ones");
+    scene.restore_state(earlier);
+}
+
 } // namespace
 
 int main() {
@@ -425,7 +731,9 @@ int main() {
         untrusted_projects(engine, protocol);
         path_rules(protocol);
         lifecycle(engine, protocol);
+        spawning(engine, protocol);
         compile_errors(engine, protocol);
+        demo_first_person(engine, protocol);
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         ++failures;

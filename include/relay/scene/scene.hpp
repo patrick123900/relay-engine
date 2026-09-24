@@ -129,21 +129,6 @@ struct PhysicsBody {
     auto operator<=>(const PhysicsBody&) const = default;
 };
 
-// First-person movement driven by the input map during Run Game: look turns the camera child,
-// move_x/move_y walk relative to where it faces, sprint and jump (only on the ground) act on the
-// dynamic physics body the node also needs. Implemented natively by FirstPersonControllers.
-struct FirstPersonController {
-    double walk_speed{4.0};         // Metres per second.
-    double sprint_speed{7.0};
-    double jump_speed{5.0};         // Upward speed when jumping.
-    double mouse_sensitivity{0.12}; // Degrees per pixel.
-    double stick_look_speed{150.0}; // Degrees per second at full stick.
-    bool invert_y{};
-    double ground_distance{1.0};    // From the node's origin down to just below its feet.
-    std::string camera{"Camera"};   // Name of the child node whose camera looks around.
-    auto operator<=>(const FirstPersonController&) const = default;
-};
-
 // An authored value for one of a behaviour's declared properties. Properties a node does not
 // override keep the default written in the script's code.
 struct ScriptProperty {
@@ -201,7 +186,6 @@ struct EntityRecord {
     std::optional<BoxCollider> collider{};
     std::optional<PhysicsBody> physics_body{};
     std::vector<Script> scripts{};
-    std::optional<FirstPersonController> first_person_controller{};
 };
 
 // The node type shown to people and agents, derived from the components an entity has now by
@@ -249,8 +233,6 @@ public:
     [[nodiscard]] bool set_collider(Entity entity, std::optional<BoxCollider> collider);
     [[nodiscard]] bool set_physics_body(Entity entity, std::optional<PhysicsBody> body);
     [[nodiscard]] bool set_scripts(Entity entity, std::vector<Script> scripts);
-    [[nodiscard]] bool set_first_person_controller(Entity entity,
-                                                   std::optional<FirstPersonController> controller);
     [[nodiscard]] std::optional<Entity> active_camera() const;
 
     [[nodiscard]] SceneState capture_state() const;

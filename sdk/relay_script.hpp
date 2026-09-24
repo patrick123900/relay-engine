@@ -45,6 +45,19 @@
 //     if (relay::input::pressed("jump")) self().apply_impulse({0, 5, 0});
 //     const auto move = relay::input::vector("move_x", "move_y"); // length at most 1
 //
+// Spawning: world::instantiate copies a project template (a prefab saved from the editor),
+// Entity::clone copies an entity, and world::create makes an empty node. New entities exist at
+// once, with physics bodies, and their scripts' on_start runs before their first on_update.
+// Entity::destroy removes an entity and its descendants once the current round of callbacks
+// finishes (after every on_update, or after contact callbacks), calling on_destroy first, so a
+// behaviour may destroy its own entity. Stop Game removes everything the run spawned.
+//
+//     void on_update(double) override {
+//         if (relay::input::pressed("fire"))
+//             relay::world::instantiate("Bullet", self().world_position() + relay::Vec3{0, 1, 0});
+//     }
+//     void on_contact_begin(relay::Entity) override { self().destroy(); }
+//
 // Hot reload: when scripts are rebuilt during Run Game, each instance is destroyed without on_stop
 // and recreated from the new code, then on_reload runs (by default it calls on_start). Member
 // variables do not survive a reload; state kept in the scene (transforms, velocities) does.
@@ -73,6 +86,17 @@ namespace detail {
 inline const RelayHostApi*& host() {
     static const RelayHostApi* api = nullptr;
     return api;
+}
+// Runs a query that fills a buffer and reports the full count, growing the buffer until it fits.
+template <class Query>
+std::vector<RelayEntity> collect(Query query) {
+    std::vector<RelayEntity> handles(16);
+    for (;;) {
+        const size_t total = query(handles.data(), handles.size());
+        const bool fits = total <= handles.size();
+        handles.resize(total);
+        if (fits) return handles;
+    }
 }
 } // namespace detail
 
@@ -128,8 +152,29 @@ public:
     [[nodiscard]] Entity child(std::string_view name) const {
         return Entity{api().child(api().context, handle_, name.data(), name.size())};
     }
+    // Direct children, in scene order.
+    [[nodiscard]] std::vector<Entity> children() const {
+        return wrap(detail::collect([this](RelayEntity* out, size_t capacity) {
+            return api().children(api().context, handle_, out, capacity);
+        }));
+    }
     // Renders the game through this entity's camera until Stop Game. False without a camera.
     bool make_active_camera() const { return api().activate_camera(api().context, handle_) != 0; }
+
+    // A copy of this entity and its descendants beside it, with the same name, components and
+    // script values. Physics velocities start at zero. Empty if it fails.
+    [[nodiscard]] Entity clone() const { return Entity{api().clone(api().context, handle_)}; }
+    // Removes this entity and its descendants once the current callbacks finish, after their
+    // on_destroy. Handles to them then stop being alive(). False if it is already gone.
+    bool destroy() const { return api().destroy(api().context, handle_) != 0; }
+
+    // Enabled colliders touching this entity's enabled collider, sorted. Each side's layer must
+    // be in the other's mask.
+    [[nodiscard]] std::vector<Entity> overlaps() const {
+        return wrap(detail::collect([this](RelayEntity* out, size_t capacity) {
+            return api().overlaps(api().context, handle_, out, capacity);
+        }));
+    }
 
     // Local transform, relative to the parent.
     [[nodiscard]] Vec3 position() const { return read(api().get_position); }
@@ -168,6 +213,10 @@ private:
         return setter(api().context, handle_, raw(value)) != 0;
     }
 
+    static std::vector<Entity> wrap(const std::vector<RelayEntity>& handles) {
+        return {handles.begin(), handles.end()};
+    }
+
     RelayEntity handle_{0};
 };
 
@@ -201,6 +250,37 @@ inline std::optional<RayHit> raycast(Vec3 origin, Vec3 direction, double maximum
         return std::nullopt;
     return RayHit{Entity{hit.entity}, hit.distance, {hit.point.x, hit.point.y, hit.point.z},
                   {hit.normal.x, hit.normal.y, hit.normal.z}};
+}
+// Enabled colliders on `layer_mask` layers that overlap a world-space sphere, sorted.
+inline std::vector<Entity> overlap_sphere(Vec3 center, double radius,
+                                          std::uint32_t layer_mask = 0xffffffffu,
+                                          Entity ignore = {}) {
+    const auto handles = detail::collect([&](RelayEntity* out, size_t capacity) {
+        return api().overlap_sphere(api().context, {center.x, center.y, center.z}, radius,
+                                    layer_mask, ignore.handle(), out, capacity);
+    });
+    return {handles.begin(), handles.end()};
+}
+// An empty node (just a Transform), a child of `parent` when given. Empty if it fails.
+inline Entity create(std::string_view name, Entity parent = {}) {
+    return Entity{api().create_entity(api().context, name.data(), name.size(), parent.handle())};
+}
+// A copy of the project template templates/<name>.relay-template.json, as saved from the editor's
+// "Save as template...". It keeps the template's saved transform, relative to `parent` when given.
+// Empty if the template is missing or invalid; the log says why.
+inline Entity instantiate(std::string_view template_name, Entity parent = {}) {
+    return Entity{api().instantiate(api().context, template_name.data(), template_name.size(),
+                                    parent.handle(), nullptr, nullptr)};
+}
+// As above, placed at `position` (and turned to `rotation`, Euler degrees, when given), relative
+// to `parent` when given.
+inline Entity instantiate(std::string_view template_name, Vec3 position,
+                          std::optional<Vec3> rotation = std::nullopt, Entity parent = {}) {
+    const RelayVec3 at{position.x, position.y, position.z};
+    RelayVec3 turn{};
+    if (rotation) turn = {rotation->x, rotation->y, rotation->z};
+    return Entity{api().instantiate(api().context, template_name.data(), template_name.size(),
+                                    parent.handle(), &at, rotation ? &turn : nullptr)};
 }
 // Messages appear in the editor log, prefixed with the calling behaviour and entity.
 inline void log(std::string_view text) {
@@ -333,6 +413,9 @@ public:
     virtual void on_contact_begin(Entity /*other*/) {}
     virtual void on_contact_end(Entity /*other*/) {}
     virtual void on_stop() {}
+    // A script destroyed this entity (or an ancestor) during the game; it is still in the scene.
+    // Stop Game calls on_stop instead.
+    virtual void on_destroy() {}
     // Runs after hot reload replaces this instance with newly built code.
     virtual void on_reload() { on_start(); }
 
@@ -487,6 +570,7 @@ relay_script_module_v1(const RelayHostApi* host) {
                 case RELAY_CALLBACK_CONTACT_END: behaviour.on_contact_end(relay::Entity{other}); break;
                 case RELAY_CALLBACK_STOP: behaviour.on_stop(); break;
                 case RELAY_CALLBACK_RELOAD: behaviour.on_reload(); break;
+                case RELAY_CALLBACK_DESTROY: behaviour.on_destroy(); break;
                 default: copy_error(error, capacity, "unknown callback"); return 0;
                 }
                 return 1;

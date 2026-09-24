@@ -8,12 +8,13 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v35: 127 native methods. Scene v15, project v1, import manifest v3.
+- Protocol schema v36: 126 native methods. Scene v16, project v1, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation, a Unity-style component model with derived node types and
-  templates/prefabs, native C++ gameplay scripts, per-project input mapping, a native first
-  person controller, and portable project export are implemented. Preserve unrelated
+  templates/prefabs shown in the node type tree, native C++ gameplay scripts, per-project input
+  mapping, a scripted first person controller template in the demo project, and portable project
+  export are implemented. Preserve unrelated
   working-tree edits and inspect `git diff` before changing them.
 
 ## Product intent
@@ -157,7 +158,7 @@ without blocking simultaneous human editing.
   The Transform and imported model animation (`animator`, which model-node children depend on)
   cannot be removed. A camera added to a scene without an active camera becomes active.
 - Node types are a tree in `src/scene/node_types.cpp`: Node > Model, PhysicsBody
-  (> FirstPersonController, RigidBody, StaticBody), Camera, Light (> DirectionalLight, PointLight, SpotLight), StaticMesh. Each type
+  (> RigidBody, StaticBody), Camera, Light (> DirectionalLight, PointLight, SpotLight), StaticMesh. Each type
   adds components to its parent's; `apply_node_type` applies them root first when
   `scene.create` receives a `type`. Light, PhysicsBody and Model are not creatable (Model comes
   from import). `node_type()` walks down the tree taking the first child whose own additions the
@@ -169,33 +170,43 @@ without blocking simultaneous human editing.
   `scene.set_script` and `scene.set_script_property`; changing a component's behaviour clears its
   overrides. Scene v13 stores `scripts` arrays; v12's single optional `script` migrates to one
   component.
-- The First Person Controller is native. `FirstPersonController` (scene v15, component id
-  `first_person_controller`, protocol `scene.set_first_person_controller`) holds walk/sprint/jump
-  speeds, mouse sensitivity, stick look speed, invert Y, ground check distance and the camera
-  child's name. `FirstPersonControllers` (`src/core/first_person.cpp`, owned by `Engine`) starts at
-  Run Game (finds each controller's named camera child and activates the first one), then each
-  game step before scripts turns that camera for look (mouse delta and look_x/look_y, pitch
-  clamped), sets the body's horizontal velocity from move_x/move_y relative to the camera's
-  heading (sprint action), and jumps only when a raycast that ignores the body finds ground.
-  The `FirstPersonController` node type sits under PhysicsBody, adds a 1.8 m capsule (70 kg, no
-  friction or damping, rotation locked), the controller and a child "Camera" at 1.6 m, and
-  places itself 1 m up so it stands on the ground plane. The editor locks the pointer during Run
-  Game when the scene has a controller, even if the input map does not ask for it. The Inspector
-  section warns when the body, rotation lock, collider or camera child is missing.
+- There is no native first person controller. Scene v15 briefly had one (a
+  `first_person_controller` component, `FirstPersonControllers` in `src/core`, protocol
+  `scene.set_first_person_controller`); v16 dropped it, and loading a v15 file turns a controller
+  into a `FirstPersonController` script component with the same settings as property overrides
+  (`camera` becomes `camera_name`). The demo project provides that behaviour in
+  `examples/demo/scripts/FirstPersonController.cpp` and a "First Person Controller" template: a
+  0.35 m radius capsule (70 kg, no friction or damping, rotation locked) 1 m up, with a child
+  "Camera" 0.7 m above it (75 degree field of view, inactive until the script's `on_start`
+  activates it). The script turns the camera for look and sets the body's horizontal velocity,
+  jumping only when a raycast that ignores the body finds ground. On `fire` it instantiates the
+  "Ball" template 0.5 m along the view from the camera with velocity `ball_speed` (20 m/s) along
+  the view plus the body's velocity. Ball is a 0.3-scale gold sphere, a dynamic 0.5 kg body on
+  collider layer 2 with `scripts/Projectile.cpp` (destroys it after `lifetime`, 6 s); the
+  player's collider mask is 0xFFFFFFFD, so its own balls pass through it. The demo's input map
+  sets `lock_mouse`. `tools/demo_project/build_demo_project.cpp` builds the template through the
+  protocol after saving the showcase, and the Ball template after it, so the showcase scene has
+  no script and runs untrusted.
 - `src/scene/templates.cpp`: project templates are node trees saved as
   `templates/<name>.relay-template.json` in the ordinary scene format with exactly one root,
   so loading reuses scene validation and migration. Instantiation copies through
   `copy_selection`/`paste_selection` in one undoable transaction, so copies are independent and
-  pasted cameras stay inactive. There is no live prefab link or override tracking.
+  pasted cameras stay inactive. Saving and instantiating keep the root's own name rather than
+  paste's "<name> Copy". There is no live prefab link or override tracking. `templates.list`
+  reports each template's root node type (`node_type()` of the saved root), its engine component
+  ids and its script behaviours.
 - The Inspector draws only present components, with a close button and Remove context item on
   removable headers, and script components as "<Behaviour> (Script)" sections with typed property
   editors and per-property Reset. **+ Add Component** opens a modal window: category list,
   component list (present ones disabled and tagged "Added"), description of the selection,
   search, "New C++ script..." (creates the file and attaches it), Add/Enter and double-click.
   **+ Add Node** under the Hierarchy (and the Scene and Hierarchy context menus) opens the Add
-  Node window: the type tree (categories dimmed), saved templates, a details pane with the
-  inheritance chain, description and components, an optional name, and "Add as a child of" the
-  selection. The Hierarchy shows the derived type on each row; template files instantiate on
+  Node window: one tree of node types (categories dimmed) and custom templates, each template a
+  leaf under the type its root inherits, after that type's subtypes. A painter's-palette icon
+  drawn next to a template's name (and in its details heading) shows a "Custom template"
+  tooltip on hover. Searching lists matching types and templates flat. The details pane shows
+  the inheritance chain, description and components (for templates, the root's components and
+  scripts), then an optional name and "Add as a child of" the selection. The Hierarchy shows the derived type on each row; template files instantiate on
   double-click, or when dragged onto the viewport (ground point) or a row (child).
 
 ### Input
@@ -271,6 +282,22 @@ without blocking simultaneous human editing.
 - Script transform writes teleport the Jolt bodies of the entity and its descendants
   (`PhysicsWorld::sync_transforms`). Script raycasts use `PhysicsWorld::raycast` against the
   running world instead of rebuilding one per query, and can ignore the caller's own collider.
+- Scripts change the scene's structure during Run Game through host functions appended to
+  `RelayHostApi` (ABI version unchanged; old libraries simply lack them): `create_entity`,
+  `instantiate` (a project template, optionally positioned and parented), `clone`, `destroy`,
+  `children`, `overlaps` and `overlap_sphere`, plus the `RELAY_CALLBACK_DESTROY` callback
+  (`on_destroy`). Spawns take effect at once: `finish_spawn` gives the tree Jolt bodies
+  (`PhysicsWorld::add_bodies`) and script instances, which start (`start_pending`) before their
+  first update, at the start of `update` or `dispatch_contacts`. Destruction is queued and
+  applied by `flush_destroyed` after `start`, `update`, `dispatch_contacts` and hot reload:
+  `on_destroy` for each doomed tree's started instances, then `Scene::destroy`, instance removal
+  and `PhysicsWorld::remove_missing_bodies`, which ends the removed bodies' contact pairs at once.
+  Instances are `unique_ptr`s and every loop that can spawn is index-based, and `call`/`create`
+  restore the caller's `active` instance, so callbacks may nest. `templates.cpp` splits
+  `load_template` from `place_template` so a run caches each template (misses warn once).
+  Spawning is refused past 100000 entities and during `on_stop`. `PhysicsWorld::overlaps` counts
+  colliders within Jolt's speculative contact distance, so resting neighbours are touching;
+  `overlap_sphere` is exact and filters on the query mask only.
 - Trust is per user, outside every project: `trusted-script-projects` in the user config
   directory (`RELAY_SCRIPT_TRUST_PATH` overrides it; tests use temporary files), keyed by the
   canonical project folder. `scripts.trust` is host-only; revoking trust unloads the library.
@@ -384,51 +411,61 @@ without blocking simultaneous human editing.
 7. Templates copy; they have no live prefab link, nested template references or per-instance
    override tracking. Built-in meshes are only a flat triangle and quad, so Static Mesh nodes start
    with a quad until a cube primitive exists; physics body types carry no mesh (as in Godot). The
-   Add Component and Add Node windows, script property editors and template dialog are covered
-   headlessly or by protocol tests, not by a desktop review.
-8. The first person controller is a dynamic rigid body driven by velocity, not a kinematic
-   character controller: it does not step up stairs, has no slope limit, crouch or coyote time,
-   and pushes other dynamic bodies with its full 70 kg. Jolt's CharacterVirtual would handle those
-   and is the next step if characters need them. Its action and axis names are fixed (move_x,
-   move_y, look_x, look_y, jump, sprint). It has simulated-input coverage (landing upright,
-   walking, mouse turn, sprint, grounded-only jump, camera switch and restore), not a desktop
-   play-test.
-9. Input has headless, protocol and compiled-script coverage only. Gamepad input has not been
-   tried with hardware, and viewport focus, mouse lock and binding capture from real SDL events
-   have not been checked on a desktop. Multiple gamepads are merged rather than assigned to
+   Add Component window, script property editors and template dialog are covered headlessly or by
+   protocol tests, not by a desktop review. The Add Node window's template tree and palette icon
+   have been seen on a Linux desktop.
+8. The demo's first person controller is a dynamic rigid body driven by velocity from a script,
+   not a kinematic character controller: it does not step up stairs, has no slope limit, crouch
+   or coyote time, and pushes other dynamic bodies with its full 70 kg. Jolt's CharacterVirtual
+   would handle those if exposed to scripts. It reads move_x, move_y, look_x, look_y, jump and
+   sprint, and shoots on fire. It has simulated-input coverage through the compiled script
+   (landing upright, walking, mouse turn, sprint, grounded-only jump, shooting, camera switch and
+   restore) and has been play-tested with mouse and keyboard on a Linux desktop, including
+   shooting balls. The first viewport click, which gives the game input, also counts as fire.
+9. Input has headless, protocol and compiled-script coverage, and viewport focus and mouse lock
+   with real mouse and keyboard events were exercised by the desktop play-test of the demo
+   controller. Gamepad input has not been tried with hardware, and press-to-bind capture from
+   real SDL events has not been checked on a desktop. Multiple gamepads are merged rather than assigned to
    players. There is no text input or on-screen cursor API for scripts yet.
 10. Native scripts cannot be contained: a crash or endless loop in a script takes the editor down,
    and in a trusted project agent-written code runs with the user's privileges. Windows script
    loading is not implemented (builds report unsupported), and the macOS `.dylib` path has never
-   been run. Scripts cannot create or destroy
-   entities, instantiate templates, or read input yet. A script-driven scale
+   been run. Scripts cannot add or remove components or reparent entities yet. A script-driven scale
    change does not rebuild collider shapes until the next Run Game. The trust prompt and Scripts
    diagnostics view are covered headlessly only.
 
 ## Next priorities
 
 1. Add joints to the Jolt backend.
-2. Extend the script API: entity spawn/destroy (including template instantiation) and scene
-   queries such as overlaps. More built-in controllers (third-person, orbit) can follow the first
-   person controller's pattern.
-3. Load scripts on Windows (MSVC or clang-cl flags and `LoadLibraryW`).
+2. Load scripts on Windows (MSVC or clang-cl flags and `LoadLibraryW`).
+3. Extend the script API further where games need it: adding and configuring components,
+   reparenting, and shape casts. More example controllers (third-person, orbit) can follow the
+   demo's scripted first person controller.
 
 ## Verification baseline
 
 The current implementation was verified with development and release builds, all five native
 CTest suites (including `relay_script_tests`, which compiles real scripts with the configured
-compiler, including property overrides of every type and scripts reading simulated and raw
-input), generated-protocol checks, and 26 ordinary bridge tests. The workflow suite covers
-component add/remove rules, derived node types, type inheritance and creation of every node type,
-prefab save/instantiate/undo, v12 script migration, the native first person controller (node
-type, settings, v15 save, and play on a floor with simulated input), and input state (taps within a step,
+compiler, including property overrides of every type, scripts reading simulated and raw input,
+a play-test of the demo's First Person Controller template and script (including shooting balls
+along the view and past the player), and spawning: templates at a position under a parent, a
+missing template warned once, clones, empty nodes, children, deferred start and
+self-destruction with `on_destroy`, spawned bodies falling, `overlaps` on a resting body,
+`overlap_sphere` with an ignored entity, a destroyed body leaving raycasts and ending its
+contacts, and Stop Game undoing it all), generated-protocol checks, and 26 ordinary bridge tests.
+The workflow suite covers component add/remove rules, derived node types, type inheritance and creation of every node type,
+prefab save/instantiate/undo, v12 script migration, v15 native controller migration to a script
+component, the demo's controller template (tree placement, components, script, mouse lock,
+refusal to run untrusted), and input state (taps within a step,
 overlapping bindings, deadzones, inversion, triggers, mouse motion, reset, map validation, saving
 and reloading per project, simulation). The headless editor suite drives the Game Configuration
 input page (press-to-bind actions and key-pair axes, Escape cancel, new actions, reset, wrapping
 that keeps buttons clear of Delete), the Add Component window (categories, add, disabled
 duplicates), section removal, the Add Node tree (indentation, typed creation under the selection,
-non-creatable categories), and the Run Game → trust prompt → build → play flow. The desktop
-smokes below
+non-creatable categories, templates nested under their type with the palette icon and its
+"Custom template" tooltip), and the Run Game → trust prompt → build → play flow. The demo's
+First Person Controller, including shooting, was also play-tested by hand on a Linux desktop. The
+desktop smokes below
 predate the asset browser, layout persistence, and frame-pacing changes and were not rerun for
 them; those changes are covered by headless and protocol tests. The live Vulkan shadow and
 visual smokes pass, as does `tests/editor_hdr_upload_smoke.py`: exposure changes captured pixels,

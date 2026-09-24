@@ -4,6 +4,8 @@
 #include "relay/core/hash.hpp"
 #include "relay/core/process.hpp"
 #include "relay/editor/editor_math.hpp"
+#include "relay/scene/scene_edit.hpp"
+#include "relay/scene/templates.hpp"
 
 #include "../../sdk/relay_script_abi.h"
 
@@ -21,6 +23,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -39,6 +42,8 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr std::size_t maximum_build_output = 64U * 1024U;
+// Scripts cannot grow the scene past the size a scene file may hold.
+constexpr std::size_t maximum_scene_entities = 100000U;
 constexpr std::chrono::seconds compile_timeout{120};
 constexpr std::string_view compile_flags =
     "-std=c++20 -O2 -g -fPIC -fvisibility=hidden -fvisibility-inlines-hidden "
@@ -403,6 +408,7 @@ std::string_view callback_name(int callback) {
     case RELAY_CALLBACK_CONTACT_END: return "on_contact_end";
     case RELAY_CALLBACK_STOP: return "on_stop";
     case RELAY_CALLBACK_RELOAD: return "on_reload";
+    case RELAY_CALLBACK_DESTROY: return "on_destroy";
     default: return "unknown";
     }
 }
@@ -582,6 +588,8 @@ struct ScriptSystem::Impl {
         Script script;
         void* object{};
         bool failed{};
+        bool started{};   // on_start has run; instances spawned mid-game start before their update.
+        bool destroyed{}; // on_destroy has run; the instance goes when the entity leaves the scene.
     };
 
     explicit Impl(Engine& host_engine) : engine(host_engine) {
@@ -592,9 +600,7 @@ struct ScriptSystem::Impl {
         host.frame = [](void* context) { return self(context).engine.status().frame_index; };
         host.log = [](void* context, int level, const char* text, size_t length) {
             auto& impl = self(context);
-            std::string message = "[" + (impl.active ? impl.active->script.behaviour + " " +
-                                                        impl.active->entity.to_string()
-                                                    : std::string{"script"}) + "] ";
+            auto message = impl.log_prefix();
             message.append(text, std::min<size_t>(length, 2048U));
             impl.engine.logs().write(level == RELAY_LOG_ERROR     ? LogLevel::error
                                      : level == RELAY_LOG_WARNING ? LogLevel::warning
@@ -741,6 +747,216 @@ struct ScriptSystem::Impl {
             *position = {input.mouse_x(), input.mouse_y(), 0.0};
             *delta = {input.mouse_dx(), input.mouse_dy(), input.mouse_wheel()};
         };
+        host.create_entity = [](void* context, const char* name, size_t length,
+                                RelayEntity parent) -> RelayEntity {
+            auto& impl = self(context);
+            auto& scene = impl.engine.scene();
+            const std::string wanted{name, length};
+            if (!impl.can_spawn("create " + wanted) || !impl.parent_alive(parent, "create " + wanted))
+                return 0;
+            const auto entity = scene.create("Entity", unpack(parent));
+            if (!entity.valid()) return 0;
+            if (!wanted.empty() && !scene.set_name(entity, wanted)) {
+                (void)scene.destroy(entity);
+                impl.warn("create: names are 1 to 128 bytes");
+                return 0;
+            }
+            return entity.packed();
+        };
+        host.instantiate = [](void* context, const char* name, size_t length, RelayEntity parent,
+                              const RelayVec3* position, const RelayVec3* rotation) -> RelayEntity {
+            auto& impl = self(context);
+            auto& scene = impl.engine.scene();
+            const std::string wanted{name, length};
+            const auto action = "instantiate " + wanted;
+            if (!impl.can_spawn(action) || !impl.parent_alive(parent, action)) return 0;
+            if ((position && !finite(*position)) || (rotation && !finite(*rotation))) {
+                impl.warn(action + ": the position or rotation is not finite");
+                return 0;
+            }
+            const auto* loaded = impl.template_named(wanted);
+            if (!loaded) return 0;
+            std::string error;
+            const auto placed = place_template(scene, *loaded, unpack(parent), {}, error);
+            if (!placed) {
+                impl.warn(action + ": " + error);
+                return 0;
+            }
+            auto transform = scene.get(*placed)->transform;
+            if (position) transform.position = {position->x, position->y, position->z};
+            if (rotation) transform.rotation_degrees = {rotation->x, rotation->y, rotation->z};
+            (void)scene.set_transform(*placed, transform);
+            return impl.finish_spawn(*placed);
+        };
+        host.clone = [](void* context, RelayEntity entity) -> RelayEntity {
+            auto& impl = self(context);
+            auto& scene = impl.engine.scene();
+            const auto source = unpack(entity);
+            if (!scene.contains(source) || !impl.can_spawn("clone")) return 0;
+            const std::array selection{source};
+            const auto clipboard = copy_selection(scene, selection);
+            const auto pasted = clipboard ? paste_selection(scene, *clipboard, {}, true)
+                                          : std::vector<Entity>{};
+            if (pasted.size() != 1U) {
+                impl.warn("clone " + source.to_string() + " failed");
+                return 0;
+            }
+            (void)scene.set_name(pasted.front(), scene.get(source)->name);
+            return impl.finish_spawn(pasted.front());
+        };
+        host.destroy = [](void* context, RelayEntity entity) {
+            auto& impl = self(context);
+            const auto target = unpack(entity);
+            if (!impl.running || impl.stopping || !impl.engine.scene().contains(target)) return 0;
+            impl.pending_destroy.push_back(target);
+            return 1;
+        };
+        host.children = [](void* context, RelayEntity parent, RelayEntity* out,
+                           size_t capacity) -> size_t {
+            const auto& scene = self(context).engine.scene();
+            const auto owner = unpack(parent);
+            if (!scene.contains(owner)) return 0;
+            std::vector<Entity> found;
+            for (const auto entity : scene.entities())
+                if (scene.get(entity)->parent == owner) found.push_back(entity);
+            return copy_entities(found, out, capacity);
+        };
+        host.overlaps = [](void* context, RelayEntity entity, RelayEntity* out,
+                           size_t capacity) -> size_t {
+            auto& owner = self(context).engine;
+            return copy_entities(owner.physics().overlaps(owner.scene(), unpack(entity)).entities,
+                                 out, capacity);
+        };
+        host.overlap_sphere = [](void* context, RelayVec3 center, double radius,
+                                 uint32_t layer_mask, RelayEntity ignore, RelayEntity* out,
+                                 size_t capacity) -> size_t {
+            auto& owner = self(context).engine;
+            return copy_entities(owner.physics()
+                                     .overlap_sphere(owner.scene(), {center.x, center.y, center.z},
+                                                     radius, layer_mask, unpack(ignore))
+                                     .entities,
+                                 out, capacity);
+        };
+    }
+
+    static size_t copy_entities(const std::vector<Entity>& entities, RelayEntity* out,
+                                size_t capacity) {
+        for (std::size_t index = 0; index < std::min(capacity, entities.size()); ++index)
+            out[index] = entities[index].packed();
+        return entities.size();
+    }
+
+    [[nodiscard]] std::string log_prefix() const {
+        return "[" + (active ? active->script.behaviour + " " + active->entity.to_string()
+                             : std::string{"script"}) + "] ";
+    }
+
+    void warn(const std::string& message) {
+        engine.logs().write(LogLevel::warning, log_prefix() + message);
+    }
+
+    // Spawning is possible only while the game runs, and the scene stays loadable in size.
+    bool can_spawn(const std::string& action) {
+        if (!running || stopping) return false;
+        if (engine.scene().entities().size() < maximum_scene_entities) return true;
+        if (!entity_limit_warned) warn(action + ": the scene already holds the maximum 100000 entities");
+        entity_limit_warned = true;
+        return false;
+    }
+
+    bool parent_alive(const RelayEntity parent, const std::string& action) {
+        if (parent == 0 || engine.scene().contains(unpack(parent))) return true;
+        warn(action + ": the parent entity is gone");
+        return false;
+    }
+
+    // Project templates are read once per run; a missing one is reported once.
+    const LoadedTemplate* template_named(const std::string& name) {
+        auto found = templates.find(name);
+        if (found == templates.end()) {
+            std::string error = "template names use letters, digits, spaces, '-' and '_'";
+            std::optional<LoadedTemplate> loaded;
+            if (valid_template_name(name))
+                loaded = load_template(project_root(), "project:" + name, error);
+            if (!loaded) warn("instantiate " + name + ": " + error);
+            found = templates.emplace(name, std::move(loaded)).first;
+        }
+        return found->second ? &*found->second : nullptr;
+    }
+
+    // Entities in `top`'s subtree, including it, in scene order.
+    [[nodiscard]] std::vector<Entity> subtree(const Entity top) const {
+        const auto& scene = engine.scene();
+        std::vector<Entity> result;
+        for (const auto entity : scene.entities())
+            for (auto current = entity; current.valid() && scene.contains(current);
+                 current = scene.get(current)->parent)
+                if (current == top) {
+                    result.push_back(entity);
+                    break;
+                }
+        return result;
+    }
+
+    // A spawned tree gets its physics bodies and script instances; the scripts start before
+    // their first update.
+    RelayEntity finish_spawn(const Entity spawned) {
+        engine.physics().add_bodies(engine.scene(), spawned);
+        if (library)
+            for (const auto entity : subtree(spawned)) {
+                const auto& scripts = engine.scene().get(entity)->scripts;
+                for (std::size_t component = 0; component < scripts.size(); ++component) {
+                    if (!scripts[component].enabled) continue;
+                    auto instance = std::make_unique<Instance>(
+                        Instance{entity, component, scripts[component]});
+                    create(*instance);
+                    by_entity[entity.packed()].push_back(instance.get());
+                    instances.push_back(std::move(instance));
+                }
+            }
+        return spawned.packed();
+    }
+
+    // Calls on_start on every instance that has not started, including ones spawned meanwhile.
+    void start_pending() {
+        for (std::size_t index = 0; index < instances.size(); ++index) {
+            auto& instance = *instances[index];
+            if (instance.started) continue;
+            instance.started = true;
+            if (engine.scene().contains(instance.entity)) call(instance, RELAY_CALLBACK_START);
+        }
+    }
+
+    // Applies queued destruction: on_destroy for every script in each doomed tree, then the
+    // entities, their instances and their physics bodies go. on_destroy may destroy more.
+    void flush_destroyed() {
+        auto& scene = engine.scene();
+        bool removed = false;
+        for (std::size_t pass = 0; !pending_destroy.empty() && pass < 64U; ++pass) {
+            const auto batch = std::exchange(pending_destroy, {});
+            std::set<Entity> doomed;
+            for (const auto top : batch)
+                if (scene.contains(top))
+                    for (const auto entity : subtree(top)) doomed.insert(entity);
+            for (std::size_t index = 0; index < instances.size(); ++index) {
+                auto& instance = *instances[index];
+                if (instance.destroyed || !doomed.contains(instance.entity)) continue;
+                if (instance.started) call(instance, RELAY_CALLBACK_DESTROY);
+                instance.destroyed = true;
+            }
+            for (const auto top : batch) (void)scene.destroy(top);
+            removed = true;
+        }
+        if (!removed) return;
+        std::erase_if(instances, [&](const std::unique_ptr<Instance>& instance) {
+            if (scene.contains(instance->entity)) return false;
+            if (instance->object) library->module->destroy(instance->object);
+            return true;
+        });
+        by_entity.clear();
+        for (const auto& instance : instances)
+            by_entity[instance->entity.packed()].push_back(instance.get());
+        engine.physics().remove_missing_bodies(scene);
     }
 
     ~Impl() { cancel_build(); }
@@ -792,6 +1008,9 @@ struct ScriptSystem::Impl {
         if (current == root) return;
         cancel_build();
         instances.clear();
+        by_entity.clear();
+        pending_destroy.clear();
+        templates.clear();
         running = false;
         library.reset();
         root = current;
@@ -820,13 +1039,14 @@ struct ScriptSystem::Impl {
                                   std::move(message)});
     }
 
+    // Callbacks nest when a script spawns entities, so the caller's `active` is restored.
     void call(Instance& instance, int callback, double delta = 0.0, RelayEntity other = 0) {
-        if (instance.failed || !instance.object) return;
+        if (instance.failed || instance.destroyed || !instance.object) return;
         char error[RELAY_SCRIPT_ERROR_CAPACITY] = {};
-        active = &instance;
+        auto* const caller = std::exchange(active, &instance);
         const int ok = library->module->call(instance.object, callback, delta, other, error,
                                              sizeof error);
-        active = nullptr;
+        active = caller;
         if (!ok) {
             instance.failed = true;
             record_error(instance, callback_name(callback),
@@ -844,10 +1064,10 @@ struct ScriptSystem::Impl {
             return;
         }
         char error[RELAY_SCRIPT_ERROR_CAPACITY] = {};
-        active = &instance;
+        auto* const caller = std::exchange(active, &instance);
         instance.object = library->module->create(found->second, instance.entity.packed(), error,
                                                   sizeof error);
-        active = nullptr;
+        active = caller;
         if (!instance.object) {
             instance.failed = true;
             record_error(instance, "create", error[0] ? std::string{error} : "construction failed");
@@ -864,11 +1084,11 @@ struct ScriptSystem::Impl {
             value.text = property.text.data();
             value.text_length = property.text.size();
             error[0] = '\0';
-            active = &instance;
+            auto* const property_caller = std::exchange(active, &instance);
             const int ok = library->module->set_property(instance.object, property.name.data(),
                                                          property.name.size(), &value, error,
                                                          sizeof error);
-            active = nullptr;
+            active = property_caller;
             if (!ok)
                 engine.logs().write(LogLevel::warning,
                                     "Script " + instance.script.behaviour + " on " +
@@ -879,8 +1099,8 @@ struct ScriptSystem::Impl {
 
     void destroy_objects() {
         for (auto& instance : instances) {
-            if (instance.object) library->module->destroy(instance.object);
-            instance.object = nullptr;
+            if (instance->object) library->module->destroy(instance->object);
+            instance->object = nullptr;
         }
     }
 
@@ -989,8 +1209,12 @@ struct ScriptSystem::Impl {
             // Old objects must be destroyed while their code is still mapped.
             destroy_objects();
             library = std::move(loaded);
-            for (auto& instance : instances) create(instance);
-            for (auto& instance : instances) call(instance, RELAY_CALLBACK_RELOAD);
+            // Index loops: constructors and on_reload may spawn, which appends instances.
+            const auto count = instances.size();
+            for (std::size_t index = 0; index < count; ++index) create(*instances[index]);
+            for (std::size_t index = 0; index < count; ++index)
+                if (instances[index]->started) call(*instances[index], RELAY_CALLBACK_RELOAD);
+            flush_destroyed();
             ++reloads;
             engine.logs().write(LogLevel::info, "Scripts reloaded from build " +
                                                     std::to_string(result.build));
@@ -1021,10 +1245,15 @@ struct ScriptSystem::Impl {
     bool trusted{};
     ScriptBuildState state{ScriptBuildState::idle};
     std::unique_ptr<Library> library;
-    std::vector<Instance> instances;
-    std::unordered_map<std::uint64_t, std::vector<std::size_t>> by_entity;
+    // Heap-allocated, so spawning during a callback never moves the instance being called.
+    std::vector<std::unique_ptr<Instance>> instances;
+    std::unordered_map<std::uint64_t, std::vector<Instance*>> by_entity;
+    std::vector<Entity> pending_destroy;
+    std::map<std::string, std::optional<LoadedTemplate>, std::less<>> templates;
+    bool entity_limit_warned{};
     Instance* active{};
     bool running{};
+    bool stopping{};
     std::uint64_t contact_cursor{};
     std::uint64_t build_counter{};
     std::string attempted_fingerprint;
@@ -1208,6 +1437,9 @@ void ScriptSystem::start() {
     auto& impl = *impl_;
     impl.instances.clear();
     impl.by_entity.clear();
+    impl.pending_destroy.clear();
+    impl.templates.clear();
+    impl.entity_limit_warned = false;
     impl.running = true;
     impl.contact_cursor = impl.engine.physics().contact_events().latest_sequence;
     if (!impl.library) return;
@@ -1216,26 +1448,37 @@ void ScriptSystem::start() {
         const auto& scripts = scene.get(entity)->scripts;
         for (std::size_t component = 0; component < scripts.size(); ++component) {
             if (!scripts[component].enabled) continue;
-            impl.by_entity[entity.packed()].push_back(impl.instances.size());
-            impl.instances.push_back({entity, component, scripts[component], nullptr, false});
+            impl.instances.push_back(std::make_unique<Impl::Instance>(
+                Impl::Instance{entity, component, scripts[component]}));
+            impl.by_entity[entity.packed()].push_back(impl.instances.back().get());
         }
     }
-    for (auto& instance : impl.instances) impl.create(instance);
-    for (auto& instance : impl.instances) impl.call(instance, RELAY_CALLBACK_START);
+    const auto count = impl.instances.size();
+    for (std::size_t index = 0; index < count; ++index) impl.create(*impl.instances[index]);
+    impl.start_pending();
+    impl.flush_destroyed();
 }
 
 void ScriptSystem::update(const double delta_seconds) {
     auto& impl = *impl_;
     if (!impl.running || !impl.library) return;
+    impl.start_pending();
+    // Instances spawned during this loop are appended and first update next step.
     const auto& scene = impl.engine.scene();
-    for (auto& instance : impl.instances)
-        if (scene.contains(instance.entity))
+    const auto count = impl.instances.size();
+    for (std::size_t index = 0; index < count; ++index) {
+        auto& instance = *impl.instances[index];
+        if (instance.started && scene.contains(instance.entity))
             impl.call(instance, RELAY_CALLBACK_UPDATE, delta_seconds);
+    }
+    impl.flush_destroyed();
 }
 
 void ScriptSystem::dispatch_contacts() {
     auto& impl = *impl_;
-    if (!impl.running || !impl.library || impl.instances.empty()) return;
+    if (!impl.running || !impl.library) return;
+    // Scripts spawned during this step's updates start before they hear about contacts.
+    impl.start_pending();
     const auto events = impl.engine.physics().contact_events(impl.contact_cursor);
     if (events.oldest_sequence > impl.contact_cursor + 1U && !events.events.empty())
         impl.engine.logs().write(LogLevel::warning,
@@ -1246,23 +1489,32 @@ void ScriptSystem::dispatch_contacts() {
                                             std::pair{event.second, event.first}}) {
             const auto found = impl.by_entity.find(target.packed());
             if (found == impl.by_entity.end()) continue;
-            for (const auto index : found->second)
-                impl.call(impl.instances[index], callback, 0.0, other.packed());
+            // A copy: callbacks may spawn, which adds to the index.
+            const auto targets = found->second;
+            for (auto* instance : targets) impl.call(*instance, callback, 0.0, other.packed());
         }
     }
     impl.contact_cursor = events.latest_sequence;
+    impl.flush_destroyed();
 }
 
 void ScriptSystem::stop() {
     auto& impl = *impl_;
     if (!impl.running) return;
+    impl.stopping = true;
     if (impl.library) {
-        for (auto& instance : impl.instances) impl.call(instance, RELAY_CALLBACK_STOP);
+        const auto count = impl.instances.size();
+        for (std::size_t index = 0; index < count; ++index)
+            if (impl.instances[index]->started)
+                impl.call(*impl.instances[index], RELAY_CALLBACK_STOP);
         impl.destroy_objects();
     }
     impl.instances.clear();
     impl.by_entity.clear();
+    impl.pending_destroy.clear();
+    impl.templates.clear();
     impl.running = false;
+    impl.stopping = false;
 }
 
 } // namespace relay

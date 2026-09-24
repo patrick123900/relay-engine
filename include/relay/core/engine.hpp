@@ -1,7 +1,6 @@
 #pragma once
 #include <functional>
 
-#include "relay/core/first_person.hpp"
 #include "relay/core/input.hpp"
 #include "relay/core/log.hpp"
 #include "relay/observe/capture.hpp"
@@ -131,7 +130,6 @@ private:
     double elapsed_seconds_{0.0};
     std::string run_game_error_;
     InputState input_;
-    FirstPersonControllers first_person_;
     std::optional<std::filesystem::path> input_root_;
     bool input_loaded_{};
     void sync_input_map();

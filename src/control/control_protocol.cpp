@@ -1469,9 +1469,10 @@ std::string ControlProtocol::handle(const std::string_view request) {
         const auto index = static_cast<std::size_t>(unsigned_field(request, "index", 0));
         std::string error;
         std::string label;
+        // Outlives `change`, which runs after this block.
+        const auto behaviour = string_field(request, "behaviour");
         std::function<bool(Scene&)> change;
         if (method == "component.add") {
-            const auto behaviour = string_field(request, "behaviour");
             label = "Add " + (component == "script" ? behaviour : component) + " to " +
                     entity->to_string();
             change = [&](Scene& scene) {
@@ -1488,9 +1489,9 @@ std::string ControlProtocol::handle(const std::string_view request) {
                 return error_response(id, "the node has no script component at that index");
             auto& script = scripts[index];
             if (method == "scene.set_script") {
-                if (const auto behaviour = optional_string_field(request, "behaviour")) {
-                    if (*behaviour != script.behaviour) script.properties.clear();
-                    script.behaviour = *behaviour;
+                if (const auto replacement = optional_string_field(request, "behaviour")) {
+                    if (*replacement != script.behaviour) script.properties.clear();
+                    script.behaviour = *replacement;
                 }
                 script.enabled = boolean_field(request, "enabled", script.enabled);
                 label = "Configure script " + script.behaviour + " on " + entity->to_string();
@@ -1575,7 +1576,13 @@ std::string ControlProtocol::handle(const std::string_view request) {
             output << (first ? "" : ",") << "{\"id\":\"" << escape_json(entry.id)
                    << "\",\"name\":\"" << escape_json(entry.name) << "\",\"type\":\""
                    << entry.type << "\",\"path\":\"" << escape_json(entry.path)
-                   << "\"}";
+                   << "\",\"components\":[";
+            for (std::size_t index = 0; index < entry.components.size(); ++index)
+                output << (index ? "," : "") << '"' << entry.components[index] << '"';
+            output << "],\"behaviours\":[";
+            for (std::size_t index = 0; index < entry.behaviours.size(); ++index)
+                output << (index ? "," : "") << '"' << escape_json(entry.behaviours[index]) << '"';
+            output << "]}";
             first = false;
         }
         output << "]}}";
@@ -1613,33 +1620,6 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) + "{\"id\":\"project:" + escape_json(name) + "\",\"path\":\"" +
                std::string{template_directory} + "/" + escape_json(name) +
                std::string{template_suffix} + "\"}}";
-    }
-    if (method == "scene.set_first_person_controller") {
-        const auto entity = Entity::parse(string_field(request, "entity"));
-        if (!entity || !engine_.scene().contains(*entity))
-            return error_response(id, "invalid or stale entity");
-        std::optional<FirstPersonController> controller;
-        if (boolean_field(request, "attached", true)) {
-            controller = engine_.scene().get(*entity)->first_person_controller.value_or(
-                FirstPersonController{});
-            const auto number = [&](const char* key, double& target) {
-                if (const auto value = number_field(request, key)) target = *value;
-            };
-            number("walk_speed", controller->walk_speed);
-            number("sprint_speed", controller->sprint_speed);
-            number("jump_speed", controller->jump_speed);
-            number("mouse_sensitivity", controller->mouse_sensitivity);
-            number("stick_look_speed", controller->stick_look_speed);
-            number("ground_distance", controller->ground_distance);
-            controller->invert_y = boolean_field(request, "invert_y", controller->invert_y);
-            if (const auto camera = optional_string_field(request, "camera")) controller->camera = *camera;
-        }
-        if (!engine_.scene_history().execute(
-                "Configure first person controller " + entity->to_string(),
-                [&](Scene& scene) { return scene.set_first_person_controller(*entity, controller); }))
-            return error_response(id, "invalid first person controller values");
-        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
-               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }
     if (method == "scene.set_collider") {
         const auto entity = Entity::parse(string_field(request, "entity"));

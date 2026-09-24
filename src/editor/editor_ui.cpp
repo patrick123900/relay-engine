@@ -305,8 +305,10 @@ struct EditorUi::Impl {
     bool headless{false};
     std::map<std::string, std::array<float, 4>, std::less<>> headless_items;
     void note_item(const std::string& key) {
+        note_rect(key, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
+    void note_rect(const std::string& key, const ImVec2 minimum, const ImVec2 maximum) {
         if (!headless) return;
-        const auto minimum = ImGui::GetItemRectMin(), maximum = ImGui::GetItemRectMax();
         headless_items[key] = {minimum.x, minimum.y, maximum.x, maximum.y};
     }
     bool sdl_backend_started{false};
@@ -464,7 +466,7 @@ struct EditorUi::Impl {
     std::array<char, 65> component_query{};
     std::string component_selected, component_category{"All"};
     bool open_component_window{};
-    // Add Node window: the node type tree and the project's saved templates.
+    // Add Node window: the node type tree, with the project's templates under their root's type.
     JsonValue node_type_catalog;
     std::array<char, 65> node_query{};
     std::array<char, 129> node_name{};
@@ -490,9 +492,10 @@ struct EditorUi::Impl {
     bool game_input_focus{}, game_lock_mouse{}, capture_requested{};
     std::string last_runtime_mode;
     std::map<std::string, std::array<char, 1025>> script_text_buffers;
-    // Node templates: built-in creation shortcuts and the project's saved node trees.
+    // The project's saved node trees (custom templates).
     struct TemplateEntry {
         std::string id, name, type;
+        std::vector<std::string> components, behaviours;
     };
     std::vector<TemplateEntry> node_templates;
     std::string template_save_entity;
@@ -644,9 +647,6 @@ struct EditorUi::Impl {
             const auto* current = object ? field(*object, "map") : nullptr;
             game_lock_mouse = current && current->object() &&
                               boolean_or(*current->object(), "lock_mouse", false);
-            // A first person controller needs relative mouse motion, so it locks the pointer too.
-            for (const auto* entity : entities)
-                if (component(*entity, "first_person_controller")) game_lock_mouse = true;
         }
         last_runtime_mode = mode;
         if (game_config_open && mode == "game") {
@@ -2222,10 +2222,18 @@ struct EditorUi::Impl {
         const auto* object = listed ? listed->object() : nullptr;
         const auto* list = object ? field(*object, "templates") : nullptr;
         if (!list || !list->array()) return;
+        const auto strings = [](const JsonValue::Object& entry, const char* key) {
+            std::vector<std::string> values;
+            if (const auto* items = field(entry, key); items && items->array())
+                for (const auto& value : *items->array())
+                    if (value.string()) values.push_back(*value.string());
+            return values;
+        };
         for (const auto& item : *list->array())
             if (const auto* entry = item.object())
                 node_templates.push_back({string_or(*entry, "id"), string_or(*entry, "name"),
-                                          string_or(*entry, "type")});
+                                          string_or(*entry, "type"), strings(*entry, "components"),
+                                          strings(*entry, "behaviours")});
     }
 
     // Creates a node from a template under `parent`, optionally at a world position, and selects it.
@@ -2984,58 +2992,6 @@ struct EditorUi::Impl {
         }
     }
 
-    void draw_first_person_controller_section(const JsonValue::Object& entity) {
-        const auto* controller = component(entity, "first_person_controller");
-        if (!controller || !component_header("First person controller", "first_person_controller"))
-            return;
-        const auto controller_request = entity_field(selection);
-        const auto set = [&](const std::string& fields, const char* label) {
-            mutate("scene.set_first_person_controller", controller_request + fields, label);
-        };
-        const auto scalar = [&](const char* label, const char* wire, double fallback, float speed) {
-            auto value = number_or(*controller, wire, fallback);
-            if (drag_scalar(label, value, speed, "%.3g") && value >= 0.0)
-                set(std::string{",\""} + wire + "\":" + number_text(value), "Controller updated");
-        };
-        scalar("Walk speed", "walk_speed", 4.0, 0.05F);
-        scalar("Sprint speed", "sprint_speed", 7.0, 0.05F);
-        scalar("Jump speed", "jump_speed", 5.0, 0.05F);
-        scalar("Mouse sensitivity", "mouse_sensitivity", 0.12, 0.005F);
-        scalar("Stick look speed", "stick_look_speed", 150.0, 1.0F);
-        scalar("Ground distance", "ground_distance", 1.0, 0.01F);
-        bool invert = boolean_or(*controller, "invert_y", false);
-        if (ImGui::Checkbox("Invert Y", &invert))
-            set(std::string{",\"invert_y\":"} + (invert ? "true" : "false"), "Controller updated");
-        auto& buffer = script_text_buffers["controller camera " + selection];
-        if (ImGui::GetActiveID() != ImGui::GetID("Camera node")) {
-            buffer.fill('\0');
-            const auto name = string_or(*controller, "camera", "Camera");
-            std::copy_n(name.begin(), std::min<std::size_t>(name.size(), 128U), buffer.begin());
-        }
-        ImGui::InputText("Camera node", buffer.data(), 129U);
-        if (ImGui::IsItemDeactivatedAfterEdit() && buffer[0] != '\0')
-            set(",\"camera\":\"" + json_escape(std::string{buffer.data()}) + '"', "Controller camera set");
-        // Say plainly what is missing; the node type sets all of it up.
-        const auto* body = component(entity, "physics_body");
-        const auto& palette = editor_palette();
-        const auto warn = [&](const char* text) {
-            ImGui::TextColored(editor_color(palette.warning), "%s", text);
-        };
-        if (!body || number_or(*body, "type", 1) != 1)
-            warn("Needs a dynamic physics body to walk.");
-        else if (!boolean_or(*body, "lock_rotation", false))
-            warn("Lock the physics body's rotation so it stays upright.");
-        if (!component(entity, "collider")) warn("Needs a collider to stand on the ground.");
-        bool has_camera = false;
-        const auto camera_name = string_or(*controller, "camera", "Camera");
-        if (const auto found = children.find(selection); found != children.end())
-            for (const auto index : found->second)
-                if (string_or(*entities[index], "name") == camera_name &&
-                    component(*entities[index], "camera"))
-                    has_camera = true;
-        if (!has_camera) warn(("Needs a child node named " + camera_name + " with a camera.").c_str());
-    }
-
     std::vector<std::string> script_behaviours() const {
         std::vector<std::string> names;
         const auto* status = scripts();
@@ -3438,7 +3394,6 @@ struct EditorUi::Impl {
         draw_light_section(*entity);
         draw_collider_section(*entity);
         draw_physics_body_section(*entity);
-        draw_first_person_controller_section(*entity);
         draw_script_sections(*entity);
         draw_add_component();
     }
@@ -4104,7 +4059,81 @@ struct EditorUi::Impl {
         return id;
     }
 
-    // One row of the node type tree, with its children beneath it.
+    static float template_icon_size() { return ImGui::GetFontSize() * 0.72F; }
+
+    // A small monochrome painter's palette marking custom templates, with a tooltip saying so:
+    // an outlined round body with a notch cut from its lower right, and four paint wells.
+    void draw_template_icon(const ImVec2 at, const std::string& key) {
+        const auto& palette = editor_palette();
+        const float size = template_icon_size();
+        const ImVec2 maximum(at.x + size, at.y + size);
+        const bool hovered = ImGui::IsMouseHoveringRect(at, maximum) && ImGui::IsWindowHovered();
+        // Faint text at half strength, so the icon sits back from the name it marks.
+        const ImU32 color = hovered ? palette.text_faint
+                                    : (palette.text_faint & ~IM_COL32_A_MASK) |
+                                          (static_cast<ImU32>(0x80) << IM_COL32_A_SHIFT);
+        const float thickness = std::max(1.0F, 1.1F * ui_scale);
+        const float radius = size * 0.5F - thickness * 0.5F;
+        const ImVec2 center(at.x + size * 0.5F, at.y + size * 0.5F);
+        auto* list = ImGui::GetWindowDrawList();
+        // The body runs clockwise round the circle, then back along the notch's concave edge.
+        constexpr float notch_angle = 0.785398F, notch_gap = 0.45F, two_pi = 6.2831853F;
+        const float start = notch_angle + notch_gap, end = notch_angle - notch_gap + two_pi;
+        const ImVec2 notch(center.x + std::cos(notch_angle) * radius * 0.95F,
+                           center.y + std::sin(notch_angle) * radius * 0.95F);
+        const ImVec2 from(center.x + std::cos(end) * radius, center.y + std::sin(end) * radius);
+        const ImVec2 to(center.x + std::cos(start) * radius, center.y + std::sin(start) * radius);
+        const float from_angle = std::atan2(from.y - notch.y, from.x - notch.x);
+        float to_angle = std::atan2(to.y - notch.y, to.x - notch.x);
+        if (to_angle > from_angle) to_angle -= two_pi;
+        list->PathArcTo(center, radius, start, end, 24);
+        list->PathArcTo(notch, std::hypot(from.x - notch.x, from.y - notch.y), from_angle, to_angle, 8);
+        list->PathStroke(color, ImDrawFlags_Closed, thickness);
+        const ImVec2 wells[]{{-0.46F, 0.08F}, {-0.28F, -0.42F}, {0.16F, -0.52F}, {0.5F, -0.18F}};
+        for (const auto& well : wells)
+            list->AddCircleFilled(ImVec2(center.x + well.x * radius, center.y + well.y * radius),
+                                  radius * 0.15F, color, 10);
+        note_rect(key, at, maximum);
+        if (hovered) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted("Custom template");
+            note_item("tooltip:custom_template");
+            ImGui::EndTooltip();
+        }
+    }
+
+    // A custom template's row: a leaf in the node type tree, or a search result.
+    void draw_template_row(const TemplateEntry& entry, const bool in_tree, bool& create_now) {
+        ImGui::PushID(entry.id.c_str());
+        bool clicked = false;
+        float label_x = 0.0F;
+        if (in_tree) {
+            ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                       ImGuiTreeNodeFlags_SpanAvailWidth;
+            if (node_selected == entry.id) flags |= ImGuiTreeNodeFlags_Selected;
+            ImGui::TreeNodeEx("##template", flags, "%s", entry.name.c_str());
+            clicked = ImGui::IsItemClicked();
+            label_x = ImGui::GetItemRectMin().x + ImGui::GetTreeNodeToLabelSpacing();
+        } else {
+            clicked = ImGui::Selectable(entry.name.c_str(), node_selected == entry.id,
+                                        ImGuiSelectableFlags_AllowDoubleClick);
+            label_x = ImGui::GetItemRectMin().x;
+        }
+        note_item("node_window:template:" + entry.name);
+        if (clicked) {
+            node_selected = entry.id;
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) create_now = true;
+        }
+        const float icon = template_icon_size();
+        const float row_top = ImGui::GetItemRectMin().y, row_bottom = ImGui::GetItemRectMax().y;
+        draw_template_icon(ImVec2(label_x + ImGui::CalcTextSize(entry.name.c_str()).x +
+                                      ImGui::GetStyle().ItemInnerSpacing.x * 1.5F,
+                                  (row_top + row_bottom - icon) * 0.5F),
+                           "node_window:template_icon:" + entry.name);
+        ImGui::PopID();
+    }
+
+    // One row of the node type tree, with its subtypes and then its custom templates beneath it.
     void draw_node_type_row(const JsonValue::Object& type, bool& create_now) {
         const auto id = string_or(type, "id");
         std::vector<const JsonValue::Object*> subtypes;
@@ -4112,9 +4141,13 @@ struct EditorUi::Impl {
         for (const auto& value : *types->array())
             if (const auto* child = value.object(); child && string_or(*child, "parent") == id)
                 subtypes.push_back(child);
+        std::vector<const TemplateEntry*> templates;
+        for (const auto& entry : node_templates)
+            if (entry.type == id) templates.push_back(&entry);
         ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
                                    ImGuiTreeNodeFlags_DefaultOpen;
-        if (subtypes.empty()) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        if (subtypes.empty() && templates.empty())
+            flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
         if (node_selected == id) flags |= ImGuiTreeNodeFlags_Selected;
         const bool creatable = boolean_or(type, "creatable", false);
         if (!creatable) ImGui::PushStyleColor(ImGuiCol_Text, editor_color(editor_palette().text_faint));
@@ -4125,13 +4158,14 @@ struct EditorUi::Impl {
             node_selected = id;
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && creatable) create_now = true;
         }
-        if (open && !subtypes.empty()) {
+        if (open && !(subtypes.empty() && templates.empty())) {
             for (const auto* child : subtypes) draw_node_type_row(*child, create_now);
+            for (const auto* entry : templates) draw_template_row(*entry, true, create_now);
             ImGui::TreePop();
         }
     }
 
-    // Node types as an inheritance tree with the project's templates below; details on the right.
+    // Node types and custom templates as one inheritance tree; details on the right.
     void draw_add_node_window() {
         if (open_node_window) {
             ImGui::OpenPopup("Add Node");
@@ -4182,23 +4216,10 @@ struct EditorUi::Impl {
                         }
                         note_item("node_window:type:" + id);
                     }
+                    for (const auto& entry : node_templates)
+                        if (lowercase(entry.name).find(query) != std::string::npos)
+                            draw_template_row(entry, false, create_now);
                 }
-            }
-            bool heading = false;
-            for (const auto& entry : node_templates) {
-                if (!query.empty() && lowercase(entry.name).find(query) == std::string::npos) continue;
-                if (!heading) ImGui::SeparatorText("Saved templates");
-                heading = true;
-                if (ImGui::Selectable(entry.name.c_str(), node_selected == entry.id,
-                                      ImGuiSelectableFlags_AllowDoubleClick)) {
-                    node_selected = entry.id;
-                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) create_now = true;
-                }
-                note_item("node_window:template:" + entry.name);
-                const auto size = ImGui::CalcTextSize(entry.type.c_str());
-                ImGui::GetWindowDrawList()->AddText(
-                    ImVec2(ImGui::GetItemRectMax().x - size.x - 4.0F * ui_scale, ImGui::GetItemRectMin().y),
-                    palette.text_faint, entry.type.c_str());
             }
         }
         ImGui::EndChild();
@@ -4210,32 +4231,44 @@ struct EditorUi::Impl {
         const bool is_template = template_entry != node_templates.end();
         const bool creatable = is_template || (type && boolean_or(*type, "creatable", false));
         if (ImGui::BeginChild("##node_details", ImVec2(0.0F, -footer), ImGuiChildFlags_Borders)) {
-            if (is_template) {
-                ImGui::PushFont(fonts.heading, fonts.heading_size * 1.1F);
-                ImGui::TextUnformatted(template_entry->name.c_str());
-                ImGui::PopFont();
-                ImGui::TextColored(editor_color(palette.text_dim), "Saved template, a %s",
-                                   template_entry->type.c_str());
-                ImGui::Spacing();
-                ImGui::TextWrapped("Creates a copy of the saved node and its children. Later "
-                                   "changes to the template do not affect copies.");
-            } else if (type) {
-                ImGui::PushFont(fonts.heading, fonts.heading_size * 1.1F);
-                ImGui::TextUnformatted(string_or(*type, "name").c_str());
-                ImGui::PopFont();
-                // The inheritance chain, root first.
+            // The inheritance chain, root first.
+            const auto inherits = [&](std::string current) {
                 std::vector<std::string> chain;
-                for (auto current = string_or(*type, "parent"); !current.empty();) {
+                for (; !current.empty();) {
                     const auto* ancestor = node_type_info(current);
                     if (!ancestor) break;
                     chain.insert(chain.begin(), string_or(*ancestor, "name"));
                     current = string_or(*ancestor, "parent");
                 }
-                if (!chain.empty()) {
-                    std::string path;
-                    for (const auto& name : chain) path += (path.empty() ? "" : " > ") + name;
-                    ImGui::TextColored(editor_color(palette.text_dim), "Inherits %s", path.c_str());
-                }
+                if (chain.empty()) return;
+                std::string path;
+                for (const auto& name : chain) path += (path.empty() ? "" : " > ") + name;
+                ImGui::TextColored(editor_color(palette.text_dim), "Inherits %s", path.c_str());
+            };
+            if (is_template) {
+                ImGui::PushFont(fonts.heading, fonts.heading_size * 1.1F);
+                ImGui::TextUnformatted(template_entry->name.c_str());
+                ImGui::PopFont();
+                const float icon = template_icon_size();
+                draw_template_icon(ImVec2(ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemInnerSpacing.x * 1.5F,
+                                          (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y - icon) * 0.5F),
+                                   "node_window:details_template_icon");
+                inherits(template_entry->type);
+                ImGui::Spacing();
+                ImGui::TextWrapped("A custom template saved in this project. Creates a copy of the "
+                                   "saved node and its children; later changes to the template do "
+                                   "not affect copies.");
+                ImGui::Spacing();
+                ImGui::SeparatorText("Components");
+                for (const auto& component : template_entry->components)
+                    ImGui::BulletText("%s", component_display_name(component).c_str());
+                for (const auto& behaviour : template_entry->behaviours)
+                    ImGui::BulletText("%s (Script)", behaviour.c_str());
+            } else if (type) {
+                ImGui::PushFont(fonts.heading, fonts.heading_size * 1.1F);
+                ImGui::TextUnformatted(string_or(*type, "name").c_str());
+                ImGui::PopFont();
+                inherits(string_or(*type, "parent"));
                 ImGui::Spacing();
                 ImGui::TextWrapped("%s", string_or(*type, "description").c_str());
                 ImGui::Spacing();
@@ -4726,7 +4759,7 @@ struct EditorUi::Impl {
                                               template_name.size(),
                                               ImGuiInputTextFlags_EnterReturnsTrue);
         note_item("dialog:template:name");
-        ImGui::TextDisabled("Saves the node and its children to templates/, for the Create menu.");
+        ImGui::TextDisabled("Saves the node and its children to templates/, for the Add Node window.");
         ImGui::Checkbox("Replace an existing template", &template_replace);
         const std::string name = template_name.data();
         ImGui::BeginDisabled(name.empty());

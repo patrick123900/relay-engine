@@ -35,7 +35,8 @@ enum RelayCallback {
     RELAY_CALLBACK_CONTACT_BEGIN = 2,
     RELAY_CALLBACK_CONTACT_END = 3,
     RELAY_CALLBACK_STOP = 4,
-    RELAY_CALLBACK_RELOAD = 5
+    RELAY_CALLBACK_RELOAD = 5,
+    RELAY_CALLBACK_DESTROY = 6
 };
 
 enum RelayInputQuery { RELAY_INPUT_HELD = 0, RELAY_INPUT_PRESSED = 1, RELAY_INPUT_RELEASED = 2 };
@@ -106,6 +107,25 @@ typedef struct RelayHostApi {
     RelayEntity (*child)(void* context, RelayEntity parent, const char* name, size_t length);
     /* Makes the entity's camera the one the game renders through, for the rest of the run. */
     int (*activate_camera)(void* context, RelayEntity entity);
+    /* Scene changes during Run Game. New entities exist at once and their scripts start before
+     * their first update; destruction waits until the current callbacks finish. Stop Game
+     * undoes all of it. Each returns 0 on failure and logs why. */
+    RelayEntity (*create_entity)(void* context, const char* name, size_t length, RelayEntity parent);
+    /* Copies templates/<name>.relay-template.json under `parent` (0 for the top level). Null
+     * position or rotation keeps the template's own. */
+    RelayEntity (*instantiate)(void* context, const char* name, size_t length, RelayEntity parent,
+                               const RelayVec3* position, const RelayVec3* rotation);
+    /* Copies an entity and its descendants beside the original, keeping its name. */
+    RelayEntity (*clone)(void* context, RelayEntity entity);
+    int (*destroy)(void* context, RelayEntity entity);
+    /* Queries that fill `out` with up to `capacity` entities, sorted, and return how many there
+     * are in total. */
+    size_t (*children)(void* context, RelayEntity parent, RelayEntity* out, size_t capacity);
+    /* Enabled colliders overlapping the entity's own collider, filtered by both layers and masks. */
+    size_t (*overlaps)(void* context, RelayEntity entity, RelayEntity* out, size_t capacity);
+    /* Enabled colliders on `layer_mask` layers overlapping a world-space sphere. */
+    size_t (*overlap_sphere)(void* context, RelayVec3 center, double radius, uint32_t layer_mask,
+                             RelayEntity ignore, RelayEntity* out, size_t capacity);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

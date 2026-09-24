@@ -1,0 +1,17 @@
+{
+  "format": "relay.input",
+  "version": 1,
+  "lock_mouse": true,
+  "actions": [
+    {"name": "jump", "bindings": ["key:space", "gamepad:a"]},
+    {"name": "interact", "bindings": ["key:e", "gamepad:x"]},
+    {"name": "fire", "bindings": ["mouse:left", "gamepad:right_trigger"]},
+    {"name": "sprint", "bindings": ["key:left_shift", "gamepad:left_stick"]}
+  ],
+  "axes": [
+    {"name": "move_x", "deadzone": 0.20000000000000001, "bindings": [{"negative": "key:a", "positive": "key:d"}, {"negative": "key:left", "positive": "key:right"}, {"analog": "gamepad:leftx", "scale": 1}]},
+    {"name": "move_y", "deadzone": 0.20000000000000001, "bindings": [{"negative": "key:s", "positive": "key:w"}, {"negative": "key:down", "positive": "key:up"}, {"analog": "gamepad:lefty", "scale": -1}]},
+    {"name": "look_x", "deadzone": 0.14999999999999999, "bindings": [{"analog": "gamepad:rightx", "scale": 1}]},
+    {"name": "look_y", "deadzone": 0.14999999999999999, "bindings": [{"analog": "gamepad:righty", "scale": -1}]}
+  ]
+}

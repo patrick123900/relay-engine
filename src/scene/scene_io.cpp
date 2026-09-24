@@ -651,7 +651,9 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                 slot.record.scripts.push_back(std::move(script));
             }
         }
-        if (result.source_version >= 15U) {
+        if (result.source_version == 15U) {
+            // Version 15 had a native first person controller. It becomes a FirstPersonController
+            // script component with the same settings, which projects provide as a script.
             const auto* value = field(*entity_object, "first_person_controller");
             if (!value) {
                 result.error = "version 15 entity requires first_person_controller";
@@ -659,34 +661,40 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
             }
             if (!value->is_null()) {
                 const auto* object = value->object();
-                FirstPersonController controller;
-                const auto number = [&](const char* key, double& target) {
+                Script script{"FirstPersonController", true, {}};
+                for (const auto* key : {"walk_speed", "sprint_speed", "jump_speed", "mouse_sensitivity",
+                                        "stick_look_speed", "ground_distance"}) {
                     const auto* item = object ? field(*object, key) : nullptr;
-                    if (!item || !item->number()) return false;
-                    target = *item->number();
-                    return true;
-                };
+                    if (!item || !item->number()) {
+                        result.error = "invalid first person controller";
+                        return result;
+                    }
+                    ScriptProperty property;
+                    property.name = key;
+                    property.number = *item->number();
+                    script.properties.push_back(std::move(property));
+                }
                 const auto* invert = object ? field(*object, "invert_y") : nullptr;
                 const auto* camera_name = object ? field(*object, "camera") : nullptr;
-                if (!number("walk_speed", controller.walk_speed) ||
-                    !number("sprint_speed", controller.sprint_speed) ||
-                    !number("jump_speed", controller.jump_speed) ||
-                    !number("mouse_sensitivity", controller.mouse_sensitivity) ||
-                    !number("stick_look_speed", controller.stick_look_speed) ||
-                    !number("ground_distance", controller.ground_distance) || !invert ||
-                    !invert->boolean() || !camera_name || !camera_name->string()) {
+                if (!invert || !invert->boolean() || !camera_name || !camera_name->string()) {
                     result.error = "invalid first person controller";
                     return result;
                 }
-                controller.invert_y = *invert->boolean();
-                controller.camera = *camera_name->string();
-                Scene validator;
-                const auto handle = validator.create();
-                if (!validator.set_first_person_controller(handle, controller)) {
+                ScriptProperty invert_property;
+                invert_property.name = "invert_y";
+                invert_property.type = ScriptProperty::Type::boolean;
+                invert_property.boolean = *invert->boolean();
+                script.properties.push_back(std::move(invert_property));
+                ScriptProperty camera_property;
+                camera_property.name = "camera_name";
+                camera_property.type = ScriptProperty::Type::text;
+                camera_property.text = *camera_name->string();
+                script.properties.push_back(std::move(camera_property));
+                if (slot.record.scripts.size() >= maximum_scripts_per_entity || !valid_script(script)) {
                     result.error = "first person controller values outside valid ranges";
                     return result;
                 }
-                slot.record.first_person_controller = std::move(controller);
+                slot.record.scripts.push_back(std::move(script));
             }
         }
         ++result.entity_count;

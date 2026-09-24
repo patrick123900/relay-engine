@@ -661,7 +661,7 @@ export function registerGeneratedTools(
       inputSchema: z.object({
         "name": z.string().min(1).max(128).optional().describe("Node name; defaults to the type's name, or Entity"),
         "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity handle"),
-        "type": z.enum(["Node", "Camera", "DirectionalLight", "PointLight", "SpotLight", "FirstPersonController", "RigidBody", "StaticBody", "StaticMesh"]).optional().describe("Node type to create; omitted creates a plain Node")
+        "type": z.enum(["Node", "Camera", "DirectionalLight", "PointLight", "SpotLight", "RigidBody", "StaticBody", "StaticMesh"]).optional().describe("Node type to create; omitted creates a plain Node")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
     },
@@ -1039,32 +1039,6 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
-    "scene_set_first_person_controller",
-    {
-      title: "Configure first person controller",
-      description: "Add, edit or remove an undoable first person controller component. During Run Game it looks around with the mouse and look_x/look_y through a child camera node, walks with move_x/move_y relative to the view, sprints and jumps (only on the ground). It needs a dynamic physics body with rotation locked and a collider; scene.create with type FirstPersonController sets all of that up.",
-      inputSchema: z.object({
-        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-        "attached": z.boolean().optional(),
-        "walkSpeed": z.number().finite().min(0).max(1000).optional(),
-        "sprintSpeed": z.number().finite().min(0).max(1000).optional(),
-        "jumpSpeed": z.number().finite().min(0).max(1000).optional(),
-        "mouseSensitivity": z.number().finite().min(0).max(10).optional().describe("Degrees per pixel"),
-        "stickLookSpeed": z.number().finite().min(0).max(3600).optional().describe("Degrees per second at full stick"),
-        "invertY": z.boolean().optional(),
-        "groundDistance": z.number().finite().min(0.001).max(100).optional().describe("From the node's origin down to just below its feet"),
-        "camera": z.string().min(1).max(128).optional().describe("Name of the child node whose camera looks around")
-      }),
-      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
-    },
-    async (input) => {
-        const override = overrides["scene_set_first_person_controller"];
-        if (override) return override(input as JsonObject);
-        return invoke("scene.set_first_person_controller", {"entity": input["entity"], "attached": input["attached"], "walk_speed": input["walkSpeed"], "sprint_speed": input["sprintSpeed"], "jump_speed": input["jumpSpeed"], "mouse_sensitivity": input["mouseSensitivity"], "stick_look_speed": input["stickLookSpeed"], "invert_y": input["invertY"], "ground_distance": input["groundDistance"], "camera": input["camera"]});
-      },
-  );
-
-  server.registerTool(
     "scripts_status",
     {
       title: "Inspect gameplay scripts",
@@ -1183,7 +1157,7 @@ export function registerGeneratedTools(
       description: "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-        "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "first_person_controller", "keyframes", "script"]),
+        "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "keyframes", "script"]),
         "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).optional().describe("Behaviour class name; required for script")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
@@ -1202,7 +1176,7 @@ export function registerGeneratedTools(
       description: "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-        "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "first_person_controller", "keyframes", "script"]),
+        "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "keyframes", "script"]),
         "index": z.number().int().min(0).max(31).optional().describe("Which script component, from zero")
       }),
       annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},
@@ -1277,7 +1251,7 @@ export function registerGeneratedTools(
     "templates_list",
     {
       title: "List node templates",
-      description: "List the project's saved templates (prefabs) with the node type of each root. Built-in node types are listed by nodes.types.",
+      description: "List the project's saved templates (prefabs) with the node type each root inherits and the root's components and script behaviours. Built-in node types are listed by nodes.types.",
       inputSchema: z.object({}),
       annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
     },

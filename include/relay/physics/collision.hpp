@@ -93,6 +93,20 @@ public:
     // Teleports the bodies of `entity` and its descendants to their scene transforms, after a
     // game-time transform edit. Collider shapes keep the scale they were built with.
     void sync_transforms(const Scene& scene, Entity entity);
+    // Entities created during the game: gives `root` and its descendants their bodies.
+    void add_bodies(const Scene& scene, Entity root);
+    // Entities destroyed during the game: removes their bodies and ends their contacts.
+    void remove_missing_bodies(const Scene& scene);
+    // Enabled colliders overlapping or resting against (within Jolt's 2 cm speculative contact
+    // distance) this entity's collider in the running world, filtered by both colliders' layers
+    // and masks as collision_overlaps does.
+    [[nodiscard]] CollisionOverlaps overlaps(const Scene& scene, Entity entity,
+                                             std::size_t maximum = 1024U);
+    // Enabled colliders on `layer_mask` layers overlapping a world-space sphere.
+    [[nodiscard]] CollisionOverlaps overlap_sphere(const Scene& scene, Vec3 center, double radius,
+                                                   std::uint32_t layer_mask = 0xffffffffU,
+                                                   Entity ignore = {},
+                                                   std::size_t maximum = 1024U);
     // Casts against the running world, without rebuilding it as collision_raycast does.
     [[nodiscard]] CollisionRaycast raycast(const Scene& scene, Vec3 origin, Vec3 direction,
                                            double maximum_distance,

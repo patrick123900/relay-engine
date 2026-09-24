@@ -1,5 +1,6 @@
 #include "relay/scene/templates.hpp"
 
+#include "relay/scene/components.hpp"
 #include "relay/scene/scene_edit.hpp"
 #include "relay/scene/scene_io.hpp"
 
@@ -48,16 +49,79 @@ std::vector<NodeTemplate> list_templates(const std::optional<fs::path>& project_
         const auto name = filename.substr(0, filename.size() - template_suffix.size());
         if (!valid_template_name(name)) continue;
         const auto loaded = load_scene_file(it->path());
-        std::string type = "Node";
         if (!loaded) continue;
-        for (const auto& slot : loaded.state->slots)
-            if (slot.alive && !slot.record.parent.valid()) type = node_type(slot.record);
-        project.push_back({"project:" + name, name, type,
-                           std::string{template_directory} + "/" + filename});
+        NodeTemplate entry{"project:" + name, name, "Node",
+                           std::string{template_directory} + "/" + filename, {}, {}};
+        for (const auto& slot : loaded.state->slots) {
+            if (!slot.alive || slot.record.parent.valid()) continue;
+            entry.type = node_type(slot.record);
+            for (const auto& kind : engine_components())
+                if (kind.id != "script" && has_component(slot.record, kind.id))
+                    entry.components.emplace_back(kind.id);
+            for (const auto& script : slot.record.scripts) entry.behaviours.push_back(script.behaviour);
+        }
+        project.push_back(std::move(entry));
     }
     std::sort(project.begin(), project.end(),
               [](const NodeTemplate& a, const NodeTemplate& b) { return a.name < b.name; });
     return project;
+}
+
+std::optional<LoadedTemplate> load_template(const std::optional<fs::path>& project_root,
+                                           const std::string_view id, std::string& error) {
+    if (!id.starts_with("project:")) {
+        error = "template ids start with project:";
+        return std::nullopt;
+    }
+    if (!project_root) {
+        error = "project templates need an open project";
+        return std::nullopt;
+    }
+    const auto path = template_file(*project_root, id.substr(8));
+    std::error_code code;
+    if (!path || !fs::is_regular_file(*path, code)) {
+        error = "project template not found";
+        return std::nullopt;
+    }
+    auto loaded = load_scene_file(*path);
+    if (!loaded) {
+        error = "invalid template file: " + loaded.error;
+        return std::nullopt;
+    }
+    Scene source;
+    source.restore_state(std::move(*loaded.state));
+    std::vector<Entity> roots;
+    for (const auto entity : source.entities())
+        if (!source.get(entity)->parent.valid()) roots.push_back(entity);
+    if (roots.size() != 1U) {
+        error = "a template file must hold exactly one root node";
+        return std::nullopt;
+    }
+    auto clipboard = copy_selection(source, roots);
+    if (!clipboard) {
+        error = "could not read the template's node tree";
+        return std::nullopt;
+    }
+    return LoadedTemplate{std::move(*clipboard), source.get(roots.front())->name};
+}
+
+std::optional<Entity> place_template(Scene& scene, const LoadedTemplate& loaded, const Entity parent,
+                                     const std::string_view name, std::string& error) {
+    if (parent.valid() && !scene.contains(parent)) {
+        error = "invalid or stale parent";
+        return std::nullopt;
+    }
+    const auto pasted = paste_selection(scene, loaded.nodes, parent);
+    if (pasted.size() != 1U) {
+        error = "could not place the template in the scene";
+        return std::nullopt;
+    }
+    if (!scene.set_name(pasted.front(), name.empty() ? loaded.root_name : std::string{name})) {
+        (void)scene.destroy(pasted.front());
+        error = "invalid node name";
+        return std::nullopt;
+    }
+    return pasted.front();
 }
 
 std::optional<Entity> instantiate_template(Scene& scene, const std::optional<fs::path>& project_root,
@@ -67,49 +131,8 @@ std::optional<Entity> instantiate_template(Scene& scene, const std::optional<fs:
         error = "invalid or stale parent";
         return std::nullopt;
     }
-    std::optional<Entity> root;
-    if (id.starts_with("project:")) {
-        if (!project_root) {
-            error = "project templates need an open project";
-            return std::nullopt;
-        }
-        const auto path = template_file(*project_root, id.substr(8));
-        std::error_code code;
-        if (!path || !fs::is_regular_file(*path, code)) {
-            error = "project template not found";
-            return std::nullopt;
-        }
-        auto loaded = load_scene_file(*path);
-        if (!loaded) {
-            error = "invalid template file: " + loaded.error;
-            return std::nullopt;
-        }
-        Scene source;
-        source.restore_state(std::move(*loaded.state));
-        std::vector<Entity> roots;
-        for (const auto entity : source.entities())
-            if (!source.get(entity)->parent.valid()) roots.push_back(entity);
-        if (roots.size() != 1U) {
-            error = "a template file must hold exactly one root node";
-            return std::nullopt;
-        }
-        const auto clipboard = copy_selection(source, roots);
-        const auto pasted = clipboard ? paste_selection(scene, *clipboard, parent)
-                                      : std::vector<Entity>{};
-        if (pasted.size() != 1U) {
-            error = "could not place the template in the scene";
-            return std::nullopt;
-        }
-        root = pasted.front();
-    } else {
-        error = "template ids start with project:";
-        return std::nullopt;
-    }
-    if (!name.empty() && !scene.set_name(*root, std::string{name})) {
-        error = "invalid node name";
-        return std::nullopt;
-    }
-    return root;
+    const auto loaded = load_template(project_root, id, error);
+    return loaded ? place_template(scene, *loaded, parent, name, error) : std::nullopt;
 }
 
 bool save_template(const Scene& scene, const Entity root, const fs::path& project_root,
@@ -136,7 +159,8 @@ bool save_template(const Scene& scene, const Entity root, const fs::path& projec
     }
     // The copy becomes a root in its own scene, so the template never refers back to this one.
     Scene isolated;
-    if (paste_selection(isolated, *clipboard).size() != 1U) {
+    const auto pasted = paste_selection(isolated, *clipboard);
+    if (pasted.size() != 1U || !isolated.set_name(pasted.front(), scene.get(root)->name)) {
         error = "could not copy the node tree";
         return false;
     }

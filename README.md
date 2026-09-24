@@ -31,7 +31,7 @@ in control of the same project.
   Vulkan viewport, inspect the image, and iterate.
 - **HDR lighting** — a floating-point scene target, camera exposure, procedural environment
   lighting, and tone mapping produce the final SDR viewport and captures.
-- **One typed API** — 127 versioned native methods cover scene editing, rendering, projects,
+- **One typed API** — 126 versioned native methods cover scene editing, rendering, projects,
   observability, capture, and session authorization. A generated MCP bridge exposes the supported
   model-facing subset.
 - **Deterministic core** — fixed-step simulation, transactional undo/redo, strict scene validation,
@@ -48,20 +48,21 @@ in control of the same project.
   packages of saved scenes and assets.
 - **Components, node types and templates** — every node is a Transform plus any components you add
   or remove in the Inspector. Node types form an inheritance tree (a Rigid Body is a Physics Body
-  is a Node), a node's type follows from its components, and saved templates reuse whole node
-  trees (prefabs).
+  is a Node), a node's type follows from its components, and custom templates reuse whole node
+  trees (prefabs), listed in the same tree under the type they inherit.
 - **Native C++ gameplay scripts** — behaviours in a project's `scripts/` folder are script
   components with Inspector-editable properties. They build in the background with per-file
-  caching, run during Run Game with start, update, contact and stop callbacks, and hot reload while
-  the game runs. Agents write, build and debug them through the same protocol.
+  caching, run during Run Game with start, update, contact, destroy and stop callbacks, spawn
+  templates, clone and destroy entities, query overlaps, and hot reload while the game runs.
+  Agents write, build and debug them through the same protocol.
 - **Input mapping** — keyboard, mouse and gamepad controls map to named actions and axes per
   project, edited in the Game Configuration window and read by scripts once per game step.
 - **Jolt physics** — authored box, sphere, capsule, convex-hull, and triangle-mesh colliders support
   overlap checks and raycasts. Static and dynamic rigid bodies provide gravity, momentum,
   friction, bounce, and angular motion during Run Game, and runtime impulses can be applied at a
   world-space point through the protocol.
-- **First person controller** — a native node type and component that walks, sprints, jumps, and
-  looks around with the input map, ready to play without writing code.
+- **First person controller example** — the demo project's template and editable C++ script walk,
+  sprint, jump and look around with the input map.
 
 The editor remembers its layout between sessions and builds: docked and floating panels, which
 panels are open, and the **View** menu toggles. They are saved per user in
@@ -83,17 +84,12 @@ components. Light and Physics Body are categories; pick one of the types beneath
 Hierarchy labels each node with the deepest type its current components match, so removing a
 Static Mesh's mesh renderer makes it a plain Node and adding a camera makes it a Camera.
 
-**Node › Physics Body › First Person Controller** creates a player you can walk around with
-straight away: an upright capsule body, a camera at eye height, and a native **First person
-controller** component for mouse, keyboard and gamepad look, walking, sprinting and jumping from
-the input map. Its speeds, mouse sensitivity, jump and camera node are Inspector fields, and it
-locks the mouse while the game has input. The component can also be added to any node with a
-dynamic, rotation-locked body, a collider and a child camera; the Inspector says what is missing.
-
 Right-click a node and choose **Save as template...** to store it and its children in the
-project's `templates/` folder. Saved templates appear in the Add Node window below the node
-types; creating one makes an independent copy, like a prefab without a live link. You can also
-double-click a template file in Assets or drag it into the viewport.
+project's `templates/` folder. Custom templates appear in the Add Node window's type tree under
+the node type their root inherits, so a template of a dynamic body sits under **Physics Body ›
+Rigid Body**. A palette icon marks each one; hover it to see "Custom template". Creating one makes
+an independent copy, like a prefab without a live link. You can also double-click a template file
+in Assets or drag it into the viewport.
 
 The **Hierarchy** lists the scene's nodes. Right-click empty space to create a node, or a row to
 add a child, duplicate, move, rename, save as a template, or destroy it. Rename in place with
@@ -192,9 +188,10 @@ scene workflow, import pipeline, control protocol, MCP bridge, and embedded agen
 functional. APIs and file formats may still change. Windows and macOS renderer parity, broader
 import sandboxing, and sustained live-provider validation remain in progress.
 
-Native C++ gameplay scripting, input mapping, components, node types, templates, and a first person
-controller are in place and verified on Linux. The next engine work is joints in the Jolt backend,
-followed by script access to entity creation and scene queries, and script loading on Windows.
+Native C++ gameplay scripting (including spawning, destroying and overlap queries), input mapping,
+components, node types, and templates are in place and verified on Linux, with a scripted first
+person controller in the demo project. The next engine work is joints in the Jolt backend, then
+script loading on Windows.
 
 ## Build
 
@@ -212,7 +209,11 @@ cmake --build --preset dev
 The command above opens the SDL/Vulkan demo. In the development build, the editor opens the demo
 project in [`examples/demo`](examples/demo) when started from the repository root. Its showcase
 scene has PBR materials, cascaded sun, point, and spot shadows, keyframed animation, and a physics
-playground to try with **Run Game**. Set `RELAY_OPEN_DEMO_PROJECT=0` to start with an empty scene
+playground to try with **Run Game**. Its **First Person Controller** template is a player you can
+walk around with: an upright capsule body, a camera at eye height, and the project's
+`scripts/FirstPersonController.cpp` for mouse, keyboard and gamepad look, walking, sprinting,
+jumping and shooting balls where you look, which you can edit like any other script (see the [scripting guide](docs/scripting.md)).
+Set `RELAY_OPEN_DEMO_PROJECT=0` to start with an empty scene
 instead; release builds always do. `python3 tools/generate_demo_project.py` rebuilds the demo from
 code after a dev build.
 

@@ -48,7 +48,6 @@ add_library(relay_engine
     src/control/local_server.cpp
     src/control/protocol_validation.cpp
     src/core/engine.cpp
-    src/core/first_person.cpp
     src/core/hash.cpp
     src/core/input.cpp
     src/core/log.cpp
@@ -384,6 +383,8 @@ if(RELAY_BUILD_TESTS)
     add_test(NAME relay_workflow_tests COMMAND relay_workflow_tests)
     add_executable(relay_script_tests tests/script_tests.cpp)
     target_link_libraries(relay_script_tests PRIVATE Relay::Engine)
+    target_compile_definitions(relay_script_tests PRIVATE
+        RELAY_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     relay_enable_warnings(relay_script_tests)
     add_test(NAME relay_script_tests COMMAND relay_script_tests)
     set_tests_properties(relay_script_tests PROPERTIES TIMEOUT 600)

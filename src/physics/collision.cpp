@@ -240,6 +240,17 @@ std::optional<detail::ColliderMeshData> detail::collider_mesh(const EntityRecord
     return result;
 }
 
+std::optional<CollisionDebugBox> detail::collider_geometry(const Scene& scene, const Entity entity) {
+    const auto* record = scene.get(entity);
+    if (!record || !record->collider || record->collider->type == BoxCollider::Type::convex ||
+        record->collider->type == BoxCollider::Type::mesh)
+        return std::nullopt;
+    const auto shape = shape_for(scene, entity);
+    if (!shape) return std::nullopt;
+    return CollisionDebugBox{entity, true, shape->collider.type, shape->center, shape->edges,
+                             shape->radius, shape->axis, {}, false};
+}
+
 CollisionDebugBoxes collision_debug_boxes(const Scene& scene, bool enabled_only,
                                           const AssetRegistry* assets) {
     CollisionDebugBoxes result;

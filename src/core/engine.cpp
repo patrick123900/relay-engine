@@ -48,7 +48,6 @@ bool Engine::run_game() {
     frame_index_ = 0;
     elapsed_seconds_ = 0.0;
     logs_.write(LogLevel::info, "Game started");
-    first_person_.start(scene_, logs_);
     scripts_.start();
     return true;
 }
@@ -60,7 +59,6 @@ bool Engine::stop_game() {
         if (!stop_video(error)) return false;
     }
     scripts_.stop();
-    first_person_.stop();
     scene_.restore_state(std::move(*authored_scene_));
     physics_.reset();
     authored_scene_.reset();
@@ -242,8 +240,6 @@ void Engine::advance_one_frame() {
     ++frame_index_;
     elapsed_seconds_ += config_.fixed_delta_seconds;
     input_.begin_step();
-    if (mode_ == RuntimeMode::game)
-        first_person_.update(scene_, physics_, input_, config_.fixed_delta_seconds);
     scripts_.update(config_.fixed_delta_seconds);
     for (const auto entity : scene_.entities()) {
         auto *record = scene_.get(entity);

@@ -1,9 +1,11 @@
 // Authors the dev-build demo project through the trusted control protocol, using the same requests
 // the editor and agents send. Run by tools/generate_demo_project.py from the repository root, after
-// it has written models/primitives.glb into the project folder.
+// it has written models/primitives.glb into the project folder. The committed scripts
+// (FirstPersonController.cpp, Projectile.cpp) are project source and are left as they are.
 
 #include "relay/control/control_protocol.hpp"
 #include "relay/core/engine.hpp"
+#include "relay/core/input.hpp"
 #include "relay/core/json.hpp"
 
 #include <algorithm>
@@ -275,9 +277,52 @@ int main(const int argument_count, char** arguments) {
     demo.call("scene.keyframes.playback", "\"entity\":" + Builder::text(torus) +
                                               ",\"playing\":true,\"loop\":true,\"duration_seconds\":4");
 
+    // Input: the engine's default map, locking the mouse so first-person look can turn freely.
+    auto input = relay::default_input_map();
+    input.lock_mouse = true;
+    demo.call("input.set_map", "\"map\":" + Builder::text(relay::input_map_json(input)));
+
     demo.call("scene.save", "\"filename\":\"showcase.relay.json\"");
     demo.call("project.add_scene", "\"scene_file\":\"showcase.relay.json\"");
     demo.call("project.set_startup", "\"scene_file\":\"showcase.relay.json\"");
-    std::cout << "Wrote " << project_file << " with scenes/showcase.relay.json\n";
+
+    // First Person Controller template: an upright capsule body with a camera at eye height, moved
+    // by the project's FirstPersonController script. It is built after the showcase is saved and
+    // kept only as a template, so the showcase keeps its overview camera and runs without trusting
+    // scripts.
+    const auto player = demo.create("First Person Controller");
+    const auto player_field = "\"entity\":" + Builder::text(player);
+    demo.transform(player, {0, 1, 0});
+    // Its mask leaves out layer 2, the Ball template's, so the player's own shots pass through it.
+    demo.collider(player, "\"type\":\"capsule\",\"radius\":0.35,\"half_height\":0.55,"
+                          "\"mask\":4294967293");
+    // Walking sets velocity, so friction and damping would only catch on walls.
+    demo.call("scene.set_physics_body", player_field +
+                                            ",\"type\":\"dynamic\",\"mass\":70,\"friction\":0,"
+                                            "\"linear_damping\":0,\"angular_damping\":0,"
+                                            "\"lock_rotation\":true");
+    demo.call("component.add", player_field + ",\"component\":\"script\","
+                                              "\"behaviour\":\"FirstPersonController\"");
+    const auto player_camera = demo.create("Camera", player);
+    demo.transform(player_camera, {0, 0.7, 0});
+    demo.call("scene.set_camera", "\"entity\":" + Builder::text(player_camera) +
+                                      ",\"enabled\":true,\"active\":false,"
+                                      "\"field_of_view_y_degrees\":75,\"near_plane\":0.05");
+    demo.call("templates.save", player_field + ",\"name\":\"First Person Controller\",\"replace\":true");
+    demo.call("scene.destroy", player_field);
+
+    // Ball template: what the First Person Controller shoots. A bouncy gold sphere on collider
+    // layer 2 that removes itself after a few seconds (scripts/Projectile.cpp).
+    const auto ball = demo.mesh_entity("Ball", {}, "Sphere", "Gold", {0, 1, 0}, {}, {0.3, 0.3, 0.3});
+    const auto ball_field = "\"entity\":" + Builder::text(ball);
+    demo.collider(ball, "\"type\":\"sphere\",\"radius\":0.5,\"layer\":2");
+    demo.body(ball, 0.5, 0.5, 0.4);
+    demo.call("component.add", ball_field + ",\"component\":\"script\",\"behaviour\":\"Projectile\"");
+    demo.call("templates.save", ball_field + ",\"name\":\"Ball\",\"replace\":true");
+    demo.call("scene.destroy", ball_field);
+
+    std::cout << "Wrote " << project_file
+              << " with scenes/showcase.relay.json and the First Person Controller and Ball "
+                 "templates\n";
     return 0;
 }

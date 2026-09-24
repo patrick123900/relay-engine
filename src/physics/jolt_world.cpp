@@ -361,76 +361,116 @@ public:
     void build(const Scene& scene, bool queries_only = false) {
         built_ = true;
         contact_filter_.scene = &scene;
-        const auto debug = collision_debug_boxes(scene, true);
-        std::map<Entity, CollisionDebugBox> colliders;
-        for (const auto& box : debug.boxes) if (box.enabled) colliders.emplace(box.entity, box);
+        for (const auto entity : scene.entities()) add_body(scene, entity, queries_only);
+        system_.OptimizeBroadPhase();
+    }
+
+    // Gives entities created during the game their bodies: `root` and its descendants that lack one.
+    void add_bodies(const Scene& scene, const Entity root) {
         for (const auto entity : scene.entities()) {
-            const auto* record = scene.get(entity);
-            const auto found = colliders.find(entity);
-            const bool mesh_based = record->collider && record->collider->enabled &&
-                                    (record->collider->type == BoxCollider::Type::convex ||
-                                     record->collider->type == BoxCollider::Type::mesh);
-            const bool has_collider = found != colliders.end() || mesh_based;
-            if (!has_collider && (!record->physics_body || queries_only)) continue;
-            const auto transform = world_transform(scene, entity);
-            if (!transform) continue;
-            JPH::ShapeRefC shape;
-            if (has_collider) {
-                std::optional<JPH::ShapeRefC> created;
-                if (mesh_based) {
-                    if (assets_)
-                        created = shape_from_mesh(*record, *transform, *assets_,
-                                                  !queries_only && dynamic_body(*record),
-                                                  triangle_budget_, over_budget_);
-                } else if (record->collider->type == BoxCollider::Type::box) {
-                    created = shape_from_box(found->second, *transform);
-                } else {
-                    created = shape_from_round(*record->collider, *transform);
+            if (bodies_.contains(entity)) continue;
+            for (auto current = entity; current.valid() && scene.contains(current);
+                 current = scene.get(current)->parent)
+                if (current == root) {
+                    add_body(scene, entity, false);
+                    break;
                 }
-                if (!created) continue;
-                shape = *created;
-            } else {
-                // Jolt cannot assign dynamic mass to EmptyShape. The contact listener rejects
-                // this proxy because the Relay entity has no enabled collider.
-                shape = new JPH::SphereShape(0.1f);
+        }
+    }
+
+    // Removes the bodies of entities no longer in the scene. Their touching pairs end now, so
+    // contact streams never report a pair whose body is gone as still touching.
+    void remove_missing_bodies(const Scene& scene) {
+        auto& api = system_.GetBodyInterface();
+        for (auto it = bodies_.begin(); it != bodies_.end();) {
+            if (scene.contains(it->first)) {
+                ++it;
+                continue;
             }
-            const bool dynamic = !queries_only && dynamic_body(*record);
-            const bool animated = record->transform_animation &&
-                                  !record->transform_animation->keys.empty();
-            const auto motion = dynamic ? JPH::EMotionType::Dynamic :
-                                animated && !queries_only ? JPH::EMotionType::Kinematic :
-                                JPH::EMotionType::Static;
-            const auto layer = dynamic || motion == JPH::EMotionType::Kinematic
-                ? Layers::moving : Layers::stationary;
-            JPH::BodyCreationSettings settings(shape.GetPtr(), to_jolt_position(transform->position),
-                                                transform->rotation, motion, layer);
-            settings.mUserData = entity.packed();
-            if (record->physics_body) {
-                settings.mGravityFactor = static_cast<float>(record->physics_body->gravity_scale);
-                settings.mRestitution = static_cast<float>(record->physics_body->restitution);
-                settings.mFriction = static_cast<float>(record->physics_body->friction);
-                settings.mLinearDamping = static_cast<float>(record->physics_body->linear_damping);
-                settings.mAngularDamping = static_cast<float>(record->physics_body->angular_damping);
-                if (dynamic) {
-                    settings.mOverrideMassProperties =
-                        JPH::EOverrideMassProperties::CalculateInertia;
-                    settings.mMassPropertiesOverride.mMass =
-                        static_cast<float>(record->physics_body->mass);
-                    settings.mMotionQuality = JPH::EMotionQuality::LinearCast;
-                    if (record->physics_body->lock_rotation)
-                        settings.mAllowedDOFs = JPH::EAllowedDOFs::TranslationX |
-                                                JPH::EAllowedDOFs::TranslationY |
-                                                JPH::EAllowedDOFs::TranslationZ;
+            const auto entity = it->first;
+            api.RemoveBody(it->second);
+            api.DestroyBody(it->second);
+            contact_filter_.entities.erase(it->second);
+            it = bodies_.erase(it);
+            auto& pairs = contact_filter_.active_pairs;
+            for (auto pair = pairs.begin(); pair != pairs.end();) {
+                if (pair->first.first != entity && pair->first.second != entity) {
+                    ++pair;
+                    continue;
                 }
-            }
-            const auto id = system_.GetBodyInterface().CreateAndAddBody(settings,
-                dynamic ? JPH::EActivation::Activate : JPH::EActivation::DontActivate);
-            if (!id.IsInvalid()) {
-                bodies_.emplace(entity, id);
-                contact_filter_.entities.emplace(id, entity);
+                contact_filter_.pending.push_back({0, pair->first.first, pair->first.second, false});
+                pair = pairs.erase(pair);
             }
         }
-        system_.OptimizeBroadPhase();
+    }
+
+    void add_body(const Scene& scene, const Entity entity, const bool queries_only) {
+        const auto* record = scene.get(entity);
+        if (!record) return;
+        const bool mesh_based = record->collider && record->collider->enabled &&
+                                (record->collider->type == BoxCollider::Type::convex ||
+                                 record->collider->type == BoxCollider::Type::mesh);
+        std::optional<CollisionDebugBox> geometry;
+        if (!mesh_based) geometry = detail::collider_geometry(scene, entity);
+        const bool has_collider = geometry || mesh_based;
+        if (!has_collider && (!record->physics_body || queries_only)) return;
+        const auto transform = world_transform(scene, entity);
+        if (!transform) return;
+        JPH::ShapeRefC shape;
+        if (has_collider) {
+            std::optional<JPH::ShapeRefC> created;
+            if (mesh_based) {
+                if (assets_)
+                    created = shape_from_mesh(*record, *transform, *assets_,
+                                              !queries_only && dynamic_body(*record),
+                                              triangle_budget_, over_budget_);
+            } else if (record->collider->type == BoxCollider::Type::box) {
+                created = shape_from_box(*geometry, *transform);
+            } else {
+                created = shape_from_round(*record->collider, *transform);
+            }
+            if (!created) return;
+            shape = *created;
+        } else {
+            // Jolt cannot assign dynamic mass to EmptyShape. The contact listener rejects
+            // this proxy because the Relay entity has no enabled collider.
+            shape = new JPH::SphereShape(0.1f);
+        }
+        const bool dynamic = !queries_only && dynamic_body(*record);
+        const bool animated = record->transform_animation &&
+                              !record->transform_animation->keys.empty();
+        const auto motion = dynamic ? JPH::EMotionType::Dynamic :
+                            animated && !queries_only ? JPH::EMotionType::Kinematic :
+                            JPH::EMotionType::Static;
+        const auto layer = dynamic || motion == JPH::EMotionType::Kinematic
+            ? Layers::moving : Layers::stationary;
+        JPH::BodyCreationSettings settings(shape.GetPtr(), to_jolt_position(transform->position),
+                                            transform->rotation, motion, layer);
+        settings.mUserData = entity.packed();
+        if (record->physics_body) {
+            settings.mGravityFactor = static_cast<float>(record->physics_body->gravity_scale);
+            settings.mRestitution = static_cast<float>(record->physics_body->restitution);
+            settings.mFriction = static_cast<float>(record->physics_body->friction);
+            settings.mLinearDamping = static_cast<float>(record->physics_body->linear_damping);
+            settings.mAngularDamping = static_cast<float>(record->physics_body->angular_damping);
+            if (dynamic) {
+                settings.mOverrideMassProperties =
+                    JPH::EOverrideMassProperties::CalculateInertia;
+                settings.mMassPropertiesOverride.mMass =
+                    static_cast<float>(record->physics_body->mass);
+                settings.mMotionQuality = JPH::EMotionQuality::LinearCast;
+                if (record->physics_body->lock_rotation)
+                    settings.mAllowedDOFs = JPH::EAllowedDOFs::TranslationX |
+                                            JPH::EAllowedDOFs::TranslationY |
+                                            JPH::EAllowedDOFs::TranslationZ;
+            }
+        }
+        const auto id = system_.GetBodyInterface().CreateAndAddBody(settings,
+            dynamic ? JPH::EActivation::Activate : JPH::EActivation::DontActivate);
+        if (!id.IsInvalid()) {
+            bodies_.emplace(entity, id);
+            contact_filter_.entities.emplace(id, entity);
+        }
     }
 
     void step(Scene& scene, double seconds) {
@@ -582,6 +622,42 @@ void cast_ray(JoltState& state, const Scene& scene, const Vec3 origin, const Vec
 
 } // namespace
 
+namespace {
+// Enabled colliders within `separation` of `shape` in the running world, sorted and without
+// duplicates. Others qualify when their layer is in `mask` and, when the query shape is a collider
+// with `layer`, that layer is in their mask.
+void collect_overlaps(JoltState& state, const Scene& scene, const JPH::Shape& shape,
+                      const JPH::RMat44& transform, const std::uint32_t mask,
+                      const std::optional<std::uint32_t> layer, const Entity ignore,
+                      const std::size_t maximum, const float separation,
+                      CollisionOverlaps& result) {
+    const auto& api = state.system().GetBodyInterface();
+    JPH::CollideShapeSettings settings;
+    settings.mMaxSeparationDistance = separation;
+    JPH::AllHitCollisionCollector<JPH::CollideShapeCollector> hits;
+    // Jolt has no triangle-mesh versus triangle-mesh test, so a mesh query skips other meshes.
+    const ExcludeTriangleMeshes exclude_meshes;
+    const JPH::BodyFilter any_body;
+    state.system().GetNarrowPhaseQuery().CollideShape(&shape, JPH::Vec3::sOne(), transform,
+        settings, JPH::RVec3::sZero(), hits, {}, {},
+        shape.GetSubType() == JPH::EShapeSubType::Mesh
+            ? static_cast<const JPH::BodyFilter&>(exclude_meshes) : any_body);
+    std::set<Entity> unique;
+    for (const auto& hit : hits.mHits) {
+        const auto other = from_user_data(api.GetUserData(hit.mBodyID2));
+        const auto* record = scene.get(other);
+        if (other == ignore || !record || !record->collider || !record->collider->enabled ||
+            !(record->collider->layer & mask) || (layer && !(*layer & record->collider->mask)))
+            continue;
+        unique.insert(other);
+    }
+    for (const auto other : unique) {
+        if (result.entities.size() == maximum) { result.truncated = true; break; }
+        result.entities.push_back(other);
+    }
+}
+} // namespace
+
 struct PhysicsWorld::Impl {
     std::unique_ptr<JoltState> state;
     const AssetRegistry* assets{};
@@ -704,6 +780,53 @@ CollisionRaycast PhysicsWorld::raycast(const Scene& scene, Vec3 origin, Vec3 dir
     cast_ray(state, scene, origin,
              {direction.x / length, direction.y / length, direction.z / length},
              maximum_distance, layer_mask, result, ignore);
+    return result;
+}
+void PhysicsWorld::add_bodies(const Scene& scene, const Entity root) {
+    // Before the first step the world is built from the scene anyway.
+    if (impl_->state && impl_->state->built()) impl_->state->add_bodies(scene, root);
+}
+void PhysicsWorld::remove_missing_bodies(const Scene& scene) {
+    if (impl_->state && impl_->state->built()) impl_->state->remove_missing_bodies(scene);
+}
+CollisionOverlaps PhysicsWorld::overlaps(const Scene& scene, const Entity entity,
+                                         const std::size_t maximum) {
+    CollisionOverlaps result;
+    const auto* target = scene.get(entity);
+    if (!target || !target->collider || !target->collider->enabled) {
+        result.error = "entity has no enabled collider";
+        return result;
+    }
+    ensure_built(scene);
+    auto& state = *impl_->state;
+    const auto id = state.body(entity);
+    if (!id) {
+        result.error = "collider has a degenerate world transform or no usable mesh";
+        return result;
+    }
+    const auto& api = state.system().GetBodyInterface();
+    const auto shape = api.GetShape(*id);
+    // Bodies resting on each other sit at the solver's contact distance rather than overlapping,
+    // so colliders within Jolt's speculative contact distance count as touching.
+    collect_overlaps(state, scene, *shape, api.GetCenterOfMassTransform(*id),
+                     target->collider->mask, target->collider->layer, entity, maximum,
+                     state.system().GetPhysicsSettings().mSpeculativeContactDistance, result);
+    return result;
+}
+CollisionOverlaps PhysicsWorld::overlap_sphere(const Scene& scene, const Vec3 center,
+                                               const double radius, const std::uint32_t layer_mask,
+                                               const Entity ignore, const std::size_t maximum) {
+    CollisionOverlaps result;
+    if (!std::isfinite(center.x) || !std::isfinite(center.y) || !std::isfinite(center.z) ||
+        !std::isfinite(radius) || radius <= 0.0 || radius > 1e6) {
+        result.error = "invalid overlap sphere";
+        return result;
+    }
+    ensure_built(scene);
+    JPH::SphereShape sphere(static_cast<float>(radius));
+    sphere.SetEmbedded();
+    collect_overlaps(*impl_->state, scene, sphere, JPH::RMat44::sTranslation(to_jolt_position(center)),
+                     layer_mask, std::nullopt, ignore, maximum, 0.0f, result);
     return result;
 }
 bool PhysicsWorld::apply_impulse(const Scene& scene, Entity entity, Vec3 impulse,

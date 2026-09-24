@@ -1082,22 +1082,6 @@ void game_configuration_ui() {
     const auto& actions = engine.input().map().actions;
     check(actions.back().name == "dash" && actions.back().bindings == std::vector<std::string>{"key:k"},
           "a new action is added and bound");
-    frame(ui, 2);
-    click_center(ui, *ui.headless_item_rect("hierarchy:add_node"));
-    frame(ui, 2);
-    const auto controller = ui.headless_item_rect("node_window:type:FirstPersonController");
-    check(controller.has_value(), "the Add Node window offers the First Person Controller type");
-    const auto category = *ui.headless_item_rect("node_window:type:PhysicsBody");
-    check((*controller)[0] > category[0] && (*controller)[1] > category[1],
-          "the controller sits in the node tree under Physics Body");
-    click(ui, *controller);
-    click_center(ui, *ui.headless_item_rect("node_window:create"));
-    frame(ui, 3);
-    bool created = false;
-    for (const auto entity : engine.scene().entities())
-        if (engine.scene().get(entity)->first_person_controller) created = true;
-    check(created && !std::filesystem::exists("projects/configured/scripts"),
-          "creating it adds a native controller without any script files");
     click_center(ui, *ui.headless_item_rect("config:input:reset"));
     check(engine.input().map().actions.size() == relay::default_input_map().actions.size(),
           "Reset to defaults restores the engine's map");
@@ -1111,10 +1095,11 @@ void game_input_ui() {
     relay::ControlProtocol protocol(engine);
     check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/locked/project.relayproject","name":"Locked"})")
               .find("\"ok\":true") != std::string::npos, "create mouse lock project");
-    // The project leaves mouse lock off; a first person controller in the scene turns it on.
-    check(!engine.input().map().lock_mouse, "the project does not ask for mouse lock");
-    check(protocol.handle(R"({"id":2,"method":"scene.create","type":"FirstPersonController"})")
-              .find("\"ok\":true") != std::string::npos, "add a first person controller");
+    auto map = engine.input().map();
+    map.lock_mouse = true;
+    check(protocol.handle(R"({"id":2,"method":"input.set_map","map":")" +
+                          relay::json_escape(relay::input_map_json(map)) + "\"}")
+              .find("\"ok\":true") != std::string::npos, "the project asks for mouse lock");
     relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
     std::string error;
     check(ui.initialize_headless(error), "initialize game input editor without windows");
@@ -1153,6 +1138,52 @@ void game_input_ui() {
     frame(ui, 40);
     check(!ui.game_has_input() && !ui.pointer_locked_for_game(), "stopping the game releases input");
     std::cout << "Headless game input focus tests passed\n";
+}
+
+// Custom templates sit in the Add Node tree under the node type their root inherits, marked by a
+// palette icon whose tooltip says "Custom template".
+void node_templates_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/templated/project.relayproject","name":"Templated"})")
+              .find("\"ok\":true") != std::string::npos, "create template project");
+    const auto crate = engine.scene().create("Crate");
+    (void)engine.scene().set_collider(crate, relay::BoxCollider{});
+    (void)engine.scene().set_physics_body(crate, relay::PhysicsBody{});
+    check(protocol.handle(R"({"id":2,"method":"templates.save","entity":")" + crate.to_string() +
+                          R"(","name":"Crate"})").find("\"ok\":true") != std::string::npos,
+          "save a rigid body template");
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize template editor without windows");
+    frame(ui, 5);
+    click_center(ui, *ui.headless_item_rect("hierarchy:add_node"));
+    frame(ui, 2);
+    const auto rigid = ui.headless_item_rect("node_window:type:RigidBody");
+    const auto row = ui.headless_item_rect("node_window:template:Crate");
+    const auto statics = ui.headless_item_rect("node_window:type:StaticBody");
+    check(rigid && row && statics, "the Add Node tree shows the template with the node types");
+    check((*row)[0] > (*rigid)[0] && (*row)[1] > (*rigid)[1] && (*row)[1] < (*statics)[1],
+          "the template is nested under Rigid Body, the type its root inherits");
+    const auto icon = ui.headless_item_rect("node_window:template_icon:Crate");
+    check(icon && (*icon)[0] > (*row)[0] && (*icon)[1] >= (*row)[1] && (*icon)[3] <= (*row)[3],
+          "a palette icon sits next to the template's name");
+    check(!ui.headless_item_rect("tooltip:custom_template"), "no tooltip before hovering");
+    ImGui::GetIO().AddMousePosEvent(((*icon)[0] + (*icon)[2]) / 2, ((*icon)[1] + (*icon)[3]) / 2);
+    frame(ui, 3);
+    check(ui.headless_item_rect("tooltip:custom_template").has_value(),
+          "hovering the palette icon shows the Custom template tooltip");
+    click(ui, *row);
+    frame(ui, 2);
+    check(ui.headless_item_rect("node_window:details_template_icon").has_value(),
+          "the details pane marks the selection as a custom template");
+    const auto before = engine.scene().entities().size();
+    click_center(ui, *ui.headless_item_rect("node_window:create"));
+    frame(ui, 3);
+    check(engine.scene().entities().size() == before + 1U, "Create makes a copy of the template");
+    std::cout << "Headless node template tests passed\n";
 }
 
 void scripts_ui() {
@@ -1235,6 +1266,7 @@ int main() {
         fresh(project_ui);
         fresh(hierarchy_and_assets_ui);
         fresh(components_ui);
+        fresh(node_templates_ui);
         fresh(game_configuration_ui);
         fresh(game_input_ui);
         fresh(scripts_ui);

@@ -21,9 +21,6 @@ const std::vector<ComponentKind>& engine_components() {
          "and raycasts."},
         {"physics_body", "Physics body", "Physics", true, true, false,
          "Makes the node static or dynamic during Run Game: gravity, mass, bounce and friction."},
-        {"first_person_controller", "First person controller", "Physics", true, true, false,
-         "Walks, sprints, jumps and looks around with the input map during Run Game. Needs a "
-         "dynamic physics body with rotation locked, a collider and a child camera node."},
         {"keyframes", "Transform keyframes", "Animation", true, true, false,
          "Animates position, rotation and scale between keys you set on a timeline."},
         {"animator", "Model animation", "Animation", false, false, false,
@@ -49,7 +46,6 @@ bool has_component(const EntityRecord& record, const std::string_view id) {
     if (id == "collider") return record.collider.has_value();
     if (id == "physics_body") return record.physics_body.has_value();
     if (id == "keyframes") return record.transform_animation.has_value();
-    if (id == "first_person_controller") return record.first_person_controller.has_value();
     if (id == "animator") return record.animator.has_value();
     if (id == "script") return !record.scripts.empty();
     return false;
@@ -84,8 +80,6 @@ bool add_component(Scene& scene, const Entity entity, const std::string_view id,
         added = scene.set_collider(entity, BoxCollider{});
     } else if (id == "physics_body") {
         added = scene.set_physics_body(entity, PhysicsBody{});
-    } else if (id == "first_person_controller") {
-        added = scene.set_first_person_controller(entity, FirstPersonController{});
     } else if (id == "keyframes") {
         TransformAnimation animation;
         animation.keys.push_back({0.0, record->transform});
@@ -130,8 +124,6 @@ bool remove_component(Scene& scene, const Entity entity, const std::string_view 
     if (id == "collider") return scene.set_collider(entity, std::nullopt);
     if (id == "physics_body") return scene.set_physics_body(entity, std::nullopt);
     if (id == "keyframes") return scene.set_transform_animation(entity, std::nullopt);
-    if (id == "first_person_controller")
-        return scene.set_first_person_controller(entity, std::nullopt);
     auto scripts = record->scripts;
     scripts.erase(scripts.begin() + static_cast<std::ptrdiff_t>(index));
     return scene.set_scripts(entity, std::move(scripts));

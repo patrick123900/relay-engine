@@ -46,9 +46,17 @@ std::optional<SceneClipboard> copy_selection(const Scene& scene,
     // Partial imported-node copies retain their authored components; never bind them to an unrelated model
     // after changing scenes (handles alone do not identify a scene).
     std::set<Entity> included(queue.begin(), queue.end());
-    for (auto& node : result.nodes)
+    for (auto& node : result.nodes) {
         if (node.record.model_node && !included.contains(node.record.model_node->root))
             node.record.model_node.reset();
+        // Likewise a joint to a node outside the copy is disabled rather than bound to whatever
+        // that handle names where it is pasted.
+        if (node.record.joint && node.record.joint->connected.valid() &&
+            !included.contains(node.record.joint->connected)) {
+            node.record.joint->connected = {};
+            node.record.joint->enabled = false;
+        }
+    }
     return result;
 }
 
@@ -70,6 +78,8 @@ std::vector<Entity> paste_selection(Scene& scene, const SceneClipboard& clipboar
                         : sibling && scene.contains(record.parent) ? record.parent : parent;
         if (record.camera) record.camera->active = false;
         if (record.model_node) record.model_node->root = copies.at(record.model_node->root);
+        if (record.joint && record.joint->connected.valid())
+            record.joint->connected = copies.at(record.joint->connected);
         *scene.get(copies.at(node.original)) = std::move(record);
     }
     std::set<std::string> names;

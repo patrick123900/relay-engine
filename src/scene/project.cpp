@@ -45,16 +45,27 @@ std::filesystem::path Project::root() const {
     return parent.empty() ? std::filesystem::path{"."} : parent;
 }
 
-std::string Project::json() const {
+std::string Project::json(const bool with_settings) const {
     std::string files = "[";
     for (const auto& scene : scenes) {
-        if (files.size() > 1) files += ',';
+        if (files.size() > 1) files += ", ";
         files += '"' + json_escape(scene) + '"';
     }
-    return "{\"format\":\"relay.project\",\"version\":1,\"filename\":\"" +
-           json_escape(filename) + "\",\"root\":\"" + json_escape(root().generic_string()) + "\",\"name\":\"" + json_escape(name) +
-           "\",\"assets_directory\":\".\",\"scenes_directory\":\"scenes\",\"scenes\":" +
-           files + "],\"startup_scene\":\"" + json_escape(startup_scene) + "\"}";
+    std::string settings;
+    if (with_settings && input) {
+        // The map keeps its own format and version; indented to sit inside the project object.
+        std::string map = input_map_json(*input);
+        while (!map.empty() && map.back() == '\n') map.pop_back();
+        for (std::size_t at = map.find('\n'); at != std::string::npos; at = map.find('\n', at + 1))
+            map.insert(at + 1, "    ");
+        settings = ",\n  \"settings\": {\n    \"input\": " + map + "\n  }";
+    }
+    return "{\n  \"format\": \"relay.project\",\n  \"version\": " +
+           std::to_string(project_file_version) + ",\n  \"filename\": \"" + json_escape(filename) +
+           "\",\n  \"root\": \"" + json_escape(root().generic_string()) + "\",\n  \"name\": \"" +
+           json_escape(name) + "\",\n  \"assets_directory\": \".\",\n  \"scenes_directory\": \"scenes\","
+           "\n  \"scenes\": " + files + "],\n  \"startup_scene\": \"" + json_escape(startup_scene) +
+           '"' + settings + "\n}";
 }
 
 namespace {
@@ -69,10 +80,18 @@ bool valid(const Project& project) {
 } // namespace
 
 std::optional<Project> load_project(const std::string_view filename, std::string& error) {
+    std::string warning;
+    return load_project(filename, error, warning);
+}
+
+std::optional<Project> load_project(const std::string_view filename, std::string& error,
+                                    std::string& warning) {
+    warning.clear();
     const auto path = workspace_file(".", filename, ".relayproject");
     std::error_code ec;
+    // Room for the largest input map (256 KiB) and the rest of the settings.
     if (!path || !std::filesystem::is_regular_file(*path, ec) ||
-        std::filesystem::file_size(*path, ec) > 65536 || ec) {
+        std::filesystem::file_size(*path, ec) > 512U * 1024U || ec) {
         error = "project must be an existing safe .relayproject file inside the workspace";
         return {};
     }
@@ -89,17 +108,28 @@ std::optional<Project> load_project(const std::string_view filename, std::string
     const auto* version = field(*object, "version");
     const auto* scenes = field(*object, "scenes");
     if (string_at("format") != "relay.project" || !version || !version->number() ||
-        *version->number() != 1 || !scenes || !scenes->array() ||
+        (*version->number() != 1 && *version->number() != project_file_version) || !scenes ||
+        !scenes->array() ||
         string_at("assets_directory") != "." || string_at("scenes_directory") != "scenes") {
         error = "unsupported project format, version or directories";
         return {};
     }
-    Project project{std::string(filename), string_at("name"), {}, string_at("startup_scene")};
+    Project project{std::string(filename), string_at("name"), {}, string_at("startup_scene"), {}, false};
     for (const auto& scene : *scenes->array()) {
         if (!scene.string()) { error = "project scenes must be filenames"; return {}; }
         project.scenes.push_back(*scene.string());
     }
     if (!valid(project)) { error = "invalid scene membership, startup scene or project name"; return {}; }
+    const auto* settings = field(*object, "settings");
+    if (settings && !settings->object()) { error = "project settings must be an object"; return {}; }
+    if (const auto* input = settings ? field(*settings->object(), "input") : nullptr) {
+        std::string problem;
+        project.input = parse_input_map(json_stringify(*input), problem);
+        if (!project.input) { error = "invalid input map in the project settings: " + problem; return {}; }
+    } else if (auto legacy = load_legacy_input_map(project.root(), warning)) {
+        project.input = std::move(*legacy);
+        project.legacy_input_file = true;
+    }
     error.clear();
     return project;
 }
@@ -139,6 +169,12 @@ bool save_project(const Project& project, std::string& error, const bool create)
         std::filesystem::remove(temporary, ec);
         error = "cannot atomically replace project metadata";
         return false;
+    }
+    // The map now lives in the project file, so the old file would only mislead.
+    if (project.legacy_input_file && project.input) {
+        const auto legacy = project.root() / legacy_input_map_filename;
+        if (!std::filesystem::is_symlink(legacy, ec) && std::filesystem::is_regular_file(legacy, ec))
+            std::filesystem::remove(legacy, ec);
     }
     error.clear();
     return true;

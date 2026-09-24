@@ -697,6 +697,60 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                 slot.record.scripts.push_back(std::move(script));
             }
         }
+        if (result.source_version >= 17U) {
+            const auto* value = field(*entity_object, "joint");
+            if (!value) {
+                result.error = "version 17 entity requires joint";
+                return result;
+            }
+            if (!value->is_null()) {
+                const auto* object = value->object();
+                Joint joint;
+                const auto number = [&](const char* key, double& target) {
+                    const auto* item = object ? field(*object, key) : nullptr;
+                    if (!item || !item->number()) return false;
+                    target = *item->number();
+                    return true;
+                };
+                const auto flag = [&](const char* key, bool& target) {
+                    const auto* item = object ? field(*object, key) : nullptr;
+                    if (!item || !item->boolean()) return false;
+                    target = *item->boolean();
+                    return true;
+                };
+                const auto* type = object ? field(*object, "type") : nullptr;
+                const auto* connected = object ? field(*object, "connected") : nullptr;
+                const auto parsed_type = type && type->string()
+                    ? joint_type_from_name(*type->string()) : std::nullopt;
+                std::optional<Entity> partner;
+                if (connected && connected->string()) partner = Entity::parse(*connected->string());
+                if (!parsed_type || !connected || (!connected->is_null() && !partner) ||
+                    !read_vec3(field(*object, "anchor"), joint.anchor) ||
+                    !read_vec3(field(*object, "axis"), joint.axis) ||
+                    !read_vec3(field(*object, "connected_anchor"), joint.connected_anchor) ||
+                    !flag("limits", joint.limits) || !number("limit_min", joint.limit_min) ||
+                    !number("limit_max", joint.limit_max) || !flag("motor", joint.motor) ||
+                    !number("motor_speed", joint.motor_speed) ||
+                    !number("motor_force", joint.motor_force) ||
+                    !number("spring_frequency", joint.spring_frequency) ||
+                    !number("spring_damping", joint.spring_damping) ||
+                    !flag("collide_connected", joint.collide_connected) ||
+                    !flag("enabled", joint.enabled)) {
+                    result.error = "invalid joint";
+                    return result;
+                }
+                joint.type = *parsed_type;
+                // Values are checked here; the connected node once every entity is loaded.
+                Scene validator;
+                const auto handle = validator.create();
+                if (!validator.set_joint(handle, joint)) {
+                    result.error = "joint values outside valid ranges";
+                    return result;
+                }
+                if (partner) joint.connected = *partner;
+                slot.record.joint = joint;
+            }
+        }
         ++result.entity_count;
     }
 
@@ -745,6 +799,17 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
         }
     }
     if (!hierarchy_is_valid(state, result.error)) return result;
+    for (std::size_t index = 0; index < state.slots.size(); ++index) {
+        const auto& slot = state.slots[index];
+        if (!slot.alive || !slot.record.joint || !slot.record.joint->connected.valid()) continue;
+        const auto partner = slot.record.joint->connected;
+        if (partner.index >= state.slots.size() || partner.index == index ||
+            !state.slots[partner.index].alive ||
+            state.slots[partner.index].generation != partner.generation) {
+            result.error = "joint connects to a missing, stale or identical node";
+            return result;
+        }
+    }
     for (const auto &slot : state.slots)
         if (slot.alive && slot.record.model_node) {
             const auto model_root = slot.record.model_node->root;

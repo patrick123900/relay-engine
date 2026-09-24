@@ -417,6 +417,31 @@ void demo_first_person(relay::Engine& engine, relay::ControlProtocol& protocol) 
     expect(status.find("\"state\":\"ready\"") != std::string::npos &&
                status.find("{\"name\":\"FirstPersonController\"") != std::string::npos,
            "the demo's FirstPersonController script builds: " + status.substr(0, 600));
+    // The showcase itself starts with a player: Run Game plays through its camera.
+    relay::Entity scene_player{}, scene_camera{};
+    for (const auto entity : engine.scene().entities())
+        if (engine.scene().get(entity)->name == "First Person Controller") scene_player = entity;
+    for (const auto entity : engine.scene().entities())
+        if (scene_player.valid() && engine.scene().get(entity)->parent == scene_player)
+            scene_camera = entity;
+    if (!scene_player.valid() || !scene_camera.valid()) {
+        expect(false, "the showcase has a first person controller with a camera");
+        return;
+    }
+    expect(engine.run_game(), "the trusted showcase runs with its controller");
+    expect(engine.scene().active_camera() == scene_camera,
+           "the showcase plays through the player's camera");
+    engine.step(60);
+    const auto landed = engine.scene().get(scene_player)->transform.position;
+    (void)request(protocol, "input.simulate", "\"name\":\"move_y\",\"value\":1,\"frames\":30");
+    engine.step(30);
+    const auto moved = engine.scene().get(scene_player)->transform.position;
+    expect(std::abs(landed.y - 0.9) < 0.05 && moved.z < landed.z - 1.5,
+           "the showcase player stands on the ground and walks towards the playgrounds");
+    expect(engine.stop_game() && engine.scene().active_camera() == scene_camera &&
+               engine.scene().get(scene_player)->transform.position.z == 8.0,
+           "Stop Game returns the player to its start");
+
     expect(ok(request(protocol, "scene.clear")), "start from an empty scene");
 
     const auto floor = engine.scene().create("Ground");
@@ -555,6 +580,21 @@ public:
 };
 RELAY_BEHAVIOUR(Pad)
 
+// Drives its hinge with the motor for half a second, then reports the angle.
+class Crank : public relay::Behaviour {
+public:
+    void on_start() override {
+        relay::world::log(std::string{"crank motor "} + (self().set_joint_motor(180.0) ? "on" : "missing"));
+    }
+    void on_update(double) override {
+        if (relay::world::frame() != 31) return;
+        const auto angle = self().joint_position();
+        relay::world::log("crank turned " + (angle ? std::to_string(static_cast<int>(*angle)) : std::string{"?"}));
+        self().stop_joint_motor();
+    }
+};
+RELAY_BEHAVIOUR(Crank)
+
 class Spawner : public relay::Behaviour {
 public:
     void on_start() override {
@@ -648,6 +688,17 @@ void spawning(relay::Engine& engine, relay::ControlProtocol& protocol) {
     box.half_extents = {0.25, 0.25, 0.25};
     (void)scene.set_collider(crate, box);
     (void)scene.set_physics_body(crate, relay::PhysicsBody{});
+    // A hinge whose motor only a script turns on.
+    const auto crank = scene.create("Crank");
+    (void)scene.set_transform(crank, {{-10, 3, 0}, {}, {1, 1, 1}});
+    relay::BoxCollider bar;
+    bar.half_extents = {1, 0.1, 0.1};
+    (void)scene.set_collider(crank, bar);
+    (void)scene.set_physics_body(crank, relay::PhysicsBody{});
+    relay::Joint hinge;
+    hinge.motor_force = 1e6;
+    expect(scene.set_joint(crank, hinge) && ok(add_script(protocol, crank, "Crank")),
+           "attach the crank's hinge and script");
     const auto spawner = scene.create("Spawner");
     expect(ok(add_script(protocol, spawner, "Spawner")), "attach the spawner");
     const auto authored = scene.entities().size();
@@ -693,12 +744,22 @@ void spawning(relay::Engine& engine, relay::ControlProtocol& protocol) {
     expect(logged(engine, "pad released a destroyed entity"),
            "destroying a touching body ends its contacts");
 
-    engine.step(19); // Frame 39; both bullets reached 30 updates by frame 33.
+    engine.step(11); // Frame 31.
+    std::string crank_line;
+    for (const auto& entry : engine.logs().read_after(0))
+        if (entry.message.find("crank turned ") != std::string::npos) crank_line = entry.message;
+    const auto turned_at = crank_line.find("crank turned ");
+    const auto crank_angle = turned_at == std::string::npos
+        ? -1 : std::atoi(crank_line.c_str() + turned_at + 13);
+    expect(logged(engine, "crank motor on") && crank_angle >= 80 && crank_angle <= 92,
+           "a script drives a hinge motor and reads the joint angle: " + crank_line);
+    engine.step(8); // Frame 39; both bullets reached 30 updates by frame 33.
     expect(count_logged(engine, "bullet destroyed after 30 updates") == 2U &&
                named(engine, "Bullet") == 0U && !scene.contains(bullet),
            "behaviours destroy their own entity after on_destroy");
     const auto instances_after = request(protocol, "scripts.status");
-    expect(instances_after.find("\"instances\":2") != std::string::npos,
+    // Pad, Crank and Spawner remain.
+    expect(instances_after.find("\"instances\":3") != std::string::npos,
            "destroyed entities' script instances are removed: " + instances_after.substr(0, 300));
 
     expect(engine.stop_game() && scene.entities().size() == authored && scene.contains(crate) &&

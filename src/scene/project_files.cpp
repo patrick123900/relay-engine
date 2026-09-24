@@ -24,9 +24,13 @@ std::string lowercase(std::string value) {
     return value;
 }
 
-constexpr std::array<std::string_view, 11> kind_names{
-    "folder", "model", "scene", "template", "image", "shader", "script", "text", "media", "project",
-    "other"};
+constexpr std::array<std::string_view, 10> kind_names{
+    "folder", "model", "scene", "template", "image", "shader", "script", "text", "media", "other"};
+
+// Hidden entries, and project files, which the Project panel manages rather than the browser.
+bool hidden_from_assets(const std::string& name, const bool directory) {
+    return name.starts_with('.') || (!directory && lowercase(name).ends_with(".relayproject"));
+}
 
 } // namespace
 
@@ -59,7 +63,6 @@ AssetKind asset_kind_of(const std::string_view filename, const bool directory) {
         return AssetKind::script;
     if (any({"txt", "md", "json", "yaml", "yml", "toml", "csv", "ini", "log"})) return AssetKind::text;
     if (any({"webm", "mp4", "mkv", "wav", "ogg", "mp3", "flac"})) return AssetKind::media;
-    if (extension == "relayproject") return AssetKind::project;
     return AssetKind::other;
 }
 
@@ -80,7 +83,7 @@ AssetDirectoryListing search_assets(const std::filesystem::path& root, const std
         }
         const auto name = item->path().filename().string();
         std::error_code status;
-        if (name.starts_with('.') || item->is_symlink(status)) {
+        if (hidden_from_assets(name, item->is_directory(status)) || item->is_symlink(status)) {
             if (item->is_directory(status)) item.disable_recursion_pending();
             continue;
         }
@@ -125,7 +128,7 @@ std::optional<AssetDirectoryListing> list_asset_directory(const std::filesystem:
          !failure && item != end; item.increment(failure)) {
         const auto name = item->path().filename().string();
         std::error_code status;
-        if (name.starts_with('.') || item->is_symlink(status)) continue;
+        if (hidden_from_assets(name, item->is_directory(status)) || item->is_symlink(status)) continue;
         const bool is_directory = item->is_directory(status);
         if (!is_directory && !item->is_regular_file(status)) continue;
         const auto relative = directory.empty() ? name : std::string(directory) + '/' + name;

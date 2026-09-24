@@ -125,6 +125,8 @@ int main(const int argument_count, char** arguments) {
     std::error_code ignored;
     std::filesystem::remove(project_file, ignored);
     std::filesystem::remove(root / ".relay-imports.json", ignored);
+    // Older demos kept the input map beside the project file; it now lives inside it.
+    std::filesystem::remove(root / "input.relay-input.json", ignored);
     std::filesystem::remove_all(root / "scenes", ignored);
 
     Builder demo;
@@ -172,13 +174,6 @@ int main(const int argument_count, char** arguments) {
                   << " materials\n";
         return 1;
     }
-
-    // Camera.
-    const auto camera = demo.create("Main camera");
-    const std::array<double, 3> eye{8.5, 5.5, 10.0};
-    demo.transform(camera, eye, Builder::look(eye, {-0.5, 1.2, -0.5}));
-    demo.call("scene.set_camera", "\"entity\":" + Builder::text(camera) +
-                                      ",\"active\":true,\"field_of_view_y_degrees\":50");
 
     // Lighting: a shadowed sun, a warm point fill and a cool spot over the material row.
     const auto lighting = demo.create("Lighting");
@@ -277,19 +272,58 @@ int main(const int argument_count, char** arguments) {
     demo.call("scene.keyframes.playback", "\"entity\":" + Builder::text(torus) +
                                               ",\"playing\":true,\"loop\":true,\"duration_seconds\":4");
 
+    // Joints playground, behind the material row: a swinging chain, a hinged door, a motorised
+    // spinner and a ball on a spring.
+    const auto joints = demo.create("Joints playground");
+    const auto joint = [&](const std::string& entity, const std::string& fields) {
+        demo.call("scene.set_joint", "\"entity\":" + Builder::text(entity) + ',' + fields);
+    };
+    const auto beam = demo.mesh_entity("Chain beam", joints, "Cube", "Mint", {-5, 4.2, -9}, {},
+                                       {1.2, 0.2, 0.2});
+    demo.collider(beam, "\"type\":\"box\"");
+    // The chain starts level and swings down; each link hangs from the one before it.
+    auto previous = beam;
+    for (int link = 1; link <= 3; ++link) {
+        const auto entity = demo.mesh_entity("Chain link " + std::to_string(link), joints, "Sphere",
+                                             "Chrome", {-5 + 0.6 * link, 4.2, -9}, {},
+                                             {0.4, 0.4, 0.4});
+        demo.collider(entity, "\"type\":\"sphere\",\"radius\":0.5");
+        demo.body(entity, 1.0, 0.1, 0.4);
+        joint(entity, "\"type\":\"point\",\"connected\":" + Builder::text(previous) +
+                          ",\"anchor_x\":-1.5");
+        previous = entity;
+    }
+    const auto post = demo.mesh_entity("Door post", joints, "Cube", "Ground", {-0.6, 1.2, -9}, {},
+                                       {0.2, 2.4, 0.2});
+    demo.collider(post, "\"type\":\"box\"");
+    const auto door = demo.mesh_entity("Door", joints, "Cube", "Copper", {0, 1.15, -9}, {},
+                                       {1.0, 2.2, 0.1});
+    demo.collider(door, "\"type\":\"box\"");
+    demo.body(door, 5.0, 0.1, 0.5);
+    joint(door, "\"type\":\"hinge\",\"connected\":" + Builder::text(post) +
+                    ",\"anchor_x\":-0.5,\"limits\":true,\"limit_min\":-100,\"limit_max\":100");
+    const auto spinner = demo.mesh_entity("Spinner", joints, "Cube", "Ocean", {4, 0.35, -9}, {},
+                                          {2.4, 0.2, 0.3});
+    demo.collider(spinner, "\"type\":\"box\"");
+    demo.body(spinner, 20.0, 0.1, 0.5);
+    joint(spinner, "\"type\":\"hinge\",\"motor\":true,\"motor_speed\":60,\"motor_force\":5000");
+    const auto bungee = demo.mesh_entity("Bungee ball", joints, "Sphere", "Gold", {7.5, 2.5, -9}, {},
+                                         {0.6, 0.6, 0.6});
+    demo.collider(bungee, "\"type\":\"sphere\",\"radius\":0.5");
+    demo.body(bungee, 1.0, 0.3, 0.4);
+    joint(bungee, "\"type\":\"distance\",\"connected_anchor_x\":7.5,\"connected_anchor_y\":5,"
+                  "\"connected_anchor_z\":-9,\"limits\":true,\"limit_min\":0,\"limit_max\":1.5,"
+                  "\"spring_frequency\":1.2,\"spring_damping\":0.1");
+
     // Input: the engine's default map, locking the mouse so first-person look can turn freely.
     auto input = relay::default_input_map();
     input.lock_mouse = true;
     demo.call("input.set_map", "\"map\":" + Builder::text(relay::input_map_json(input)));
 
-    demo.call("scene.save", "\"filename\":\"showcase.relay.json\"");
-    demo.call("project.add_scene", "\"scene_file\":\"showcase.relay.json\"");
-    demo.call("project.set_startup", "\"scene_file\":\"showcase.relay.json\"");
-
-    // First Person Controller template: an upright capsule body with a camera at eye height, moved
-    // by the project's FirstPersonController script. It is built after the showcase is saved and
-    // kept only as a template, so the showcase keeps its overview camera and runs without trusting
-    // scripts.
+    // First Person Controller: an upright capsule body with a camera at eye height, moved by the
+    // project's FirstPersonController script. It is saved as a template at the origin (its camera
+    // inactive, so placing it never steals another scene's view), then placed in the showcase in
+    // front of the playgrounds, looking down -Z, as the scene's only and active camera.
     const auto player = demo.create("First Person Controller");
     const auto player_field = "\"entity\":" + Builder::text(player);
     demo.transform(player, {0, 1, 0});
@@ -309,10 +343,16 @@ int main(const int argument_count, char** arguments) {
                                       ",\"enabled\":true,\"active\":false,"
                                       "\"field_of_view_y_degrees\":75,\"near_plane\":0.05");
     demo.call("templates.save", player_field + ",\"name\":\"First Person Controller\",\"replace\":true");
-    demo.call("scene.destroy", player_field);
+    demo.transform(player, {0, 1, 8});
+    demo.call("scene.set_camera", "\"entity\":" + Builder::text(player_camera) + ",\"active\":true");
 
-    // Ball template: what the First Person Controller shoots. A bouncy gold sphere on collider
-    // layer 2 that removes itself after a few seconds (scripts/Projectile.cpp).
+    demo.call("scene.save", "\"filename\":\"showcase.relay.json\"");
+    demo.call("project.add_scene", "\"scene_file\":\"showcase.relay.json\"");
+    demo.call("project.set_startup", "\"scene_file\":\"showcase.relay.json\"");
+
+    // Ball template: what the First Person Controller shoots, built after the showcase is saved and
+    // kept only as a template. A bouncy gold sphere on collider layer 2 that removes itself after a
+    // few seconds (scripts/Projectile.cpp).
     const auto ball = demo.mesh_entity("Ball", {}, "Sphere", "Gold", {0, 1, 0}, {}, {0.3, 0.3, 0.3});
     const auto ball_field = "\"entity\":" + Builder::text(ball);
     demo.collider(ball, "\"type\":\"sphere\",\"radius\":0.5,\"layer\":2");
@@ -322,7 +362,7 @@ int main(const int argument_count, char** arguments) {
     demo.call("scene.destroy", ball_field);
 
     std::cout << "Wrote " << project_file
-              << " with scenes/showcase.relay.json and the First Person Controller and Ball "
-                 "templates\n";
+              << " with scenes/showcase.relay.json (with a First Person Controller) and the "
+                 "First Person Controller and Ball templates\n";
     return 0;
 }

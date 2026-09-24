@@ -82,20 +82,22 @@ void on_update(double dt) override {
 
 ## Example: a first person controller
 
-The demo project in [`examples/demo`](../examples/demo) has a **First Person Controller**
-template. Find it in the Add Node window under **Physics Body › Rigid Body**, marked with a palette
-icon like every custom template. It is an upright capsule with a dynamic, rotation-locked physics
-body, a child **Camera** at eye height, and a `FirstPersonController` script component from
+The demo project in [`examples/demo`](../examples/demo) starts with a player in its showcase scene:
+press **Run Game** (and trust the project the first time) to walk around. The player is also a
+**First Person Controller** template for other scenes; find it in the Add Node window under
+**Physics Body › Rigid Body**, marked with a palette icon like every custom template. It is an
+upright capsule with a dynamic, rotation-locked physics body, a child **Camera** at eye height, and
+a `FirstPersonController` script component from
 [`scripts/FirstPersonController.cpp`](../examples/demo/scripts/FirstPersonController.cpp). The
 script looks around with the mouse and `look_x`/`look_y`, walks with `move_x`/`move_y` relative to
 the view, sprints, and jumps only when a raycast finds ground. `fire` (left mouse button or right
 trigger) shoots: it instantiates the demo's **Ball** template just in front of the camera and sets
-its velocity along the view, plus the player's own motion. Balls sit on collider layer 2, which
-the player's collider mask leaves out, so they never knock into the shooter, and their
+its velocity along the view, plus the player's own motion. Balls sit on collider layer 2, which the
+player's collider mask leaves out, so they never knock into the shooter, and their
 [`Projectile`](../examples/demo/scripts/Projectile.cpp) script destroys them after six seconds. Its
-speeds, mouse sensitivity, camera name, ball template and ball speed are Inspector properties. Edit the script to change how the player moves, or copy the
-file and the template into another project. The demo's input map locks the mouse while the game
-has input.
+speeds, mouse sensitivity, camera name, ball template and ball speed are Inspector properties. Edit
+the script to change how the player moves, or copy the file and the template into another project.
+The demo's input map locks the mouse while the game has input.
 
 ## Callbacks
 
@@ -105,7 +107,7 @@ name (`self().child("Camera")`) or list them all (`children()`), make a camera t
 renders through (`camera.make_active_camera()`, restored by Stop Game), read and set local
 transforms, read world positions, set velocities, apply impulses, raycast and test overlaps
 against the live physics world, find entities by name, spawn and destroy entities, and log to the
-editor. The header documents each call.
+editor, and read and drive joints. The header documents each call.
 
 Each frame runs every `on_update`, then animation and physics, then the contact callbacks for that
 step. Stop Game calls `on_stop` and restores the authored scene, so scripts can change the scene
@@ -157,6 +159,27 @@ void on_contact_begin(relay::Entity) override { self().destroy(); }
   `entity.children()` lists direct children.
 
 All queries use the running physics world, including spawned bodies and excluding destroyed ones.
+
+## Joints
+
+Joints are authored in the editor (the **Joint** component) and scripts can drive them:
+
+```cpp
+void on_update(double) override {
+    // A drawbridge on a hinge joint: raise it while "interact" is held, then let it fall.
+    if (relay::input::held("interact")) self().set_joint_motor(30.0);
+    else self().stop_joint_motor();
+    if (const auto angle = self().joint_position(); angle && *angle > 80.0) self().stop_joint_motor();
+}
+```
+
+- `entity.joint_position()` is a hinge's angle in degrees, a slider's travel in metres from where
+  it started, or a distance joint's current length. Hinge angles and slider travel follow the
+  right-hand rule about the joint's axis.
+- `entity.set_joint_motor(speed)` drives a hinge (degrees per second) or slider (metres per
+  second) up to the motor force set in the Inspector; `stop_joint_motor()` lets it move freely.
+- Entities spawned with joints, from templates or clones, join their partners at once. Destroying
+  a node releases the bodies joined to it.
 
 ## Trust
 

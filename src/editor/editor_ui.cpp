@@ -502,6 +502,16 @@ struct EditorUi::Impl {
     std::array<char, 65> template_name{};
     bool open_template_dialog{}, template_replace{};
     bool asset_listing_truncated{}, assets_focused{}, hierarchy_focused{};
+    // Hierarchy search: a name fragment and node types; either lists matching nodes flat.
+    std::array<char, 65> hierarchy_query{};
+    std::set<std::string> hierarchy_type_filters;
+    bool hierarchy_search_focus{};
+    // Applied to every row with children for one frame by the collapse/expand-all button.
+    std::optional<bool> hierarchy_open_all;
+    bool hierarchy_any_open{}, hierarchy_rows_open{};
+    // "Show in hierarchy": ancestors to open and the row to scroll to on the next frame.
+    std::set<std::string> hierarchy_reveal;
+    std::string hierarchy_scroll_to;
     std::string assets_root = "assets";
     std::vector<std::string> undo_labels, redo_labels;
     std::array<bool, 9> panel_open{true, true, true, false, true, true, false, false, false};
@@ -1664,6 +1674,42 @@ struct EditorUi::Impl {
                     if (corner < other) line(corners[corner], corners[other]);
                 }
         }
+        // Joints: a cross at the anchor, the hinge or slider axis, and a line to the partner.
+        const auto* joint_values = field(*result, "joints");
+        if (joint_values && joint_values->array())
+            for (const auto& value : *joint_values->array()) {
+                const auto* joint = value.object();
+                Vec3 anchor{}, axis{}, partner{};
+                if (!joint || !read_vector(field(*joint, "anchor"), anchor) ||
+                    !read_vector(field(*joint, "axis"), axis)) continue;
+                const auto selected = string_or(*joint, "entity") == selection;
+                const auto enabled = boolean_or(*joint, "enabled", true);
+                const ImU32 color = selected ? IM_COL32(255, 194, 67, 255) :
+                                      enabled ? IM_COL32(176, 140, 255, 220) :
+                                                IM_COL32(147, 156, 165, 110);
+                const float thickness = selected ? 2.0F : 1.4F;
+                const auto segment = [&](const Vec3 from, const Vec3 to) {
+                    auto a = camera_point(from), b = camera_point(to);
+                    if (a.z > -near && b.z > -near) return;
+                    if (a.z > -near || b.z > -near) {
+                        const double fraction = (-near - a.z) / (b.z - a.z);
+                        const Vec3 clipped{a.x + fraction * (b.x - a.x),
+                                           a.y + fraction * (b.y - a.y), -near};
+                        if (a.z > -near) a = clipped; else b = clipped;
+                    }
+                    const auto first = project(a), last = project(b);
+                    if (std::isfinite(first.x) && std::isfinite(first.y) &&
+                        std::isfinite(last.x) && std::isfinite(last.y))
+                        viewport_draw_list->AddLine(first, last, color, thickness);
+                };
+                constexpr double cross = 0.08;
+                for (const Vec3 direction : {Vec3{cross, 0, 0}, Vec3{0, cross, 0}, Vec3{0, 0, cross}})
+                    segment(add(anchor, scaled(direction, -1.0)), add(anchor, direction));
+                const auto type = string_or(*joint, "type");
+                if (type == "hinge" || type == "slider")
+                    segment(add(anchor, scaled(axis, -0.4)), add(anchor, scaled(axis, 0.4)));
+                if (read_vector(field(*joint, "partner"), partner)) segment(anchor, partner);
+            }
         viewport_draw_list->PopClipRect();
     }
 
@@ -2365,11 +2411,20 @@ struct EditorUi::Impl {
 
         if (selections.contains(handle)) flags |= ImGuiTreeNodeFlags_Selected;
 
+        if (has_children && hierarchy_open_all)
+            ImGui::SetNextItemOpen(*hierarchy_open_all, ImGuiCond_Always);
+        else if (has_children && hierarchy_reveal.contains(handle))
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
         // Hierarchy highlights meet edge-to-edge; other controls keep normal spacing.
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0F));
         const bool open = ImGui::TreeNodeEx(handle.c_str(), flags, "%s", editing ? "" : name.c_str());
         ImGui::PopStyleVar();
         note_item("entity:" + handle);
+        if (has_children && open) hierarchy_rows_open = true;
+        if (hierarchy_scroll_to == handle) {
+            ImGui::SetScrollHereY(0.5F);
+            hierarchy_scroll_to.clear();
+        }
         const auto row_min = ImGui::GetItemRectMin();
         const auto row_max = ImGui::GetItemRectMax();
         // The node type is derived from its components; plain nodes stay unlabelled.
@@ -2474,15 +2529,240 @@ struct EditorUi::Impl {
         ImGui::PopStyleVar(3); ImGui::PopStyleColor(); ImGui::PopID();
     }
 
+    [[nodiscard]] bool hierarchy_search_active() const {
+        return hierarchy_query[0] != '\0' || !hierarchy_type_filters.empty();
+    }
+
+    // Whether a derived node type is `wanted` or one of its subtypes.
+    [[nodiscard]] bool type_within(std::string type, const std::string& wanted) const {
+        for (int depth = 0; !type.empty() && depth < 32; ++depth) {
+            if (type == wanted) return true;
+            const auto* info = node_type_info(type);
+            type = info ? string_or(*info, "parent") : std::string{};
+        }
+        return false;
+    }
+
+    // Ancestor names from the top, such as "Environment / Props"; empty for top-level nodes.
+    [[nodiscard]] std::string entity_parent_path(const JsonValue::Object& entity) const {
+        std::vector<std::string> names;
+        for (auto parent = string_or(entity, "parent"); !parent.empty() && names.size() < 64;) {
+            const auto* node = find_entity(parent);
+            if (!node) break;
+            names.insert(names.begin(), string_or(*node, "name"));
+            parent = string_or(*node, "parent");
+        }
+        std::string path;
+        for (const auto& name : names) path += (path.empty() ? "" : " / ") + name;
+        return path;
+    }
+
+    // Leaves the search and shows `handle` in the tree, opening its ancestors.
+    void reveal_entity(const std::string& handle) {
+        hierarchy_query.fill('\0');
+        hierarchy_type_filters.clear();
+        const auto* entity = find_entity(handle);
+        for (auto parent = entity ? string_or(*entity, "parent") : std::string{}; !parent.empty();) {
+            hierarchy_reveal.insert(parent);
+            const auto* node = find_entity(parent);
+            parent = node ? string_or(*node, "parent") : std::string{};
+        }
+        hierarchy_scroll_to = handle;
+        select(handle);
+    }
+
+    void ensure_node_type_catalog() {
+        if (!node_type_catalog.object())
+            if (auto types = call("nodes.types", {}, false)) node_type_catalog = std::move(*types);
+    }
+
+    // A square toolbar button drawn as a funnel, tinted while filters are active.
+    bool filter_button(const char* id, const bool active) {
+        const float size = ImGui::GetFrameHeight();
+        if (active) ImGui::PushStyleColor(ImGuiCol_Button, editor_palette().accent_soft);
+        const bool clicked = ImGui::Button(id, ImVec2(size, size));
+        if (active) ImGui::PopStyleColor();
+        auto* list = ImGui::GetWindowDrawList();
+        const auto low = ImGui::GetItemRectMin(), high = ImGui::GetItemRectMax();
+        const float width = high.x - low.x;
+        const float cx = low.x + width * 0.5F, top = low.y + width * 0.28F;
+        const float neck = low.y + width * 0.55F, bottom = low.y + width * 0.74F;
+        const ImU32 color = active ? editor_palette().accent : editor_palette().text_dim;
+        const ImVec2 funnel[]{{low.x + width * 0.24F, top}, {high.x - width * 0.24F, top},
+                              {cx + width * 0.07F, neck}, {cx + width * 0.07F, bottom},
+                              {cx - width * 0.07F, bottom + width * 0.05F}, {cx - width * 0.07F, neck}};
+        list->AddConvexPolyFilled(funnel, 6, color);
+        return clicked;
+    }
+
+    // A square toolbar button with two chevrons: pointing apart to expand every row, or together
+    // to collapse them when `collapse` is set.
+    bool expand_collapse_button(const char* id, const bool collapse) {
+        const float size = ImGui::GetFrameHeight();
+        const bool clicked = ImGui::Button(id, ImVec2(size, size));
+        auto* list = ImGui::GetWindowDrawList();
+        const auto low = ImGui::GetItemRectMin();
+        const float width = ImGui::GetItemRectSize().x;
+        const float cx = low.x + width * 0.5F, half = width * 0.2F, rise = width * 0.1F;
+        const ImU32 color = ImGui::IsItemHovered() ? editor_palette().text : editor_palette().text_dim;
+        const float thickness = std::max(1.0F, 1.5F * ui_scale);
+        for (const float centre : {low.y + width * 0.33F, low.y + width * 0.67F}) {
+            const bool upper = centre < low.y + width * 0.5F;
+            // Expanding: the upper chevron points up and the lower down; collapsing, the reverse.
+            const float tip = (upper != collapse) ? -rise : rise;
+            const ImVec2 chevron[]{{cx - half, centre - tip}, {cx, centre + tip}, {cx + half, centre - tip}};
+            list->AddPolyline(chevron, 3, color, ImDrawFlags_None, thickness);
+        }
+        return clicked;
+    }
+
+    void draw_hierarchy_search_bar() {
+        const auto& style = ImGui::GetStyle();
+        const float button = ImGui::GetFrameHeight();
+        if (hierarchy_search_focus) {
+            ImGui::SetKeyboardFocusHere();
+            hierarchy_search_focus = false;
+        }
+        ImGui::SetNextItemWidth(-(button * 2.0F + style.ItemSpacing.x * 2.0F));
+        ImGui::InputTextWithHint("##hierarchy_search", "Search nodes", hierarchy_query.data(),
+                                 hierarchy_query.size());
+        note_item("hierarchy:search");
+        if (ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+            hierarchy_query.fill('\0');
+        ImGui::SameLine();
+        ImGui::BeginDisabled(hierarchy_search_active());
+        if (expand_collapse_button("##hierarchy_expand", hierarchy_any_open))
+            hierarchy_open_all = !hierarchy_any_open;
+        ImGui::EndDisabled();
+        note_item("hierarchy:expand_all");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(hierarchy_any_open ? "Collapse all" : "Expand all");
+        ImGui::SameLine();
+        const bool filtering = !hierarchy_type_filters.empty();
+        if (filter_button("##hierarchy_filter", filtering)) {
+            ensure_node_type_catalog();
+            ImGui::OpenPopup("##hierarchy_filters");
+        }
+        note_item("hierarchy:filter");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(filtering ? "Filter by node type (%zu active)" : "Filter by node type",
+                              hierarchy_type_filters.size());
+        const auto* catalog = node_type_catalog.object();
+        const auto* types = catalog ? field(*catalog, "types") : nullptr;
+        if (ImGui::BeginPopup("##hierarchy_filters")) {
+            // Types are listed as their tree; choosing a category includes its subtypes.
+            ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
+            if (types && types->array())
+                for (const auto& value : *types->array()) {
+                    const auto* type = value.object();
+                    if (!type) continue;
+                    const auto id = string_or(*type, "id");
+                    int depth = 0;
+                    for (auto parent = string_or(*type, "parent"); !parent.empty() && depth < 16; ++depth) {
+                        const auto* info = node_type_info(parent);
+                        parent = info ? string_or(*info, "parent") : std::string{};
+                    }
+                    const auto label = std::string(static_cast<std::size_t>(depth) * 3U, ' ') +
+                                       string_or(*type, "name");
+                    bool enabled = hierarchy_type_filters.contains(id);
+                    if (ImGui::MenuItem(label.c_str(), nullptr, &enabled)) {
+                        if (enabled) hierarchy_type_filters.insert(id);
+                        else hierarchy_type_filters.erase(id);
+                    }
+                    note_item("hierarchy:filter:" + id);
+                }
+            ImGui::PopItemFlag();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear filters", nullptr, false, !hierarchy_type_filters.empty()))
+                hierarchy_type_filters.clear();
+            ImGui::EndPopup();
+        }
+        // Active filters as removable chips.
+        bool first = true;
+        for (const auto& id : std::vector<std::string>(hierarchy_type_filters.begin(),
+                                                       hierarchy_type_filters.end())) {
+            const auto* info = node_type_info(id);
+            const std::string chip = (info ? string_or(*info, "name") : id) + "  x##type_chip_" + id;
+            const float width = ImGui::CalcTextSize(chip.c_str(), nullptr, true).x +
+                                style.FramePadding.x * 2.0F;
+            if (!first && ImGui::GetContentRegionAvail().x > width + style.ItemSpacing.x)
+                ImGui::SameLine();
+            first = false;
+            if (ImGui::SmallButton(chip.c_str())) hierarchy_type_filters.erase(id);
+        }
+    }
+
+    // One search result: the node's name with its ancestors, and its type on the right.
+    void draw_hierarchy_result(const JsonValue::Object& entity) {
+        const auto handle = string_or(entity, "entity");
+        const auto name = string_or(entity, "name", "Entity");
+        drawing_rows.push_back(handle);
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                   ImGuiTreeNodeFlags_SpanAvailWidth;
+        if (selections.contains(handle)) flags |= ImGuiTreeNodeFlags_Selected;
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0F));
+        ImGui::TreeNodeEx(("result:" + handle).c_str(), flags, "%s", name.c_str());
+        ImGui::PopStyleVar();
+        note_item("hierarchy:result:" + handle);
+        const auto row_min = ImGui::GetItemRectMin(), row_max = ImGui::GetItemRectMax();
+        if (ImGui::IsItemClicked()) {
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) reveal_entity(handle);
+            else click_selection(handle, true);
+        }
+        if (ImGui::BeginPopupContextItem()) {
+            if (!selections.contains(handle)) select(handle);
+            if (ImGui::MenuItem("Show in hierarchy")) reveal_entity(handle);
+            if (ImGui::MenuItem("Duplicate", "Ctrl+D")) duplicate_selection();
+            if (ImGui::MenuItem("Destroy", "Del")) mutate("scene.destroy", entity_field(handle), "Entity destroyed");
+            ImGui::EndPopup();
+        }
+        auto* list = ImGui::GetWindowDrawList();
+        const float text_y = row_min.y + (row_max.y - row_min.y - ImGui::GetTextLineHeight()) * 0.5F;
+        const auto path = entity_parent_path(entity);
+        const float name_end = row_min.x + ImGui::GetTreeNodeToLabelSpacing() +
+                               ImGui::CalcTextSize(name.c_str()).x + ImGui::GetStyle().ItemSpacing.x;
+        const auto type = string_or(entity, "type", "Node");
+        const auto type_size = ImGui::CalcTextSize(type.c_str());
+        const float type_x = row_max.x - type_size.x - 6.0F * ui_scale;
+        const auto faint = ImGui::GetColorU32(editor_color(editor_palette().text_faint));
+        list->PushClipRect(ImVec2(name_end, row_min.y), ImVec2(type_x - 4.0F * ui_scale, row_max.y), true);
+        list->AddText(ImVec2(name_end, text_y), faint, path.empty() ? "top level" : path.c_str());
+        list->PopClipRect();
+        if (type != "Node") list->AddText(ImVec2(type_x, text_y), faint, type.c_str());
+    }
+
     void draw_hierarchy() {
         drawing_rows.clear();
         hierarchy_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         if (inline_rename.kind == RenameKind::entity && !find_entity(inline_rename.target))
             inline_rename = {};
+        draw_hierarchy_search_bar();
         const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
         if (begin_region("##tree", ImVec2(0.0F, -footer))) {
-            for (const auto root : roots)
-                draw_tree_node(root);
+            if (hierarchy_search_active()) {
+                const auto query = lowercase(hierarchy_query.data());
+                std::size_t matches = 0;
+                for (const auto* entity : entities) {
+                    if (!query.empty() && lowercase(string_or(*entity, "name")).find(query) == std::string::npos)
+                        continue;
+                    const auto type = string_or(*entity, "type", "Node");
+                    if (!hierarchy_type_filters.empty() &&
+                        std::none_of(hierarchy_type_filters.begin(), hierarchy_type_filters.end(),
+                                     [&](const std::string& wanted) { return type_within(type, wanted); }))
+                        continue;
+                    draw_hierarchy_result(*entity);
+                    ++matches;
+                }
+                if (matches == 0)
+                    ImGui::TextColored(editor_color(editor_palette().text_faint), "No matching nodes.");
+            } else {
+                hierarchy_rows_open = false;
+                for (const auto root : roots)
+                    draw_tree_node(root);
+                hierarchy_any_open = hierarchy_rows_open;
+                hierarchy_open_all.reset();
+                hierarchy_reveal.clear();
+            }
             // The space below the rows clears the selection, accepts drops at the root, and
             // offers entity creation.
             const auto available = ImGui::GetContentRegionAvail();
@@ -2992,6 +3272,148 @@ struct EditorUi::Impl {
         }
     }
 
+    void draw_joint_section(const JsonValue::Object& entity) {
+        const auto* joint = component(entity, "joint");
+        if (!joint || !component_header("Joint", "joint")) return;
+        const auto joint_request = entity_field(selection);
+        const auto set = [&](const std::string& fields, const char* label) {
+            mutate("scene.set_joint", joint_request + fields, label);
+        };
+        constexpr std::array<const char*, 5> type_names{"Fixed", "Point (ball and socket)", "Hinge",
+                                                        "Slider", "Distance (rope or spring)"};
+        constexpr std::array<const char*, 5> type_values{"fixed", "point", "hinge", "slider",
+                                                         "distance"};
+        const auto type_text = string_or(*joint, "type", "hinge");
+        std::size_t type = 2;
+        for (std::size_t index = 0; index < type_values.size(); ++index)
+            if (type_text == type_values[index]) type = index;
+        const bool hinge = type == 2, slider = type == 3, distance = type == 4;
+        const bool open = ImGui::BeginCombo("Joint type", type_names[type]);
+        note_item("joint:type");
+        if (open) {
+            for (std::size_t index = 0; index < type_names.size(); ++index) {
+                if (ImGui::Selectable(type_names[index], index == type))
+                    set(std::string{",\"type\":\""} + type_values[index] + '"', "Joint type updated");
+                note_item(std::string{"joint:type:"} + type_values[index]);
+            }
+            ImGui::EndCombo();
+        }
+        bool enabled = boolean_or(*joint, "enabled", true);
+        if (ImGui::Checkbox("Enabled##joint", &enabled))
+            set(std::string{",\"enabled\":"} + (enabled ? "true" : "false"), "Joint updated");
+
+        // The partner: any other node with a physics body or collider, or the world.
+        const auto connected = string_or(*joint, "connected");
+        const auto* partner = connected.empty() ? nullptr : find_entity(connected);
+        const auto preview = partner ? string_or(*partner, "name") : std::string{"World"};
+        const bool choosing = ImGui::BeginCombo("Connected to", preview.c_str());
+        note_item("joint:connected");
+        if (choosing) {
+            if (ImGui::Selectable("World", connected.empty()))
+                set(",\"connected\":\"\"", "Joint connected to the world");
+            for (const auto* candidate : entities) {
+                const auto handle = string_or(*candidate, "entity");
+                if (handle == selection || (!component(*candidate, "physics_body") &&
+                                            !component(*candidate, "collider")))
+                    continue;
+                const auto label = string_or(*candidate, "name") + "##" + handle;
+                if (ImGui::Selectable(label.c_str(), handle == connected))
+                    set(",\"connected\":\"" + handle + '"', "Joint connected");
+                note_item("joint:connected:" + handle);
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The body this node is joined to, or a fixed point in the world");
+
+        auto anchor = editor_vector(*joint, "anchor", {0, 0, 0});
+        if (const auto mask = drag_vector3("Anchor", anchor, 0.05F, 84.0F * ui_scale))
+            set(vector_fields(anchor, {"anchor_x", "anchor_y", "anchor_z"}, mask), "Joint anchor updated");
+        if (hinge || slider) {
+            auto axis = editor_vector(*joint, "axis", {0, 1, 0});
+            if (const auto mask = drag_vector3("Axis", axis, 0.05F, 84.0F * ui_scale);
+                mask && (axis[0] != 0.0 || axis[1] != 0.0 || axis[2] != 0.0))
+                set(vector_fields(axis, {"axis_x", "axis_y", "axis_z"}, mask), "Joint axis updated");
+        }
+        if (distance) {
+            auto far = editor_vector(*joint, "connected_anchor", {0, 0, 0});
+            if (const auto mask = drag_vector3(partner ? "Other anchor" : "World point", far, 0.05F,
+                                               84.0F * ui_scale))
+                set(vector_fields(far, {"connected_anchor_x", "connected_anchor_y",
+                                        "connected_anchor_z"}, mask),
+                    "Joint anchor updated");
+        }
+        if (hinge || slider || distance) {
+            bool limits = boolean_or(*joint, "limits", false);
+            const char* limits_label = hinge ? "Limit angle" : slider ? "Limit travel" : "Limit length";
+            if (ImGui::Checkbox(limits_label, &limits))
+                set(std::string{",\"limits\":"} + (limits ? "true" : "false"), "Joint limits updated");
+            if (distance && !limits)
+                ImGui::TextDisabled("Keeps the length it has when the game starts.");
+            if (limits) {
+                // Clamped to what the joint type accepts, so a drag never produces a refusal.
+                auto minimum = number_or(*joint, "limit_min", 0.0);
+                auto maximum = number_or(*joint, "limit_max", 0.0);
+                const char* unit = hinge ? "%.1f deg" : "%.2f m";
+                if (drag_scalar("Minimum", minimum, hinge ? 1.0F : 0.05F, unit)) {
+                    minimum = hinge ? std::clamp(minimum, -180.0, 0.0)
+                            : slider ? std::min(minimum, 0.0)
+                                     : std::clamp(minimum, 0.0, maximum);
+                    set(",\"limit_min\":" + number_text(minimum), "Joint limits updated");
+                }
+                if (drag_scalar("Maximum", maximum, hinge ? 1.0F : 0.05F, unit)) {
+                    maximum = hinge ? std::clamp(maximum, 0.0, 180.0)
+                            : slider ? std::max(maximum, 0.0)
+                                     : std::max(maximum, minimum);
+                    set(",\"limit_max\":" + number_text(maximum), "Joint limits updated");
+                }
+            }
+        }
+        if (hinge || slider) {
+            bool motor = boolean_or(*joint, "motor", false);
+            if (ImGui::Checkbox("Motor", &motor))
+                set(std::string{",\"motor\":"} + (motor ? "true" : "false"), "Joint motor updated");
+            if (motor) {
+                auto speed = number_or(*joint, "motor_speed", 90.0);
+                if (drag_scalar("Speed", speed, hinge ? 1.0F : 0.05F, hinge ? "%.1f deg/s" : "%.2f m/s"))
+                    set(",\"motor_speed\":" + number_text(speed), "Joint motor updated");
+                auto force = number_or(*joint, "motor_force", 1000.0);
+                if (drag_scalar(hinge ? "Max torque" : "Max force", force, 10.0F,
+                                hinge ? "%.0f N m" : "%.0f N"))
+                    set(",\"motor_force\":" + number_text(std::max(force, 0.0)), "Joint motor updated");
+            }
+        }
+        if (distance) {
+            auto frequency = number_or(*joint, "spring_frequency", 0.0);
+            if (drag_scalar("Spring frequency", frequency, 0.05F, "%.2f Hz"))
+                set(",\"spring_frequency\":" + number_text(std::clamp(frequency, 0.0, 1000.0)),
+                    "Joint spring updated");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 keeps the length rigid");
+            auto damping = number_or(*joint, "spring_damping", 0.5);
+            if (drag_scalar("Spring damping", damping, 0.01F))
+                set(",\"spring_damping\":" + number_text(std::clamp(damping, 0.0, 100.0)),
+                    "Joint spring updated");
+        }
+        if (partner) {
+            bool collide = boolean_or(*joint, "collide_connected", false);
+            if (ImGui::Checkbox("Collide with connected", &collide))
+                set(std::string{",\"collide_connected\":"} + (collide ? "true" : "false"),
+                    "Joint updated");
+        }
+        // Say plainly why a joint would do nothing.
+        const auto dynamic = [&](const JsonValue::Object* node) {
+            const auto* body = node ? component(*node, "physics_body") : nullptr;
+            return body && number_or(*body, "type", 1) == 1;
+        };
+        const auto warning = editor_color(editor_palette().warning);
+        if (!component(entity, "physics_body") && !component(entity, "collider"))
+            ImGui::TextColored(warning, "Add a physics body or collider to this node.");
+        else if (!dynamic(&entity) && !dynamic(partner))
+            ImGui::TextColored(warning, "One of the joined bodies must be dynamic.");
+        if (!enabled)
+            ImGui::TextDisabled("Removing the connected node disables its joints.");
+    }
+
     std::vector<std::string> script_behaviours() const {
         std::vector<std::string> names;
         const auto* status = scripts();
@@ -3394,6 +3816,7 @@ struct EditorUi::Impl {
         draw_light_section(*entity);
         draw_collider_section(*entity);
         draw_physics_body_section(*entity);
+        draw_joint_section(*entity);
         draw_script_sections(*entity);
         draw_add_component();
     }
@@ -4538,9 +4961,9 @@ struct EditorUi::Impl {
         ImGui::TextWrapped("Scripts read actions, such as jump, with relay::input::pressed, and "
                            "axes from -1 to 1, such as move_x, with relay::input::axis.");
         ImGui::PopStyleColor();
-        ImGui::TextColored(editor_color(palette.text_faint), "%s%s",
-                           std::string{input_map_filename}.c_str(),
-                           input_file_saved ? "" : "  (engine defaults until you change something)");
+        ImGui::TextColored(editor_color(palette.text_faint), "%s",
+                           input_file_saved ? "Saved in the project file"
+                                            : "Engine defaults until you change something");
         if (ImGui::Checkbox("Lock the mouse cursor while the game has input", &input_edit.lock_mouse))
             changed = true;
         ImGui::SameLine();
@@ -4991,6 +5414,10 @@ struct EditorUi::Impl {
             return;
         const auto& shortcuts = ImGui::GetIO();
         if (update_asset_shortcuts()) return;
+        if (hierarchy_focused && shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+            hierarchy_search_focus = true;
+            return;
+        }
         if (!assets_focused && ImGui::IsKeyPressed(ImGuiKey_F2, false) && panel_open[0] &&
             selections.handles.size() == 1U) {
             if (const auto* entity = find_entity(selection))
@@ -5130,6 +5557,25 @@ struct EditorUi::Impl {
                                        boolean_or(*entry, "importable", false),
                                        boolean_or(*entry, "protected", false)});
         return true;
+    }
+
+    // Lists and opens every folder below the root, breadth first, up to 256 folders so a huge
+    // project cannot stall the editor.
+    void expand_all_asset_folders() {
+        std::deque<std::string> pending{std::string{}};
+        std::size_t opened = 0;
+        while (!pending.empty() && opened < 256U) {
+            const auto folder = pending.front();
+            pending.pop_front();
+            if (!folder.empty()) {
+                if (!list_asset_folder(folder)) continue;
+                expanded_asset_folders.insert(folder);
+                ++opened;
+            }
+            if (const auto found = asset_folders.find(folder); found != asset_folders.end())
+                for (const auto& entry : found->second)
+                    if (entry.folder) pending.push_back(entry.path);
+        }
     }
 
     void refresh_asset_listing() {
@@ -5391,11 +5837,11 @@ struct EditorUi::Impl {
         ImGui::EndPopup();
     }
 
-    static constexpr std::array<std::pair<const char*, const char*>, 11> asset_kind_labels{{
+    static constexpr std::array<std::pair<const char*, const char*>, 10> asset_kind_labels{{
         {"model", "Models"}, {"scene", "Scenes"}, {"template", "Templates"},
         {"image", "Images"}, {"shader", "Shaders"},
         {"script", "Scripts"}, {"text", "Text"}, {"media", "Audio and video"},
-        {"folder", "Folders"}, {"project", "Project files"}, {"other", "Other"}}};
+        {"folder", "Folders"}, {"other", "Other"}}};
 
     void draw_asset_search_bar() {
         const auto& style = ImGui::GetStyle();
@@ -5404,7 +5850,7 @@ struct EditorUi::Impl {
             ImGui::SetKeyboardFocusHere();
             asset_search_focus = false;
         }
-        ImGui::SetNextItemWidth(-(button + style.ItemSpacing.x));
+        ImGui::SetNextItemWidth(-(button * 2.0F + style.ItemSpacing.x * 2.0F));
         if (ImGui::InputTextWithHint("##asset_search", "Search assets", asset_query.data(),
                                      asset_query.size()))
             run_asset_search();
@@ -5414,27 +5860,23 @@ struct EditorUi::Impl {
             run_asset_search();
         }
         ImGui::SameLine();
+        const bool any_open = !expanded_asset_folders.empty();
+        ImGui::BeginDisabled(asset_search_active());
+        if (expand_collapse_button("##asset_expand", any_open)) {
+            if (any_open) expanded_asset_folders.clear();
+            else expand_all_asset_folders();
+        }
+        ImGui::EndDisabled();
+        note_item("assets:expand_all");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(any_open ? "Collapse all" : "Expand all");
+        ImGui::SameLine();
         const bool filtering = !asset_kind_filters.empty();
-        if (filtering) ImGui::PushStyleColor(ImGuiCol_Button, editor_palette().accent_soft);
-        if (ImGui::Button("##asset_filter", ImVec2(button, button))) ImGui::OpenPopup("##asset_filters");
-        if (filtering) ImGui::PopStyleColor();
+        if (filter_button("##asset_filter", filtering)) ImGui::OpenPopup("##asset_filters");
         note_item("assets:filter");
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(filtering ? "Filter by type (%zu active)" : "Filter by type",
                               asset_kind_filters.size());
-        {
-            // A funnel: a wide top narrowing to a short stem.
-            auto* list = ImGui::GetWindowDrawList();
-            const auto low = ImGui::GetItemRectMin(), high = ImGui::GetItemRectMax();
-            const float size = high.x - low.x;
-            const float cx = low.x + size * 0.5F, top = low.y + size * 0.28F;
-            const float neck = low.y + size * 0.55F, bottom = low.y + size * 0.74F;
-            const ImU32 color = filtering ? editor_palette().accent : editor_palette().text_dim;
-            const ImVec2 funnel[]{{low.x + size * 0.24F, top}, {high.x - size * 0.24F, top},
-                                  {cx + size * 0.07F, neck}, {cx + size * 0.07F, bottom},
-                                  {cx - size * 0.07F, bottom + size * 0.05F}, {cx - size * 0.07F, neck}};
-            list->AddConvexPolyFilled(funnel, 6, color);
-        }
         if (ImGui::BeginPopup("##asset_filters")) {
             // Toggling a category keeps the menu open so several can be picked in one go.
             ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);

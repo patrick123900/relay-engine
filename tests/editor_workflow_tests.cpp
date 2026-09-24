@@ -442,9 +442,9 @@ void asset_files() {
         }
         return result;
     };
-    check(names("") == std::vector<std::string>{"scenes/!", "notes.txt", "project.relayproject!",
-                                                "robot.obj*"},
-          "browse lists folders first, marks models, protects project-owned files, hides dot files");
+    check(names("") == std::vector<std::string>{"scenes/!", "notes.txt", "robot.obj*"},
+          "browse lists folders first, marks models, protects project-owned files, and hides dot "
+          "files and the project file");
     check(names("scenes") == std::vector<std::string>{"main.relay.json!"},
           "browse marks project member scenes as protected");
     (void)request(protocol, "assets.create_folder", "\"path\":\"models\"");
@@ -475,7 +475,7 @@ void asset_files() {
     check(!std::filesystem::exists("projects/files/notes.txt") &&
               std::filesystem::exists("projects/files/" + trash) && trash.starts_with(".relay-trash/"),
           "deleting moves the file into the hidden project trash");
-    check(names("") == std::vector<std::string>{"meshes/", "scenes/!", "project.relayproject!"},
+    check(names("") == std::vector<std::string>{"meshes/", "scenes/!"},
           "trash stays hidden from the browser");
     (void)request(protocol, "assets.browse", "\"directory\":\"gone\"", false);
     std::filesystem::create_directories("projects/files/textures/wood");
@@ -534,11 +534,43 @@ void demo_project() {
     check(relay::collision_debug_boxes(engine.scene(), true, &engine.assets()).boxes.size() == colliders,
           "every demo collider, including convex and mesh shapes, builds");
     const double start = engine.scene().get(wrecking_ball)->transform.position.y;
+    const auto named = [&](const std::string& name) {
+        for (const auto entity : engine.scene().entities())
+            if (engine.scene().get(entity)->name == name) return entity;
+        return relay::Entity{};
+    };
+    const auto link1 = named("Chain link 1"), link3 = named("Chain link 3");
+    const auto spinner = named("Spinner"), bungee = named("Bungee ball");
+    check(link1.valid() && link3.valid() && spinner.valid() && bungee.valid() &&
+              engine.scene().get(spinner)->joint && engine.scene().get(bungee)->joint,
+          "the demo has a joints playground");
+    const auto player = named("First Person Controller");
+    check(player.valid() && engine.scene().get(player)->scripts.size() == 1U &&
+              engine.scene().get(player)->scripts.front().behaviour == "FirstPersonController" &&
+              engine.scene().get(named("Camera"))->camera->active &&
+              engine.scene().active_camera() == named("Camera") && !named("Main camera").valid(),
+          "the showcase starts with a first person controller whose camera is the scene's camera");
+    check(!engine.run_game() && engine.run_game_error().find("trust") != std::string::npos,
+          "the showcase's controller script needs the project to be trusted");
+    // The rest checks the physics alone; relay_script_tests plays the scene with its script.
+    (void)engine.scene().set_scripts(player, {});
     check(engine.run_game(), "demo scene runs");
     engine.step(120);
     check(engine.scene().get(wrecking_ball)->transform.position.y < start - 2.0 &&
               !engine.physics().contact_events().events.empty(),
           "demo bodies fall and collide during Run Game");
+    const auto position = [&](const relay::Entity entity) {
+        return engine.scene().get(entity)->transform.position;
+    };
+    const auto first = position(link1);
+    const double reach = std::sqrt((first.x + 5.0) * (first.x + 5.0) + (first.y - 4.2) * (first.y - 4.2) +
+                                   (first.z + 9.0) * (first.z + 9.0));
+    check(position(link3).y < 3.6 && std::abs(reach - 0.6) < 0.03,
+          "the demo chain swings down, each link held at its length");
+    const auto turned = engine.physics().joint_position(engine.scene(), spinner);
+    check(turned && std::abs(*turned) > 60.0, "the demo spinner's motor turns it");
+    const auto stretch = engine.physics().joint_position(engine.scene(), bungee);
+    check(stretch && *stretch < 2.2, "the demo bungee ball is held on its spring");
     check(engine.stop_game(), "demo game session stops");
 }
 } // namespace
@@ -782,8 +814,46 @@ void input_mapping() {
     (void)request(protocol, "project.create",
                   "\"filename\":\"projects/controls/project.relayproject\",\"name\":\"Controls\"");
     request(protocol, "input.set_map", document);
-    check(std::filesystem::exists("projects/controls/input.relay-input.json"),
-          "the input map is saved beside the project file");
+    {
+        std::string load_error;
+        const auto saved = relay::load_project("projects/controls/project.relayproject", load_error);
+        check(saved && saved->input && saved->input->actions.size() == map.actions.size() &&
+                  !std::filesystem::exists("projects/controls/input.relay-input.json"),
+              "the input map is saved in the project file");
+        const auto listed = request(protocol, "input.map");
+        check(*relay::field(*listed.object(), "saved")->boolean() &&
+                  *relay::field(*listed.object(), "path")->string() ==
+                      "projects/controls/project.relayproject",
+              "input.map reports the project file that holds the map");
+    }
+    // A version 1 project keeps its map in input.relay-input.json; opening reads it and the next
+    // save moves it into the project file.
+    std::filesystem::create_directories("projects/legacy");
+    std::ofstream("projects/legacy/project.relayproject")
+        << R"({"format":"relay.project","version":1,"filename":"projects/legacy/project.relayproject",)"
+           R"("root":"projects/legacy","name":"Legacy","assets_directory":".","scenes_directory":"scenes",)"
+           R"("scenes":[],"startup_scene":""})";
+    std::ofstream("projects/legacy/input.relay-input.json") << relay::input_map_json(map);
+    request(protocol, "project.open", "\"filename\":\"projects/legacy/project.relayproject\"");
+    check(engine.input().map().actions.size() == map.actions.size() &&
+              std::filesystem::exists("projects/legacy/input.relay-input.json"),
+          "opening a version 1 project reads its input.relay-input.json");
+    auto legacy_map = map;
+    legacy_map.lock_mouse = true;
+    request(protocol, "input.set_map",
+            "\"map\":\"" + relay::json_escape(relay::input_map_json(legacy_map)) + '"');
+    {
+        std::string load_error;
+        const auto migrated = relay::load_project("projects/legacy/project.relayproject", load_error);
+        std::ifstream file("projects/legacy/project.relayproject");
+        const std::string text{std::istreambuf_iterator<char>(file), {}};
+        check(migrated && migrated->input && migrated->input->lock_mouse &&
+                  !migrated->legacy_input_file &&
+                  text.find("\"version\": 2") != std::string::npos &&
+                  !std::filesystem::exists("projects/legacy/input.relay-input.json"),
+              "saving moves the legacy map into a version 2 project file and removes the old file");
+    }
+    request(protocol, "project.open", "\"filename\":\"projects/controls/project.relayproject\"");
     request(protocol, "input.set_map", "\"map\":\"{}\"", false);
     request(protocol, "project.create",
             "\"filename\":\"projects/other/project.relayproject\",\"name\":\"Other\"");
@@ -869,11 +939,11 @@ void first_person_migration() {
     input.close();
     const auto replace = [&](const std::string& from, const std::string& to) {
         const auto at = text.find(from);
-        check(at != std::string::npos, "the v16 file has the expected shape");
+        check(at != std::string::npos, "the v17 file has the expected shape");
         text.replace(at, from.size(), to);
     };
-    replace("\"version\":16", "\"version\":15");
-    replace("\"scripts\":[]}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
+    replace("\"version\":17", "\"version\":15");
+    replace("\"scripts\":[],\"joint\":null}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
                                "\"sprint_speed\":8,\"jump_speed\":4,\"mouse_sensitivity\":0.2,"
                                "\"stick_look_speed\":120,\"invert_y\":true,\"ground_distance\":1.1,"
                                "\"camera\":\"Eyes\"}}");
@@ -892,6 +962,183 @@ void first_person_migration() {
     check(property("walk_speed").number == 5.0 && property("ground_distance").number == 1.1 &&
               property("invert_y").boolean && property("camera_name").text == "Eyes",
           "the script component keeps the controller's settings");
+}
+
+// Joints: protocol and scene rules, saving, copying, and each joint type simulated by Jolt.
+void joints() {
+    relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+    relay::ControlProtocol protocol(engine);
+    auto& scene = engine.scene();
+    // Rigs sit 10 m apart so they never touch each other.
+    const auto body = [&](const char* name, const relay::Vec3 position, const bool dynamic,
+                          const relay::Vec3 half = {0.25, 0.25, 0.25}) {
+        const auto entity = scene.create(name);
+        (void)scene.set_transform(entity, {position, {}, {1, 1, 1}});
+        relay::BoxCollider box;
+        box.half_extents = half;
+        (void)scene.set_collider(entity, box);
+        (void)scene.set_physics_body(entity, relay::PhysicsBody{
+            dynamic ? relay::PhysicsBody::Type::dynamic : relay::PhysicsBody::Type::static_body});
+        return entity;
+    };
+    const auto joint = [&](const relay::Entity entity, const std::string& fields, const bool ok = true) {
+        return request(protocol, "scene.set_joint",
+                       "\"entity\":\"" + entity.to_string() + "\"," + fields, ok);
+    };
+
+    const auto pendulum = body("Pendulum", {1, 5, 0}, true);
+    request(protocol, "component.add", "\"entity\":\"" + pendulum.to_string() + "\",\"component\":\"joint\"");
+    check(scene.get(pendulum)->joint && scene.get(pendulum)->joint->type == relay::Joint::Type::hinge &&
+              !scene.get(pendulum)->joint->connected.valid(),
+          "component.add gives a hinge joint to the world");
+    joint(pendulum, "\"connected\":\"" + pendulum.to_string() + '"', false);
+    joint(pendulum, "\"connected\":\"999:9\"", false);
+    joint(pendulum, "\"axis_x\":0,\"axis_y\":0,\"axis_z\":0", false);
+    joint(pendulum, "\"limits\":true,\"limit_min\":10", false);
+    joint(pendulum, "\"type\":\"slider\"");
+    check(scene.get(pendulum)->joint->limit_min == -1.0 && scene.get(pendulum)->joint->limit_max == 1.0,
+          "changing type resets the limits to that type's defaults");
+    joint(pendulum, "\"type\":\"point\",\"anchor_x\":-1");
+    check(scene.get(pendulum)->joint->type == relay::Joint::Type::point &&
+              scene.get(pendulum)->joint->anchor.x == -1.0,
+          "scene.set_joint edits type and anchor");
+    request(protocol, "scene.undo");
+    check(scene.get(pendulum)->joint->type == relay::Joint::Type::slider, "joint edits are undoable");
+    request(protocol, "scene.redo");
+
+    const auto plank = body("Plank", {11, 5, 0}, true, {1, 0.1, 0.1});
+    joint(plank, "\"type\":\"hinge\",\"anchor_x\":-1,\"axis_x\":0,\"axis_y\":0,\"axis_z\":1,"
+                 "\"limits\":true,\"limit_min\":-30,\"limit_max\":30");
+    const auto wheel = body("Wheel", {21, 5, 0}, true, {1, 0.1, 0.1});
+    joint(wheel, "\"type\":\"hinge\",\"motor\":true,\"motor_speed\":90,\"motor_force\":100000");
+    const auto welded = body("Welded", {31, 5, 0}, true);
+    joint(welded, "\"type\":\"fixed\"");
+    const auto rail = body("Rail car", {41, 5, 0}, true);
+    joint(rail, "\"type\":\"slider\",\"axis_x\":1,\"axis_y\":0,\"axis_z\":0");
+    const auto bob = body("Rope bob", {51, 3, 0}, true);
+    joint(bob, "\"type\":\"distance\",\"connected_anchor_x\":51,\"connected_anchor_y\":5,"
+               "\"connected_anchor_z\":0");
+    const auto frame = body("Door frame", {61, 5, 0}, false);
+    const auto door = body("Door", {62, 5, 0}, true, {0.5, 1, 0.05});
+    joint(door, "\"type\":\"hinge\",\"connected\":\"" + frame.to_string() + "\",\"anchor_x\":-0.5");
+    // Overlapping pairs on sliders along X: contacts would push the car along the rail.
+    const auto base = body("Base", {71, 5, 0}, false, {0.5, 0.5, 0.5});
+    const auto ghost = body("Ghost", {71.3, 5, 0}, true, {0.5, 0.5, 0.5});
+    joint(ghost, "\"type\":\"slider\",\"axis_x\":1,\"axis_y\":0,\"axis_z\":0,\"connected\":\"" +
+                     base.to_string() + '"');
+    const auto solid_base = body("Solid base", {81, 5, 0}, false, {0.5, 0.5, 0.5});
+    const auto solid = body("Solid", {81.3, 5, 0}, true, {0.5, 0.5, 0.5});
+    joint(solid, "\"type\":\"slider\",\"axis_x\":1,\"axis_y\":0,\"axis_z\":0,\"collide_connected\":true,"
+                 "\"connected\":\"" + solid_base.to_string() + '"');
+
+    // Removing a node disables joints to it, and undo brings both back.
+    request(protocol, "scene.destroy", "\"entity\":\"" + frame.to_string() + '"');
+    check(!scene.get(door)->joint->enabled && !scene.get(door)->joint->connected.valid(),
+          "destroying the connected node disables the joint instead of joining the world");
+    request(protocol, "scene.undo");
+    check(scene.contains(frame) && scene.get(door)->joint->enabled &&
+              scene.get(door)->joint->connected == frame,
+          "undo restores the connected node and the joint");
+
+    // Copies keep joints within the copy and disable joints that leave it.
+    {
+        const std::array pair{door, frame};
+        const auto both = relay::copy_selection(scene, pair);
+        const std::array single{door};
+        const auto alone = relay::copy_selection(scene, single);
+        relay::Scene target;
+        const auto pasted = relay::paste_selection(target, *both);
+        relay::Entity pasted_door{}, pasted_frame{};
+        for (const auto entity : target.entities())
+            (target.get(entity)->name.starts_with("Door frame") ? pasted_frame : pasted_door) = entity;
+        check(pasted.size() == 2U && target.get(pasted_door)->joint->connected == pasted_frame &&
+                  target.get(pasted_door)->joint->enabled,
+              "a pasted pair keeps its joint, pointing at the pasted partner");
+        check(alone && !alone->nodes.front().record.joint->enabled &&
+                  !alone->nodes.front().record.joint->connected.valid(),
+              "copying a node without its partner disables its joint");
+        const auto duplicate = scene.duplicate(door);
+        check(duplicate.valid() && scene.get(duplicate)->joint->connected == frame,
+              "duplicating in place keeps the partner");
+        (void)scene.destroy(duplicate);
+    }
+
+    // Scene v17 saves joints.
+    relay::Scene saved;
+    saved.restore_state(scene.capture_state());
+    std::string error;
+    check(relay::save_scene_file_atomic(saved, "joints.relay.json", error), "save the joint scene");
+    const auto loaded = relay::load_scene_file("joints.relay.json");
+    check(loaded && loaded.state->slots[door.index].record.joint == scene.get(door)->joint &&
+              loaded.state->slots[bob.index].record.joint == scene.get(bob)->joint,
+          "version 17 scenes save joints with their partners");
+
+    check(engine.run_game(), "the joint scene runs");
+    engine.step(30);
+    const auto distance = [&](const relay::Vec3 a, const relay::Vec3 b) {
+        return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+    };
+    const auto at = [&](const relay::Entity entity) { return scene.get(entity)->transform.position; };
+    check(std::abs(distance(at(pendulum), {0, 5, 0}) - 1.0) < 0.02 && at(pendulum).y < 4.8,
+          "a point joint swings its body around the pivot at a fixed distance");
+    engine.step(90);
+    const auto plank_angle = engine.physics().joint_position(scene, plank);
+    check(plank_angle && std::abs(*plank_angle + 30.0) < 3.0 &&
+              std::abs(scene.get(plank)->transform.rotation_degrees.z + 30.0) < 3.0,
+          "a hinge falls until its lower angle limit");
+    const auto turned = engine.physics().joint_position(scene, wheel);
+    const auto spin = engine.physics().angular_velocity(scene, wheel);
+    check(turned && spin && std::abs(spin->y - 3.14159265358979323846 / 2.0) < 0.05 &&
+              std::abs(at(wheel).y - 5.0) < 0.01,
+          "a hinge motor turns its body at the set speed about the axis");
+    check(engine.physics().set_joint_motor(scene, wheel, true, -90.0), "motors can be driven at runtime");
+    engine.step(30);
+    check(std::abs(engine.physics().angular_velocity(scene, wheel)->y + 3.14159265358979323846 / 2.0) < 0.05,
+          "a motor reverses when its speed changes");
+    check(distance(at(welded), {31, 5, 0}) < 0.01, "a fixed joint holds its body in place");
+    check(engine.physics().apply_impulse(scene, rail, {3, 3, 3}), "push the rail car");
+    check(engine.physics().apply_impulse(scene, bob, {0, 0, 3}), "push the rope bob");
+    engine.step(30);
+    check(at(rail).x > 41.5 && std::abs(at(rail).y - 5.0) < 0.01 && std::abs(at(rail).z) < 0.01,
+          "a slider moves only along its axis");
+    const auto travel = engine.physics().joint_position(scene, rail);
+    check(travel && std::abs(*travel - (at(rail).x - 41.0)) < 0.01, "slider position is its travel");
+    const auto rope = engine.physics().joint_position(scene, bob);
+    check(std::abs(distance(at(bob), {51, 5, 0}) - 2.0) < 0.05 && rope && std::abs(*rope - 2.0) < 0.05,
+          "a distance joint keeps its starting length");
+    check(std::abs(at(ghost).x - 71.3) < 0.01, "joined bodies pass through each other by default");
+    check(at(solid).x > 81.5, "collide_connected lets joined bodies push each other apart");
+    check(std::abs(at(door).y - 5.0) < 0.05, "a hinged door hangs on its static frame");
+
+    // A joint's partner destroyed during the game releases its body.
+    (void)scene.destroy(frame);
+    engine.physics().remove_missing_bodies(scene);
+    engine.step(30);
+    check(at(door).y < 4.5, "a body whose partner is destroyed falls free");
+
+    // Joints spawned during the game join their new bodies.
+    const auto rig = scene.create("Rig");
+    const auto hook = scene.create("Hook", rig);
+    (void)scene.set_transform(hook, {{91, 5, 0}, {}, {1, 1, 1}});
+    (void)scene.set_physics_body(hook, relay::PhysicsBody{relay::PhysicsBody::Type::static_body});
+    relay::BoxCollider small;
+    small.half_extents = {0.1, 0.1, 0.1};
+    (void)scene.set_collider(hook, small);
+    const auto swing = scene.create("Swing", rig);
+    (void)scene.set_transform(swing, {{92, 5, 0}, {}, {1, 1, 1}});
+    (void)scene.set_collider(swing, small);
+    (void)scene.set_physics_body(swing, relay::PhysicsBody{});
+    relay::Joint rope_joint;
+    rope_joint.type = relay::Joint::Type::point;
+    rope_joint.connected = hook;
+    rope_joint.anchor = {-1, 0, 0};
+    check(scene.set_joint(swing, rope_joint), "join the spawned pair");
+    engine.physics().add_bodies(scene, rig);
+    engine.step(30);
+    check(std::abs(distance(at(swing), {91, 5, 0}) - 1.0) < 0.02 && at(swing).y < 4.8,
+          "joints between entities spawned during the game work");
+    check(engine.stop_game() && scene.contains(frame) && at(pendulum).x == 1.0,
+          "Stop Game restores the authored joint scene");
 }
 
 int main() {
@@ -914,6 +1161,7 @@ int main() {
         input_mapping();
         demo_first_person_template();
         first_person_migration();
+        joints();
         std::cout << "Background editor workflow tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

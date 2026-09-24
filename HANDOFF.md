@@ -8,14 +8,14 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v36: 126 native methods. Scene v16, project v1, import manifest v3.
+- Protocol schema v38: 127 native methods. Scene v17, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
-  colliders, Jolt body simulation, a Unity-style component model with derived node types and
-  templates/prefabs shown in the node type tree, native C++ gameplay scripts, per-project input
-  mapping, a scripted first person controller template in the demo project, and portable project
-  export are implemented. Preserve unrelated
-  working-tree edits and inspect `git diff` before changing them.
+  colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
+  component model with derived node types and templates/prefabs shown in the node type tree, native
+  C++ gameplay scripts, per-project input mapping, a scripted first person controller template in
+  the demo project, and portable project export are implemented. Preserve unrelated working-tree
+  edits and inspect `git diff` before changing them.
 
 ## Product intent
 
@@ -60,8 +60,19 @@ without blocking simultaneous human editing.
   state and the selection follow moves and renames. Entries carry a name-based `kind`
   (`AssetKind` in `project_files.hpp`); `assets.search` walks the whole tree (hidden and symlinked
   entries skipped, 65,536 visited, 512 results) for a case-insensitive name fragment and optional
-  kinds. The panel's search box and Filter popup switch it to a flat result list with folder
-  paths and removable filter chips. The filter menu keeps itself open while toggling categories.
+  kinds. Listings and searches leave out `.relayproject` files (`hidden_from_assets`), and the
+  `project` kind is gone (protocol v38). The panel's search box and Filter popup switch it to a
+  flat result list with folder paths and removable filter chips. The filter menu keeps itself
+  open while toggling categories. The chevron button left of the filter collapses every folder,
+  or when none is open lists and opens all of them breadth first (`expand_all_asset_folders`,
+  at most 256 folders).
+- The Hierarchy has the same search bar: a case-insensitive name search and a node type filter
+  (from `nodes.types`, listed as a tree; a category matches its subtypes via `type_within`)
+  switch it to a flat list of matching nodes with their parent path and type. Double-click or
+  **Show in hierarchy** clears the search, opens the node's ancestors (`hierarchy_reveal`),
+  scrolls to it and selects it. Ctrl+F focuses the search. Its chevron button applies
+  `SetNextItemOpen` to every row with children for one frame (`hierarchy_open_all`); whether any
+  row is open is recorded while drawing and decides whether the button collapses or expands.
   **Open in file browser** is an editor-only host action (`show_in_file_browser` in
   `src/editor/file_browser.cpp`: FreeDesktop FileManager1 over `gdbus`, falling back to
   `xdg-open`; `explorer /select` on Windows; `open -R` on macOS), not a protocol method, so agents
@@ -116,11 +127,36 @@ without blocking simultaneous human editing.
   Colliders without bodies are static. Linear/angular velocities are runtime state, cleared on Run
   Game and Stop Game, and observable through `physics.body_status`; `physics.apply_impulse` accepts
   an optional world-space point to generate torque. Paused games advance only via frame step.
-  Dynamic bodies with authored transform keys are kinematic. Joints remain future work. Jolt
-  contact callbacks record ordered entity-pair
+  Dynamic bodies with authored transform keys are kinematic. Jolt contact callbacks record
+  ordered entity-pair
   begin/end events in a bounded, sequence-cursor stream exposed by `physics.contact_events`.
   The stream resets on Run Game and Stop Game, and reports the oldest retained sequence for
   detecting missed events.
+- Scene v17 adds an optional `joint` component (`Joint` in `scene.hpp`, component id `joint`,
+  protocol `scene.set_joint`): type fixed/point/hinge/slider/distance, `connected` entity
+  (invalid = world), local `anchor` and `axis`, `connected_anchor` (distance joints; the
+  partner's local space, or world space for the world), limits (hinge degrees with min in
+  [-180, 0] and max in [0, 180], slider metres with min <= 0 <= max, distance lengths
+  0 <= min <= max; a distance joint without limits keeps its starting length), hinge/slider motor
+  speed and force, distance spring frequency/damping, `collide_connected` and `enabled`.
+  Changing type through the protocol resets limits to that type's defaults. `Scene::destroy`
+  disables joints whose partner went and clears the partner; `Scene::duplicate` keeps outside
+  partners and remaps inside ones; `copy_selection` disables joints to nodes outside the copy
+  (handles do not identify scenes) and `paste_selection` remaps the rest. Loading checks each
+  partner exists and differs from its node.
+- `JoltState::add_joint` builds Jolt constraints in world space from the authored transforms at
+  Run Game (after all bodies), and for spawned trees in `add_bodies`. The partner is Jolt body 1
+  (`Body::sFixedToWorld` for the world) and the joint's node body 2, so hinge angles, slider
+  travel and positive motor speeds follow the right-hand rule about the node's axis. Joints need
+  a body on each end (a collider or physics body) and at least one non-static body; otherwise
+  they are skipped. Joined pairs without `collide_connected` are rejected in
+  `OnContactValidate`. `remove_missing_bodies` removes constraints before their bodies and wakes
+  the bodies they held. `PhysicsWorld::joint_position` and `set_joint_motor` back the script
+  functions `Entity::joint_position`, `set_joint_motor` and `stop_joint_motor`.
+  `physics.debug_boxes` also returns `joints` (world anchor, axis and partner point), which the
+  editor draws with the collider wireframes (cross, axis, line to the partner). The Inspector's
+  Joint section edits every field, lists bodies to connect to, clamps limits to what the type
+  accepts, and warns when neither body is dynamic.
 - The live editor presents with FIFO (vsync) and advances the fixed 60 Hz game step from real
   elapsed time (at most four steps per frame), so frame rate and game speed are independent of
   the monitor. Mailbox presentation with a fixed 16 ms loop sleep previously dropped a frame
@@ -184,9 +220,12 @@ without blocking simultaneous human editing.
   the view plus the body's velocity. Ball is a 0.3-scale gold sphere, a dynamic 0.5 kg body on
   collider layer 2 with `scripts/Projectile.cpp` (destroys it after `lifetime`, 6 s); the
   player's collider mask is 0xFFFFFFFD, so its own balls pass through it. The demo's input map
-  sets `lock_mouse`. `tools/demo_project/build_demo_project.cpp` builds the template through the
-  protocol after saving the showcase, and the Ball template after it, so the showcase scene has
-  no script and runs untrusted.
+  sets `lock_mouse`. `tools/demo_project/build_demo_project.cpp` builds the player through the
+  protocol, saves it as the template at the origin, and leaves it in the showcase at (0, 1, 8)
+  facing -Z, with its camera as the showcase's only and active camera (the template's copy stays
+  inactive). The editor viewport renders from its own inspection camera either way. Run Game
+  needs the project trusted and its scripts built. The Ball template is built after the showcase
+  is saved.
 - `src/scene/templates.cpp`: project templates are node trees saved as
   `templates/<name>.relay-template.json` in the ordinary scene format with exactly one root,
   so loading reuses scene validation and migration. Instantiation copies through
@@ -224,10 +263,15 @@ without blocking simultaneous human editing.
   case). Traces from before this change recorded layout-dependent keycodes (`key:down:32`),
   which no binding matches.
 - `InputMap` holds actions (any bound control) and axes (button pairs or scaled analog bindings,
-  strongest wins, deadzone rescaled), plus `lock_mouse`. Projects store it as
-  `input.relay-input.json` (format `relay.input` v1); without the file the engine defaults apply
-  (move_x/move_y/look_x/look_y, jump, interact, fire, sprint). `Engine::sync_input_map` reloads
-  when the open project changes. Project export includes the file.
+  strongest wins, deadzone rescaled), plus `lock_mouse`. Project files v2 store it as
+  `settings.input` (the `relay.input` v1 document, embedded as-is); `Project::input` is empty until
+  someone saves a map, and the engine defaults apply meanwhile
+  (move_x/move_y/look_x/look_y, jump, interact, fire, sprint). `load_project` still reads v1
+  files; a v1 project's `input.relay-input.json` is read into `Project::input` with
+  `legacy_input_file` set, and `save_project` removes that file after writing the map into the
+  project file. `Engine::set_input_map` saves the project; `sync_input_map` applies the open
+  project's map when the project changes. Protocol replies (`project.*`) leave the settings out;
+  the file, and so project export, keeps them. Project files may be up to 512 KiB.
 - Protocol: `input.map`, `input.set_map` (validated, saved, applied), `input.state`,
   `input.simulate` (Run Game only; holds an action or sets an axis for N steps, taking precedence
   over devices), host-only `input.release` (sends `input:reset`, which traces record), and the
@@ -433,55 +477,68 @@ without blocking simultaneous human editing.
    been run. Scripts cannot add or remove components or reparent entities yet. A script-driven scale
    change does not rebuild collider shapes until the next Run Game. The trust prompt and Scripts
    diagnostics view are covered headlessly only.
+11. Joints have headless and simulated coverage, not a desktop review of the Inspector section,
+   the wireframe gizmos or the demo playground. Anchors and axes are captured when Run Game
+   starts, so moving a jointed body with a script teleports it against its constraint. There are
+   no breakable joints, cone or swing-twist limits, or target-angle servos, and anchors are edited
+   as numbers rather than with a viewport gizmo.
 
 ## Next priorities
 
-1. Add joints to the Jolt backend.
-2. Load scripts on Windows (MSVC or clang-cl flags and `LoadLibraryW`).
-3. Extend the script API further where games need it: adding and configuring components,
+1. Load scripts on Windows (MSVC or clang-cl flags and `LoadLibraryW`).
+2. Extend the script API further where games need it: adding and configuring components,
    reparenting, and shape casts. More example controllers (third-person, orbit) can follow the
    demo's scripted first person controller.
+3. Grow joints where games need them: breakable joints, cone/swing-twist limits for ragdolls,
+   hinge target angles (servo motors), and editing joint anchors with a viewport gizmo.
 
 ## Verification baseline
 
-The current implementation was verified with development and release builds, all five native
-CTest suites (including `relay_script_tests`, which compiles real scripts with the configured
-compiler, including property overrides of every type, scripts reading simulated and raw input,
-a play-test of the demo's First Person Controller template and script (including shooting balls
-along the view and past the player), and spawning: templates at a position under a parent, a
-missing template warned once, clones, empty nodes, children, deferred start and
-self-destruction with `on_destroy`, spawned bodies falling, `overlaps` on a resting body,
-`overlap_sphere` with an ignored entity, a destroyed body leaving raycasts and ending its
-contacts, and Stop Game undoing it all), generated-protocol checks, and 26 ordinary bridge tests.
-The workflow suite covers component add/remove rules, derived node types, type inheritance and creation of every node type,
-prefab save/instantiate/undo, v12 script migration, v15 native controller migration to a script
-component, the demo's controller template (tree placement, components, script, mouse lock,
-refusal to run untrusted), and input state (taps within a step,
-overlapping bindings, deadzones, inversion, triggers, mouse motion, reset, map validation, saving
-and reloading per project, simulation). The headless editor suite drives the Game Configuration
-input page (press-to-bind actions and key-pair axes, Escape cancel, new actions, reset, wrapping
-that keeps buttons clear of Delete), the Add Component window (categories, add, disabled
-duplicates), section removal, the Add Node tree (indentation, typed creation under the selection,
-non-creatable categories, templates nested under their type with the palette icon and its
-"Custom template" tooltip), and the Run Game → trust prompt → build → play flow. The demo's
-First Person Controller, including shooting, was also play-tested by hand on a Linux desktop. The
-desktop smokes below
-predate the asset browser, layout persistence, and frame-pacing changes and were not rerun for
-them; those changes are covered by headless and protocol tests. The live Vulkan shadow and
-visual smokes pass, as does `tests/editor_hdr_upload_smoke.py`: exposure changes captured pixels,
-keyframe scrubbing changes the image, a model import submits another GPU upload, and a package
-containing the saved keys and imported asset opens as a tar. The legacy coordinate-based
-`editor_interaction_smoke.py` misses targets on this desktop's 2560x1410 layout; its input
-assertions are inconclusive until recalibrated. Socket-dependent tests were run with loopback
-access after the sandbox refused local socket creation. Headless editor tests cover
+The current implementation was verified with development and release builds, all five native CTest
+suites (including `relay_script_tests`, which compiles real scripts with the configured compiler,
+including property overrides of every type, scripts reading simulated and raw input, a play-test of
+the demo's First Person Controller template and script (including shooting balls along the view and
+past the player), and spawning: templates at a position under a parent, a missing template warned
+once, clones, empty nodes, children, deferred start and self-destruction with `on_destroy`, spawned
+bodies falling, `overlaps` on a resting body, `overlap_sphere` with an ignored entity, a destroyed
+body leaving raycasts and ending its contacts, and Stop Game undoing it all, plus a script driving a
+hinge motor and reading its angle), generated-protocol checks, and 26 ordinary bridge tests. The
+workflow suite covers component add/remove rules, derived node types, type inheritance and creation
+of every node type, prefab save/instantiate/undo, v12 script migration, joints (protocol validation
+and undo, type defaults, partner removal and undo, copy/paste/duplicate remapping, v17 save/load,
+and simulated point, limited hinge, motor hinge with runtime reversal, fixed, slider, distance,
+ignored and colliding joined pairs, a partner destroyed mid-game, and joints spawned mid-game), the
+demo's joints playground, v15 native controller migration to a script component, the demo's
+controller template (tree placement, components, script, mouse lock, refusal to run untrusted), the
+showcase starting with the player (trust required; the script suite plays it, walking forward from
+its start through the player's camera), and input state (taps within a step, overlapping bindings,
+deadzones, inversion, triggers, mouse motion, reset, map validation, saving in the project file and
+reloading per project, migrating a v1 project's input.relay-input.json, simulation). The headless
+editor suite drives the Game Configuration input page (press-to-bind actions and key-pair axes,
+Escape cancel, new actions, reset, wrapping that keeps buttons clear of Delete), the Add Component
+window (categories, add, disabled duplicates), section removal, the Add Node tree (indentation,
+typed creation under the selection, non-creatable categories, templates nested under their type with
+the palette icon and its "Custom template" tooltip), the Joint section (choosing the connected body
+and the type), the Hierarchy search (name search, type filters with subtypes, reveal in the tree,
+collapse and expand all) and the Assets collapse/expand-all button, and the Run Game → trust prompt
+→ build → play flow. The demo's First Person Controller, including shooting, was also play-tested by
+hand on a Linux desktop. The desktop smokes below predate the asset browser, layout persistence, and
+frame-pacing changes and were not rerun for them; those changes are covered by headless and protocol
+tests. The live Vulkan shadow and visual smokes pass, as does `tests/editor_hdr_upload_smoke.py`:
+exposure changes captured pixels, keyframe scrubbing changes the image, a model import submits
+another GPU upload, and a package containing the saved keys and imported asset opens as a tar. The
+legacy coordinate-based `editor_interaction_smoke.py` misses targets on this desktop's 2560x1410
+layout; its input assertions are inconclusive until recalibrated. Socket-dependent tests were run
+with loopback access after the sandbox refused local socket creation. Headless editor tests cover
 the current hierarchy spacing, chat selection/wrapping, attachments, media viewer, composer layout,
 usage meters, camera controls, authorization, collider zero-extent input, and round collider
-outlines. Convex and mesh colliders have headless physics coverage but no real-desktop visual check. A separate sustained fixture has exercised more
-than two minutes of editing/capture work with injected disconnects. The Vulkan directional-shadow
-path also has real-desktop coverage that compares captured receiver pixels with and without an
-occluder for cascaded directional, perspective spot, and cubemap point shadows; the general visual
-smoke covers capture isolation and swapchain resizing with all shadow resources active. These
-results do not prove live-provider stability or the newest Agent-panel presentation quality.
+outlines. Convex and mesh colliders have headless physics coverage but no real-desktop visual check.
+A separate sustained fixture has exercised more than two minutes of editing/capture work with
+injected disconnects. The Vulkan directional-shadow path also has real-desktop coverage that
+compares captured receiver pixels with and without an occluder for cascaded directional, perspective
+spot, and cubemap point shadows; the general visual smoke covers capture isolation and swapchain
+resizing with all shadow resources active. These results do not prove live-provider stability or the
+newest Agent-panel presentation quality.
 
 Run native suites sequentially because some fixtures share temporary import paths:
 

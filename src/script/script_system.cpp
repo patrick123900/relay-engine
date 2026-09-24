@@ -827,6 +827,17 @@ struct ScriptSystem::Impl {
             return copy_entities(owner.physics().overlaps(owner.scene(), unpack(entity)).entities,
                                  out, capacity);
         };
+        host.joint_position = [](void* context, RelayEntity entity, double* value) {
+            auto& owner = self(context).engine;
+            const auto position = owner.physics().joint_position(owner.scene(), unpack(entity));
+            if (position) *value = *position;
+            return position ? 1 : 0;
+        };
+        host.set_joint_motor = [](void* context, RelayEntity entity, int on, double speed) {
+            auto& owner = self(context).engine;
+            return owner.physics().set_joint_motor(owner.scene(), unpack(entity), on != 0, speed)
+                       ? 1 : 0;
+        };
         host.overlap_sphere = [](void* context, RelayVec3 center, double radius,
                                  uint32_t layer_mask, RelayEntity ignore, RelayEntity* out,
                                  size_t capacity) -> size_t {

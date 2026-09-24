@@ -126,6 +126,12 @@ typedef struct RelayHostApi {
     /* Enabled colliders on `layer_mask` layers overlapping a world-space sphere. */
     size_t (*overlap_sphere)(void* context, RelayVec3 center, double radius, uint32_t layer_mask,
                              RelayEntity ignore, RelayEntity* out, size_t capacity);
+    /* The entity's active joint: a hinge's angle in degrees, a slider's travel in metres or a
+     * distance joint's length. Returns 0 without one. */
+    int (*joint_position)(void* context, RelayEntity entity, double* value);
+    /* Runs a hinge or slider joint's motor at `speed` degrees or metres per second (up to its
+     * authored motor force), or stops it when `on` is 0. */
+    int (*set_joint_motor)(void* context, RelayEntity entity, int on, double speed);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

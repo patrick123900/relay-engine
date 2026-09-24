@@ -175,7 +175,29 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
         }
         output << "]}";
     }
-    output << "]}";
+    output << "],\"joint\":";
+    if (record.joint) {
+        const auto& joint = *record.joint;
+        output << "{\"type\":\"" << joint_type_name(joint.type) << "\",\"connected\":";
+        if (joint.connected.valid()) output << '"' << joint.connected.to_string() << '"';
+        else output << "null";
+        output << ",\"anchor\":";
+        append_vec3(output, joint.anchor);
+        output << ",\"axis\":";
+        append_vec3(output, joint.axis);
+        output << ",\"connected_anchor\":";
+        append_vec3(output, joint.connected_anchor);
+        output << ",\"limits\":" << (joint.limits ? "true" : "false")
+               << ",\"limit_min\":" << joint.limit_min << ",\"limit_max\":" << joint.limit_max
+               << ",\"motor\":" << (joint.motor ? "true" : "false")
+               << ",\"motor_speed\":" << joint.motor_speed
+               << ",\"motor_force\":" << joint.motor_force
+               << ",\"spring_frequency\":" << joint.spring_frequency
+               << ",\"spring_damping\":" << joint.spring_damping
+               << ",\"collide_connected\":" << (joint.collide_connected ? "true" : "false")
+               << ",\"enabled\":" << (joint.enabled ? "true" : "false") << '}';
+    } else output << "null";
+    output << '}';
 }
 
 std::string_view field_type_name(const ReflectedFieldType type) {
@@ -243,6 +265,13 @@ Entity Scene::create(std::string name, const Entity parent) {
 bool Scene::destroy(const Entity entity) {
     if (!contains(entity)) return false;
     destroy_recursive(entity);
+    // A joint must not quietly re-anchor to the world when its partner goes.
+    for (auto& slot : slots_)
+        if (slot.alive && slot.record.joint && slot.record.joint->connected.valid() &&
+            !contains(slot.record.joint->connected)) {
+            slot.record.joint->connected = {};
+            slot.record.joint->enabled = false;
+        }
     return true;
 }
 
@@ -509,6 +538,70 @@ bool valid_script(const Script& script) {
     return true;
 }
 
+void set_default_joint_limits(Joint& joint) {
+    switch (joint.type) {
+    case Joint::Type::hinge: joint.limit_min = -45.0; joint.limit_max = 45.0; break;
+    case Joint::Type::slider: joint.limit_min = -1.0; joint.limit_max = 1.0; break;
+    case Joint::Type::distance: joint.limit_min = 0.0; joint.limit_max = 2.0; break;
+    default: break;
+    }
+}
+
+std::string_view joint_type_name(const Joint::Type type) {
+    switch (type) {
+    case Joint::Type::fixed: return "fixed";
+    case Joint::Type::point: return "point";
+    case Joint::Type::hinge: return "hinge";
+    case Joint::Type::slider: return "slider";
+    case Joint::Type::distance: return "distance";
+    }
+    return "hinge";
+}
+
+std::optional<Joint::Type> joint_type_from_name(const std::string_view name) {
+    for (const auto type : {Joint::Type::fixed, Joint::Type::point, Joint::Type::hinge,
+                            Joint::Type::slider, Joint::Type::distance})
+        if (joint_type_name(type) == name) return type;
+    return std::nullopt;
+}
+
+bool Scene::set_joint(const Entity entity, std::optional<Joint> joint) {
+    auto* record = get(entity);
+    if (!record) return false;
+    if (joint) {
+        const auto finite = [](const Vec3 value, const double limit) {
+            return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z) &&
+                   std::abs(value.x) <= limit && std::abs(value.y) <= limit &&
+                   std::abs(value.z) <= limit;
+        };
+        const auto within = [](const double value, const double minimum, const double maximum) {
+            return std::isfinite(value) && value >= minimum && value <= maximum;
+        };
+        const auto& j = *joint;
+        const double axis_length =
+            std::sqrt(j.axis.x * j.axis.x + j.axis.y * j.axis.y + j.axis.z * j.axis.z);
+        bool limits_valid = std::isfinite(j.limit_min) && std::isfinite(j.limit_max) &&
+                            j.limit_min <= j.limit_max;
+        if (j.type == Joint::Type::hinge)
+            limits_valid = limits_valid && j.limit_min >= -180.0 && j.limit_max <= 180.0 &&
+                           j.limit_min <= 0.0 && j.limit_max >= 0.0;
+        else if (j.type == Joint::Type::slider)
+            limits_valid = limits_valid && j.limit_min >= -1e6 && j.limit_max <= 1e6 &&
+                           j.limit_min <= 0.0 && j.limit_max >= 0.0;
+        else if (j.type == Joint::Type::distance)
+            limits_valid = limits_valid && j.limit_min >= 0.0 && j.limit_max <= 1e6;
+        if (static_cast<unsigned>(j.type) > 4U || j.connected == entity ||
+            (j.connected.valid() && !contains(j.connected)) || !finite(j.anchor, 1e6) ||
+            !finite(j.connected_anchor, 1e6) || !finite(j.axis, 1e6) || axis_length < 1e-6 ||
+            (j.limits && !limits_valid) || !within(j.motor_speed, -1e6, 1e6) ||
+            !within(j.motor_force, 0.0, 1e9) || !within(j.spring_frequency, 0.0, 1000.0) ||
+            !within(j.spring_damping, 0.0, 100.0))
+            return false;
+    }
+    record->joint = std::move(joint);
+    return true;
+}
+
 bool Scene::set_scripts(const Entity entity, std::vector<Script> scripts) {
     auto* record = get(entity);
     if (!record || scripts.size() > maximum_scripts_per_entity ||
@@ -569,6 +662,11 @@ Entity Scene::duplicate(const Entity source) {
         if (record.model_node) {
             const auto root = copies.find(record.model_node->root);
             if (root != copies.end()) record.model_node->root = root->second;
+        }
+        // Joints inside the copied tree join the copies; others keep their partner.
+        if (record.joint) {
+            const auto partner = copies.find(record.joint->connected);
+            if (partner != copies.end()) record.joint->connected = partner->second;
         }
         slots_[copy.index].record = std::move(record);
     }
@@ -757,6 +855,22 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
           {"gravity_scale", ReflectedFieldType::number},
           {"restitution", ReflectedFieldType::number},
           {"lock_rotation", ReflectedFieldType::boolean}}},
+        {"Joint", 0x0eU,
+         {{"type", ReflectedFieldType::string},
+          {"connected", ReflectedFieldType::entity},
+          {"anchor", ReflectedFieldType::vec3},
+          {"axis", ReflectedFieldType::vec3},
+          {"connected_anchor", ReflectedFieldType::vec3},
+          {"limits", ReflectedFieldType::boolean},
+          {"limit_min", ReflectedFieldType::number},
+          {"limit_max", ReflectedFieldType::number},
+          {"motor", ReflectedFieldType::boolean},
+          {"motor_speed", ReflectedFieldType::number},
+          {"motor_force", ReflectedFieldType::number},
+          {"spring_frequency", ReflectedFieldType::number},
+          {"spring_damping", ReflectedFieldType::number},
+          {"collide_connected", ReflectedFieldType::boolean},
+          {"enabled", ReflectedFieldType::boolean}}},
         {"Scripts", 0x0cU,
          {{"behaviour", ReflectedFieldType::string},
           {"enabled", ReflectedFieldType::boolean},

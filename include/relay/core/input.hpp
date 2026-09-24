@@ -40,17 +40,19 @@ struct InputMap {
     bool lock_mouse{}; // The editor hides and locks the cursor while the game has input focus.
 };
 
-inline constexpr std::string_view input_map_filename = "input.relay-input.json";
+// Projects before version 2 kept their input map in this file beside the .relayproject; it is read
+// once when such a project opens and removed when the project is next saved.
+inline constexpr std::string_view legacy_input_map_filename = "input.relay-input.json";
 inline constexpr std::size_t maximum_input_entries = 128U;
 inline constexpr std::size_t maximum_input_bindings = 16U;
 
 [[nodiscard]] InputMap default_input_map();
 [[nodiscard]] std::optional<InputMap> parse_input_map(std::string_view json, std::string& error);
 [[nodiscard]] std::string input_map_json(const InputMap& map);
-// A project without input.relay-input.json uses the defaults.
-[[nodiscard]] InputMap load_input_map(const std::filesystem::path& project_root, std::string& error);
-[[nodiscard]] bool save_input_map(const std::filesystem::path& project_root, const InputMap& map,
-                                  std::string& error);
+// The map in a project folder's legacy input.relay-input.json, or nothing when there is no such
+// file or it is unreadable (`error` says why).
+[[nodiscard]] std::optional<InputMap> load_legacy_input_map(
+    const std::filesystem::path& project_root, std::string& error);
 
 // Live devices plus the per-step view scripts read. Platform events update the live state at any
 // time; begin_step() latches it once per fixed game step, so a tap shorter than a step still

@@ -57,7 +57,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_assets_browse{{
 
 constexpr std::array<ProtocolFieldSpec, 2> fields_assets_search{{
     {"query", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 64U, "", ""},
-    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 11U, "^(folder|model|scene|template|image|shader|script|text|media|project|other)$", ""},
+    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 11U, "^(folder|model|scene|template|image|shader|script|text|media|other)$", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_assets_create_folder{{
@@ -252,15 +252,41 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scripts_create{{
     {"behaviour", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 23> fields_scene_set_joint{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "fixed|point|hinge|slider|distance"},
+    {"connected", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^(\\d+:\\d+)?$", ""},
+    {"anchor_x", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"anchor_y", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"anchor_z", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"axis_x", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"axis_y", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"axis_z", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"connected_anchor_x", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"connected_anchor_y", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"connected_anchor_z", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"limits", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"limit_min", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"limit_max", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"motor", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"motor_speed", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"motor_force", ProtocolValueType::number, false, false, true, true, 0, 1000000000, 0U, 0U, "", ""},
+    {"spring_frequency", ProtocolValueType::number, false, false, true, true, 0, 1000, 0U, 0U, "", ""},
+    {"spring_damping", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
+    {"collide_connected", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 3> fields_component_add{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|keyframes|script"},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|joint|keyframes|script"},
     {"behaviour", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 3> fields_component_remove{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|keyframes|script"},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|joint|keyframes|script"},
     {"index", ProtocolValueType::integer, false, false, true, true, 0, 31, 0U, 0U, "", ""},
 }};
 
@@ -497,7 +523,7 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_chat_control{{
     {"provider", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "openai|compatible"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 126> methods{{
+constexpr std::array<ProtocolMethodSpec, 127> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -519,8 +545,8 @@ constexpr std::array<ProtocolMethodSpec, 126> methods{{
     {"render.assets", "render_assets", "Inspect render assets", "List built-in and imported meshes, materials and textures currently available to scene renderer components.", true, false, false, false, false, no_fields},
     {"assets.formats", "asset_import_formats", "Inspect model import formats", "Report model formats and feature coverage available in this Relay build, including Godot-compatible interchange paths.", true, false, false, false, false, no_fields},
     {"assets.import_model", "asset_import_model", "Import project model", "Import a model from the project-local assets directory using a content-addressed identity and optionally instantiate its node hierarchy.", false, false, false, false, false, fields_assets_import_model},
-    {"assets.browse", "asset_browse", "Browse project files", "List the folders and files in one project folder, folders first, with each entry's asset kind. Hidden entries and symlinks are omitted; importable models are marked.", true, false, false, false, false, fields_assets_browse},
-    {"assets.search", "asset_search", "Search project files", "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries and symlinks are skipped; at most 512 results.", true, false, false, false, false, fields_assets_search},
+    {"assets.browse", "asset_browse", "Browse project files", "List the folders and files in one project folder, folders first, with each entry's asset kind. Hidden entries, symlinks and .relayproject files are omitted; importable models are marked.", true, false, false, false, false, fields_assets_browse},
+    {"assets.search", "asset_search", "Search project files", "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.", true, false, false, false, false, fields_assets_search},
     {"assets.create_folder", "asset_create_folder", "Create project folder", "Create a new, empty folder inside an existing project folder.", false, false, false, false, false, fields_assets_create_folder},
     {"assets.move", "asset_move", "Rename or move project file", "Rename or move a project file or folder without overwriting. Import records follow moved models; project scene files and the project file cannot move.", false, false, false, false, false, fields_assets_move},
     {"assets.delete", "asset_delete", "Delete project file", "Move a project file or folder into the hidden .relay-trash folder, where it can be recovered by hand. Project scene files and the project file cannot be deleted.", false, true, false, false, false, fields_assets_delete},
@@ -528,7 +554,7 @@ constexpr std::array<ProtocolMethodSpec, 126> methods{{
     {"performance.read", "performance_read", "Read Relay performance", "Read bounded per-frame CPU/GPU timing, draw/resource counts, entities and process memory.", true, false, false, false, false, fields_performance_read},
     {"input.recent", "input_recent", "Read recent Relay input", "Read the bounded normalized keyboard, mouse and gamepad input event history.", true, false, false, false, false, no_fields},
     {"input.map", "input_map", "Read input map", "Read the project's input map: named actions bound to keys, mouse buttons or gamepad buttons, and axes built from button pairs or gamepad sticks. Also returns the engine defaults. Controls look like key:space, key:left_shift, mouse:left, gamepad:a or gamepad:leftx.", true, false, false, false, false, no_fields},
-    {"input.set_map", "input_set_map", "Replace input map", "Validate, save as input.relay-input.json in the project and apply a complete input map document (format relay.input, version 1) as returned by input.map.", false, true, false, false, false, fields_input_set_map},
+    {"input.set_map", "input_set_map", "Replace input map", "Validate, save in the project file (settings.input in the .relayproject) and apply a complete input map document (format relay.input, version 1) as returned by input.map.", false, true, false, false, false, fields_input_set_map},
     {"input.state", "input_state", "Inspect game input", "Read the current game step's input: each action's held and pressed state, each axis value, held controls and mouse movement.", true, false, false, false, false, no_fields},
     {"input.simulate", "input_simulate", "Simulate game input", "Hold an action, or set an axis value, for a number of game steps during Run Game, as if a player pressed it. Use it with runtime.step to play-test scripts.", false, false, false, false, false, fields_input_simulate},
     {"input.release", "input_release", "Release game input", "Host-only. Release every held control, used when the game viewport loses input focus.", false, false, false, true, false, no_fields},
@@ -566,6 +592,7 @@ constexpr std::array<ProtocolMethodSpec, 126> methods{{
     {"scripts.write", "scripts_write", "Write script source", "Create or replace a C++ source or header in the project's scripts/ folder, creating subfolders. Allowed during Run Game; build afterwards to compile it or hot reload it.", false, true, false, false, false, fields_scripts_write},
     {"scripts.create", "scripts_create", "Create behaviour script", "Create scripts/<behaviour>.cpp from a starter template defining and registering that behaviour class. Refuses to overwrite.", false, false, false, false, false, fields_scripts_create},
     {"component.types", "component_types", "List component types", "List every component a node can carry: engine components with their category and whether they can be added, removed or repeated, plus each built script behaviour with its declared properties and code defaults.", true, false, false, false, false, no_fields},
+    {"scene.set_joint", "scene_set_joint", "Configure joint", "Add, edit or remove an undoable joint linking this node's physics body to another node's body, or to the world when connected is empty, during Run Game. Types: fixed (weld), point (ball and socket), hinge (turns about axis, optional angle limits in degrees with min in [-180, 0] and max in [0, 180], optional motor), slider (moves along axis, optional travel limits in metres with min <= 0 <= max, optional motor) and distance (rope or spring between anchor and connected_anchor; limits are lengths, otherwise the starting length is kept). Anchor and axis are in this node's local space; connected_anchor is in the connected node's space, or world space for the world. At least one body must be dynamic. Joined bodies do not collide unless collide_connected is set. Changing type resets the limits to that type's defaults unless limits are given too.", false, false, false, false, false, fields_scene_set_joint},
     {"component.add", "component_add", "Add component", "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.", false, false, false, false, false, fields_component_add},
     {"component.remove", "component_remove", "Remove component", "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.", false, true, false, false, false, fields_component_remove},
     {"scene.set_script", "scene_set_script", "Configure script component", "Change the behaviour or enabled state of one of a node's script components, as an undoable transaction.", false, false, false, false, false, fields_scene_set_script},

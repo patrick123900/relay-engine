@@ -357,7 +357,7 @@ export function registerGeneratedTools(
     "asset_browse",
     {
       title: "Browse project files",
-      description: "List the folders and files in one project folder, folders first, with each entry's asset kind. Hidden entries and symlinks are omitted; importable models are marked.",
+      description: "List the folders and files in one project folder, folders first, with each entry's asset kind. Hidden entries, symlinks and .relayproject files are omitted; importable models are marked.",
       inputSchema: z.object({
         "directory": z.string().max(128).regex(new RegExp("^([A-Za-z0-9][A-Za-z0-9._ /-]*)?$")).default("").describe("Project-relative folder; empty lists the project root")
       }),
@@ -374,10 +374,10 @@ export function registerGeneratedTools(
     "asset_search",
     {
       title: "Search project files",
-      description: "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries and symlinks are skipped; at most 512 results.",
+      description: "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.",
       inputSchema: z.object({
         "query": z.string().max(64).default("").describe("Case-insensitive name fragment; empty matches every name"),
-        "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|shader|script|text|media|project|other)$"))).max(11).optional().describe("Asset kinds to include; omitted or empty includes all")
+        "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|shader|script|text|media|other)$"))).max(11).optional().describe("Asset kinds to include; omitted or empty includes all")
       }),
       annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
     },
@@ -509,7 +509,7 @@ export function registerGeneratedTools(
     "input_set_map",
     {
       title: "Replace input map",
-      description: "Validate, save as input.relay-input.json in the project and apply a complete input map document (format relay.input, version 1) as returned by input.map.",
+      description: "Validate, save in the project file (settings.input in the .relayproject) and apply a complete input map document (format relay.input, version 1) as returned by input.map.",
       inputSchema: z.object({
         "map": z.string().min(2).max(262144).describe("The whole input map as JSON text")
       }),
@@ -1151,13 +1151,52 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "scene_set_joint",
+    {
+      title: "Configure joint",
+      description: "Add, edit or remove an undoable joint linking this node's physics body to another node's body, or to the world when connected is empty, during Run Game. Types: fixed (weld), point (ball and socket), hinge (turns about axis, optional angle limits in degrees with min in [-180, 0] and max in [0, 180], optional motor), slider (moves along axis, optional travel limits in metres with min <= 0 <= max, optional motor) and distance (rope or spring between anchor and connected_anchor; limits are lengths, otherwise the starting length is kept). Anchor and axis are in this node's local space; connected_anchor is in the connected node's space, or world space for the world. At least one body must be dynamic. Joined bodies do not collide unless collide_connected is set. Changing type resets the limits to that type's defaults unless limits are given too.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "attached": z.boolean().optional(),
+        "enabled": z.boolean().optional(),
+        "type": z.enum(["fixed", "point", "hinge", "slider", "distance"]).optional(),
+        "connected": z.string().regex(new RegExp("^(\\d+:\\d+)?$")).optional().describe("Handle of the node to join; empty for the world"),
+        "anchorX": z.number().finite().min(-1000000).max(1000000).optional(),
+        "anchorY": z.number().finite().min(-1000000).max(1000000).optional(),
+        "anchorZ": z.number().finite().min(-1000000).max(1000000).optional(),
+        "axisX": z.number().finite().min(-1000000).max(1000000).optional(),
+        "axisY": z.number().finite().min(-1000000).max(1000000).optional(),
+        "axisZ": z.number().finite().min(-1000000).max(1000000).optional(),
+        "connectedAnchorX": z.number().finite().min(-1000000).max(1000000).optional(),
+        "connectedAnchorY": z.number().finite().min(-1000000).max(1000000).optional(),
+        "connectedAnchorZ": z.number().finite().min(-1000000).max(1000000).optional(),
+        "limits": z.boolean().optional(),
+        "limitMin": z.number().finite().min(-1000000).max(1000000).optional(),
+        "limitMax": z.number().finite().min(-1000000).max(1000000).optional(),
+        "motor": z.boolean().optional(),
+        "motorSpeed": z.number().finite().min(-1000000).max(1000000).optional().describe("Degrees per second for hinges, metres per second for sliders"),
+        "motorForce": z.number().finite().min(0).max(1000000000).optional().describe("Maximum torque (N m) for hinges, force (N) for sliders"),
+        "springFrequency": z.number().finite().min(0).max(1000).optional().describe("Distance joints: spring frequency in Hz; 0 is rigid"),
+        "springDamping": z.number().finite().min(0).max(100).optional(),
+        "collideConnected": z.boolean().optional()
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_set_joint"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.set_joint", {"entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "connected": input["connected"], "anchor_x": input["anchorX"], "anchor_y": input["anchorY"], "anchor_z": input["anchorZ"], "axis_x": input["axisX"], "axis_y": input["axisY"], "axis_z": input["axisZ"], "connected_anchor_x": input["connectedAnchorX"], "connected_anchor_y": input["connectedAnchorY"], "connected_anchor_z": input["connectedAnchorZ"], "limits": input["limits"], "limit_min": input["limitMin"], "limit_max": input["limitMax"], "motor": input["motor"], "motor_speed": input["motorSpeed"], "motor_force": input["motorForce"], "spring_frequency": input["springFrequency"], "spring_damping": input["springDamping"], "collide_connected": input["collideConnected"]});
+      },
+  );
+
+  server.registerTool(
     "component_add",
     {
       title: "Add component",
       description: "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-        "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "keyframes", "script"]),
+        "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "joint", "keyframes", "script"]),
         "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).optional().describe("Behaviour class name; required for script")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
@@ -1176,7 +1215,7 @@ export function registerGeneratedTools(
       description: "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-        "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "keyframes", "script"]),
+        "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "joint", "keyframes", "script"]),
         "index": z.number().int().min(0).max(31).optional().describe("Which script component, from zero")
       }),
       annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},

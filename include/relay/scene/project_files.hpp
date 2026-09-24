@@ -11,7 +11,8 @@ namespace relay {
 
 // File operations for the editor's asset browser. Every path is relative to the asset root (the
 // open project folder) and must pass workspace_file(): no traversal, hidden components or symlinks.
-// An empty directory names the root itself.
+// An empty directory names the root itself. Listings and searches leave out hidden entries and
+// .relayproject files, which the Project panel manages.
 
 inline constexpr std::size_t maximum_asset_listing = 4096U;
 // Deleted entries move here, so a deletion can be recovered by hand. Hidden folders are excluded
@@ -22,7 +23,7 @@ inline constexpr std::size_t maximum_asset_search_results = 512U;
 
 // Coarse file categories for browsing and filtering, decided by name alone.
 enum class AssetKind : std::uint8_t {
-    folder, model, scene, node_template, image, shader, script, text, media, project, other
+    folder, model, scene, node_template, image, shader, script, text, media, other
 };
 [[nodiscard]] std::string_view asset_kind_name(AssetKind kind);
 [[nodiscard]] std::optional<AssetKind> asset_kind_from_name(std::string_view name);

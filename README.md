@@ -31,7 +31,7 @@ in control of the same project.
   Vulkan viewport, inspect the image, and iterate.
 - **HDR lighting** — a floating-point scene target, camera exposure, procedural environment
   lighting, and tone mapping produce the final SDR viewport and captures.
-- **One typed API** — 126 versioned native methods cover scene editing, rendering, projects,
+- **One typed API** — 127 versioned native methods cover scene editing, rendering, projects,
   observability, capture, and session authorization. A generated MCP bridge exposes the supported
   model-facing subset.
 - **Deterministic core** — fixed-step simulation, transactional undo/redo, strict scene validation,
@@ -60,7 +60,8 @@ in control of the same project.
 - **Jolt physics** — authored box, sphere, capsule, convex-hull, and triangle-mesh colliders support
   overlap checks and raycasts. Static and dynamic rigid bodies provide gravity, momentum,
   friction, bounce, and angular motion during Run Game, and runtime impulses can be applied at a
-  world-space point through the protocol.
+  world-space point through the protocol. Fixed, point, hinge, slider and distance joints link
+  bodies to each other or to the world, with limits, motors and springs.
 - **First person controller example** — the demo project's template and editable C++ script walk,
   sprint, jump and look around with the input map.
 
@@ -95,22 +96,29 @@ The **Hierarchy** lists the scene's nodes. Right-click empty space to create a n
 add a child, duplicate, move, rename, save as a template, or destroy it. Rename in place with
 **F2**, **Rename** in the context menu, or a second, slower click on the selected row; **Enter** or
 clicking away commits and **Escape** cancels. Drag rows onto each other to reparent them.
+Type in the search box at the top (**Ctrl+F** while the panel is focused) to find nodes by name,
+and use the funnel button to show only certain node types; a category such as Light includes its
+directional, point and spot lights. Results list each match with its parents; double-click one or
+choose **Show in hierarchy** to jump back to it in the tree. **Escape** clears the search. The
+chevron button left of the funnel collapses every node, or expands them all when all are
+collapsed.
 
 The **Assets** panel shows the open project folder as a tree. Expand a folder with its arrow, a
 double-click, or the arrow keys. Right-click empty space to create a folder at the top level, or a
 folder to create one inside it; right-click any entry to rename or delete it. **F2** and **Delete**
-also work. Deleting moves the entry into the project's hidden `.relay-trash` folder, where it can
-be recovered by hand. Drag entries onto a folder to move them there, or onto the empty space below
-the tree to move them to the top level. Type in the search box (**Ctrl+F** while the panel is
-focused) to find assets by name anywhere in the project, and use the funnel button to show only
-models, scenes, templates, images, shaders, scripts, text, audio and video, folders, project files,
-or other files; the menu stays open so several categories can be ticked at once. Right-click an entry and
-choose **Open in file browser** to show it in your system file manager.
-Results list each match with its folder; double-click a folder result or choose **Show in
-folder** to jump back to the tree there. **Escape** clears the search. The project file and the project's member
-scenes cannot be moved or deleted from here. To bring a model into the scene, double-click it,
-drag it into the viewport (it lands on the ground under the pointer) or onto a hierarchy row
-(it becomes a child), or right-click it and choose **Import to scene**.
+also work. Deleting moves the entry into the project's hidden `.relay-trash` folder, where it can be
+recovered by hand. Drag entries onto a folder to move them there, or onto the empty space below the
+tree to move them to the top level. Type in the search box (**Ctrl+F** while the panel is focused)
+to find assets by name anywhere in the project, and use the funnel button to show only models,
+scenes, templates, images, shaders, scripts, text, audio and video, folders, or other files; the
+menu stays open so several categories can be ticked at once. Right-click an entry and choose **Open
+in file browser** to show it in your system file manager. Results list each match with its folder;
+double-click a folder result or choose **Show in folder** to jump back to the tree there. **Escape**
+clears the search. The chevron button left of the funnel collapses every folder, or opens them all
+when all are closed. The project's `.relayproject` file is not listed; the Project panel manages it.
+The project's member scenes cannot be moved or deleted from here. To bring a model into the scene,
+double-click it, drag it into the viewport (it lands on the ground under the pointer) or onto a
+hierarchy row (it becomes a child), or right-click it and choose **Import to scene**.
 
 Select an entity and open **Transform keyframes** in the Inspector to add, edit, scrub, or play
 position, rotation, and scale keys. To share a project, save its scenes, then use **Export saved
@@ -147,6 +155,19 @@ During Run Game, `physics.contact_events` reports contact `begin` and `end` pair
 order. Pass the last sequence as `after` to read new events; `oldest_sequence` shows when older
 events have left the bounded history. Stop Game clears the stream.
 
+Add a **Joint** component (Physics category) to link a node's physics body to another node's body,
+or to a fixed point in the world when **Connected to** is **World**. **Fixed** welds the two
+together, **Point** is a ball and socket, **Hinge** turns about an axis with optional angle limits
+and a motor, **Slider** moves along an axis with optional travel limits and a motor, and
+**Distance** is a rope or, with a spring frequency, a bungee. The anchor and axis are in the
+node's own space. At least one of the two bodies must be dynamic, and the Inspector says when
+neither is. Joined bodies pass through each other unless **Collide with connected** is ticked.
+Removing the connected node disables the joint rather than tying it to the world. The collider
+wireframes also show joints: a cross at the anchor, the hinge or slider axis, and a line to the
+connected body. Scripts can read a joint's angle, travel or length and drive its motor. The demo
+has a joints playground behind the material row: a swinging chain, a hinged door, a motorised
+spinner and a ball on a spring.
+
 Gameplay code is native C++. Choose **Create → C++ script...** in the Assets panel (or **New C++
 script...** in the Add Component window), add the behaviour to a node as a script component, and
 press **Run Game**. A node can carry several scripts, and fields a behaviour declares as
@@ -156,14 +177,16 @@ line. Saving a script while the game runs rebuilds it and swaps in the new code.
 Because scripts run with your full user permissions, Relay only builds a project's scripts after
 you trust that project. See the [scripting guide](docs/scripting.md).
 
-Player input goes through the project's input map. **Edit → Game Configuration...** opens the
-Input page, where actions (buttons such as `jump`) and axes (values from -1 to 1 such as `move_x`)
-list their bindings. Click **+ Add**, **+ Keys** or **+ Stick** and press the key, mouse button or
+Player input goes through the project's input map. **Edit → Game Configuration...** opens the Input
+page, where actions (buttons such as `jump`) and axes (values from -1 to 1 such as `move_x`) list
+their bindings. Click **+ Add**, **+ Keys** or **+ Stick** and press the key, mouse button or
 gamepad control to bind; keys are recorded by physical position, so WASD stays in place on other
 keyboard layouts. New projects start with move, look, jump, interact, fire and sprint. The map is
-saved as `input.relay-input.json` in the project. During Run Game, click the viewport to give the
-game keyboard and mouse input and press **Escape** to hand it back to the editor; the Input page
-can also lock the mouse cursor while the game has input, for first-person controls.
+saved in the project's `.relayproject` file, under `settings`; projects that kept it in an older
+`input.relay-input.json` move it there the next time the project is saved. During Run Game, click
+the viewport to give the game keyboard and mouse input and press **Escape** to hand it back to the
+editor; the Input page can also lock the mouse cursor while the game has input, for first-person
+controls.
 
 ## Built-in agent workspace
 
@@ -188,10 +211,10 @@ scene workflow, import pipeline, control protocol, MCP bridge, and embedded agen
 functional. APIs and file formats may still change. Windows and macOS renderer parity, broader
 import sandboxing, and sustained live-provider validation remain in progress.
 
-Native C++ gameplay scripting (including spawning, destroying and overlap queries), input mapping,
-components, node types, and templates are in place and verified on Linux, with a scripted first
-person controller in the demo project. The next engine work is joints in the Jolt backend, then
-script loading on Windows.
+Native C++ gameplay scripting (including spawning, destroying and overlap queries), physics joints,
+input mapping, components, node types, and templates are in place and verified on Linux, with a
+scripted first person controller in the demo project. The next engine work is script loading on
+Windows.
 
 ## Build
 
@@ -208,14 +231,15 @@ cmake --build --preset dev
 
 The command above opens the SDL/Vulkan demo. In the development build, the editor opens the demo
 project in [`examples/demo`](examples/demo) when started from the repository root. Its showcase
-scene has PBR materials, cascaded sun, point, and spot shadows, keyframed animation, and a physics
-playground to try with **Run Game**. Its **First Person Controller** template is a player you can
-walk around with: an upright capsule body, a camera at eye height, and the project's
-`scripts/FirstPersonController.cpp` for mouse, keyboard and gamepad look, walking, sprinting,
-jumping and shooting balls where you look, which you can edit like any other script (see the [scripting guide](docs/scripting.md)).
-Set `RELAY_OPEN_DEMO_PROJECT=0` to start with an empty scene
-instead; release builds always do. `python3 tools/generate_demo_project.py` rebuilds the demo from
-code after a dev build.
+scene has PBR materials, cascaded sun, point, and spot shadows, keyframed animation, and physics and
+joints playgrounds. **Run Game** puts you in them as a first person player: an upright capsule body,
+a camera at eye height, and the project's `scripts/FirstPersonController.cpp` for mouse, keyboard
+and gamepad look, walking, sprinting, jumping and shooting balls where you look. The first Run Game
+asks you to trust the project so its scripts can build. The player is also a **First Person
+Controller** template for other scenes, and its script is editable like any other (see the
+[scripting guide](docs/scripting.md)). The player's camera is the scene's camera. Set
+`RELAY_OPEN_DEMO_PROJECT=0` to start with an empty scene instead; release builds always do. `python3
+tools/generate_demo_project.py` rebuilds the demo from code after a dev build.
 
 For a display-free runtime:
 

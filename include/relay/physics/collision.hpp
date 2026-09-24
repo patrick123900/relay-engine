@@ -41,9 +41,21 @@ struct CollisionDebugBox {
     bool lines_truncated{};
 };
 
+// One joint for the editor overlay, in world space from the authored transforms.
+struct CollisionDebugJoint {
+    Entity entity{};
+    bool enabled{};
+    Joint::Type type{Joint::Type::hinge};
+    Vec3 anchor{};
+    Vec3 axis{};      // Unit world axis for hinges and sliders.
+    Vec3 partner{};   // The far end: a distance joint's other anchor, else the partner's origin.
+    bool has_partner{}; // False for joints to the world other than distance joints.
+};
+
 struct CollisionDebugBoxes {
     std::vector<CollisionDebugBox> boxes;
     bool truncated{};
+    std::vector<CollisionDebugJoint> joints; // At most 4096.
 };
 
 struct ContactEvent {
@@ -107,6 +119,13 @@ public:
                                                    std::uint32_t layer_mask = 0xffffffffU,
                                                    Entity ignore = {},
                                                    std::size_t maximum = 1024U);
+    // The entity's active joint: a hinge's angle in degrees, a slider's travel in metres from its
+    // start, or a distance joint's current length. Nothing without an active hinge, slider or
+    // distance joint.
+    [[nodiscard]] std::optional<double> joint_position(const Scene& scene, Entity entity);
+    // Turns a hinge or slider joint's motor on or off at runtime, at `speed` degrees or metres per
+    // second, up to its authored motor force. False without an active hinge or slider joint.
+    [[nodiscard]] bool set_joint_motor(const Scene& scene, Entity entity, bool on, double speed);
     // Casts against the running world, without rebuilding it as collision_raycast does.
     [[nodiscard]] CollisionRaycast raycast(const Scene& scene, Vec3 origin, Vec3 direction,
                                            double maximum_distance,

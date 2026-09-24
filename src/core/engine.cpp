@@ -211,25 +211,27 @@ InputState& Engine::input() {
     return input_;
 }
 
-// Loads the open project's input map when the project changes; standalone sessions use defaults.
+// Applies the open project's input map when the project changes; standalone sessions and projects
+// that never saved one use the defaults.
 void Engine::sync_input_map() {
     std::optional<std::filesystem::path> root;
     if (project_) root = std::filesystem::absolute(project_->root()).lexically_normal();
     if (input_loaded_ && root == input_root_) return;
     input_loaded_ = true;
     input_root_ = root;
-    std::string error;
-    input_.set_map(root ? load_input_map(*root, error) : default_input_map());
-    if (!error.empty()) logs_.write(LogLevel::warning, error);
+    input_.set_map(project_ && project_->input ? *project_->input : default_input_map());
 }
 
 bool Engine::set_input_map(InputMap map, std::string& error) {
     sync_input_map();
-    if (!input_root_) {
+    if (!project_) {
         error = "the input map is saved with a project; open one first";
         return false;
     }
-    if (!save_input_map(*input_root_, map, error)) return false;
+    auto updated = *project_;
+    updated.input = map;
+    if (!save_project(updated, error)) return false;
+    *project_ = std::move(updated);
     input_.set_map(std::move(map));
     return true;
 }

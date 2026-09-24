@@ -563,11 +563,11 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return result.str();
     }
     if (method == "input.map") {
-        const bool saved = engine_.project() &&
-                           std::filesystem::is_regular_file(engine_.project()->root() / input_map_filename);
+        const bool saved = engine_.project() && engine_.project()->input.has_value();
         return response_prefix(id) + "{\"map\":" + input_map_json(engine_.input().map()) +
                ",\"saved\":" + (saved ? "true" : "false") + ",\"path\":\"" +
-               std::string{input_map_filename} + "\",\"defaults\":" +
+               (engine_.project() ? json_escape(engine_.project()->filename) : std::string{}) +
+               "\",\"defaults\":" +
                input_map_json(default_input_map()) + "}}";
     }
     if (method == "input.set_map") {
@@ -857,7 +857,21 @@ std::string ControlProtocol::handle(const std::string_view request) {
             output << std::setprecision(std::numeric_limits<double>::max_digits10)
                    << "],\"lines_truncated\":" << (box.lines_truncated ? "true" : "false") << '}';
         }
-        output << "],\"truncated\":" << (result.truncated ? "true" : "false") << '}';
+        output << "],\"truncated\":" << (result.truncated ? "true" : "false") << ",\"joints\":[";
+        for (std::size_t index = 0; index < result.joints.size(); ++index) {
+            const auto& joint = result.joints[index];
+            output << (index ? "," : "") << "{\"entity\":\"" << joint.entity.to_string()
+                   << "\",\"enabled\":" << (joint.enabled ? "true" : "false") << ",\"type\":\""
+                   << joint_type_name(joint.type) << "\",\"anchor\":";
+            vector(joint.anchor);
+            output << ",\"axis\":";
+            vector(joint.axis);
+            output << ",\"partner\":";
+            if (joint.has_partner) vector(joint.partner);
+            else output << "null";
+            output << '}';
+        }
+        output << "]}";
         return response_prefix(id) + output.str() + '}';
     }
     if (method == "physics.body_status") {
@@ -1015,7 +1029,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
     }
     if (method == "project.status") {
         return response_prefix(id) + "{\"project\":" +
-               (engine_.project() ? engine_.project()->json() : "null") + "}}";
+               (engine_.project() ? engine_.project()->json(false) : "null") + "}}";
     }
     if (method == "project.list") {
         std::string files = "[";
@@ -1043,9 +1057,11 @@ std::string ControlProtocol::handle(const std::string_view request) {
     if (method == "project.create" || method == "project.open") {
         std::string error;
         const auto filename = string_field(request, "filename");
-        auto project = method == "project.open" ? load_project(filename, error)
-                                                : std::optional{Project{filename, string_field(request, "name"), {}, {}}};
+        std::string warning;
+        auto project = method == "project.open" ? load_project(filename, error, warning)
+                                                : std::optional{Project{filename, string_field(request, "name"), {}, {}, {}, false}};
         if (!project) return error_response(id, error);
+        if (!warning.empty()) engine_.logs().write(LogLevel::warning, warning);
         SceneState state;
         if (!project->startup_scene.empty()) {
             const auto path = workspace_file((project->root() / "scenes").generic_string(), project->startup_scene, ".relay.json");
@@ -1065,7 +1081,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
                 return true;
             })) return error_response(id, "cannot apply project scene");
         engine_.project() = std::move(project);
-        return response_prefix(id) + "{\"project\":" + engine_.project()->json() +
+        return response_prefix(id) + "{\"project\":" + engine_.project()->json(false) +
                ",\"scene_file\":\"" + escape_json(engine_.project()->startup_scene) +
                "\",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }
@@ -1093,7 +1109,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         std::string error;
         if (!save_project(project, error)) return error_response(id, error);
         engine_.project() = std::move(project);
-        return response_prefix(id) + "{\"project\":" + engine_.project()->json() + "}}";
+        return response_prefix(id) + "{\"project\":" + engine_.project()->json(false) + "}}";
     }
     if (method == "animation.clip") {
         const auto* model = engine_.assets().find_model(string_field(request, "model"));
@@ -1439,6 +1455,63 @@ std::string ControlProtocol::handle(const std::string_view request) {
         if (!engine_.scene_history().execute("Configure physics body " + entity->to_string(),
                 [&](Scene& scene) { return scene.set_physics_body(*entity, body); }))
             return error_response(id, "invalid physics body values");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.set_joint") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::optional<Joint> joint;
+        if (boolean_field(request, "attached", true)) {
+            joint = engine_.scene().get(*entity)->joint.value_or(Joint{});
+            if (const auto type = optional_string_field(request, "type")) {
+                const auto parsed = joint_type_from_name(*type);
+                if (!parsed) return error_response(id, "unknown joint type");
+                if (*parsed != joint->type) {
+                    joint->type = *parsed;
+                    set_default_joint_limits(*joint);
+                }
+            }
+            if (const auto connected = optional_string_field(request, "connected")) {
+                if (connected->empty()) {
+                    joint->connected = {};
+                } else {
+                    const auto partner = Entity::parse(*connected);
+                    if (!partner || !engine_.scene().contains(*partner))
+                        return error_response(id, "connected must be a live node, or empty for the world");
+                    joint->connected = *partner;
+                }
+            }
+            const auto vector = [&](const char* prefix, Vec3& target) {
+                const std::string base{prefix};
+                if (const auto value = number_field(request, base + "_x")) target.x = *value;
+                if (const auto value = number_field(request, base + "_y")) target.y = *value;
+                if (const auto value = number_field(request, base + "_z")) target.z = *value;
+            };
+            vector("anchor", joint->anchor);
+            vector("axis", joint->axis);
+            vector("connected_anchor", joint->connected_anchor);
+            const auto number = [&](const char* key, double& target) {
+                if (const auto value = number_field(request, key)) target = *value;
+            };
+            number("limit_min", joint->limit_min);
+            number("limit_max", joint->limit_max);
+            number("motor_speed", joint->motor_speed);
+            number("motor_force", joint->motor_force);
+            number("spring_frequency", joint->spring_frequency);
+            number("spring_damping", joint->spring_damping);
+            joint->limits = boolean_field(request, "limits", joint->limits);
+            joint->motor = boolean_field(request, "motor", joint->motor);
+            joint->collide_connected =
+                boolean_field(request, "collide_connected", joint->collide_connected);
+            joint->enabled = boolean_field(request, "enabled", joint->enabled);
+        }
+        if (!engine_.scene_history().execute("Configure joint " + entity->to_string(),
+                [&](Scene& scene) { return scene.set_joint(*entity, joint); }))
+            return error_response(id, "invalid joint values: the connected node must differ from "
+                                      "this one, the axis must not be zero, and limits must fit "
+                                      "the joint type");
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }

@@ -296,6 +296,38 @@ CollisionDebugBoxes collision_debug_boxes(const Scene& scene, bool enabled_only,
         }
         result.boxes.push_back(std::move(box));
     }
+    for (const auto entity : scene.entities()) {
+        const auto* record = scene.get(entity);
+        if (!record || !record->joint || result.joints.size() == maximum_query_colliders) continue;
+        const auto& joint = *record->joint;
+        const auto affine = affine_for(scene, entity);
+        if (!affine) continue;
+        CollisionDebugJoint gizmo{entity, joint.enabled, joint.type, {}, {}, {}, false};
+        gizmo.anchor = add(affine->position, transform_direction(*affine, joint.anchor));
+        // The axis turns with the node but ignores its scale.
+        const auto turned = rotate(joint.axis, record->transform.rotation_degrees);
+        Vec3 axis = turned;
+        for (auto parent = record->parent; parent.valid();) {
+            const auto* node = scene.get(parent);
+            if (!node) break;
+            axis = rotate(axis, node->transform.rotation_degrees);
+            parent = node->parent;
+        }
+        const double length = std::sqrt(dot(axis, axis));
+        gizmo.axis = length > 0.0 ? scale(axis, 1.0 / length) : Vec3{0, 1, 0};
+        if (joint.connected.valid()) {
+            if (const auto partner = affine_for(scene, joint.connected)) {
+                gizmo.partner = joint.type == Joint::Type::distance
+                    ? add(partner->position, transform_direction(*partner, joint.connected_anchor))
+                    : partner->position;
+                gizmo.has_partner = true;
+            }
+        } else if (joint.type == Joint::Type::distance) {
+            gizmo.partner = joint.connected_anchor;
+            gizmo.has_partner = true;
+        }
+        if (bounded(gizmo.anchor) && bounded(gizmo.partner)) result.joints.push_back(gizmo);
+    }
     return result;
 }
 

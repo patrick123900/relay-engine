@@ -7,6 +7,7 @@
 #include "relay/editor/chat_media.hpp"
 #include "relay/editor/wrapped_input.hpp"
 #include "relay/render/scene_render.hpp"
+#include "relay/scene/project.hpp"
 #include "relay/script/script_system.hpp"
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -384,8 +385,8 @@ void hierarchy_and_assets_ui() {
     frame(ui, 40);
     const auto models = ui.headless_item_rect("asset:models");
     check(models.has_value() && ui.headless_item_rect("asset:readme.txt") &&
-              ui.headless_item_rect("asset:project.relayproject"),
-          "asset tree lists the project root folder");
+              !ui.headless_item_rect("asset:project.relayproject"),
+          "asset tree lists the project root folder without the project file");
     check(!ui.headless_item_rect("asset:models/tri.obj"), "folders start collapsed");
     double_click(ui, *models);
     const auto model = ui.headless_item_rect("asset:models/tri.obj");
@@ -1013,6 +1014,129 @@ void components_ui() {
     std::cout << "Headless component Inspector tests passed\n";
 }
 
+// The Inspector's Joint section picks the connected body and the joint type.
+void joints_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    auto& scene = engine.scene();
+    const auto anchor = scene.create("Anchor");
+    (void)scene.set_physics_body(anchor, relay::PhysicsBody{relay::PhysicsBody::Type::static_body});
+    const auto swing = scene.create("Swing");
+    (void)scene.set_physics_body(swing, relay::PhysicsBody{});
+    (void)scene.set_joint(swing, relay::Joint{});
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize joint editor without windows");
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + swing.to_string()));
+    frame(ui, 3);
+    check(ui.headless_item_rect("inspector:component:joint") && ui.headless_item_rect("joint:type") &&
+              ui.headless_item_rect("joint:connected"),
+          "the Inspector shows the Joint section");
+    click_center(ui, *ui.headless_item_rect("joint:connected"));
+    frame(ui, 2);
+    check(!ui.headless_item_rect("joint:connected:" + swing.to_string()).has_value(),
+          "a node cannot be joined to itself");
+    click_center(ui, *ui.headless_item_rect("joint:connected:" + anchor.to_string()));
+    frame(ui, 3);
+    check(scene.get(swing)->joint->connected == anchor, "choosing a body connects the joint to it");
+    click_center(ui, *ui.headless_item_rect("joint:type"));
+    frame(ui, 2);
+    click_center(ui, *ui.headless_item_rect("joint:type:slider"));
+    frame(ui, 3);
+    check(scene.get(swing)->joint->type == relay::Joint::Type::slider &&
+              scene.get(swing)->joint->limit_max == 1.0,
+          "choosing a type changes the joint and its default limits");
+    std::cout << "Headless joint Inspector tests passed\n";
+}
+
+// Hierarchy search, type filters and collapse/expand all, and the same button in Assets.
+void hierarchy_search_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/searching/project.relayproject","name":"Searching"})")
+              .find("\"ok\":true") != std::string::npos, "create search project");
+    std::filesystem::create_directories("projects/searching/art/props/small");
+    auto& scene = engine.scene();
+    const auto lights = scene.create("Lights");
+    const auto sun = scene.create("Sun", lights);
+    (void)scene.set_light(sun, relay::Light{relay::Light::Type::directional});
+    const auto lamp = scene.create("Lamp", lights);
+    (void)scene.set_light(lamp, relay::Light{});
+    const auto level = scene.create("Level");
+    const auto floor = scene.create("Floor", level);
+    (void)scene.set_collider(floor, relay::BoxCollider{});
+    (void)scene.set_physics_body(floor, relay::PhysicsBody{relay::PhysicsBody::Type::static_body});
+    const auto crate = scene.create("Crate");
+    (void)scene.set_collider(crate, relay::BoxCollider{});
+    (void)scene.set_physics_body(crate, relay::PhysicsBody{});
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize search editor without windows");
+    frame(ui, 5);
+    const auto row = [&](relay::Entity entity) { return ui.headless_item_rect("entity:" + entity.to_string()); };
+    const auto result = [&](relay::Entity entity) {
+        return ui.headless_item_rect("hierarchy:result:" + entity.to_string());
+    };
+    check(row(sun) && row(floor) && ui.headless_item_rect("hierarchy:expand_all"),
+          "the Hierarchy starts expanded with a collapse/expand-all button");
+    const auto expand = *ui.headless_item_rect("hierarchy:expand_all");
+    const auto filter = *ui.headless_item_rect("hierarchy:filter");
+    check(expand[2] <= filter[0] && std::abs(expand[1] - filter[1]) < 1.0F,
+          "the collapse/expand-all button sits left of the filter button");
+    click_center(ui, expand);
+    frame(ui, 2);
+    check(row(lights) && !row(sun) && !row(floor), "collapse all folds every node");
+    click_center(ui, expand);
+    frame(ui, 2);
+    check(row(sun) && row(floor), "expand all opens every node again");
+    click_center(ui, expand);
+    frame(ui, 2);
+
+    click_center(ui, *ui.headless_item_rect("hierarchy:search"));
+    type_text(ui, "lA");
+    check(result(lamp) && !result(sun) && !result(floor) && !row(lights),
+          "searching lists matching nodes flat, ignoring case");
+    key(ui, ImGuiKey_Escape, false);
+    check(row(lights) && !result(lamp), "Escape clears the search");
+
+    click_center(ui, filter);
+    frame(ui, 2);
+    click_center(ui, *ui.headless_item_rect("hierarchy:filter:Light"));
+    click(ui, *ui.headless_item_rect("hierarchy:empty"));
+    check(result(sun) && result(lamp) && !result(crate) && !result(lights),
+          "filtering by a category includes its subtypes");
+    click_center(ui, filter);
+    frame(ui, 2);
+    click_center(ui, *ui.headless_item_rect("hierarchy:filter:Light"));
+    click_center(ui, *ui.headless_item_rect("hierarchy:filter:StaticBody"));
+    click(ui, *ui.headless_item_rect("hierarchy:empty"));
+    check(result(floor) && !result(crate) && !result(sun), "filters narrow the list to node types");
+    double_click(ui, *result(floor));
+    frame(ui, 3);
+    check(row(floor) && !result(floor) && ui.selected_entities() == std::vector<relay::Entity>{floor},
+          "double-clicking a result shows it in the tree, opening its parents, and selects it");
+
+    // Assets: the same button opens every folder, or closes them all.
+    check(!ui.headless_item_rect("asset:project.relayproject"), "the project file is not listed");
+    const auto folders = *ui.headless_item_rect("assets:expand_all");
+    check(folders[2] <= ui.headless_item_rect("assets:filter")->at(0),
+          "the Assets collapse/expand-all button sits left of its filter button");
+    click_center(ui, folders);
+    frame(ui, 2);
+    check(ui.headless_item_rect("asset:art/props/small").has_value(),
+          "expand all lists and opens nested asset folders");
+    click_center(ui, folders);
+    frame(ui, 2);
+    check(ui.headless_item_rect("asset:art") && !ui.headless_item_rect("asset:art/props"),
+          "collapse all closes every asset folder");
+    std::cout << "Headless hierarchy search tests passed\n";
+}
+
 void key_event(relay::EditorUi& ui, SDL_Scancode scancode) {
     SDL_Event event{};
     event.type = SDL_EVENT_KEY_DOWN;
@@ -1055,8 +1179,12 @@ void game_configuration_ui() {
     };
     check(jump().bindings.back() == "key:q" && !ui.headless_item_rect("config:input:capture"),
           "pressing a key binds it to the action by physical position");
-    check(std::filesystem::exists("projects/configured/input.relay-input.json"),
-          "a binding change saves the project's input map");
+    {
+        std::string load_error;
+        const auto saved = relay::load_project("projects/configured/project.relayproject", load_error);
+        check(saved && saved->input && saved->input->actions.size() == engine.input().map().actions.size(),
+              "a binding change saves the input map in the project file");
+    }
     click_center(ui, *ui.headless_item_rect("config:input:action:jump:add"));
     key_event(ui, SDL_SCANCODE_ESCAPE);
     check(!ui.headless_item_rect("config:input:capture") && jump().bindings.size() == 3U,
@@ -1267,6 +1395,8 @@ int main() {
         fresh(hierarchy_and_assets_ui);
         fresh(components_ui);
         fresh(node_templates_ui);
+        fresh(joints_ui);
+        fresh(hierarchy_search_ui);
         fresh(game_configuration_ui);
         fresh(game_input_ui);
         fresh(scripts_ui);

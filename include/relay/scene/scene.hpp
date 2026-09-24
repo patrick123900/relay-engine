@@ -129,6 +129,41 @@ struct PhysicsBody {
     auto operator<=>(const PhysicsBody&) const = default;
 };
 
+// Links this node's physics body to another node's body, or to a fixed point in the world, during
+// Run Game. Anchor and axis are in this node's local space, captured when the game starts. At least
+// one of the two bodies must be dynamic for the joint to do anything.
+struct Joint {
+    enum class Type : std::uint8_t { fixed, point, hinge, slider, distance } type{Type::hinge};
+    Entity connected{};      // Invalid means the world.
+    Vec3 anchor{};           // Pivot, in this node's local space.
+    Vec3 axis{0.0, 1.0, 0.0}; // Hinge or slider axis, in this node's local space.
+    // Distance joints: the far end, in the connected node's local space (world space for the world).
+    Vec3 connected_anchor{};
+    // Hinge angle in degrees (min in [-180, 0], max in [0, 180]); slider travel in metres from the
+    // start (min <= 0 <= max); distance length in metres (0 <= min <= max). Without limits a
+    // distance joint keeps its starting length.
+    bool limits{};
+    double limit_min{-45.0};
+    double limit_max{45.0};
+    // Hinge and slider: drive at motor_speed (degrees or metres per second) with at most
+    // motor_force (newton metres or newtons).
+    bool motor{};
+    double motor_speed{90.0};
+    double motor_force{1000.0};
+    // Distance: a spring of this frequency (Hz) and damping ratio holds the limits; 0 is rigid.
+    double spring_frequency{};
+    double spring_damping{0.5};
+    bool collide_connected{}; // Joined bodies pass through each other unless this is set.
+    bool enabled{true};
+    auto operator<=>(const Joint&) const = default;
+};
+
+// Default limits for a joint type: +-45 degrees for hinges, +-1 m for sliders, 0 to 2 m for
+// distance joints.
+void set_default_joint_limits(Joint& joint);
+[[nodiscard]] std::string_view joint_type_name(Joint::Type type);
+[[nodiscard]] std::optional<Joint::Type> joint_type_from_name(std::string_view name);
+
 // An authored value for one of a behaviour's declared properties. Properties a node does not
 // override keep the default written in the script's code.
 struct ScriptProperty {
@@ -186,6 +221,7 @@ struct EntityRecord {
     std::optional<BoxCollider> collider{};
     std::optional<PhysicsBody> physics_body{};
     std::vector<Script> scripts{};
+    std::optional<Joint> joint{};
 };
 
 // The node type shown to people and agents, derived from the components an entity has now by
@@ -209,6 +245,7 @@ public:
     static constexpr std::size_t maximum_duplicate_entities = 4096;
 
     [[nodiscard]] Entity create(std::string name = "Entity", Entity parent = {});
+    // Joints connected to a destroyed node are disabled and fall back to the world connection.
     [[nodiscard]] bool destroy(Entity entity);
     // Copies `source` and everything beneath it, placing the copy beside the original. Components
     // are preserved, except that a copied camera is never the active one. Returns an invalid
@@ -233,6 +270,8 @@ public:
     [[nodiscard]] bool set_collider(Entity entity, std::optional<BoxCollider> collider);
     [[nodiscard]] bool set_physics_body(Entity entity, std::optional<PhysicsBody> body);
     [[nodiscard]] bool set_scripts(Entity entity, std::vector<Script> scripts);
+    // The connected node must exist and differ from `entity`.
+    [[nodiscard]] bool set_joint(Entity entity, std::optional<Joint> joint);
     [[nodiscard]] std::optional<Entity> active_camera() const;
 
     [[nodiscard]] SceneState capture_state() const;

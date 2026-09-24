@@ -21,6 +21,11 @@
 #include <Jolt/Physics/Collision/CollideShape.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Constraints/DistanceConstraint.h>
+#include <Jolt/Physics/Constraints/FixedConstraint.h>
+#include <Jolt/Physics/Constraints/HingeConstraint.h>
+#include <Jolt/Physics/Constraints/PointConstraint.h>
+#include <Jolt/Physics/Constraints/SliderConstraint.h>
 
 #include <algorithm>
 #include <array>
@@ -104,6 +109,8 @@ public:
     std::map<JPH::BodyID, Entity> entities;
     std::map<std::pair<Entity, Entity>, unsigned> active_pairs;
     std::vector<ContactEvent> pending;
+    // Bodies joined without collide_connected; each pair ordered with std::minmax.
+    std::multiset<std::pair<Entity, Entity>> joined;
     JPH::ValidateResult OnContactValidate(const JPH::Body& first, const JPH::Body& second,
                                            JPH::RVec3Arg,
                                            const JPH::CollideShapeResult&) override {
@@ -115,7 +122,8 @@ public:
         if (!a || !b || !a->collider || !b->collider ||
             !(a->collider->layer & b->collider->mask) ||
             !(b->collider->layer & a->collider->mask) ||
-            related(*scene, first_entity, second_entity))
+            related(*scene, first_entity, second_entity) ||
+            joined.contains(std::minmax(first_entity, second_entity)))
             return JPH::ValidateResult::RejectAllContactsForThisBodyPair;
         return JPH::ValidateResult::AcceptAllContactsForThisBodyPair;
     }
@@ -343,6 +351,16 @@ bool triangle_mesh(const JPH::Body& body) {
     return body.GetShape()->GetSubType() == JPH::EShapeSubType::Mesh;
 }
 
+Vec3 add_vectors(const Vec3 a, const Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+
+struct JointEntry {
+    Entity owner;     // The node carrying the Joint component.
+    Entity connected; // Invalid for the world.
+    JPH::Ref<JPH::TwoBodyConstraint> constraint;
+    Joint::Type type{};
+    bool ignores_contacts{};
+};
+
 class JoltState {
 public:
     explicit JoltState(const AssetRegistry* assets) : jobs_(JPH::cMaxPhysicsJobs), assets_(assets) {
@@ -350,6 +368,8 @@ public:
         system_.SetContactListener(&contact_filter_);
     }
     ~JoltState() {
+        for (const auto& joint : joints_) system_.RemoveConstraint(joint.constraint);
+        joints_.clear();
         auto& api = system_.GetBodyInterface();
         for (const auto& [entity, id] : bodies_) {
             (void)entity;
@@ -362,25 +382,39 @@ public:
         built_ = true;
         contact_filter_.scene = &scene;
         for (const auto entity : scene.entities()) add_body(scene, entity, queries_only);
+        if (!queries_only)
+            for (const auto entity : scene.entities()) add_joint(scene, entity);
         system_.OptimizeBroadPhase();
     }
 
     // Gives entities created during the game their bodies: `root` and its descendants that lack one.
     void add_bodies(const Scene& scene, const Entity root) {
+        std::vector<Entity> added;
         for (const auto entity : scene.entities()) {
             if (bodies_.contains(entity)) continue;
             for (auto current = entity; current.valid() && scene.contains(current);
                  current = scene.get(current)->parent)
                 if (current == root) {
                     add_body(scene, entity, false);
+                    added.push_back(entity);
                     break;
                 }
         }
+        // Bodies first, so joints within the new tree find both ends.
+        for (const auto entity : added) add_joint(scene, entity);
     }
 
     // Removes the bodies of entities no longer in the scene. Their touching pairs end now, so
     // contact streams never report a pair whose body is gone as still touching.
     void remove_missing_bodies(const Scene& scene) {
+        // Constraints go before the bodies they hold.
+        std::erase_if(joints_, [&](const JointEntry& joint) {
+            if (scene.contains(joint.owner) &&
+                (!joint.connected.valid() || scene.contains(joint.connected)))
+                return false;
+            remove_constraint(joint);
+            return true;
+        });
         auto& api = system_.GetBodyInterface();
         for (auto it = bodies_.begin(); it != bodies_.end();) {
             if (scene.contains(it->first)) {
@@ -402,6 +436,142 @@ public:
                 pair = pairs.erase(pair);
             }
         }
+    }
+
+    // Creates the constraint for an entity's enabled joint once both bodies exist. The partner is
+    // Jolt's body 1 (the world when there is none) and the joint's own node body 2, so angles,
+    // positions and motor speeds describe the node's motion about its axis.
+    void add_joint(const Scene& scene, const Entity owner) {
+        const auto* record = scene.get(owner);
+        if (!record || !record->joint || !record->joint->enabled) return;
+        const auto& joint = *record->joint;
+        const auto body = bodies_.find(owner);
+        if (body == bodies_.end()) return;
+        JPH::BodyID partner; // Invalid: fixed to the world.
+        if (joint.connected.valid()) {
+            const auto found = bodies_.find(joint.connected);
+            if (found == bodies_.end()) return;
+            partner = found->second;
+        }
+        auto& api = system_.GetBodyInterface();
+        const auto moves = [&](const JPH::BodyID id) {
+            return !id.IsInvalid() && api.GetMotionType(id) != JPH::EMotionType::Static;
+        };
+        const auto pose = world_transform(scene, owner);
+        if (!pose || (!moves(body->second) && !moves(partner))) return;
+        const auto anchor = to_jolt_position(add_vectors(
+            pose->position, transform_direction(pose->axes, joint.anchor)));
+        const auto axis = (pose->rotation * to_jolt(joint.axis)).NormalizedOr(JPH::Vec3::sAxisY());
+        const auto normal = axis.GetNormalizedPerpendicular();
+        const auto degrees = static_cast<float>(JPH::JPH_PI / 180.0);
+        JPH::Ref<JPH::TwoBodyConstraintSettings> settings;
+        switch (joint.type) {
+        case Joint::Type::fixed: {
+            auto fixed = new JPH::FixedConstraintSettings;
+            fixed->mAutoDetectPoint = true;
+            settings = fixed;
+            break;
+        }
+        case Joint::Type::point: {
+            auto point = new JPH::PointConstraintSettings;
+            point->mPoint1 = point->mPoint2 = anchor;
+            settings = point;
+            break;
+        }
+        case Joint::Type::hinge: {
+            auto hinge = new JPH::HingeConstraintSettings;
+            hinge->mPoint1 = hinge->mPoint2 = anchor;
+            hinge->mHingeAxis1 = hinge->mHingeAxis2 = axis;
+            hinge->mNormalAxis1 = hinge->mNormalAxis2 = normal;
+            if (joint.limits) {
+                hinge->mLimitsMin = static_cast<float>(joint.limit_min) * degrees;
+                hinge->mLimitsMax = static_cast<float>(joint.limit_max) * degrees;
+            }
+            hinge->mMotorSettings.SetTorqueLimit(static_cast<float>(joint.motor_force));
+            settings = hinge;
+            break;
+        }
+        case Joint::Type::slider: {
+            auto slider = new JPH::SliderConstraintSettings;
+            slider->mPoint1 = slider->mPoint2 = anchor;
+            slider->mSliderAxis1 = slider->mSliderAxis2 = axis;
+            slider->mNormalAxis1 = slider->mNormalAxis2 = normal;
+            if (joint.limits) {
+                slider->mLimitsMin = static_cast<float>(joint.limit_min);
+                slider->mLimitsMax = static_cast<float>(joint.limit_max);
+            }
+            slider->mMotorSettings.SetForceLimit(static_cast<float>(joint.motor_force));
+            settings = slider;
+            break;
+        }
+        case Joint::Type::distance: {
+            auto distance = new JPH::DistanceConstraintSettings;
+            Vec3 far = joint.connected_anchor;
+            if (joint.connected.valid()) {
+                const auto partner_pose = world_transform(scene, joint.connected);
+                if (!partner_pose) return;
+                far = add_vectors(partner_pose->position,
+                                  transform_direction(partner_pose->axes, joint.connected_anchor));
+            }
+            distance->mPoint1 = to_jolt_position(far);
+            distance->mPoint2 = anchor;
+            // Negative lengths make Jolt keep the starting distance.
+            distance->mMinDistance = joint.limits ? static_cast<float>(joint.limit_min) : -1.0f;
+            distance->mMaxDistance = joint.limits ? static_cast<float>(joint.limit_max) : -1.0f;
+            distance->mLimitsSpringSettings.mFrequency = static_cast<float>(joint.spring_frequency);
+            distance->mLimitsSpringSettings.mDamping = static_cast<float>(joint.spring_damping);
+            settings = distance;
+            break;
+        }
+        }
+        JPH::Ref<JPH::TwoBodyConstraint> constraint =
+            api.CreateConstraint(settings.GetPtr(), partner, body->second);
+        if (!constraint) return;
+        JointEntry entry{owner, joint.connected, constraint, joint.type,
+                         !joint.collide_connected && joint.connected.valid()};
+        if (entry.ignores_contacts)
+            contact_filter_.joined.insert(std::minmax(owner, joint.connected));
+        system_.AddConstraint(constraint);
+        joints_.push_back(std::move(entry));
+        set_motor(joints_.back(), joint.motor, joint.motor_speed);
+        api.ActivateBody(body->second);
+        if (!partner.IsInvalid()) api.ActivateBody(partner);
+    }
+
+    // Wakes the bodies it held: a sleeping body hanging from a removed joint must start to fall.
+    void remove_constraint(const JointEntry& joint) {
+        system_.RemoveConstraint(joint.constraint);
+        auto& api = system_.GetBodyInterface();
+        for (const auto* held : {joint.constraint->GetBody1(), joint.constraint->GetBody2()})
+            if (held != &JPH::Body::sFixedToWorld) api.ActivateBody(held->GetID());
+        if (joint.ignores_contacts) {
+            const auto found = contact_filter_.joined.find(std::minmax(joint.owner, joint.connected));
+            if (found != contact_filter_.joined.end()) contact_filter_.joined.erase(found);
+        }
+    }
+
+    // Hinge motors take degrees per second, slider motors metres per second.
+    static bool set_motor(const JointEntry& joint, const bool on, const double speed) {
+        const auto state = on ? JPH::EMotorState::Velocity : JPH::EMotorState::Off;
+        if (joint.type == Joint::Type::hinge) {
+            auto& hinge = static_cast<JPH::HingeConstraint&>(*joint.constraint);
+            hinge.SetMotorState(state);
+            hinge.SetTargetAngularVelocity(static_cast<float>(speed * JPH::JPH_PI / 180.0));
+            return true;
+        }
+        if (joint.type == Joint::Type::slider) {
+            auto& slider = static_cast<JPH::SliderConstraint&>(*joint.constraint);
+            slider.SetMotorState(state);
+            slider.SetTargetVelocity(static_cast<float>(speed));
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] const JointEntry* joint(const Entity owner) const {
+        const auto found = std::find_if(joints_.begin(), joints_.end(),
+                                        [&](const JointEntry& entry) { return entry.owner == owner; });
+        return found == joints_.end() ? nullptr : &*found;
     }
 
     void add_body(const Scene& scene, const Entity entity, const bool queries_only) {
@@ -570,6 +740,7 @@ private:
     JPH::TempAllocatorMalloc allocator_;
     JPH::JobSystemSingleThreaded jobs_;
     std::map<Entity, JPH::BodyID> bodies_;
+    std::vector<JointEntry> joints_;
     std::deque<ContactEvent> events_;
     std::uint64_t latest_sequence_{};
     const AssetRegistry* assets_{};
@@ -781,6 +952,40 @@ CollisionRaycast PhysicsWorld::raycast(const Scene& scene, Vec3 origin, Vec3 dir
              {direction.x / length, direction.y / length, direction.z / length},
              maximum_distance, layer_mask, result, ignore);
     return result;
+}
+std::optional<double> PhysicsWorld::joint_position(const Scene& scene, const Entity entity) {
+    if (!scene.contains(entity)) return std::nullopt;
+    ensure_built(scene);
+    const auto* joint = impl_->state->joint(entity);
+    if (!joint) return std::nullopt;
+    switch (joint->type) {
+    case Joint::Type::hinge:
+        return static_cast<const JPH::HingeConstraint&>(*joint->constraint).GetCurrentAngle() *
+               180.0 / JPH::JPH_PI;
+    case Joint::Type::slider:
+        return static_cast<const JPH::SliderConstraint&>(*joint->constraint).GetCurrentPosition();
+    case Joint::Type::distance: {
+        const auto& constraint = *joint->constraint;
+        const auto first = constraint.GetBody1()->GetCenterOfMassTransform() *
+                           constraint.GetConstraintToBody1Matrix().GetTranslation();
+        const auto second = constraint.GetBody2()->GetCenterOfMassTransform() *
+                            constraint.GetConstraintToBody2Matrix().GetTranslation();
+        return (second - first).Length();
+    }
+    default: return std::nullopt;
+    }
+}
+bool PhysicsWorld::set_joint_motor(const Scene& scene, const Entity entity, const bool on,
+                                   const double speed) {
+    if (!scene.contains(entity) || !std::isfinite(speed) || std::abs(speed) > 1e6) return false;
+    ensure_built(scene);
+    const auto* joint = impl_->state->joint(entity);
+    if (!joint || !JoltState::set_motor(*joint, on, speed)) return false;
+    auto& api = impl_->state->system().GetBodyInterface();
+    api.ActivateBody(joint->constraint->GetBody2()->GetID());
+    if (joint->constraint->GetBody1() != &JPH::Body::sFixedToWorld)
+        api.ActivateBody(joint->constraint->GetBody1()->GetID());
+    return true;
 }
 void PhysicsWorld::add_bodies(const Scene& scene, const Entity root) {
     // Before the first step the world is built from the scene anyway.

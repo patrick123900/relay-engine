@@ -21,6 +21,9 @@ const std::vector<ComponentKind>& engine_components() {
          "and raycasts."},
         {"physics_body", "Physics body", "Physics", true, true, false,
          "Makes the node static or dynamic during Run Game: gravity, mass, bounce and friction."},
+        {"joint", "Joint", "Physics", true, true, false,
+         "Links this node's physics body to another body or to the world during Run Game: fixed, "
+         "point (ball and socket), hinge, slider or distance (rope or spring)."},
         {"keyframes", "Transform keyframes", "Animation", true, true, false,
          "Animates position, rotation and scale between keys you set on a timeline."},
         {"animator", "Model animation", "Animation", false, false, false,
@@ -46,6 +49,7 @@ bool has_component(const EntityRecord& record, const std::string_view id) {
     if (id == "collider") return record.collider.has_value();
     if (id == "physics_body") return record.physics_body.has_value();
     if (id == "keyframes") return record.transform_animation.has_value();
+    if (id == "joint") return record.joint.has_value();
     if (id == "animator") return record.animator.has_value();
     if (id == "script") return !record.scripts.empty();
     return false;
@@ -80,6 +84,8 @@ bool add_component(Scene& scene, const Entity entity, const std::string_view id,
         added = scene.set_collider(entity, BoxCollider{});
     } else if (id == "physics_body") {
         added = scene.set_physics_body(entity, PhysicsBody{});
+    } else if (id == "joint") {
+        added = scene.set_joint(entity, Joint{});
     } else if (id == "keyframes") {
         TransformAnimation animation;
         animation.keys.push_back({0.0, record->transform});
@@ -124,6 +130,7 @@ bool remove_component(Scene& scene, const Entity entity, const std::string_view 
     if (id == "collider") return scene.set_collider(entity, std::nullopt);
     if (id == "physics_body") return scene.set_physics_body(entity, std::nullopt);
     if (id == "keyframes") return scene.set_transform_animation(entity, std::nullopt);
+    if (id == "joint") return scene.set_joint(entity, std::nullopt);
     auto scripts = record->scripts;
     scripts.erase(scripts.begin() + static_cast<std::ptrdiff_t>(index));
     return scene.set_scripts(entity, std::move(scripts));

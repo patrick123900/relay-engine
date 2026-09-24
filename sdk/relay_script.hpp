@@ -168,6 +168,22 @@ public:
     // on_destroy. Handles to them then stop being alive(). False if it is already gone.
     bool destroy() const { return api().destroy(api().context, handle_) != 0; }
 
+    // This entity's joint while the game runs: a hinge's angle in degrees, a slider's travel in
+    // metres from where it started, or a distance joint's length. Hinge angles and slider travel
+    // follow the right-hand rule about the joint's axis. Nothing without such a joint.
+    [[nodiscard]] std::optional<double> joint_position() const {
+        double value{};
+        if (!api().joint_position(api().context, handle_, &value)) return std::nullopt;
+        return value;
+    }
+    // Drives this entity's hinge (degrees per second) or slider (metres per second) joint with its
+    // motor, up to the motor force set in the editor; positive speeds follow the right-hand rule
+    // about the axis. False without a hinge or slider joint.
+    bool set_joint_motor(double speed) const {
+        return api().set_joint_motor(api().context, handle_, 1, speed) != 0;
+    }
+    bool stop_joint_motor() const { return api().set_joint_motor(api().context, handle_, 0, 0.0) != 0; }
+
     // Enabled colliders touching this entity's enabled collider, sorted. Each side's layer must
     // be in the other's mask.
     [[nodiscard]] std::vector<Entity> overlaps() const {

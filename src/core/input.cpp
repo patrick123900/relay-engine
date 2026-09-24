@@ -233,54 +233,20 @@ std::string input_map_json(const InputMap& map) {
     return output.str();
 }
 
-InputMap load_input_map(const fs::path& project_root, std::string& error) {
-    const auto path = project_root / input_map_filename;
+std::optional<InputMap> load_legacy_input_map(const fs::path& project_root, std::string& error) {
+    const auto path = project_root / legacy_input_map_filename;
     std::error_code code;
-    if (fs::is_symlink(path, code)) {
-        error = "input map must not be a symbolic link; using defaults";
-        return default_input_map();
-    }
-    if (!fs::is_regular_file(path, code)) return default_input_map();
+    if (fs::is_symlink(path, code) || !fs::is_regular_file(path, code)) return std::nullopt;
     if (fs::file_size(path, code) > 256U * 1024U) {
-        error = "input map exceeds 256 KiB; using defaults";
-        return default_input_map();
+        error = "input.relay-input.json exceeds 256 KiB; using the default input map";
+        return std::nullopt;
     }
     std::ifstream input(path, std::ios::binary);
     std::ostringstream text;
     text << input.rdbuf();
     auto map = parse_input_map(text.str(), error);
-    if (!map) {
-        error = "invalid input map: " + error + "; using defaults";
-        return default_input_map();
-    }
-    return *map;
-}
-
-bool save_input_map(const fs::path& project_root, const InputMap& map, std::string& error) {
-    const auto path = project_root / input_map_filename;
-    const auto temporary = project_root / ".relay-input.tmp";
-    std::error_code code;
-    if (fs::is_symlink(path, code)) {
-        error = "input map must not be a symbolic link";
-        return false;
-    }
-    {
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-        const auto text = input_map_json(map);
-        output.write(text.data(), static_cast<std::streamsize>(text.size()));
-        if (!output.flush()) {
-            error = "could not write the input map";
-            fs::remove(temporary, code);
-            return false;
-        }
-    }
-    fs::rename(temporary, path, code);
-    if (code) {
-        error = "could not replace the input map: " + code.message();
-        fs::remove(temporary, code);
-        return false;
-    }
-    return true;
+    if (!map) error = "invalid input.relay-input.json: " + error + "; using the default input map";
+    return map;
 }
 
 void InputState::apply(const std::string_view event) {

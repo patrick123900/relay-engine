@@ -404,14 +404,16 @@ int main() {
     }
 
     const auto render_graph = relay::make_scene_render_graph();
-    expect(render_graph.valid && render_graph.ordered_passes.size() == 8U &&
+    expect(render_graph.valid && render_graph.ordered_passes.size() == 10U &&
                render_graph.ordered_passes.front().name == "directional_shadow_0" &&
                render_graph.ordered_passes[2].name == "directional_shadow_2" &&
                render_graph.ordered_passes[3].name == "spot_shadow" &&
                render_graph.ordered_passes[4].name == "point_shadow" &&
                render_graph.ordered_passes[5].name == "scene_geometry" &&
-               render_graph.ordered_passes[6].name == "tone_map" &&
-               render_graph.transitions.size() == 16U,
+               render_graph.ordered_passes[6].name == "global_illumination" &&
+               render_graph.ordered_passes[7].name == "scene_forward" &&
+               render_graph.ordered_passes[8].name == "tone_map" &&
+               render_graph.transitions.size() == 33U,
            "render graph compiles geometry and presentation with explicit transitions: " +
                render_graph.error);
     const auto depth_resource = std::find_if(
@@ -425,6 +427,22 @@ int main() {
                                   transition.pass == "scene_geometry";
                        }),
            "render graph records the depth attachment transition in the geometry pass");
+    {
+        // A pass that loads an attachment follows its writer, and readers follow both.
+        relay::RenderGraph graph;
+        const auto target = graph.add_resource("target", relay::RenderResourceKind::image);
+        const auto output = graph.add_resource("output", relay::RenderResourceKind::image, true);
+        graph.add_pass("read", {{target, relay::RenderAccess::sampled},
+                                {output, relay::RenderAccess::color_attachment}});
+        graph.add_pass("add", {{target, relay::RenderAccess::color_attachment_load}});
+        graph.add_pass("draw", {{target, relay::RenderAccess::color_attachment}});
+        const auto compiled = graph.compile();
+        expect(compiled.valid && compiled.ordered_passes.size() == 3U &&
+                   compiled.ordered_passes[0].name == "draw" &&
+                   compiled.ordered_passes[1].name == "add" &&
+                   compiled.ordered_passes[2].name == "read",
+               "loading an attachment orders a pass between its writer and its readers");
+    }
     expect(relay::texture_mip_bytes(4U, 2U) == 44U &&
                relay::texture_mip_bytes(1U, 1U) == 4U,
            "upload planning accounts for every RGBA8 mip level");
@@ -1177,7 +1195,7 @@ int main() {
     const auto tone_fragment = relay::reflect_spirv(read_spirv(RELAY_TEST_TONE_FRAGMENT_PATH));
     expect(tone_vertex.valid && tone_vertex.stage == "vertex" && tone_vertex.inputs.empty() &&
                tone_fragment.valid && tone_fragment.stage == "fragment" &&
-               tone_fragment.push_constant_bytes == 8U &&
+               tone_fragment.push_constant_bytes == 24U &&
                !tone_fragment.bindings.empty() && tone_fragment.bindings.front().set == 0U &&
                tone_fragment.bindings.front().binding == 0U,
            "post-process shaders use a vertex-free fullscreen pass and an HDR sampler");
@@ -2002,7 +2020,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 38U && relay::protocol_methods().size() == 127U,
+    expect(relay::protocol_schema_version == 39U && relay::protocol_methods().size() == 129U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");
@@ -2084,7 +2102,7 @@ int main() {
         std::filesystem::create_directories(package_root / "captures");
         const auto project_file = package_root / "sample.relayproject";
         relay::Project package{project_file.generic_string(), "Portable test", {"main.relay.json"},
-                               "main.relay.json", {}, false};
+                               "main.relay.json", {}, false, {}};
         std::string package_error;
         expect(relay::save_project(package, package_error, true), "test project metadata saves");
         expect(relay::save_scene_file_atomic(engine.scene(), package_root / "scenes/main.relay.json",

@@ -7,6 +7,7 @@ option(RELAY_ENABLE_SDL "Build the SDL-powered human window" ON)
 option(RELAY_ENABLE_EDITOR_UI "Build the Dear ImGui human editor interface" ON)
 option(RELAY_FETCH_VULKAN_HEADERS "Fetch pinned Khronos headers when the system only has a loader" ON)
 option(RELAY_OPEN_DEMO_PROJECT "Open examples/demo when the editor starts (dev builds)" OFF)
+option(RELAY_ENABLE_FIDELITYFX "Build AMD FidelityFX effects for ray traced lighting" ON)
 
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 include(FetchContent)
@@ -66,6 +67,7 @@ add_library(relay_engine
     src/render/scene_render.cpp
     src/render/render_graph.cpp
     src/render/upload_budget.cpp
+    src/render/graphics_settings.cpp
     src/render/shader_reflection.cpp
     src/render/vulkan_device.cpp
     src/scene/scene.cpp
@@ -215,6 +217,7 @@ if(RELAY_ENABLE_SDL)
                         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/first_light.frag"
                         -o "${RELAY_FRAGMENT_SHADER}"
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/first_light.frag"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/surface_lighting.glsl"
                 VERBATIM
             )
             foreach(stage vert frag)
@@ -263,13 +266,50 @@ if(RELAY_ENABLE_SDL)
                     VERBATIM
                 )
             endforeach()
+            set(RELAY_GI_COMPOSITE_FRAGMENT "${RELAY_SHADER_OUTPUT_DIR}/gi_composite.frag.spv")
+            add_custom_command(
+                OUTPUT "${RELAY_GI_COMPOSITE_FRAGMENT}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
+                COMMAND "${RELAY_GLSLC}" -fshader-stage=frag
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gi_composite.frag"
+                        -o "${RELAY_GI_COMPOSITE_FRAGMENT}"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gi_composite.frag"
+                VERBATIM
+            )
+            # Ray traced reflections; ray queries need SPIR-V 1.4, so these target Vulkan 1.3.
+            foreach(shader reflection_trace reflection_arguments)
+                set(RELAY_${shader}_SHADER "${RELAY_SHADER_OUTPUT_DIR}/${shader}.comp.spv")
+                add_custom_command(
+                    OUTPUT "${RELAY_${shader}_SHADER}"
+                    COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
+                    COMMAND "${RELAY_GLSLC}" --target-env=vulkan1.3 -fshader-stage=comp
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.comp"
+                            -o "${RELAY_${shader}_SHADER}"
+                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.comp"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/surface_lighting.glsl"
+                    VERBATIM
+                )
+            endforeach()
             add_custom_target(relay_shaders DEPENDS "${RELAY_VERTEX_SHADER}" "${RELAY_FRAGMENT_SHADER}"
+                              "${RELAY_GI_COMPOSITE_FRAGMENT}" "${RELAY_reflection_trace_SHADER}"
+                              "${RELAY_reflection_arguments_SHADER}"
                               "${RELAY_TONE_VERTEX}" "${RELAY_TONE_FRAGMENT}"
                               "${RELAY_SHADOW_VERTEX}" "${RELAY_SHADOW_FRAGMENT}"
                               "${RELAY_GRID_vert}" "${RELAY_GRID_frag}"
                               "${RELAY_SELECTION_vert}" "${RELAY_SELECTION_frag}")
             add_dependencies(relay_demo relay_shaders)
             target_sources(relay_demo PRIVATE src/platform/vulkan_window.cpp)
+            find_program(RELAY_GLSLANG_VALIDATOR glslangValidator)
+            if(RELAY_ENABLE_FIDELITYFX AND RELAY_GLSLANG_VALIDATOR)
+                # Global illumination and reflections; see third_party/fidelityfx/README.md.
+                add_subdirectory(third_party/fidelityfx)
+                target_sources(relay_demo PRIVATE src/platform/vulkan_lighting.cpp
+                                                  src/platform/vulkan_ray_tracing.cpp)
+                target_link_libraries(relay_demo PRIVATE relay_fidelityfx)
+                target_compile_definitions(relay_demo PRIVATE RELAY_HAS_FIDELITYFX=1)
+            elseif(RELAY_ENABLE_FIDELITYFX)
+                message(STATUS "FidelityFX disabled: glslangValidator was not found")
+            endif()
             target_link_libraries(relay_demo PRIVATE Vulkan::Vulkan)
             if(TARGET Vulkan::Headers)
                 target_link_libraries(relay_demo PRIVATE Vulkan::Headers)
@@ -286,6 +326,9 @@ if(RELAY_ENABLE_SDL)
                 RELAY_GRID_FRAGMENT_PATH="${RELAY_GRID_frag}"
                 RELAY_SELECTION_VERTEX_PATH="${RELAY_SELECTION_vert}"
                 RELAY_SELECTION_FRAGMENT_PATH="${RELAY_SELECTION_frag}"
+                RELAY_GI_COMPOSITE_FRAGMENT_PATH="${RELAY_GI_COMPOSITE_FRAGMENT}"
+                RELAY_REFLECTION_TRACE_PATH="${RELAY_reflection_trace_SHADER}"
+                RELAY_REFLECTION_ARGUMENTS_PATH="${RELAY_reflection_arguments_SHADER}"
             )
 
             if(RELAY_ENABLE_EDITOR_UI)
@@ -399,6 +442,17 @@ if(RELAY_BUILD_TESTS)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/session_protocol_tests.py"
                 "$<TARGET_FILE:relay_demo>")
     set_tests_properties(relay_session_protocol_tests PROPERTIES TIMEOUT 30)
+    if(TARGET relay_fidelityfx)
+        add_executable(relay_fidelityfx_tests tests/fidelityfx_tests.cpp)
+        target_link_libraries(relay_fidelityfx_tests PRIVATE relay_fidelityfx)
+        relay_enable_warnings(relay_fidelityfx_tests)
+        add_test(NAME relay_fidelityfx_tests COMMAND relay_fidelityfx_tests)
+        # Renders offscreen through SDL's offscreen video driver; no window reaches the desktop.
+        add_test(NAME relay_lighting_render_tests
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/lighting_render_tests.py"
+                    "$<TARGET_FILE:relay_demo>")
+        set_tests_properties(relay_lighting_render_tests PROPERTIES TIMEOUT 900)
+    endif()
     if(TARGET relay_imgui)
         add_executable(relay_editor_headless_tests tests/editor_headless_tests.cpp
             src/editor/editor_ui.cpp src/editor/editor_theme.cpp src/editor/editor_layout.cpp src/editor/chat_media.cpp

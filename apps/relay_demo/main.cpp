@@ -97,6 +97,23 @@ int run_socket_mode(const std::string_view port_text) {
 }
 
 #ifdef RELAY_HAS_VULKAN_WINDOW
+// Applies the project's graphics settings to the renderer. RELAY_GLOBAL_ILLUMINATION and
+// RELAY_REFLECTIONS set to 0 or 1 override them, for comparisons and smoke runs.
+void apply_graphics_settings(relay::VulkanWindow& window, const relay::Engine& engine) {
+    bool global_illumination = engine.graphics_settings().global_illumination;
+    if (const char* value = std::getenv("RELAY_GLOBAL_ILLUMINATION")) {
+        if (std::string_view(value) == "0") global_illumination = false;
+        if (std::string_view(value) == "1") global_illumination = true;
+    }
+    window.set_global_illumination(global_illumination);
+    bool reflections = engine.graphics_settings().reflections;
+    if (const char* value = std::getenv("RELAY_REFLECTIONS")) {
+        if (std::string_view(value) == "0") reflections = false;
+        if (std::string_view(value) == "1") reflections = true;
+    }
+    window.set_reflections(reflections);
+}
+
 int run_windowed() {
     relay::Engine engine;
     relay::VulkanWindow window("Relay Engine — Vulkan First Light", 1280, 720, engine.assets());
@@ -111,6 +128,7 @@ int run_windowed() {
         for (auto& input : window.drain_input_events()) engine.apply_input_event(std::move(input));
         const auto frame_start = std::chrono::steady_clock::now();
         engine.tick();
+        apply_graphics_settings(window, engine);
         if (!window.draw(engine.scene(), engine.status().elapsed_seconds)) {
             std::cerr << "Vulkan rendering failed: " << window.error() << '\n';
             return 1;
@@ -165,6 +183,44 @@ int run_vulkan_capture(const std::string_view path_text) {
     return 0;
 }
 
+// Opens a project through the control protocol, renders it for a number of frames so temporal
+// effects settle, and captures the final frame. Run with SDL_VIDEODRIVER=offscreen to render
+// without a visible window.
+int run_vulkan_scene_capture(const std::string& project, const std::string& output,
+                             const unsigned frames) {
+    relay::Engine engine;
+    relay::ControlProtocol protocol(engine);
+    std::string request = R"({"id":1,"method":"project.open","filename":)";
+    request += '"' + project + "\"}";
+    const auto opened = protocol.handle(request);
+    if (opened.find(R"("ok":true)") == std::string::npos) {
+        std::cerr << "Could not open " << project << ": " << opened << '\n';
+        return 1;
+    }
+    relay::VulkanWindow window("Relay Scene Capture", 1280, 720, engine.assets());
+    if (!window.valid()) {
+        std::cerr << window.error() << '\n';
+        return 1;
+    }
+    for (unsigned frame = 0; frame < frames; ++frame) {
+        (void)window.poll_quit();
+        apply_graphics_settings(window, engine);
+        if (!window.draw(engine.scene(), static_cast<double>(frame) / 60.0)) {
+            std::cerr << window.error() << '\n';
+            return 1;
+        }
+    }
+    if (!window.capture_image(output, engine.scene(), static_cast<double>(frames) / 60.0)) {
+        std::cerr << window.error() << '\n';
+        return 1;
+    }
+    std::cout << "Captured " << project << " after " << frames << " frames to " << output
+              << " on " << window.device_name() << '\n'
+              << window.lighting_status_json() << '\n'
+              << "GPU frame: " << window.gpu_frame_milliseconds() << " ms\n";
+    return 0;
+}
+
 // Model smoke modes read the repository's test fixtures, independent of the working directory.
 std::filesystem::path fixture_models() {
     return std::filesystem::path(RELAY_SOURCE_ROOT) / "tests/fixtures/models";
@@ -195,6 +251,7 @@ int run_vulkan_model_smoke(const std::string_view filename) {
             window.resize(960, 540);
         (void)window.poll_quit();
         engine.step();
+        apply_graphics_settings(window, engine);
         if (!window.draw(engine.scene(), engine.status().elapsed_seconds)) {
             std::cerr << window.error() << '\n';
             return 1;
@@ -209,7 +266,8 @@ int run_vulkan_model_smoke(const std::string_view filename) {
         std::cerr << window.error() << '\n';
         return 1;
     }
-    std::cout << "Phase D Vulkan model smoke passed on " << window.device_name() << '\n';
+    std::cout << "Phase D Vulkan model smoke passed on " << window.device_name() << '\n'
+              << window.lighting_status_json() << '\n';
     return 0;
 }
 
@@ -235,6 +293,7 @@ int run_vulkan_async_smoke(const std::string& filename) {
         if (frame == 60) window.resize(960, 540);
         (void)window.poll_quit();
         engine.step();
+        apply_graphics_settings(window, engine);
         if (!window.draw(engine.scene(), engine.status().elapsed_seconds)) { std::cerr << window.error() << '\n'; return 1; }
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
         if (frame >= 90 && (!job || engine.capture_status(job).state == relay::CaptureJobState::failed)) job = engine.capture_async("/tmp/relay-phase-e.png", error, "vulkan");
@@ -287,6 +346,7 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
             if (kind == "graph") return window.render_graph_json();
             if (kind == "shader_interfaces") return window.shader_interfaces_json();
             if (kind == "upload_status") return window.upload_status_json();
+            if (kind == "lighting") return window.lighting_status_json();
             return std::string{};
         });
 
@@ -380,6 +440,7 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
             engine.tick();
             unsimulated_seconds -= step;
         }
+        apply_graphics_settings(window, engine);
         if (!window.draw(engine.scene(), engine.status().elapsed_seconds)) {
             std::cerr << "Live editor Vulkan draw failed: " << window.error() << '\n';
             engine.request_shutdown();
@@ -486,6 +547,23 @@ int main(const int argument_count, char** arguments) {
     if (mode == "--vulkan-capture") {
         return run_vulkan_capture(argument_count > 2 ? std::string_view(arguments[2])
                                                      : std::string_view{});
+    }
+    if (mode == "--vulkan-scene-capture") {
+        if (argument_count < 4) {
+            std::cerr << "usage: relay_demo --vulkan-scene-capture <project> <output.png> "
+                         "[frames]\n";
+            return 2;
+        }
+        unsigned frames = 60;
+        if (argument_count > 4) {
+            const std::string_view text = arguments[4];
+            if (std::from_chars(text.data(), text.data() + text.size(), frames).ec !=
+                    std::errc{} || frames == 0U || frames > 100000U) {
+                std::cerr << "frames must be between 1 and 100000\n";
+                return 2;
+            }
+        }
+        return run_vulkan_scene_capture(arguments[2], arguments[3], frames);
     }
     if (mode == "--editor-stdio") return run_live_editor(false, true);
     if (mode == "--editor") return run_editor_bridge(arguments[0]);

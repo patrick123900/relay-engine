@@ -1,0 +1,185 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive : require
+
+// Traces one reflection ray for each pixel the FidelityFX classifier listed, and shades what it
+// hits with the same material and light code as the raster pass. Writes radiance and hit
+// distance for the FidelityFX reflection denoiser, copying to the neighbours the classifier
+// asked to share this ray.
+
+layout(local_size_x = 32) in;
+
+float surface_lod = 0.0;
+#define SURFACE_TEXTURE(index, uv) textureLod(textures[nonuniformEXT(index)], uv, surface_lod)
+#include "surface_lighting.glsl"
+
+layout(set = 1, binding = 0) uniform accelerationStructureEXT scene;
+layout(std430, set = 1, binding = 1) readonly buffer RayList { uint rays[]; };
+layout(std430, set = 1, binding = 2) readonly buffer RayCounter { uint counter[]; };
+layout(set = 1, binding = 3, rgba16f) uniform writeonly image2D radiance_output;
+layout(set = 1, binding = 4, r16f) uniform writeonly image2D variance_output;
+layout(set = 1, binding = 5) uniform sampler2D depth_texture;
+layout(set = 1, binding = 6) uniform sampler2D normal_roughness_texture;
+layout(set = 1, binding = 7) uniform sampler2D blue_noise;
+layout(std430, set = 1, binding = 8) readonly buffer StaticVertices { float static_vertices[]; };
+layout(std430, set = 1, binding = 9) readonly buffer DeformedVertices { float deformed_vertices[]; };
+layout(std430, set = 1, binding = 10) readonly buffer Indices { uint indices[]; };
+struct InstanceData {
+    uint material;
+    uint first_index;
+    int vertex_offset;
+    uint deformed;
+};
+layout(std430, set = 1, binding = 11) readonly buffer Instances { InstanceData instances[]; };
+
+layout(push_constant) uniform TraceData {
+    mat4 inverse_view_projection;
+    vec4 camera_position;
+    // x, y: target size; z: frame index.
+    uvec4 extent;
+} trace;
+
+const uint floats_per_vertex = 12u;
+const float max_distance = 1000.0;
+// Hit distance reported for rays that leave the scene, as in AMD's sample.
+const float sky_distance = 100.0;
+
+// Samples a visible GGX microfacet normal (Heitz 2018, "Sampling the GGX Distribution of Visible
+// Normals"). `view` is in the tangent frame with z along the surface normal.
+vec3 sample_visible_normal(vec3 view, float alpha, vec2 u) {
+    vec3 stretched = normalize(vec3(alpha * view.x, alpha * view.y, view.z));
+    float length_squared = dot(stretched.xy, stretched.xy);
+    vec3 t1 = length_squared > 0.0 ? vec3(-stretched.y, stretched.x, 0.0) * inversesqrt(length_squared)
+                                   : vec3(1.0, 0.0, 0.0);
+    vec3 t2 = cross(stretched, t1);
+    float r = sqrt(u.x);
+    float phi = 2.0 * pi * u.y;
+    float p1 = r * cos(phi);
+    float p2 = r * sin(phi);
+    float s = 0.5 * (1.0 + stretched.z);
+    p2 = (1.0 - s) * sqrt(1.0 - p1 * p1) + s * p2;
+    vec3 normal = p1 * t1 + p2 * t2 + sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * stretched;
+    return normalize(vec3(alpha * normal.x, alpha * normal.y, max(0.0, normal.z)));
+}
+
+vec3 environment(vec3 direction) {
+    // The sky and ground as global illumination sees them: the analytic ambient scale.
+    return mix(ground_radiance, sky_radiance, clamp(direction.y * 0.5 + 0.5, 0.0, 1.0)) / pi;
+}
+
+vec3 vertex_vector(InstanceData instance, uint vertex, uint offset) {
+    uint base = vertex * floats_per_vertex + offset;
+    return instance.deformed != 0u
+               ? vec3(deformed_vertices[base], deformed_vertices[base + 1u], deformed_vertices[base + 2u])
+               : vec3(static_vertices[base], static_vertices[base + 1u], static_vertices[base + 2u]);
+}
+
+vec4 vertex_vector4(InstanceData instance, uint vertex, uint offset) {
+    uint base = vertex * floats_per_vertex + offset;
+    return instance.deformed != 0u
+               ? vec4(deformed_vertices[base], deformed_vertices[base + 1u],
+                      deformed_vertices[base + 2u], deformed_vertices[base + 3u])
+               : vec4(static_vertices[base], static_vertices[base + 1u], static_vertices[base + 2u],
+                      static_vertices[base + 3u]);
+}
+
+vec2 vertex_uv(InstanceData instance, uint vertex) {
+    uint base = vertex * floats_per_vertex + 3u;
+    return instance.deformed != 0u ? vec2(deformed_vertices[base], deformed_vertices[base + 1u])
+                                   : vec2(static_vertices[base], static_vertices[base + 1u]);
+}
+
+void store(ivec2 pixel, vec4 value) {
+    imageStore(radiance_output, pixel, value);
+    imageStore(variance_output, pixel, vec4(value.w));
+}
+
+void main() {
+    uint ray_index = gl_GlobalInvocationID.x;
+    if (ray_index >= counter[5]) return;
+    uint packed = rays[ray_index];
+    ivec2 pixel = ivec2(packed & 32767u, (packed >> 15u) & 16383u);
+    bool copy_horizontal = ((packed >> 29u) & 1u) != 0u;
+    bool copy_vertical = ((packed >> 30u) & 1u) != 0u;
+    bool copy_diagonal = ((packed >> 31u) & 1u) != 0u;
+
+    float depth = texelFetch(depth_texture, pixel, 0).r;
+    vec4 normal_roughness = texelFetch(normal_roughness_texture, pixel, 0);
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(trace.extent.xy);
+    vec4 world = trace.inverse_view_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec3 position = world.xyz / world.w;
+    vec3 normal = normalize(normal_roughness.xyz);
+    vec3 view_direction = normalize(trace.camera_position.xyz - position);
+    float alpha = normal_roughness.w * normal_roughness.w;
+
+    // Reflect about a GGX microfacet normal drawn with this frame's blue noise.
+    vec3 helper = abs(normal.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(helper, normal));
+    vec3 bitangent = cross(normal, tangent);
+    vec3 local_view = vec3(dot(view_direction, tangent), dot(view_direction, bitangent),
+                           dot(view_direction, normal));
+    // Blue noise, shifted by the R2 sequence every frame so temporal accumulation keeps seeing
+    // new directions rather than cycling through a few patterns.
+    vec2 noise = fract(texelFetch(blue_noise, pixel & 127, 0).rg +
+                       float(trace.extent.z & 0xFFFFu) * vec2(0.7548776662, 0.5698402910));
+    vec3 local_half = sample_visible_normal(local_view, max(alpha, 1e-4), noise);
+    vec3 half_vector = normalize(tangent * local_half.x + bitangent * local_half.y + normal * local_half.z);
+    vec3 direction = reflect(-view_direction, half_vector);
+    if (dot(direction, normal) <= 0.0) direction = reflect(-view_direction, normal);
+
+    // Push the origin off the surface in proportion to its distance from the camera.
+    float camera_distance = length(trace.camera_position.xyz - position);
+    vec3 origin = position + normal * max(0.002, camera_distance * 0.0015);
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 0xFFu, origin, 0.0, direction,
+                          max_distance);
+    while (rayQueryProceedEXT(query)) {
+    }
+    vec4 result;
+    if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        float distance = rayQueryGetIntersectionTEXT(query, true);
+        InstanceData instance = instances[rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)];
+        uint primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+        vec2 barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, true);
+        vec3 weights = vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
+        uint first = instance.first_index + primitive * 3u;
+        uvec3 corners = uvec3(uint(int(indices[first]) + instance.vertex_offset),
+                              uint(int(indices[first + 1u]) + instance.vertex_offset),
+                              uint(int(indices[first + 2u]) + instance.vertex_offset));
+        vec2 hit_uv = vertex_uv(instance, corners.x) * weights.x +
+                      vertex_uv(instance, corners.y) * weights.y +
+                      vertex_uv(instance, corners.z) * weights.z;
+        vec3 object_normal = vertex_vector(instance, corners.x, 5u) * weights.x +
+                             vertex_vector(instance, corners.y, 5u) * weights.y +
+                             vertex_vector(instance, corners.z, 5u) * weights.z;
+        vec4 object_tangent = vertex_vector4(instance, corners.x, 8u) * weights.x +
+                              vertex_vector4(instance, corners.y, 8u) * weights.y +
+                              vertex_vector4(instance, corners.z, 8u) * weights.z;
+        mat4x3 object_to_world = rayQueryGetIntersectionObjectToWorldEXT(query, true);
+        mat4x3 world_to_object = rayQueryGetIntersectionWorldToObjectEXT(query, true);
+        vec3 world_normal = normalize(transpose(mat3(world_to_object)) * object_normal);
+        vec4 world_tangent = vec4(normalize(mat3(object_to_world) * object_tangent.xyz),
+                                  object_tangent.w < 0.0 ? -1.0 : 1.0);
+        bool front_facing = rayQueryGetIntersectionFrontFaceEXT(query, true);
+        // Coarser texture levels further along the ray, where a texel covers more of the image.
+        surface_lod = clamp(log2(1.0 + distance), 0.0, 6.0);
+        Surface surface = evaluate_surface(instance.material, hit_uv, world_normal, world_tangent,
+                                           front_facing);
+        vec3 hit_position = origin + direction * distance;
+        vec3 direct_total;
+        vec3 direct_diffuse;
+        direct_lighting(surface, hit_position, -direction, direct_total, direct_diffuse);
+        vec3 radiance = direct_total + ambient_lighting(surface, -direction) + surface.emissive;
+        result = vec4(radiance, distance);
+    } else {
+        result = vec4(environment(direction), sky_distance);
+    }
+    // A single NaN would spread through the denoiser's history, so such a ray is dropped.
+    if (any(isnan(result))) return;
+    result.rgb = min(result.rgb, vec3(64.0));
+    store(pixel, result);
+    if (copy_horizontal) store(pixel ^ ivec2(1, 0), result);
+    if (copy_vertical) store(pixel ^ ivec2(0, 1), result);
+    if (copy_diagonal) store(pixel ^ ivec2(1, 1), result);
+}

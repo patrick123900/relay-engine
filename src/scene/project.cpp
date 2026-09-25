@@ -52,13 +52,21 @@ std::string Project::json(const bool with_settings) const {
         files += '"' + json_escape(scene) + '"';
     }
     std::string settings;
-    if (with_settings && input) {
-        // The map keeps its own format and version; indented to sit inside the project object.
-        std::string map = input_map_json(*input);
-        while (!map.empty() && map.back() == '\n') map.pop_back();
-        for (std::size_t at = map.find('\n'); at != std::string::npos; at = map.find('\n', at + 1))
-            map.insert(at + 1, "    ");
-        settings = ",\n  \"settings\": {\n    \"input\": " + map + "\n  }";
+    if (with_settings && (input || graphics)) {
+        std::string entries;
+        if (input) {
+            // The map keeps its own format and version; indented to sit inside the project object.
+            std::string map = input_map_json(*input);
+            while (!map.empty() && map.back() == '\n') map.pop_back();
+            for (std::size_t at = map.find('\n'); at != std::string::npos; at = map.find('\n', at + 1))
+                map.insert(at + 1, "    ");
+            entries += "\n    \"input\": " + map;
+        }
+        if (graphics) {
+            if (!entries.empty()) entries += ',';
+            entries += "\n    \"graphics\": " + graphics_settings_json(*graphics);
+        }
+        settings = ",\n  \"settings\": {" + entries + "\n  }";
     }
     return "{\n  \"format\": \"relay.project\",\n  \"version\": " +
            std::to_string(project_file_version) + ",\n  \"filename\": \"" + json_escape(filename) +
@@ -114,7 +122,8 @@ std::optional<Project> load_project(const std::string_view filename, std::string
         error = "unsupported project format, version or directories";
         return {};
     }
-    Project project{std::string(filename), string_at("name"), {}, string_at("startup_scene"), {}, false};
+    Project project{std::string(filename), string_at("name"), {}, string_at("startup_scene"), {}, false,
+                    {}};
     for (const auto& scene : *scenes->array()) {
         if (!scene.string()) { error = "project scenes must be filenames"; return {}; }
         project.scenes.push_back(*scene.string());
@@ -129,6 +138,11 @@ std::optional<Project> load_project(const std::string_view filename, std::string
     } else if (auto legacy = load_legacy_input_map(project.root(), warning)) {
         project.input = std::move(*legacy);
         project.legacy_input_file = true;
+    }
+    if (const auto* graphics = settings ? field(*settings->object(), "graphics") : nullptr) {
+        std::string problem;
+        project.graphics = parse_graphics_settings(*graphics, problem);
+        if (!project.graphics) { error = "invalid graphics settings in the project: " + problem; return {}; }
     }
     error.clear();
     return project;

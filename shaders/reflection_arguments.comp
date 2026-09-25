@@ -1,0 +1,30 @@
+#version 450
+
+// Turns the reflection classifier's counters into indirect dispatch sizes for the ray tracing
+// pass and the denoiser, and resets the counters for the next frame. The offsets match
+// vulkan_lighting.hpp (AMD Hybrid Reflections layout).
+
+layout(local_size_x = 1) in;
+
+layout(std430, set = 0, binding = 0) buffer RayCounter { uint counter[]; };
+layout(std430, set = 0, binding = 1) buffer Arguments { uint arguments[]; };
+
+void main() {
+    uint screen_space = counter[0];
+    counter[0] = 0u;
+    counter[1] = screen_space;
+
+    uint tiles = counter[2];
+    counter[2] = 0u;
+    counter[3] = tiles;
+    arguments[3] = tiles;
+    arguments[4] = 1u;
+    arguments[5] = 1u;
+
+    uint rays = counter[4];
+    counter[4] = 0u;
+    counter[5] = rays;
+    arguments[9] = (rays + 31u) / 32u;
+    arguments[10] = 1u;
+    arguments[11] = 1u;
+}

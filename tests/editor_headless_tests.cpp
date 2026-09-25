@@ -1213,6 +1213,25 @@ void game_configuration_ui() {
     click_center(ui, *ui.headless_item_rect("config:input:reset"));
     check(engine.input().map().actions.size() == relay::default_input_map().actions.size(),
           "Reset to defaults restores the engine's map");
+
+    click_center(ui, *ui.headless_item_rect("config:page:graphics"));
+    frame(ui, 2);
+    const auto global_illumination = ui.headless_item_rect("config:graphics:global_illumination");
+    check(global_illumination && ui.headless_item_rect("config:graphics:reflections"),
+          "the Graphics page offers global illumination and ray traced reflections");
+    click_center(ui, *global_illumination);
+    frame(ui, 2);
+    {
+        std::string load_error;
+        const auto saved = relay::load_project("projects/configured/project.relayproject", load_error);
+        check(saved && saved->graphics && !saved->graphics->global_illumination &&
+                  saved->graphics->reflections,
+              "unticking Global illumination saves the setting in the project file");
+    }
+    click_center(ui, *ui.headless_item_rect("config:graphics:global_illumination"));
+    frame(ui, 2);
+    check(engine.graphics_settings().global_illumination,
+          "ticking it again turns global illumination back on");
     std::cout << "Headless Game Configuration tests passed\n";
 }
 

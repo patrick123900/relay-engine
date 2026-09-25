@@ -562,6 +562,29 @@ std::string ControlProtocol::handle(const std::string_view request) {
         result << "]}}";
         return result.str();
     }
+    if (method == "graphics.settings") {
+        const bool saved = engine_.project() && engine_.project()->graphics.has_value();
+        std::string renderer = "null";
+        if (render_inspection_handler_) {
+            const auto live = render_inspection_handler_("lighting");
+            if (!live.empty()) renderer = live;
+        }
+        return response_prefix(id) + "{\"settings\":" +
+               graphics_settings_json(engine_.graphics_settings()) +
+               ",\"saved\":" + (saved ? "true" : "false") +
+               ",\"defaults\":" + graphics_settings_json(GraphicsSettings{}) +
+               ",\"renderer\":" + renderer + "}}";
+    }
+    if (method == "graphics.set_settings") {
+        auto settings = engine_.graphics_settings();
+        settings.global_illumination =
+            boolean_field(request, "global_illumination", settings.global_illumination);
+        settings.reflections = boolean_field(request, "reflections", settings.reflections);
+        std::string error;
+        if (!engine_.set_graphics_settings(settings, error)) return error_response(id, error);
+        engine_.logs().write(LogLevel::info, "Graphics settings saved");
+        return response_prefix(id) + "{\"settings\":" + graphics_settings_json(settings) + "}}";
+    }
     if (method == "input.map") {
         const bool saved = engine_.project() && engine_.project()->input.has_value();
         return response_prefix(id) + "{\"map\":" + input_map_json(engine_.input().map()) +
@@ -1059,7 +1082,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         const auto filename = string_field(request, "filename");
         std::string warning;
         auto project = method == "project.open" ? load_project(filename, error, warning)
-                                                : std::optional{Project{filename, string_field(request, "name"), {}, {}, {}, false}};
+                                                : std::optional{Project{filename, string_field(request, "name"), {}, {}, {}, false, {}}};
         if (!project) return error_response(id, error);
         if (!warning.empty()) engine_.logs().write(LogLevel::warning, warning);
         SceneState state;

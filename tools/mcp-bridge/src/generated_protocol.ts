@@ -491,6 +491,39 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "graphics_settings",
+    {
+      title: "Read graphics settings",
+      description: "Read the project's graphics settings (settings.graphics in the .relayproject): global illumination and ray traced reflections, with the defaults. When a live renderer is attached, also reports whether each effect is supported and running on this GPU and why not.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["graphics_settings"];
+        if (override) return override({});
+        return invoke("graphics.settings", {});
+      },
+  );
+
+  server.registerTool(
+    "graphics_set_settings",
+    {
+      title: "Change graphics settings",
+      description: "Turn global illumination or ray traced reflections on or off and save the choice in the open project. Omitted settings keep their current values. Effects the GPU cannot run stay off and are reported by graphics.settings.",
+      inputSchema: z.object({
+        "global_illumination": z.boolean().optional().describe("FidelityFX Brixelizer global illumination"),
+        "reflections": z.boolean().optional().describe("Hardware ray traced reflections")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["graphics_set_settings"];
+        if (override) return override(input as JsonObject);
+        return invoke("graphics.set_settings", {"global_illumination": input["global_illumination"], "reflections": input["reflections"]});
+      },
+  );
+
+  server.registerTool(
     "input_map",
     {
       title: "Read input map",

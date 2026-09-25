@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "format": "relay.protocol",
-  "version": 38,
+  "version": 39,
   "methods": [
     {"method":"runtime.status","tool":"runtime_status","title":"Inspect Relay runtime","description":"Read the current editor or game mode, pause, frame, simulation time and resolution state.","readOnly":true,"params":[]},
     {"method":"runtime.play","tool":"runtime_play","title":"Run game","description":"Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.","params":[]},
@@ -35,6 +35,8 @@
     {"method":"logs.read","tool":"logs_read","title":"Read Relay logs","description":"Read structured engine log entries newer than a sequence number.","readOnly":true,"params":[{"name":"after","type":"integer","minimum":0,"default":0,"description":"Last sequence number already seen"}]},
     {"method":"performance.read","tool":"performance_read","title":"Read Relay performance","description":"Read bounded per-frame CPU/GPU timing, draw/resource counts, entities and process memory.","readOnly":true,"params":[{"name":"afterFrame","wire":"after_frame","type":"integer","minimum":0,"default":0},{"name":"limit","type":"integer","minimum":1,"maximum":240,"default":30}]},
     {"method":"input.recent","tool":"input_recent","title":"Read recent Relay input","description":"Read the bounded normalized keyboard, mouse and gamepad input event history.","readOnly":true,"params":[]},
+    {"method":"graphics.settings","tool":"graphics_settings","title":"Read graphics settings","description":"Read the project's graphics settings (settings.graphics in the .relayproject): global illumination and ray traced reflections, with the defaults. When a live renderer is attached, also reports whether each effect is supported and running on this GPU and why not.","readOnly":true,"params":[]},
+    {"method":"graphics.set_settings","tool":"graphics_set_settings","title":"Change graphics settings","description":"Turn global illumination or ray traced reflections on or off and save the choice in the open project. Omitted settings keep their current values. Effects the GPU cannot run stay off and are reported by graphics.settings.","params":[{"name":"global_illumination","type":"boolean","description":"FidelityFX Brixelizer global illumination"},{"name":"reflections","type":"boolean","description":"Hardware ray traced reflections"}]},
     {"method":"input.map","tool":"input_map","title":"Read input map","description":"Read the project's input map: named actions bound to keys, mouse buttons or gamepad buttons, and axes built from button pairs or gamepad sticks. Also returns the engine defaults. Controls look like key:space, key:left_shift, mouse:left, gamepad:a or gamepad:leftx.","readOnly":true,"params":[]},
     {"method":"input.set_map","tool":"input_set_map","title":"Replace input map","description":"Validate, save in the project file (settings.input in the .relayproject) and apply a complete input map document (format relay.input, version 1) as returned by input.map.","destructive":true,"params":[{"name":"map","type":"string","minimumLength":2,"maximumLength":262144,"required":true,"description":"The whole input map as JSON text"}]},
     {"method":"input.state","tool":"input_state","title":"Inspect game input","description":"Read the current game step's input: each action's held and pressed state, each axis value, held controls and mouse movement.","readOnly":true,"params":[]},

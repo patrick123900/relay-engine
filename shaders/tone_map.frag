@@ -2,7 +2,13 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 color;
 layout(set = 0, binding = 0) uniform sampler2D scene_hdr;
-layout(push_constant) uniform DisplaySettings { float exposure; uint encode_srgb; } settings;
+// The scene image covers only the viewport, whose top-left pixel and size are given here.
+layout(push_constant) uniform DisplaySettings {
+    float exposure;
+    uint encode_srgb;
+    vec2 viewport_offset;
+    vec2 viewport_size;
+} settings;
 
 vec3 aces_fitted(vec3 value) {
     // ACES filmic fit in linear display primaries, with a bounded output for SDR surfaces.
@@ -16,6 +22,8 @@ vec3 linear_to_srgb(vec3 value) {
 }
 
 void main() {
-    vec3 mapped = aces_fitted(max(texture(scene_hdr, uv).rgb, vec3(0.0)) * settings.exposure);
+    vec2 scene_uv = (gl_FragCoord.xy - settings.viewport_offset) / settings.viewport_size;
+    vec3 mapped = aces_fitted(max(texture(scene_hdr, scene_uv).rgb, vec3(0.0)) *
+                              settings.exposure);
     color = vec4(settings.encode_srgb != 0u ? linear_to_srgb(mapped) : mapped, 1.0);
 }

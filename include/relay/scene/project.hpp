@@ -1,6 +1,7 @@
 #pragma once
 
 #include "relay/core/input.hpp"
+#include "relay/render/graphics_settings.hpp"
 
 #include <filesystem>
 #include <cstdint>
@@ -22,6 +23,8 @@ struct Project {
     std::optional<InputMap> input;
     // `input` came from a version 1 project's input.relay-input.json, which the next save removes.
     bool legacy_input_file{};
+    // settings.graphics; none until someone saves settings, and the defaults apply meanwhile.
+    std::optional<GraphicsSettings> graphics;
     [[nodiscard]] std::filesystem::path root() const;
     // The file contents; protocol replies leave the settings out.
     [[nodiscard]] std::string json(bool with_settings = true) const;

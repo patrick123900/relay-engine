@@ -478,6 +478,8 @@ struct EditorUi::Impl {
     InputMap input_edit;
     bool input_file_saved{};
     JsonValue input_live;
+    // The Graphics page: graphics.settings, refreshed while the page is visible for live status.
+    JsonValue graphics_status;
     std::array<char, 65> new_action_name{}, new_axis_name{};
     std::map<std::string, std::array<char, 65>> input_name_buffers;
     struct BindingCapture {
@@ -663,6 +665,10 @@ struct EditorUi::Impl {
             if (auto state = call("input.state", {}, false)) input_live = std::move(*state);
         } else {
             input_live = JsonValue{};
+        }
+        if (game_config_open && game_config_page == 1) {
+            if (auto settings = call("graphics.settings", {}, false))
+                graphics_status = std::move(*settings);
         }
     }
 
@@ -5137,6 +5143,72 @@ struct EditorUi::Impl {
         if (changed) save_input_edit();
     }
 
+    // Lighting effects. Each checkbox saves through graphics.set_settings; the status under it
+    // comes from the renderer, which may not support an effect on this GPU.
+    void draw_graphics_page() {
+        const auto& palette = editor_palette();
+        const auto* status = graphics_status.object();
+        const auto* settings_value = status ? field(*status, "settings") : nullptr;
+        const auto* settings = settings_value ? settings_value->object() : nullptr;
+        const auto* renderer_value = status ? field(*status, "renderer") : nullptr;
+        const auto* renderer = renderer_value ? renderer_value->object() : nullptr;
+        const auto* project = project_status.object();
+        const bool has_project = project && !string_or(*project, "filename").empty();
+        if (!has_project)
+            ImGui::TextColored(editor_color(palette.warning),
+                               "Open a project to save its graphics settings.");
+        ImGui::TextColored(editor_color(palette.text_faint), "%s",
+                           status && boolean_or(*status, "saved", false)
+                               ? "Saved in the project file"
+                               : "Defaults until you change something");
+        const auto effect = [&](const char* label, const char* key, const char* id,
+                                const char* description, const JsonValue::Object* live) {
+            bool enabled = settings && boolean_or(*settings, key, true);
+            // Without a project the save fails and the status bar says why.
+            if (ImGui::Checkbox(label, &enabled)) {
+                if (auto saved = call("graphics.set_settings",
+                                      std::string{"\""} + key + "\":" + (enabled ? "true" : "false"))) {
+                    set_status(std::string(label) + (enabled ? " on" : " off"), false);
+                    if (auto refreshed = call("graphics.settings")) graphics_status = std::move(*refreshed);
+                }
+            }
+            note_item(id);
+            ImGui::Indent();
+            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+            ImGui::TextWrapped("%s", description);
+            ImGui::PopStyleColor();
+            if (live) {
+                const auto error = string_or(*live, "error");
+                if (boolean_or(*live, "active", false))
+                    ImGui::TextColored(editor_color(palette.success), "Running");
+                else if (!error.empty())
+                    ImGui::TextColored(editor_color(palette.warning), "Unavailable: %s",
+                                       error.c_str());
+                else if (!enabled)
+                    ImGui::TextColored(editor_color(palette.text_faint), "Off");
+                else
+                    ImGui::TextColored(editor_color(palette.text_faint),
+                                       "Starts with the next frame of a scene");
+            }
+            ImGui::Unindent();
+        };
+        ImGui::SeparatorText("Lighting");
+        const auto* gi_value = renderer ? field(*renderer, "global_illumination") : nullptr;
+        effect("Global illumination", "global_illumination", "config:graphics:global_illumination",
+               "Light bounces between surfaces, and rough surfaces reflect their surroundings. "
+               "Uses AMD FidelityFX Brixelizer GI and replaces the flat sky light on opaque "
+               "surfaces.",
+               gi_value ? gi_value->object() : nullptr);
+        const auto* reflections_value = renderer ? field(*renderer, "reflections") : nullptr;
+        effect("Ray traced reflections", "reflections", "config:graphics:reflections",
+               "Sharp reflections on smooth surfaces, traced with hardware ray tracing and "
+               "denoised with AMD FidelityFX.",
+               reflections_value ? reflections_value->object() : nullptr);
+        if (!renderer)
+            ImGui::TextColored(editor_color(palette.text_faint),
+                               "No GPU renderer is attached, so availability is unknown.");
+    }
+
     // Project-wide game settings, one page per area. Input is the first; others follow.
     void draw_game_config() {
         if (!game_config_open) {
@@ -5153,7 +5225,12 @@ struct EditorUi::Impl {
         if (ImGui::BeginChild("##config_pages", ImVec2(150.0F * ui_scale, 0.0F), ImGuiChildFlags_Borders)) {
             if (ImGui::Selectable("Input", game_config_page == 0)) game_config_page = 0;
             note_item("config:page:input");
-            for (const char* page : {"Graphics", "Physics", "Audio"}) {
+            if (ImGui::Selectable("Graphics", game_config_page == 1)) {
+                game_config_page = 1;
+                if (auto settings = call("graphics.settings")) graphics_status = std::move(*settings);
+            }
+            note_item("config:page:graphics");
+            for (const char* page : {"Physics", "Audio"}) {
                 ImGui::BeginDisabled();
                 ImGui::Selectable(page);
                 ImGui::EndDisabled();
@@ -5163,7 +5240,12 @@ struct EditorUi::Impl {
         }
         ImGui::EndChild();
         ImGui::SameLine();
-        if (ImGui::BeginChild("##config_page", ImVec2(0.0F, 0.0F))) draw_input_page();
+        if (ImGui::BeginChild("##config_page", ImVec2(0.0F, 0.0F))) {
+            if (game_config_page == 1)
+                draw_graphics_page();
+            else
+                draw_input_page();
+        }
         ImGui::EndChild();
         ImGui::End();
     }

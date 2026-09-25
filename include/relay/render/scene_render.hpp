@@ -18,6 +18,9 @@ struct RenderCamera {
     Entity entity{};
     bool using_default{true};
     RenderMatrix view_projection{};
+    // The parts of view_projection, for effects that reconstruct positions from depth.
+    RenderMatrix view{};
+    RenderMatrix projection{};
     float exposure_ev{};
 };
 
@@ -32,7 +35,8 @@ struct RenderInstance {
     std::uint32_t material_index{};
     // Alpha-blended instances render after opaque/masked geometry, back to front.
     bool alpha_blended{false};
-    // Off-camera objects can still enter the render list when they cast into a shadow cascade.
+    // Off-camera objects can still enter the render list when they cast into a shadow cascade,
+    // or always when build_render_scene is asked to keep culled instances.
     bool camera_visible{true};
     std::uint16_t shadow_cascade_mask{};
     // Distance from the camera plane to the instance's bounds centre. Opaque instances are drawn
@@ -119,7 +123,8 @@ struct ViewOverride {
 
 [[nodiscard]] RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
                                              float aspect_ratio,
-                                             const ViewOverride* view = nullptr, bool collect_bounds = false);
+                                             const ViewOverride* view = nullptr, bool collect_bounds = false,
+                                             bool keep_culled = false);
 
 struct ScenePick {
     std::string error;

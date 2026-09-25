@@ -526,7 +526,7 @@ SceneBounds compute_scene_bounds(const Scene& scene, const AssetRegistry& assets
 
 RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
                                const float aspect_ratio, const ViewOverride* const view,
-                               const bool collect_bounds) {
+                               const bool collect_bounds, const bool keep_culled) {
     RenderScene output;
     const auto entities = scene.entities();
     std::unordered_map<std::uint64_t, std::unordered_map<std::uint32_t, Entity>> model_nodes;
@@ -550,8 +550,9 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         selected_camera = *scene.get(*active)->camera;
         camera_world = resolve_world(*active);
     }
-    output.camera.view_projection =
-        multiply(perspective(selected_camera, aspect_ratio), inverse(camera_world));
+    output.camera.view = inverse(camera_world);
+    output.camera.projection = perspective(selected_camera, aspect_ratio);
+    output.camera.view_projection = multiply(output.camera.projection, output.camera.view);
     output.camera.exposure_ev = static_cast<float>(selected_camera.exposure_ev);
     output.camera_position = transform_point(camera_world, {});
     output.camera_forward = normalized(transform_point(camera_world, {0, 0, -1}, true));
@@ -881,7 +882,7 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         }
         if (!camera_visible) {
             ++output.culled;
-            if (shadow_cascade_mask == 0U) continue;
+            if (shadow_cascade_mask == 0U && !keep_culled) continue;
         }
         // The clip-space w of the bounds centre is its distance along the camera's view direction.
         float view_depth = 0.0F;

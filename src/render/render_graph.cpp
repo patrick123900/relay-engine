@@ -10,6 +10,11 @@
 namespace relay {
 namespace {
 
+bool loads(const RenderAccess access) {
+    return access == RenderAccess::color_attachment_load ||
+           access == RenderAccess::depth_stencil_load;
+}
+
 bool writes(const RenderAccess access) {
     // A depth attachment is bound with a clear load and depth writes enabled, so the pass using it
     // produces it rather than consuming something an earlier pass wrote.
@@ -44,6 +49,8 @@ std::string_view to_string(const RenderAccess access) {
     case RenderAccess::transfer_source: return "transfer_source";
     case RenderAccess::transfer_destination: return "transfer_destination";
     case RenderAccess::present: return "present";
+    case RenderAccess::color_attachment_load: return "color_attachment_load";
+    case RenderAccess::depth_stencil_load: return "depth_stencil_load";
     }
     return "unknown";
 }
@@ -100,11 +107,30 @@ CompiledRenderGraph RenderGraph::compile() const {
         }
     }
 
+    // Passes that load an attachment and add to it, in declaration order. They follow the writer
+    // and each other, and every plain reader of the resource follows them.
+    std::vector<std::vector<std::size_t>> loaders(resources_.size());
+    for (std::size_t pass_index = 0; pass_index < passes_.size(); ++pass_index)
+        for (const auto& use : passes_[pass_index].resources)
+            if (loads(use.access)) loaders[use.resource].push_back(pass_index);
+
     std::vector<std::vector<std::size_t>> edges(passes_.size());
     std::vector<std::size_t> incoming(passes_.size(), 0U);
+    const auto add_edge = [&](const std::size_t from, const std::size_t to) {
+        edges[from].push_back(to);
+        ++incoming[to];
+    };
     for (std::size_t pass_index = 0; pass_index < passes_.size(); ++pass_index) {
         for (const auto& use : passes_[pass_index].resources) {
             if (writes(use.access)) continue;
+            if (loads(use.access)) {
+                const auto& chain = loaders[use.resource];
+                const auto position = std::find(chain.begin(), chain.end(), pass_index);
+                if (position != chain.begin()) add_edge(*std::prev(position), pass_index);
+            } else {
+                for (const auto loader : loaders[use.resource])
+                    if (loader != pass_index) add_edge(loader, pass_index);
+            }
             const auto writer = writers[use.resource];
             if (!writer.has_value()) {
                 if (!resources_[use.resource].imported) {
@@ -208,6 +234,12 @@ CompiledRenderGraph make_scene_render_graph() {
     const auto point_shadow = graph.add_resource("point_shadow_cube", RenderResourceKind::image);
     graph.add_pass("point_shadow", {{textures, RenderAccess::sampled},
                                      {point_shadow, RenderAccess::depth_stencil_attachment}});
+    // The geometry pass also writes the G-buffer that global illumination reads.
+    const auto normal_roughness = graph.add_resource("gbuffer_normal_roughness", RenderResourceKind::image);
+    const auto albedo_metallic = graph.add_resource("gbuffer_albedo_metallic", RenderResourceKind::image);
+    const auto motion_occlusion = graph.add_resource("gbuffer_motion_occlusion", RenderResourceKind::image);
+    const auto depth_value = graph.add_resource("gbuffer_depth_value", RenderResourceKind::image);
+    const auto diffuse_light = graph.add_resource("gbuffer_diffuse_light", RenderResourceKind::image);
     graph.add_pass("scene_geometry", {{textures, RenderAccess::sampled},
                                       {shadows[0], RenderAccess::sampled},
                                       {shadows[1], RenderAccess::sampled},
@@ -215,7 +247,34 @@ CompiledRenderGraph make_scene_render_graph() {
                                       {spot_shadow, RenderAccess::sampled},
                                       {point_shadow, RenderAccess::sampled},
                                       {depth, RenderAccess::depth_stencil_attachment},
-                                      {hdr, RenderAccess::color_attachment}});
+                                      {hdr, RenderAccess::color_attachment},
+                                      {normal_roughness, RenderAccess::color_attachment},
+                                      {albedo_metallic, RenderAccess::color_attachment},
+                                      {motion_occlusion, RenderAccess::color_attachment},
+                                      {depth_value, RenderAccess::color_attachment},
+                                      {diffuse_light, RenderAccess::color_attachment}});
+    // FidelityFX Brixelizer GI; runs only when global illumination is on. The previous frame's
+    // G-buffer is the other frame set, imported as history.
+    const auto history = graph.add_resource("gbuffer_history", RenderResourceKind::image, true);
+    const auto distance_field = graph.add_resource("brixelizer_distance_field",
+                                                   RenderResourceKind::buffer, true);
+    const auto diffuse_gi = graph.add_resource("diffuse_gi", RenderResourceKind::image);
+    const auto specular_gi = graph.add_resource("specular_gi", RenderResourceKind::image);
+    graph.add_pass("global_illumination", {{normal_roughness, RenderAccess::sampled},
+                                           {motion_occlusion, RenderAccess::sampled},
+                                           {depth_value, RenderAccess::sampled},
+                                           {history, RenderAccess::sampled},
+                                           {distance_field, RenderAccess::storage_write},
+                                           {diffuse_gi, RenderAccess::storage_write},
+                                           {specular_gi, RenderAccess::storage_write}});
+    // Adds indirect light, then transparent geometry and editor overlays.
+    graph.add_pass("scene_forward", {{textures, RenderAccess::sampled},
+                                     {normal_roughness, RenderAccess::sampled},
+                                     {albedo_metallic, RenderAccess::sampled},
+                                     {diffuse_gi, RenderAccess::sampled},
+                                     {specular_gi, RenderAccess::sampled},
+                                     {depth, RenderAccess::depth_stencil_load},
+                                     {hdr, RenderAccess::color_attachment_load}});
     graph.add_pass("tone_map", {{hdr, RenderAccess::sampled},
                                 {swapchain, RenderAccess::color_attachment}});
     graph.add_pass("present", {{swapchain, RenderAccess::present}});

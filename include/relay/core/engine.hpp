@@ -100,6 +100,10 @@ public:
     [[nodiscard]] const InputState& input() const { return input_; }
     // Validates, saves to the open project and applies a new input map.
     [[nodiscard]] bool set_input_map(InputMap map, std::string& error);
+    // The open project's graphics settings, or the defaults without a project or saved settings.
+    [[nodiscard]] GraphicsSettings graphics_settings() const;
+    // Saves graphics settings in the open project. The renderer picks them up on its next frame.
+    [[nodiscard]] bool set_graphics_settings(const GraphicsSettings& settings, std::string& error);
     // Why the last run_game() refused to start, or empty.
     [[nodiscard]] const std::string& run_game_error() const { return run_game_error_; }
 

@@ -8,13 +8,14 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v38: 127 native methods. Scene v17, project v2, import manifest v3.
+- Protocol schema v39: 129 native methods. Scene v17, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
   component model with derived node types and templates/prefabs shown in the node type tree, native
   C++ gameplay scripts, per-project input mapping, a scripted first person controller template in
-  the demo project, and portable project export are implemented. Preserve unrelated working-tree
+  the demo project, portable project export, and FidelityFX global illumination and hardware ray
+  traced reflections are implemented. Preserve unrelated working-tree
   edits and inspect `git diff` before changing them.
 
 ## Product intent
@@ -351,6 +352,56 @@ without blocking simultaneous human editing.
 ### Rendering and assets
 
 - Deterministic CPU renderer for headless verification.
+- The Vulkan scene renders into viewport-sized targets, one set per frame in flight, recreated
+  (after `vkDeviceWaitIdle`) when the editor viewport changes size; the other set is the previous
+  frame for temporal effects. The geometry pass draws opaque and masked geometry into six color
+  attachments: HDR, world normal plus perceptual roughness (RGBA16F), base color plus metallic
+  (RGBA8 sRGB), motion (previous minus current UV) plus occlusion (RGBA16F), depth as R32F, and
+  direct diffuse light plus emission (RGBA16F, fed back to GI next frame). The forward pass then
+  loads HDR and depth-stencil for the lighting composite, transparent geometry, grid and
+  selection. The tone pass samples the scene image at the viewport's offset. Motion vectors come
+  from each draw's previous model-view-projection in a per-frame storage buffer (set 0, binding
+  5), keyed by entity, mesh and occurrence; draws use their draw index as first instance. Devices
+  need six color attachments. `build_render_scene` can keep culled instances (lighting uses the
+  whole scene) and reports camera view and projection separately.
+- `shaders/surface_lighting.glsl` holds material evaluation, shadowed direct light and the
+  analytic sky, shared by `first_light.frag` and the reflection hit shader.
+- Lighting effects are per-project `settings.graphics` (`GraphicsSettings`: `global_illumination`,
+  `reflections`, both default on; `graphics.settings` also reports the live renderer's status
+  through the host inspection handler, kind `lighting`). The host applies them each frame with
+  `VulkanWindow::set_global_illumination` and `set_reflections`; `RELAY_GLOBAL_ILLUMINATION` and
+  `RELAY_REFLECTIONS` (0 or 1) override them in `relay_demo`. The editor's Game Configuration has
+  a Graphics page. Effects start lazily, need Vulkan 1.3 features checked in
+  `create_logical_device` (`lighting_features`, `ray_query_features`), and on failure record an
+  error, turn themselves off and leave the analytic sky light. `lighting_status_json()` reports
+  requested, supported, active and errors.
+- Global illumination (`src/platform/vulkan_lighting.cpp`, `GlobalIllumination`): FidelityFX
+  Brixelizer builds a sparse distance field (8 cascades, 0.1 m voxels doubling, centred on the
+  camera) from the shared mesh buffers, registered by handle and size. Instances unchanged for 30
+  frames are static; moved or deformed ones are dynamic and submitted every frame. Brixelizer
+  rebuilds one cascade per update: cascade 0 every 2 frames, each further one half as often.
+  Brixelizer GI runs at native resolution (at 50%, moving objects left streaks along their path:
+  the downsample gives outline texels the object's depth, and history drags them along). It reads depth, normals, motion, the previous frame's G-buffer and
+  diffuse light, blue noise, and the sky as a 16-pixel cube at 1/pi (the analytic ambient's scale)
+  and writes diffuse and specular GI. FidelityFX takes Direct3D clip space, so the projection's
+  y is flipped for it. The lighting buffer's `camera_forward.w` flags (1 GI, 2 reflections) tell
+  the geometry pass which analytic sky terms to leave out; `shaders/gi_composite.frag` adds
+  diffuse GI times base color, and specular light weighted by an analytic split-sum BRDF.
+- Ray traced reflections (`Reflections` in `vulkan_lighting.cpp`, `vulkan_ray_tracing.cpp`,
+  `shaders/reflection_*.comp`), following AMD's Hybrid Reflections sample without its
+  screen-space path: acceleration structures are rebuilt each frame (a cached bottom level per
+  mesh, per-frame ones for deformed instances, a top level per frame slot, each in its own
+  allocation); the FidelityFX Classifier lists pixels below a GGX alpha of 0.25; a compute pass
+  turns its counters into indirect arguments; `reflection_trace.comp` samples a GGX visible
+  normal with blue noise shifted by R2 each frame, traces a ray query, and shades hits with
+  `surface_lighting.glsl` (misses see the sky at 1/pi); the FidelityFX reflection denoiser
+  filters the result, reading R32F depth as mip 0 of its depth hierarchy. The composite blends
+  from the rough specular (GI or the analytic sky) to traced reflections over the last fifth
+  of the threshold. Materials are treated as opaque by rays.
+- `relay_demo --vulkan-scene-capture <project> <png> [frames]` opens a project and captures it;
+  with `SDL_VIDEODRIVER=offscreen` (Mesa's `VK_EXT_headless_surface`) the real renderer runs
+  without a window, which is how the lighting was verified and how
+  `tests/lighting_render_tests.py` runs.
 - Vulkan scene geometry and transparent blending render into a per-swapchain-image RGBA16F target.
   A fullscreen post-process pass applies camera exposure in EV stops, ACES-fit tone mapping and
   correct SDR transfer encoding before editor UI or capture. The PBR shader uses an analytic
@@ -482,20 +533,46 @@ without blocking simultaneous human editing.
    starts, so moving a jointed body with a script teleports it against its constraint. There are
    no breakable joints, cone or swing-twist limits, or target-angle servos, and anchors are edited
    as numbers rather than with a viewport gizmo.
+12. Global illumination and reflections have been checked in offscreen captures of the demo and
+   its editor viewport (static views, a moving object, animated skinned models), plus the
+   automated offscreen render test. Under the Khronos validation layer, core and synchronization
+   validation report no errors in any combination of the two, in scene captures, the model and
+   async smokes, the editor and the headless effect test. The only warning is
+   `Undefined-Value-ShaderOutputNotConsumed`: the transparent pipeline shares the geometry pass
+   shaders and ignores their extra outputs. They have been checked on a Linux desktop, and have
+   only run on RADV (RX 9070 XT). Known limits: Brixelizer GI
+   learns radiance from the screen, so light from off-screen surfaces arrives through its cache
+   only; GI around a moving object lags it slightly, since the coarse cascades and caches
+   update less often; a small dark fleck was seen once on the demo
+   floor and did not reproduce. Reflection hits use the analytic sky instead of GI, masked
+   materials trace as opaque, transparent objects are not in the ray tracing scene, rough
+   metals near the threshold keep some denoiser blotching, and each acceleration structure is a
+   separate allocation (no sub-allocation yet). The FidelityFX build is only tested on Linux
+   with GCC; the Windows build of the vendored SDK has not been tried. The Graphics page has
+   headless coverage only.
 
 ## Next priorities
 
-1. Load scripts on Windows (MSVC or clang-cl flags and `LoadLibraryW`).
-2. Extend the script API further where games need it: adding and configuring components,
+1. Extend the script API further where games need it: adding and configuring components,
    reparenting, and shape casts. More example controllers (third-person, orbit) can follow the
    demo's scripted first person controller.
-3. Grow joints where games need them: breakable joints, cone/swing-twist limits for ragdolls,
+2. Grow joints where games need them: breakable joints, cone/swing-twist limits for ragdolls,
    hinge target angles (servo motors), and editing joint anchors with a viewport gizmo.
+
+Deferred:
+
+- Load scripts on Windows (`LoadLibraryW`, `.dll`, MSVC/clang-cl and MinGW compiler flags). The
+  stubs are in `src/script/script_system.cpp` (`load`, `build`, `status`). It can be developed on
+  Linux: MinGW and Wine can run the script tests end to end, but the MSVC/clang-cl flags need the
+  MSVC CRT and Windows SDK (for example through `xwin`) or a Windows machine to verify.
 
 ## Verification baseline
 
-The current implementation was verified with development and release builds, all five native CTest
-suites (including `relay_script_tests`, which compiles real scripts with the configured compiler,
+The current implementation was verified with development and release builds, all seven native
+CTest suites (including `relay_fidelityfx_tests`, which creates every FidelityFX effect on a
+headless Vulkan device, and `relay_lighting_render_tests`, which renders the demo offscreen with
+each combination of global illumination and reflections and checks their status and pixels;
+`relay_script_tests`, which compiles real scripts with the configured compiler,
 including property overrides of every type, scripts reading simulated and raw input, a play-test of
 the demo's First Person Controller template and script (including shooting balls along the view and
 past the player), and spawning: templates at a position under a parent, a missing template warned
@@ -522,7 +599,14 @@ the palette icon and its "Custom template" tooltip), the Joint section (choosing
 and the type), the Hierarchy search (name search, type filters with subtypes, reveal in the tree,
 collapse and expand all) and the Assets collapse/expand-all button, and the Run Game → trust prompt
 → build → play flow. The demo's First Person Controller, including shooting, was also play-tested by
-hand on a Linux desktop. The desktop smokes below predate the asset browser, layout persistence, and
+hand on a Linux desktop. The workflow suite covers graphics settings (defaults, partial updates,
+saving, per-project reloading, rejecting unknown or mistyped settings) and the headless editor
+suite the Game Configuration Graphics page. With both lighting effects off, offscreen captures of
+the demo and of the editor viewport match the renderer before the G-buffer rework within one
+level per channel; the model, resize and asynchronous capture smokes also pass offscreen with
+both effects on. Every offscreen Vulkan mode (scene captures with each effect combination, the
+model and async smokes, the editor with both effects on, and `relay_fidelityfx_tests`) runs
+without errors under the Khronos validation layer with synchronization validation enabled. The desktop smokes below predate the asset browser, layout persistence, and
 frame-pacing changes and were not rerun for them; those changes are covered by headless and protocol
 tests. The live Vulkan shadow and visual smokes pass, as does `tests/editor_hdr_upload_smoke.py`:
 exposure changes captured pixels, keyframe scrubbing changes the image, a model import submits
@@ -572,6 +656,7 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Physics and collision | `src/physics/`, `include/relay/physics/` |
 | Gameplay scripting | `src/script/`, `include/relay/script/`, `sdk/`, `docs/scripting.md` |
 | Rendering/import | `src/render/`, `shaders/` |
+| Lighting (GI, reflections, acceleration structures) | `src/platform/vulkan_lighting.cpp`, `src/platform/vulkan_ray_tracing.cpp`, `shaders/gi_composite.frag`, `shaders/reflection_*.comp`, `third_party/fidelityfx/` |
 | Editor | `src/editor/`, `include/relay/editor/` |
 | Agent bridge | `tools/mcp-bridge/src/` |
 | Input | `src/core/input.cpp`, `src/platform/sdl_input.cpp` |

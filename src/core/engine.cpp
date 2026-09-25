@@ -235,6 +235,22 @@ bool Engine::set_input_map(InputMap map, std::string& error) {
     input_.set_map(std::move(map));
     return true;
 }
+GraphicsSettings Engine::graphics_settings() const {
+    return project_ && project_->graphics ? *project_->graphics : GraphicsSettings{};
+}
+
+bool Engine::set_graphics_settings(const GraphicsSettings& settings, std::string& error) {
+    if (!project_) {
+        error = "graphics settings are saved with a project; open one first";
+        return false;
+    }
+    auto updated = *project_;
+    updated.graphics = settings;
+    if (!save_project(updated, error)) return false;
+    *project_ = std::move(updated);
+    return true;
+}
+
 const AssetRegistry& Engine::assets() const { return assets_; }
 
 void Engine::advance_one_frame() {

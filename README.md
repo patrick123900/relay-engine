@@ -31,7 +31,11 @@ in control of the same project.
   Vulkan viewport, inspect the image, and iterate.
 - **HDR lighting** — a floating-point scene target, camera exposure, procedural environment
   lighting, and tone mapping produce the final SDR viewport and captures.
-- **One typed API** — 127 versioned native methods cover scene editing, rendering, projects,
+- **Global illumination and ray traced reflections** — light bounces between surfaces through AMD
+  FidelityFX Brixelizer GI, and smooth surfaces show hardware ray traced reflections denoised with
+  FidelityFX. Both are per-project settings and fall back to the analytic sky light on GPUs that
+  cannot run them.
+- **One typed API** — 129 versioned native methods cover scene editing, rendering, projects,
   observability, capture, and session authorization. A generated MCP bridge exposes the supported
   model-facing subset.
 - **Deterministic core** — fixed-step simulation, transactional undo/redo, strict scene validation,
@@ -126,6 +130,15 @@ project** in the Project panel. Relay writes an uncompressed `.tar` under that p
 folder, containing the project metadata, member scenes, and non-hidden assets. Export refuses to
 overwrite an existing package.
 
+**Edit → Game Configuration... → Graphics** turns lighting effects on or off for the project.
+**Global illumination** traces the scene's light through a sparse distance field that AMD
+FidelityFX Brixelizer keeps up to date, so surfaces pick up color and shadow from their
+surroundings and rough surfaces reflect them softly. **Ray traced reflections** trace hardware
+rays for smooth surfaces and denoise them with FidelityFX. Both are on by default and are saved
+in the project file under `settings.graphics`. The page says whether each effect is running; on a
+GPU without the Vulkan features they need (ray queries for reflections), Relay keeps the analytic
+sky light. Agents use `graphics.settings` and `graphics.set_settings`.
+
 Use **Run Game** from the toolbar or Run menu to test the current scene. The game viewport uses the
 active scene camera. Scene edits and saves are unavailable during the run; **Stop Game** restores
 the scene as it was when the run began. Pause and frame step control the running game only.
@@ -213,13 +226,15 @@ import sandboxing, and sustained live-provider validation remain in progress.
 
 Native C++ gameplay scripting (including spawning, destroying and overlap queries), physics joints,
 input mapping, components, node types, and templates are in place and verified on Linux, with a
-scripted first person controller in the demo project. The next engine work is script loading on
-Windows.
+scripted first person controller in the demo project. Scripts do not load on Windows yet.
+Global illumination and ray traced reflections run on Linux with RADV and have been checked on a
+desktop and in offscreen captures.
 
 ## Build
 
 You need CMake 3.25+, Ninja, Python 3.10+, and a C++20 compiler. The graphical editor additionally
-needs SDL3, Vulkan, and `glslc`. CMake fetches pinned Jolt 5.6 sources for physics, plus Dear ImGui
+needs SDL3, Vulkan, and `glslc`, and its lighting effects `glslangValidator`. The AMD FidelityFX
+SDK parts they use are included under [`third_party/fidelityfx`](third_party/fidelityfx). CMake fetches pinned Jolt 5.6 sources for physics, plus Dear ImGui
 and ImGuizmo sources when the editor is enabled. The editor compiles projects' gameplay scripts
 with the same C++ compiler (`RELAY_SCRIPT_COMPILER` chooses another).
 
@@ -272,6 +287,11 @@ cmake --build --preset dev
 ctest --preset dev
 npm --prefix tools/mcp-bridge test
 ```
+
+`relay_lighting_render_tests` renders the demo with each lighting effect through SDL's offscreen
+video driver, so it shows no window; it skips on GPUs without the features.
+`./build/dev/relay_demo --vulkan-scene-capture <project> <image.png> [frames]` renders a project
+the same way when run with `SDL_VIDEODRIVER=offscreen`.
 
 Windowed smoke tests live under `tests/editor_*_smoke.py`; they are intended for deliberate manual
 or dedicated-desktop runs because they move focus and synthesize input. The focused

@@ -1,0 +1,632 @@
+--- a/sdk/include/FidelityFX/gpu/classifier/ffx_classifier_reflections_callbacks_glsl.h
++++ b/sdk/include/FidelityFX/gpu/classifier/ffx_classifier_reflections_callbacks_glsl.h
+@@ -334,7 +334,8 @@
+ 
+ // UAVs
+ #if defined CLASSIFIER_BIND_UAV_RADIANCE
+-        layout (set = 0, binding = CLASSIFIER_BIND_UAV_RADIANCE, rgba32f)                  uniform image2D rw_radiance;
++        // Relay: rgba16f, the format the reflection denoiser declares for the same image.
++        layout (set = 0, binding = CLASSIFIER_BIND_UAV_RADIANCE, rgba16f)                  uniform image2D rw_radiance;
+ #endif
+ #if defined CLASSIFIER_BIND_UAV_RAY_LIST
+         layout (set = 0, binding = CLASSIFIER_BIND_UAV_RAY_LIST, std430)                   buffer rw_ray_list_t
+@@ -361,7 +362,8 @@
+         } rw_ray_counter;
+ #endif
+ #if defined CLASSIFIER_BIND_UAV_EXTRACTED_ROUGHNESS
+-        layout (set = 0, binding = CLASSIFIER_BIND_UAV_EXTRACTED_ROUGHNESS, r32f)          uniform image2D rw_extracted_roughness;
++        // Relay: r8, the format of the denoiser's roughness history that this image is copied to.
++        layout (set = 0, binding = CLASSIFIER_BIND_UAV_EXTRACTED_ROUGHNESS, r8)            uniform image2D rw_extracted_roughness;
+ #endif
+ #if defined CLASSIFIER_BIND_UAV_HIT_COUNTER
+         layout(set = 0, binding = CLASSIFIER_BIND_UAV_HIT_COUNTER, r32ui)                  uniform uimage2D rw_hit_counter;
+--- a/sdk/include/FidelityFX/gpu/ffx_core_cpu.h
++++ b/sdk/include/FidelityFX/gpu/ffx_core_cpu.h
+@@ -20,6 +20,8 @@
+ // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ // THE SOFTWARE.
+ 
++#include <math.h> // Relay: sqrt, floor and friends; MSVC includes them transitively.
++
+ /// A define for a true value in a boolean expression.
+ ///
+ /// @ingroup CPUTypes
+--- a/sdk/include/FidelityFX/host/ffx_brixelizergi.h
++++ b/sdk/include/FidelityFX/host/ffx_brixelizergi.h
+@@ -50,7 +50,12 @@
+ /// The size of the context specified in 32bit values.
+ ///
+ /// @ingroup ffxBrixgi
++// Relay: opaque storage must hold the private context, which is larger where wchar_t is 4 bytes.
++#ifdef _WIN32
+ #define FFX_BRIXELIZER_GI_CONTEXT_SIZE (210000)
++#else
++#define FFX_BRIXELIZER_GI_CONTEXT_SIZE (360000)
++#endif
+ 
+ /// FidelityFX Brixelizer GI context count
+ /// 
+--- a/sdk/include/FidelityFX/host/ffx_brixelizer.h
++++ b/sdk/include/FidelityFX/host/ffx_brixelizer.h
+@@ -27,12 +27,22 @@
+ /// The size of the context specified in 32bit values.
+ ///
+ /// @ingroup ffxBrixelizer
++// Relay: opaque storage must hold the private context, which is larger where wchar_t is 4 bytes.
++#ifdef _WIN32
+ #define FFX_BRIXELIZER_CONTEXT_SIZE            (5938838)
++#else
++#define FFX_BRIXELIZER_CONTEXT_SIZE (6300000)
++#endif
+ 
+ /// The size of the update description specified in 32bit values.
+ ///
+ /// @ingroup ffxBrixelizer
++// Relay: opaque storage must hold the private context, which is larger where wchar_t is 4 bytes.
++#ifdef _WIN32
+ #define FFX_BRIXELIZER_UPDATE_DESCRIPTION_SIZE 2099376
++#else
++#define FFX_BRIXELIZER_UPDATE_DESCRIPTION_SIZE 2110000
++#endif
+ 
+ #ifdef __cplusplus
+ extern "C" {
+--- a/sdk/include/FidelityFX/host/ffx_brixelizer_raw.h
++++ b/sdk/include/FidelityFX/host/ffx_brixelizer_raw.h
+@@ -57,7 +57,12 @@
+ /// The size of the raw context specified in 32bit values.
+ ///
+ /// @ingroup ffxBrixelizer
++// Relay: opaque storage must hold the private context, which is larger where wchar_t is 4 bytes.
++#ifdef _WIN32
+ #define FFX_BRIXELIZER_RAW_CONTEXT_SIZE (2924058)
++#else
++#define FFX_BRIXELIZER_RAW_CONTEXT_SIZE (3250000)
++#endif
+ 
+ #ifdef __cplusplus
+ extern "C" {
+--- a/sdk/include/FidelityFX/host/ffx_classifier.h
++++ b/sdk/include/FidelityFX/host/ffx_classifier.h
+@@ -59,7 +59,12 @@
+ /// The size of the context specified in 32bit values.
+ ///
+ /// @ingroup ffxClassifier
++// Relay: opaque storage must hold the private context, which is larger where wchar_t is 4 bytes.
++#ifdef _WIN32
+ #define FFX_CLASSIFIER_CONTEXT_SIZE  (18500)
++#else
++#define FFX_CLASSIFIER_CONTEXT_SIZE (36000)
++#endif
+ 
+ #if defined(__cplusplus)
+ extern "C" {
+--- a/sdk/include/FidelityFX/host/ffx_denoiser.h
++++ b/sdk/include/FidelityFX/host/ffx_denoiser.h
+@@ -55,7 +55,12 @@
+ /// The size of the context specified in 32bit values.
+ ///
+ /// @ingroup Denoiser
++// Relay: opaque storage must hold the private context, which is larger where wchar_t is 4 bytes.
++#ifdef _WIN32
+ #define FFX_DENOISER_CONTEXT_SIZE (73098)
++#else
++#define FFX_DENOISER_CONTEXT_SIZE (145000)
++#endif
+ 
+ #if defined(__cplusplus)
+ extern "C" {
+--- a/sdk/include/FidelityFX/host/ffx_spd.h
++++ b/sdk/include/FidelityFX/host/ffx_spd.h
+@@ -57,7 +57,12 @@
+ /// The size of the context specified in 32bit values.
+ ///
+ /// @ingroup FfxSpd
++// Relay: opaque storage must hold the private context, which is larger where wchar_t is 4 bytes.
++#ifdef _WIN32
+ #define FFX_SPD_CONTEXT_SIZE       (9300)
++#else
++#define FFX_SPD_CONTEXT_SIZE (18000)
++#endif
+ 
+ /// If this ever changes, need to also reflect a change in number
+ /// of resources in ffx_spd_resources.h
+--- a/sdk/include/FidelityFX/host/ffx_util.h
++++ b/sdk/include/FidelityFX/host/ffx_util.h
+@@ -23,6 +23,9 @@
+ #pragma once
+ 
+ #include <FidelityFX/host/ffx_types.h>
++#if __cplusplus >= 202002L
++#include <bit> // Relay: std::popcount below; MSVC includes it transitively.
++#endif
+ 
+ /// @defgroup Utils Utilities
+ /// Utility Macros used by the FidelityFX SDK
+--- a/sdk/src/backends/vk/ffx_vk.cpp
++++ b/sdk/src/backends/vk/ffx_vk.cpp
+@@ -31,10 +31,17 @@
+ #include <windows.h>
+ #else
+ #include <codecvt>  // this is deprecated so it's just a fallback solution
++#include <locale>   // Relay: std::wstring_convert
++#include <math.h>   // Relay: log2 and floor; MSVC includes them transitively
+ #endif  // _WIN32
+ 
+ #include <vulkan/vulkan.h>
+ 
++#include <cstddef>  // Relay: std::max_align_t
++
++// Relay: alignment of every array in the backend scratch memory.
++static constexpr size_t relayScratchAlignment = alignof(std::max_align_t);
++
+ // prototypes for functions in the interface
+ FfxVersionNumber       GetSDKVersionVK(FfxInterface* backendInterface);
+ FfxErrorCode           GetEffectGpuMemoryUsageVK(FfxInterface* backendInterface, FfxUInt32 effectContextId, FfxEffectMemoryUsage* outVramUsage);
+@@ -280,14 +287,15 @@
+         vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &numExtensions, nullptr);
+ 
+     uint32_t extensionPropArraySize = sizeof(VkExtensionProperties) * numExtensions;
+-    uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
+-    uint32_t resourceViewArraySize = FFX_ALIGN_UP(((maxContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), sizeof(uint32_t));
+-    uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(maxContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, sizeof(uint32_t));
+-    uint32_t pipelineArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), sizeof(uint32_t));
+-    uint32_t resourceArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), sizeof(uint32_t));
+-    uint32_t contextArraySize = FFX_ALIGN_UP(maxContexts * sizeof(BackendContext_VK::EffectContext), sizeof(uint32_t));
++    uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), relayScratchAlignment);
++    uint32_t resourceViewArraySize = FFX_ALIGN_UP(((maxContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), relayScratchAlignment);
++    uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(maxContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, relayScratchAlignment);
++    uint32_t pipelineArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), relayScratchAlignment);
++    uint32_t resourceArraySize = FFX_ALIGN_UP(maxContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), relayScratchAlignment);
++    uint32_t contextArraySize = FFX_ALIGN_UP(maxContexts * sizeof(BackendContext_VK::EffectContext), relayScratchAlignment);
+     
+-    return FFX_ALIGN_UP(sizeof(BackendContext_VK) + extensionPropArraySize + gpuJobDescArraySize + resourceViewArraySize + stagingRingBufferArraySize +
++    // Relay: room to align the first array after the backend context.
++    return FFX_ALIGN_UP(sizeof(BackendContext_VK) + relayScratchAlignment + extensionPropArraySize + gpuJobDescArraySize + resourceViewArraySize + stagingRingBufferArraySize +
+                             pipelineArraySize + resourceArraySize + contextArraySize,
+                         sizeof(uint64_t));
+ }
+@@ -341,7 +349,12 @@
+     backendInterface->fpBreadcrumbsWrite = BreadcrumbsWriteVK;
+     backendInterface->fpBreadcrumbsPrintDeviceInfo = BreadcrumbsPrintDeviceInfoVK;
+     backendInterface->fpRegisterConstantBufferAllocator = RegisterConstantBufferAllocatorVK;
++#if defined(FFX_FI) || defined(FFX_ALL)
+     backendInterface->fpSwapChainConfigureFrameGeneration = ffxSetFrameGenerationConfigToSwapchainVK;
++#else
++    // Relay: the frame generation swapchain is not built, so there is nothing to configure.
++    backendInterface->fpSwapChainConfigureFrameGeneration = nullptr;
++#endif
+ 
+     // Memory assignments
+     backendInterface->scratchBuffer = scratchBuffer;
+@@ -1402,13 +1415,16 @@
+         new (&backendContext->uniformBufferMutex) std::mutex();
+ 
+         // Map all of our pointers
+-        uint32_t gpuJobDescArraySize   = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
+-        uint32_t resourceViewArraySize = FFX_ALIGN_UP(((backendContext->maxEffectContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), sizeof(uint32_t));
+-        uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, sizeof(uint32_t));
+-        uint32_t pipelineArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), sizeof(uint32_t));
+-        uint32_t resourceArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), sizeof(uint32_t));
+-        uint32_t contextArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * sizeof(BackendContext_VK::EffectContext), sizeof(uint32_t));
++        uint32_t gpuJobDescArraySize   = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), relayScratchAlignment);
++        uint32_t resourceViewArraySize = FFX_ALIGN_UP(((backendContext->maxEffectContexts * FFX_MAX_QUEUED_FRAMES * FFX_MAX_RESOURCE_COUNT * 2) + FFX_MAX_BINDLESS_DESCRIPTOR_COUNT) * sizeof(BackendContext_VK::VkResourceView), relayScratchAlignment);
++        uint32_t stagingRingBufferArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_CONSTANT_BUFFER_RING_BUFFER_SIZE, relayScratchAlignment);
++        uint32_t pipelineArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * sizeof(BackendContext_VK::PipelineLayout), relayScratchAlignment);
++        uint32_t resourceArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_VK::Resource), relayScratchAlignment);
++        uint32_t contextArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * sizeof(BackendContext_VK::EffectContext), relayScratchAlignment);
+         uint8_t* pMem = (uint8_t*)((BackendContext_VK*)(backendContext + 1));
++        // Relay: every array starts at the strictest fundamental alignment. Upstream packs them
++        // at 4 bytes, and optimized GCC builds then fault on aligned stores into EffectContext.
++        pMem = (uint8_t*)FFX_ALIGN_UP((uintptr_t)pMem, relayScratchAlignment);
+ 
+         // Map gpu job array
+         backendContext->pGpuJobs = (FfxGpuJobDescription*)pMem;
+@@ -1485,6 +1501,10 @@
+         backendContext->vkFunctionTable.vkDestroyShaderModule = (PFN_vkDestroyShaderModule)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkDestroyShaderModule");
+         backendContext->vkFunctionTable.vkGetBufferMemoryRequirements = (PFN_vkGetBufferMemoryRequirements)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkGetBufferMemoryRequirements");
+         backendContext->vkFunctionTable.vkGetBufferMemoryRequirements2KHR = (PFN_vkGetBufferMemoryRequirements2KHR)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkGetBufferMemoryRequirements2KHR");
++        // Relay: the KHR entry point is only exposed when the application enables
++        // VK_KHR_get_memory_requirements2; the function is core since Vulkan 1.1.
++        if (!backendContext->vkFunctionTable.vkGetBufferMemoryRequirements2KHR)
++            backendContext->vkFunctionTable.vkGetBufferMemoryRequirements2KHR = (PFN_vkGetBufferMemoryRequirements2KHR)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkGetBufferMemoryRequirements2");
+         backendContext->vkFunctionTable.vkGetImageMemoryRequirements = (PFN_vkGetImageMemoryRequirements)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkGetImageMemoryRequirements");
+         backendContext->vkFunctionTable.vkAllocateDescriptorSets = (PFN_vkAllocateDescriptorSets)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkAllocateDescriptorSets");
+         backendContext->vkFunctionTable.vkFreeDescriptorSets = (PFN_vkFreeDescriptorSets)vkDeviceContext->vkDeviceProcAddr(backendContext->device, "vkFreeDescriptorSets");
+@@ -1521,7 +1541,6 @@
+             { VK_DESCRIPTOR_TYPE_SAMPLER, backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * FFX_MAX_PASS_COUNT * FFX_MAX_QUEUED_FRAMES * MAX_PIPELINE_USAGE_PER_FRAME },
+             { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * FFX_MAX_PASS_COUNT * FFX_MAX_QUEUED_FRAMES * MAX_PIPELINE_USAGE_PER_FRAME },
+             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * FFX_MAX_PASS_COUNT * FFX_MAX_QUEUED_FRAMES * MAX_PIPELINE_USAGE_PER_FRAME },
+-            { VK_DESCRIPTOR_TYPE_SAMPLER, backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * FFX_MAX_PASS_COUNT * FFX_MAX_QUEUED_FRAMES * MAX_PIPELINE_USAGE_PER_FRAME },
+             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * FFX_MAX_PASS_COUNT * FFX_MAX_QUEUED_FRAMES * MAX_PIPELINE_USAGE_PER_FRAME },
+             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * FFX_MAX_PASS_COUNT * FFX_MAX_QUEUED_FRAMES * MAX_PIPELINE_USAGE_PER_FRAME },
+         };
+@@ -1529,7 +1548,9 @@
+         descriptorPoolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+         descriptorPoolCreateInfo.pNext = nullptr;
+         descriptorPoolCreateInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+-        descriptorPoolCreateInfo.poolSizeCount = 5;
++        // Relay: upstream listed the sampler twice and passed a count of 5, leaving out storage
++        // buffers, which Brixelizer's passes bind.
++        descriptorPoolCreateInfo.poolSizeCount = FFX_ARRAY_ELEMENTS(poolSizes);
+         descriptorPoolCreateInfo.pPoolSizes = poolSizes;
+         descriptorPoolCreateInfo.maxSets = backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * MAX_PIPELINE_USAGE_PER_FRAME * FFX_MAX_QUEUED_FRAMES;
+ 
+@@ -1792,10 +1813,12 @@
+ 
+                 descriptorPoolCreateInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+                 descriptorPoolCreateInfo.pNext         = nullptr;
+-                descriptorPoolCreateInfo.flags         = 0;
++                // Relay: destruction frees the sets individually, and there can be one set per
++                // table kind (texture SRV/UAV, buffer SRV/UAV), more than the pool size entries.
++                descriptorPoolCreateInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+                 descriptorPoolCreateInfo.poolSizeCount = poolSizeCount;
+                 descriptorPoolCreateInfo.pPoolSizes    = poolSizes;
+-                descriptorPoolCreateInfo.maxSets       = poolSizeCount;
++                descriptorPoolCreateInfo.maxSets       = 4;
+ 
+                 if (backendContext->vkFunctionTable.vkCreateDescriptorPool(
+                         backendContext->device, &descriptorPoolCreateInfo, nullptr, &effectContext.bindlessDescriptorPool) != VK_SUCCESS)
+--- a/sdk/src/components/brixelizer/ffx_brixelizer.cpp
++++ b/sdk/src/components/brixelizer/ffx_brixelizer.cpp
+@@ -59,7 +59,8 @@
+     FfxBrixelizerRawJobDescription                 dynamicJobs[FFX_BRIXELIZER_MAX_INSTANCES];
+ } FfxBrixelizerBakedUpdateDescription_Private;
+ 
+-FFX_STATIC_ASSERT(sizeof(FfxBrixelizerBakedUpdateDescription) == sizeof(FfxBrixelizerBakedUpdateDescription_Private));
++// Relay: >= rather than ==, since the private layout differs where wchar_t is 4 bytes.
++FFX_STATIC_ASSERT(sizeof(FfxBrixelizerBakedUpdateDescription) >= sizeof(FfxBrixelizerBakedUpdateDescription_Private));
+ 
+ typedef struct FfxBrixelizerCascadePrivate {
+     FfxBrixelizerCascadeFlag flags;
+--- a/tools/ffx_shader_compiler/src/ffx_sc.cpp
++++ b/tools/ffx_shader_compiler/src/ffx_sc.cpp
+@@ -20,12 +20,16 @@
+ // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ // THE SOFTWARE.
+ 
++#ifdef _WIN32
+ #include "hlsl_compiler.h"
++#endif
+ #include "glsl_compiler.h"
+ #include "utils.h"
+ 
++#ifdef _WIN32
+ #include <Windows.h>
+ #include <pathcch.h>
++#endif
+ #include <vector>
+ #include <string_view>
+ #include <filesystem>
+@@ -34,7 +38,9 @@
+ #include <stdexcept>
+ 
+ 
++#ifdef _WIN32
+ #pragma comment(lib, "pathcch.lib")
++#endif
+ 
+ static const wchar_t* const APP_NAME    = L"FidelityFX-SC";
+ static const wchar_t* const EXE_NAME    = L"FidelityFX_SC";
+@@ -80,6 +86,18 @@
+     }
+ }
+ 
++// Relay: portable replacement for _wfopen_s that fails loudly instead of writing through NULL.
++inline void OpenFileForWriting(FILE*& fp, const std::wstring& path)
++{
++#ifdef _WIN32
++    _wfopen_s(&fp, path.c_str(), L"wb");
++#else
++    fp = fopen(WCharToUTF8(path).c_str(), "wb");
++#endif
++    if (fp == NULL)
++        throw std::runtime_error("could not open output file " + WCharToUTF8(path));
++}
++
+ inline bool IsNumeric(std::wstring_view s)
+ {
+     for (wchar_t c : s)
+@@ -258,7 +276,7 @@
+             }
+         }
+         else if (StartsWith(args[i], L"-debugcmdline"))
+-            wprintf(debugOutput.c_str());
++            wprintf(L"%ls", debugOutput.c_str());
+         else if (StartsWith(args[i], L"-num-threads"))
+             ParseNumThreads(numThreads, args[i]);
+         else if (StartsWith(args[i], L"-output"))
+@@ -309,6 +327,13 @@
+ 
+ void LaunchParameters::EnsureOutputPathExistsAndMakeCanonical(std::wstring& inoutOutputPath)
+ {
++#ifndef _WIN32
++    // Relay: create the folder and make the path absolute with std::filesystem.
++    fs::path outputPath = fs::path(WCharToUTF8(inoutOutputPath));
++    fs::create_directories(outputPath);
++    inoutOutputPath = UTF8ToWChar(fs::absolute(outputPath).lexically_normal().string());
++    return;
++#else
+     std::replace(inoutOutputPath.begin(), inoutOutputPath.end(), L'/', L'\\');
+ 
+     PWSTR canonicalOutputPath = NULL;
+@@ -342,6 +367,7 @@
+         inoutOutputPath = canonicalOutputPath;
+         LocalFree(canonicalOutputPath);
+     }
++#endif
+ }
+ 
+ void LaunchParameters::ParsePermutationOption(PermutationOption& outPermutationOption, const std::wstring arg)
+@@ -431,12 +457,15 @@
+            predictedDuplicates);
+     if (totalPermutations - m_LastPermutationIndex < predictedDuplicates)
+     {
+-        printf("\nERROR: Predicted %llu duplicates\n\n\n", predictedDuplicates);
++        printf("\nERROR: Predicted %zu duplicates\n\n\n", predictedDuplicates);
+     }
+ }
+ 
+ std::wstring Application::MakeFullPath(const std::wstring & outputPath, const std::wstring & fileName)
+ {
++#ifndef _WIN32
++    return UTF8ToWChar((fs::path(WCharToUTF8(outputPath)) / WCharToUTF8(fileName)).string());
++#else
+     // Append file name, optionally converting to long path again, because the outputPath alone could be normal path, but when filename is added -- it could become a long path
+     PWSTR canonicalFileNameRaw = NULL;
+     HRESULT hr = PathAllocCombine(outputPath.c_str(), fileName.c_str(), PATHCCH_ALLOW_LONG_PATHS, &canonicalFileNameRaw);
+@@ -448,6 +477,7 @@
+         return canonicalFileName;
+     }
+     return fileName;
++#endif
+ }
+ 
+ void Application::GenerateMacroPermutations(std::deque<Permutation>& permutations)
+@@ -558,8 +588,12 @@
+         std::wstring extension    = m_Params.inputFile.substr(extensionPos + 1, m_Params.inputFile.size() - extensionPos - 1);
+ 
+         if (extension == L"hlsl")
++#ifndef _WIN32
++            throw std::runtime_error("HLSL shaders can only be compiled on Windows");
++#else
+             m_Compiler = std::unique_ptr<HLSLCompiler>(
+                 new HLSLCompiler(HLSLCompiler::DXC, dxcDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
++#endif
+         else if (extension == L"glsl")
+             m_Compiler = std::unique_ptr<GLSLCompiler>(new GLSLCompiler(glslangExe, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
+         else
+@@ -567,6 +601,10 @@
+     }
+     else
+     {
++#ifndef _WIN32
++        if (m_Params.compiler != L"glslang")
++            throw std::runtime_error("only the glslang compiler is available outside Windows");
++#else
+         if (m_Params.compiler == L"dxc")
+             m_Compiler = std::unique_ptr<HLSLCompiler>(
+                 new HLSLCompiler(HLSLCompiler::DXC, dxcDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
+@@ -579,7 +617,9 @@
+         else if (m_Params.compiler == L"fxc")
+             m_Compiler = std::unique_ptr<HLSLCompiler>(
+                 new HLSLCompiler(HLSLCompiler::FXC, d3dDll, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
+-        else if (m_Params.compiler == L"glslang")
++        else
++#endif
++        if (m_Params.compiler == L"glslang")
+             m_Compiler = std::unique_ptr<GLSLCompiler>(new GLSLCompiler(glslangExe, shaderPath, shaderName, shaderFileName, outputPath, m_Params.disableLogs, m_Params.debugCompile));
+         else
+             throw std::runtime_error("Unknown compiler requested (valid options: dxc, fxc or glslang)");
+@@ -782,7 +822,7 @@
+ 
+     std::wstring outputPath = MakeFullPath(m_Params.ouputPath, headerFileName);
+ 
+-    _wfopen_s(&fp, outputPath.c_str(), L"wb");
++    OpenFileForWriting(fp, outputPath);
+ 
+     // ------------------------------------------------------------------------------------------------
+     // Write autogen comment
+@@ -919,7 +959,7 @@
+ 
+     std::wstring outputPath = MakeFullPath(m_Params.ouputPath, m_ShaderName + L"_permutations.h");
+ 
+-    _wfopen_s(&fp, outputPath.c_str(), L"wb");
++    OpenFileForWriting(fp, outputPath);
+ 
+     // ------------------------------------------------------------------------------------------------
+     // Write header includes
+@@ -1061,7 +1101,7 @@
+     std::wstring outputFilename = MakeFullPath(m_Params.ouputPath, m_ShaderName + L"_permutations.h");
+     std::wstring depfilePath = outputFilename + L".d";
+ 
+-    _wfopen_s(&fp, depfilePath.c_str(), L"wb");
++    OpenFileForWriting(fp, depfilePath);
+ 
+     fs::path output = WCharToUTF8(outputFilename);
+ 
+@@ -1084,8 +1124,43 @@
+     printf("MSVC depfile not implemented yet.\n");
+ }
+ 
++#ifdef _WIN32
+ int wmain(int argc, wchar_t** argv)
+ {
++#else
++// Relay: convert UTF-8 arguments to the wide strings the tool works with. An argument of the form
++// @<file> is replaced by the lines of that file, one argument per line, so build systems can pass
++// permutation lists such as -DOPTION={0,1} without a POSIX shell brace-expanding them.
++int main(int argc, char** argv)
++{
++    std::vector<std::wstring> wideArguments;
++    for (int i = 0; i < argc; ++i)
++    {
++        if (i > 0 && argv[i][0] == '@')
++        {
++            std::ifstream responseFile(argv[i] + 1);
++            if (!responseFile)
++            {
++                fprintf(stderr, "ffx_sc failed: could not open response file %s\n", argv[i] + 1);
++                return -1;
++            }
++            for (std::string line; std::getline(responseFile, line);)
++            {
++                if (!line.empty() && line.back() == '\r')
++                    line.pop_back();
++                if (!line.empty())
++                    wideArguments.push_back(UTF8ToWChar(line));
++            }
++        }
++        else
++            wideArguments.push_back(UTF8ToWChar(argv[i]));
++    }
++    argc = static_cast<int>(wideArguments.size());
++    std::vector<const wchar_t*> wideArgumentPointers;
++    for (const auto& argument : wideArguments)
++        wideArgumentPointers.push_back(argument.c_str());
++    const wchar_t* const* wargv = wideArgumentPointers.data();
++#endif
+     try
+     {
+         if (argc <= 1)
+@@ -1095,7 +1170,11 @@
+         }
+ 
+         LaunchParameters params;
++#ifdef _WIN32
+         params.ParseCommandLine(argc - 1, argv + 1);
++#else
++        params.ParseCommandLine(argc - 1, wargv + 1);
++#endif
+ 
+         Application app(params);
+         app.Process();
+--- a/tools/ffx_shader_compiler/src/glsl_compiler.cpp
++++ b/tools/ffx_shader_compiler/src/glsl_compiler.cpp
+@@ -74,7 +74,11 @@
+                            bool               disableLogs,
+                            bool               debugCompile)
+     : ICompiler(shaderPath, shaderName, shaderFileName, outputPath, disableLogs, debugCompile)
++#ifdef _WIN32
+     , m_GlslangExe(glslangExe.empty() ? "glslangValidator.exe" : glslangExe)
++#else
++    , m_GlslangExe(glslangExe.empty() ? "glslangValidator" : glslangExe)
++#endif
+ {
+     fs::create_directory(m_OutputPath + "/" + m_ShaderName + "_temp");
+ }
+@@ -251,7 +255,8 @@
+                         token.erase(0, end + 2);
+                     }
+                 }
+-                token.pop_back();
++                if (!token.empty() && token.back() == '\r') // Relay: only Windows output ends in \r
++                    token.pop_back();
+                 errors.push_back(ErrorData{token, lineNumber});
+             }
+         }
+--- a/tools/ffx_shader_compiler/src/pch.hpp
++++ b/tools/ffx_shader_compiler/src/pch.hpp
+@@ -22,12 +22,18 @@
+ 
+ #pragma once
+ 
++#ifdef _WIN32
+ #define NOMINMAX
+ #define WIN32_LEAN_AND_MEAN
+ #include <Windows.h>
+ #include <atlcomcli.h>
+ #include <dxcapi.h>
+ #include <d3dcompiler.h>
++#endif // Relay: the HLSL compilers are Windows-only; the GLSL path builds everywhere.
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <memory>
+ #include <assert.h>
+ #include <stdio.h>
+ #include <exception>
+@@ -44,7 +50,9 @@
+ #include <iostream>
+ #include <algorithm>
+ #include <fstream>
++#ifdef _WIN32
+ #include <d3d12shader.h>
++#endif
+ 
+ #include <filesystem>
+ namespace fs = std::filesystem;
+--- a/tools/ffx_shader_compiler/src/utils.cpp
++++ b/tools/ffx_shader_compiler/src/utils.cpp
+@@ -22,6 +22,7 @@
+ 
+ #include "utils.h"
+ 
++#ifdef _WIN32
+ std::string WCharToUTF8(const std::wstring& wstr)
+ {
+     if (wstr.empty())
+@@ -49,3 +50,51 @@
+ 
+     return wstr;
+ }
++#else
++// Relay: wchar_t is UTF-32 outside Windows.
++std::string WCharToUTF8(const std::wstring& wstr)
++{
++    std::string str;
++    for (const wchar_t wc : wstr)
++    {
++        const auto c = static_cast<uint32_t>(wc);
++        if (c < 0x80)
++            str += static_cast<char>(c);
++        else if (c < 0x800)
++        {
++            str += static_cast<char>(0xC0 | (c >> 6));
++            str += static_cast<char>(0x80 | (c & 0x3F));
++        }
++        else if (c < 0x10000)
++        {
++            str += static_cast<char>(0xE0 | (c >> 12));
++            str += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
++            str += static_cast<char>(0x80 | (c & 0x3F));
++        }
++        else
++        {
++            str += static_cast<char>(0xF0 | (c >> 18));
++            str += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
++            str += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
++            str += static_cast<char>(0x80 | (c & 0x3F));
++        }
++    }
++    return str;
++}
++
++std::wstring UTF8ToWChar(const std::string& str)
++{
++    std::wstring wstr;
++    for (size_t i = 0; i < str.size();)
++    {
++        const auto byte = static_cast<unsigned char>(str[i]);
++        const size_t length = byte < 0x80 ? 1 : byte < 0xE0 ? 2 : byte < 0xF0 ? 3 : 4;
++        uint32_t c = length == 1 ? byte : length == 2 ? (byte & 0x1F) : length == 3 ? (byte & 0x0F) : (byte & 0x07);
++        for (size_t j = 1; j < length && i + j < str.size(); ++j)
++            c = (c << 6) | (static_cast<unsigned char>(str[i + j]) & 0x3F);
++        wstr += static_cast<wchar_t>(c);
++        i += length;
++    }
++    return wstr;
++}
++#endif
+--- a/tools/ffx_shader_compiler/src/utils.h
++++ b/tools/ffx_shader_compiler/src/utils.h
+@@ -23,7 +23,9 @@
+ #pragma once
+ 
+ #include "pch.hpp"
++#ifdef _WIN32
+ #include "DXBCChecksum.h"
++#endif
+ 
+ std::string WCharToUTF8(const std::wstring& wstr);
+ std::wstring UTF8ToWChar(const std::string& str);

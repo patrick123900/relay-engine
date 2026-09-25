@@ -82,6 +82,11 @@ constexpr std::array<ProtocolFieldSpec, 2> fields_performance_read{{
     {"limit", ProtocolValueType::integer, false, false, true, true, 1, 240, 0U, 0U, "", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 2> fields_graphics_set_settings{{
+    {"global_illumination", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"reflections", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 1> fields_input_set_map{{
     {"map", ProtocolValueType::string, true, false, false, false, 0, 0, 2U, 262144U, "", ""},
 }};
@@ -523,7 +528,7 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_chat_control{{
     {"provider", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "openai|compatible"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 127> methods{{
+constexpr std::array<ProtocolMethodSpec, 129> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -553,6 +558,8 @@ constexpr std::array<ProtocolMethodSpec, 127> methods{{
     {"logs.read", "logs_read", "Read Relay logs", "Read structured engine log entries newer than a sequence number.", true, false, false, false, false, fields_logs_read},
     {"performance.read", "performance_read", "Read Relay performance", "Read bounded per-frame CPU/GPU timing, draw/resource counts, entities and process memory.", true, false, false, false, false, fields_performance_read},
     {"input.recent", "input_recent", "Read recent Relay input", "Read the bounded normalized keyboard, mouse and gamepad input event history.", true, false, false, false, false, no_fields},
+    {"graphics.settings", "graphics_settings", "Read graphics settings", "Read the project's graphics settings (settings.graphics in the .relayproject): global illumination and ray traced reflections, with the defaults. When a live renderer is attached, also reports whether each effect is supported and running on this GPU and why not.", true, false, false, false, false, no_fields},
+    {"graphics.set_settings", "graphics_set_settings", "Change graphics settings", "Turn global illumination or ray traced reflections on or off and save the choice in the open project. Omitted settings keep their current values. Effects the GPU cannot run stay off and are reported by graphics.settings.", false, false, false, false, false, fields_graphics_set_settings},
     {"input.map", "input_map", "Read input map", "Read the project's input map: named actions bound to keys, mouse buttons or gamepad buttons, and axes built from button pairs or gamepad sticks. Also returns the engine defaults. Controls look like key:space, key:left_shift, mouse:left, gamepad:a or gamepad:leftx.", true, false, false, false, false, no_fields},
     {"input.set_map", "input_set_map", "Replace input map", "Validate, save in the project file (settings.input in the .relayproject) and apply a complete input map document (format relay.input, version 1) as returned by input.map.", false, true, false, false, false, fields_input_set_map},
     {"input.state", "input_state", "Inspect game input", "Read the current game step's input: each action's held and pressed state, each axis value, held controls and mouse movement.", true, false, false, false, false, no_fields},

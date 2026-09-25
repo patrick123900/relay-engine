@@ -10,9 +10,11 @@ namespace relay {
 using RenderResourceId = std::uint32_t;
 
 enum class RenderResourceKind { image, buffer };
+// The *_load accesses bind an attachment that an earlier pass wrote and keep adding to it, so
+// they order after that pass without counting as a second writer.
 enum class RenderAccess { sampled, storage_read, storage_write, color_attachment,
                           depth_stencil_attachment, transfer_source, transfer_destination,
-                          present };
+                          present, color_attachment_load, depth_stencil_load };
 
 struct RenderResourceDescription {
     std::string name;

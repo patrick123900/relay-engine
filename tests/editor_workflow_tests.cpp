@@ -725,6 +725,55 @@ void components_and_templates() {
           "a version 12 script becomes the first script component");
 }
 
+void graphics_settings() {
+    relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+    relay::ControlProtocol protocol(engine);
+    const auto defaults = request(protocol, "graphics.settings");
+    const auto* settings = relay::field(*defaults.object(), "settings")->object();
+    check(*relay::field(*settings, "global_illumination")->boolean() &&
+              *relay::field(*settings, "reflections")->boolean() &&
+              !*relay::field(*defaults.object(), "saved")->boolean() &&
+              relay::field(*defaults.object(), "renderer")->is_null(),
+          "without a project, both lighting effects default on and no renderer reports status");
+    request(protocol, "graphics.set_settings", "\"global_illumination\":false", false);
+    request(protocol, "project.create",
+            "\"filename\":\"projects/lighting/project.relayproject\",\"name\":\"Lighting\"");
+    request(protocol, "graphics.set_settings", "\"global_illumination\":false");
+    check(!engine.graphics_settings().global_illumination && engine.graphics_settings().reflections,
+          "graphics.set_settings changes only the settings it names");
+    {
+        std::string load_error;
+        const auto saved = relay::load_project("projects/lighting/project.relayproject", load_error);
+        check(saved && saved->graphics && !saved->graphics->global_illumination &&
+                  saved->graphics->reflections,
+              "graphics settings are saved in the project file");
+    }
+    request(protocol, "graphics.set_settings", "\"reflections\":false,\"global_illumination\":true");
+    request(protocol, "project.create",
+            "\"filename\":\"projects/unlit/project.relayproject\",\"name\":\"Unlit\"");
+    check(engine.graphics_settings() == relay::GraphicsSettings{},
+          "another project starts from the default graphics settings");
+    request(protocol, "project.open", "\"filename\":\"projects/lighting/project.relayproject\"");
+    check(engine.graphics_settings().global_illumination && !engine.graphics_settings().reflections,
+          "reopening a project restores its graphics settings");
+    request(protocol, "graphics.set_settings", "\"global_illumination\":\"yes\"", false);
+
+    std::string error;
+    relay::JsonParser parser(R"({"global_illumination":true,"shadows":false})");
+    check(!relay::parse_graphics_settings(*parser.parse(), error) &&
+              error.find("shadows") != std::string::npos,
+          "unknown graphics settings are rejected");
+    std::filesystem::create_directories("projects/typo");
+    std::ofstream("projects/typo/project.relayproject")
+        << R"({"format":"relay.project","version":2,"filename":"projects/typo/project.relayproject",)"
+           R"("root":"projects/typo","name":"Typo","assets_directory":".","scenes_directory":"scenes",)"
+           R"("scenes":[],"startup_scene":"","settings":{"graphics":{"global_illumination":1}}})";
+    check(!relay::load_project("projects/typo/project.relayproject", error) &&
+              error.find("graphics") != std::string::npos,
+          "a project with invalid graphics settings is refused with a reason");
+    std::cout << "Graphics settings workflow tests passed\n";
+}
+
 void input_mapping() {
     using Query = relay::InputState::Query;
     relay::InputState input;
@@ -1159,6 +1208,7 @@ int main() {
         demo_project();
         components_and_templates();
         input_mapping();
+        graphics_settings();
         demo_first_person_template();
         first_person_migration();
         joints();

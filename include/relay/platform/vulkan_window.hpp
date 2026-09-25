@@ -47,6 +47,12 @@ public:
     bool readback_async(const Scene& scene, double elapsed_seconds, FrameReceiver receiver, std::string& error);
     void flush_readbacks();
     void resize(std::uint32_t width, std::uint32_t height);
+    // Turns FidelityFX global illumination on or off. When the device or build cannot provide it,
+    // the renderer keeps its analytic sky light and lighting_status_json() says why.
+    void set_global_illumination(bool enabled);
+    // Turns hardware ray traced reflections on or off, with the same fallback and reporting.
+    void set_reflections(bool enabled);
+    [[nodiscard]] std::string lighting_status_json() const;
     // Installs the human-facing UI layer. The overlay must outlive the window. It is drawn into the
     // swapchain render pass for presentation only and is deliberately excluded from every capture
     // and readback, so screenshots, recordings and golden comparisons keep showing scene pixels.

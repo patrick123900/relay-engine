@@ -1032,6 +1032,10 @@ void joints_ui() {
     frame(ui, 5);
     click(ui, *ui.headless_item_rect("entity:" + swing.to_string()));
     frame(ui, 3);
+    if (auto* inspector = ImGui::FindWindowByName("Inspector")) {
+        ImGui::SetScrollY(inspector, inspector->ScrollMax.y);
+        frame(ui, 3);
+    }
     check(ui.headless_item_rect("inspector:component:joint") && ui.headless_item_rect("joint:type") &&
               ui.headless_item_rect("joint:connected"),
           "the Inspector shows the Joint section");
@@ -1251,7 +1255,16 @@ void game_input_ui() {
     std::string error;
     check(ui.initialize_headless(error), "initialize game input editor without windows");
     frame(ui, 5);
-    check(engine.run_game(), "start the game");
+    SDL_Event run_key{};
+    run_key.type = SDL_EVENT_KEY_DOWN;
+    run_key.key.scancode = SDL_SCANCODE_F5;
+    check(ui.handle_event(&run_key) && engine.status().mode == relay::RuntimeMode::game,
+          "F5 runs the game from the editor");
+    run_key.key.repeat = true;
+    check(ui.handle_event(&run_key) && engine.status().mode == relay::RuntimeMode::game,
+          "holding F5 does not restart the game");
+    run_key.type = SDL_EVENT_KEY_UP;
+    check(ui.handle_event(&run_key), "F5 release stays in the editor");
     frame(ui, 40);
     const auto viewport = ui.headless_item_rect("viewport");
     check(viewport.has_value(), "the viewport is visible");
@@ -1281,7 +1294,13 @@ void game_input_ui() {
     (void)ui.handle_event(&click);
     frame(ui, 2);
     check(ui.game_has_input(), "clicking again gives input back");
-    check(engine.stop_game(), "stop the game");
+    SDL_Event stop_key{};
+    stop_key.type = SDL_EVENT_KEY_DOWN;
+    stop_key.key.scancode = SDL_SCANCODE_F8;
+    check(ui.handle_event(&stop_key) && engine.status().mode == relay::RuntimeMode::editor,
+          "F8 stops the game while it owns keyboard input");
+    stop_key.type = SDL_EVENT_KEY_UP;
+    check(ui.handle_event(&stop_key), "F8 release stays in the editor");
     frame(ui, 40);
     check(!ui.game_has_input() && !ui.pointer_locked_for_game(), "stopping the game releases input");
     std::cout << "Headless game input focus tests passed\n";

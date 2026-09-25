@@ -139,7 +139,8 @@ in the project file under `settings.graphics`. The page says whether each effect
 GPU without the Vulkan features they need (ray queries for reflections), Relay keeps the analytic
 sky light. Agents use `graphics.settings` and `graphics.set_settings`.
 
-Use **Run Game** from the toolbar or Run menu to test the current scene. The game viewport uses the
+Use **Run Game** (F5) from the toolbar or Run menu to test the current scene, and **Stop Game**
+(F8) to end it; both keys work while the game has input. The game viewport uses the
 active scene camera. Scene edits and saves are unavailable during the run; **Stop Game** restores
 the scene as it was when the run began. Pause and frame step control the running game only.
 Select an entity and open **Collider** in the Inspector to add a box, sphere, capsule, convex hull,

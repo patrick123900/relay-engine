@@ -35,7 +35,9 @@ without blocking simultaneous human editing.
   `runtime.play` snapshots authored scene state and starts a temporary game session; `runtime.stop`
   restores it without changing undo history. During a run, scene/project/asset mutations and trace
   replay are rejected through the control protocol. Pause and step apply only in Game mode. The
-  game viewport uses the active scene camera rather than the editor inspection camera.
+  game viewport uses the active scene camera rather than the editor inspection camera. In the
+  editor, F5 runs the game and F8 stops it, even while the game has input; the run controls sit
+  at the centre of the toolbar and the frame rate in the viewport's top-right corner.
 - Transactional undo/redo, multi-selection, clipboard workflows, strict loading, migration, and
   atomic saves.
 - Folder projects with contained `scenes/`, `assets/`, `captures/`, and traces.

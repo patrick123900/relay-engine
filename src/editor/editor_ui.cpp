@@ -28,6 +28,7 @@
 #include <array>
 #include <cstdint>
 #include <chrono>
+#include <cstdio>
 #include <deque>
 #include <iomanip>
 #include <limits>
@@ -237,14 +238,39 @@ struct EditorUi::Impl {
     explicit Impl(RequestHandler handler) : request(std::move(handler)) {}
 
     std::map<ImGuiID, EditorScalarDraft> drafts;
+    bool drawing_inspector{};
+
+    void inspector_field_label(const char* label) const {
+        const float label_width = 108.0F * ui_scale;
+        if (ImGui::CalcTextSize(label).x > label_width - 12.0F * ui_scale ||
+            ImGui::GetContentRegionAvail().x < 230.0F * ui_scale) {
+            ImGui::TextColored(editor_color(editor_palette().text_dim), "%s", label);
+        } else {
+            row_label(label, ImGui::GetWindowContentRegionMin().x + label_width);
+        }
+        ImGui::SetNextItemWidth(-FLT_MIN);
+    }
+
+    bool inspector_begin_combo(const char* label, const char* preview) const {
+        inspector_field_label(label);
+        const auto id = std::string{"##"} + label;
+        return ImGui::BeginCombo(id.c_str(), preview);
+    }
 
     bool drag_scalar(const char* label, double& current, float speed, const char* format = "%.6f") {
         auto& draft = drafts[ImGui::GetID(label)];
-        ImGui::DragScalar(label, ImGuiDataType_Double, &draft.begin(current), speed, nullptr,
-                          nullptr, format);
+        const bool inspector_field = drawing_inspector && label[0] != '#';
+        if (inspector_field) {
+            ImGui::PushID(label);
+            inspector_field_label(label);
+        }
+        ImGui::DragScalar(inspector_field ? "##value" : label, ImGuiDataType_Double,
+                          &draft.begin(current), speed, nullptr, nullptr,
+                          inspector_field && std::string_view(format) == "%.6f" ? "%.3f" : format);
         const bool commit = ImGui::IsItemDeactivatedAfterEdit();
         current = draft.value;
         draft.finish(ImGui::IsItemActive());
+        if (inspector_field) ImGui::PopID();
         return commit;
     }
 
@@ -252,11 +278,18 @@ struct EditorUi::Impl {
     bool slider_scalar(const char* label, double& current, const double minimum,
                        const double maximum, const char* format) {
         auto& draft = drafts[ImGui::GetID(label)];
+        const bool inspector_field = drawing_inspector && label[0] != '#';
+        if (inspector_field) {
+            ImGui::PushID(label);
+            inspector_field_label(label);
+        }
         const bool changed = ImGui::SliderScalar(
-            label, ImGuiDataType_Double, &draft.begin(current), &minimum, &maximum, format);
+            inspector_field ? "##value" : label, ImGuiDataType_Double, &draft.begin(current),
+            &minimum, &maximum, format);
         if (ImGui::IsItemActivated()) ++animation_gesture;
         current = std::clamp(draft.value, minimum, maximum);
         draft.finish(ImGui::IsItemActive());
+        if (inspector_field) ImGui::PopID();
         return changed;
     }
 
@@ -267,8 +300,14 @@ struct EditorUi::Impl {
                                              IM_COL32(125, 200, 125, 255),
                                              IM_COL32(109, 156, 226, 255)};
         ImGui::PushID(label);
-        row_label(label, label_width);
         const auto& style = ImGui::GetStyle();
+        const bool stacked = ImGui::GetContentRegionAvail().x < label_width + 220.0F * ui_scale ||
+                             ImGui::CalcTextSize(label).x + 12.0F * ui_scale > label_width;
+        if (stacked) {
+            ImGui::TextColored(editor_color(editor_palette().text_dim), "%s", label);
+        } else {
+            row_label(label, label_width);
+        }
         const float tag = ImGui::CalcTextSize("X").x + style.ItemInnerSpacing.x;
         const float width =
             (ImGui::GetContentRegionAvail().x - style.ItemSpacing.x * 2.0F) / 3.0F - tag;
@@ -2877,7 +2916,7 @@ struct EditorUi::Impl {
         const auto combo = [&](const char* const label, const std::vector<std::string>& options,
                                const std::string& current) -> std::optional<std::string> {
             std::optional<std::string> chosen;
-            if (ImGui::BeginCombo(label, current.empty() ? "<none>" : current.c_str())) {
+            if (inspector_begin_combo(label, current.empty() ? "<none>" : current.c_str())) {
                 for (const auto& option : options) {
                     if (ImGui::Selectable(option.c_str(), option == current)) chosen = option;
                 }
@@ -2953,7 +2992,7 @@ struct EditorUi::Impl {
                        entity_field(selection) + ",\"clip\":" + std::to_string(clip),
                        "Clip selected");
             }
-        } else if (ImGui::BeginCombo("Clip", clip_label(static_cast<std::size_t>(clip)).c_str())) {
+        } else if (inspector_begin_combo("Clip", clip_label(static_cast<std::size_t>(clip)).c_str())) {
             for (std::size_t index = 0; index < clips.size(); ++index) {
                 if (ImGui::Selectable(clip_label(index).c_str(),
                                       index == static_cast<std::size_t>(clip))) {
@@ -3084,8 +3123,8 @@ struct EditorUi::Impl {
         const auto type = static_cast<unsigned>(number_or(*light, "type", 1));
         static constexpr std::array<const char*, 3> type_names{"directional", "point", "spot"};
         int type_index = static_cast<int>(std::min(type, 2U));
-        ImGui::SetNextItemWidth(160.0F);
-        if (ImGui::Combo("Type", &type_index, "directional\0point\0spot\0")) {
+        inspector_field_label("Type");
+        if (ImGui::Combo("##light_type", &type_index, "directional\0point\0spot\0")) {
             mutate("scene.set_light",
                    entity_field(selection) + ",\"type\":\"" +
                        type_names[static_cast<std::size_t>(type_index)] + '"',
@@ -3154,7 +3193,7 @@ struct EditorUi::Impl {
         constexpr std::array<const char*, 5> shape_values{"box", "sphere", "capsule", "convex",
                                                           "mesh"};
         auto shape_index = std::clamp(static_cast<int>(number_or(*collider, "type", 0)), 0, 4);
-        if (ImGui::BeginCombo("Shape", shape_names[static_cast<std::size_t>(shape_index)])) {
+        if (inspector_begin_combo("Shape", shape_names[static_cast<std::size_t>(shape_index)])) {
             for (int index = 0; index < 5; ++index) {
                 if (ImGui::Selectable(shape_names[static_cast<std::size_t>(index)],
                                       index == shape_index)) {
@@ -3187,7 +3226,7 @@ struct EditorUi::Impl {
             const auto* renderer = component(entity, "mesh_renderer");
             const auto renderer_mesh = renderer ? string_or(*renderer, "mesh") : std::string{};
             const auto preview = mesh.empty() ? "Renderer mesh" : mesh;
-            if (ImGui::BeginCombo("Collision mesh", preview.c_str())) {
+            if (inspector_begin_combo("Collision mesh", preview.c_str())) {
                 if (ImGui::Selectable("Renderer mesh", mesh.empty()))
                     mutate("scene.set_collider", entity_request + ",\"mesh\":\"\"",
                            "Collider mesh updated");
@@ -3218,11 +3257,13 @@ struct EditorUi::Impl {
             }
         }
         auto layer = static_cast<std::uint32_t>(number_or(*collider, "layer", 1));
-        if (ImGui::InputScalar("Layer bits", ImGuiDataType_U32, &layer) && layer != 0U)
+        inspector_field_label("Layer bits");
+        if (ImGui::InputScalar("##layer_bits", ImGuiDataType_U32, &layer) && layer != 0U)
             mutate("scene.set_collider", entity_request + ",\"layer\":" + std::to_string(layer),
                    "Collider layer updated");
         auto collision_mask = static_cast<std::uint32_t>(number_or(*collider, "mask", 0xffffffffU));
-        if (ImGui::InputScalar("Mask bits", ImGuiDataType_U32, &collision_mask))
+        inspector_field_label("Mask bits");
+        if (ImGui::InputScalar("##mask_bits", ImGuiDataType_U32, &collision_mask))
             mutate("scene.set_collider", entity_request + ",\"mask\":" +
                    std::to_string(collision_mask), "Collider mask updated");
     }
@@ -3233,7 +3274,8 @@ struct EditorUi::Impl {
         const auto body_request = entity_field(selection);
         const auto type = static_cast<int>(number_or(*body, "type", 1));
         int selected_type = std::clamp(type, 0, 1);
-        if (ImGui::Combo("Body type", &selected_type, "Static\0Dynamic\0"))
+        inspector_field_label("Body type");
+        if (ImGui::Combo("##body_type", &selected_type, "Static\0Dynamic\0"))
             mutate("scene.set_physics_body", body_request +
                    (selected_type == 0 ? ",\"type\":\"static\"" : ",\"type\":\"dynamic\""),
                    "Physics body type updated");
@@ -3294,7 +3336,7 @@ struct EditorUi::Impl {
         for (std::size_t index = 0; index < type_values.size(); ++index)
             if (type_text == type_values[index]) type = index;
         const bool hinge = type == 2, slider = type == 3, distance = type == 4;
-        const bool open = ImGui::BeginCombo("Joint type", type_names[type]);
+        const bool open = inspector_begin_combo("Joint type", type_names[type]);
         note_item("joint:type");
         if (open) {
             for (std::size_t index = 0; index < type_names.size(); ++index) {
@@ -3312,7 +3354,7 @@ struct EditorUi::Impl {
         const auto connected = string_or(*joint, "connected");
         const auto* partner = connected.empty() ? nullptr : find_entity(connected);
         const auto preview = partner ? string_or(*partner, "name") : std::string{"World"};
-        const bool choosing = ImGui::BeginCombo("Connected to", preview.c_str());
+        const bool choosing = inspector_begin_combo("Connected to", preview.c_str());
         note_item("joint:connected");
         if (choosing) {
             if (ImGui::Selectable("World", connected.empty()))
@@ -3570,12 +3612,19 @@ struct EditorUi::Impl {
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(5, 5, 5, 255));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(8, 8, 8, 255));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(11, 11, 11, 255));
+        ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(13, 13, 13, 255));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0F * ui_scale);
         if (ImGui::Button("+ Add Component", ImVec2(ImGui::GetContentRegionAvail().x, 0.0F))) {
             component_query.fill('\0');
             component_selected.clear();
             if (auto catalog = call("component.types")) component_catalog = std::move(*catalog);
             open_component_window = true;
         }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(4);
         note_item("inspector:add_component");
     }
 
@@ -3784,12 +3833,14 @@ struct EditorUi::Impl {
 
     void draw_inspector() {
         if (selection.empty()) {
-            ImGui::Dummy(ImVec2(0.0F, 6.0F * ui_scale));
-            ImGui::TextColored(editor_color(editor_palette().text_faint), "Nothing selected.");
-            ImGui::TextColored(editor_color(editor_palette().text_faint),
-                               "Pick an object in the viewport or");
-            ImGui::TextColored(editor_color(editor_palette().text_faint),
-                               "choose one from the hierarchy.");
+            ImGui::Dummy(ImVec2(0.0F, 24.0F * ui_scale));
+            ImGui::PushFont(fonts.heading, fonts.heading_size);
+            ImGui::TextUnformatted("No selection");
+            ImGui::PopFont();
+            ImGui::TextColored(editor_color(editor_palette().text_dim),
+                               "Select a node in the hierarchy or viewport");
+            ImGui::TextColored(editor_color(editor_palette().text_dim),
+                               "to edit its components here.");
             return;
         }
         const auto* entity = find_entity(selection);
@@ -3797,34 +3848,55 @@ struct EditorUi::Impl {
             ImGui::TextDisabled("The selected entity no longer exists.");
             return;
         }
-        const auto& palette = editor_palette();
-        if (selections.handles.size() > 1) {
-            ImGui::Text("%zu selected", selections.handles.size());
-            ImGui::TextDisabled("Gizmo transforms all selected objects.");
-            ImGui::TextDisabled("Properties below edit the active object.");
-        }
-        ImGui::PushFont(fonts.heading, fonts.heading_size * 1.05F);
-        ImGui::TextUnformatted(string_or(*entity, "name", "Entity").c_str());
+        drawing_inspector = true;
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                            ImVec2(8.0F * ui_scale, 6.0F * ui_scale));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(9.0F * ui_scale, 5.0F * ui_scale));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(3, 3, 3, 255));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(6, 6, 6, 255));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(9, 9, 9, 255));
+        ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(5, 5, 5, 255));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(8, 8, 8, 255));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(11, 11, 11, 255));
+
+        ImGui::PushFont(fonts.heading, fonts.heading_size);
+        ImGui::TextWrapped("%s", string_or(*entity, "name", "Entity").c_str());
         ImGui::PopFont();
-        const auto parent = string_or(*entity, "parent");
-        ImGui::PushFont(fonts.monospace, fonts.monospace_size);
-        ImGui::TextColored(editor_color(palette.text_faint), "%s   parent %s", selection.c_str(),
-                           parent.empty() ? "root" : parent.c_str());
-        ImGui::PopFont();
-        ImGui::Dummy(ImVec2(0.0F, 4.0F * ui_scale));
+        ImGui::TextColored(editor_color(editor_palette().text_dim), "%s  ·  ID %s",
+                           string_or(*entity, "type", "Node").c_str(), selection.c_str());
+        ImGui::Separator();
+        ImGui::Spacing();
 
         draw_transform_section(*entity);
-        draw_camera_section(*entity);
-        draw_renderer_section(*entity);
-        draw_animator_section(*entity);
-        draw_keyframes_section(*entity);
-        draw_morph_section(*entity);
-        draw_light_section(*entity);
-        draw_collider_section(*entity);
-        draw_physics_body_section(*entity);
-        draw_joint_section(*entity);
-        draw_script_sections(*entity);
+        if (component(*entity, "camera"))
+            draw_camera_section(*entity);
+        if (component(*entity, "mesh_renderer"))
+            draw_renderer_section(*entity);
+        if (component(*entity, "animator"))
+            draw_animator_section(*entity);
+        if (component(*entity, "transform_animation"))
+            draw_keyframes_section(*entity);
+        if (const auto* renderer = component(*entity, "mesh_renderer"); renderer) {
+            const auto morph = morph_defaults.find(string_or(*renderer, "mesh"));
+            if (morph != morph_defaults.end() && !morph->second.empty())
+                draw_morph_section(*entity);
+        }
+        if (component(*entity, "light"))
+            draw_light_section(*entity);
+        if (component(*entity, "collider"))
+            draw_collider_section(*entity);
+        if (component(*entity, "physics_body"))
+            draw_physics_body_section(*entity);
+        if (component(*entity, "joint"))
+            draw_joint_section(*entity);
+        if (const auto* scripts = field(*entity, "scripts"); scripts && scripts->array() &&
+            !scripts->array()->empty())
+            draw_script_sections(*entity);
         draw_add_component();
+        ImGui::PopStyleColor(6);
+        ImGui::PopStyleVar(2);
+        drawing_inspector = false;
     }
 
     // Pulls the scene revision out of wherever a response carries it: `scene.history` nests it
@@ -4178,7 +4250,7 @@ struct EditorUi::Impl {
             const auto* status = runtime_status.object();
             const bool game = status && string_or(*status, "mode") == "game";
             const bool paused = status && boolean_or(*status, "paused", false);
-            if (ImGui::MenuItem(game ? "Stop Game" : "Run Game")) {
+            if (ImGui::MenuItem(game ? "Stop Game" : "Run Game", game ? "F8" : "F5")) {
                 if (game) mutate("runtime.stop", {}, "Game stopped");
                 else request_play();
             }
@@ -5414,7 +5486,7 @@ struct EditorUi::Impl {
                     "| W/E/R: move/rotate/scale\nCtrl+Z: undo | Ctrl+Shift+Z: redo\nCtrl+D: "
                     "duplicate | Delete: delete selection\nCtrl+A: select all | Ctrl+C/X/V: copy/cut/paste\nCtrl/Shift+click: toggle/range selection\nCtrl+N: new scene | Ctrl+O: open | "
                     "Ctrl+S: save | Ctrl+Shift+S: save as\nDrag panel tabs to dock; Shift-drag "
-                    "to float.");
+                    "to float.\nF5: run game | F8: stop game.");
             }
             ImGui::End();
         }
@@ -5431,27 +5503,7 @@ struct EditorUi::Impl {
     }
 
     void draw_toolbar() {
-        const auto* status = runtime_status.object();
-        const bool game = status && string_or(*status, "mode") == "game";
-        const bool paused = status && boolean_or(*status, "paused", false);
-        const bool run_pressed = toolbar_button("##run_game", game ? ToolIcon::stop : ToolIcon::play,
-                                                game, game ? "Stop Game" : "Run Game");
-        note_item("toolbar:run");
-        if (run_pressed) {
-            if (game) mutate("runtime.stop", {}, "Game stopped");
-            else request_play();
-        }
-        ImGui::BeginDisabled(!game);
-        if (toolbar_button("##simulation", paused ? ToolIcon::play : ToolIcon::pause, paused,
-                           paused ? "Resume simulation" : "Pause simulation"))
-            mutate(paused ? "runtime.resume" : "runtime.pause", {}, paused ? "Resumed" : "Paused");
-        if (toolbar_button("##step", ToolIcon::step, false, "Advance exactly one game frame"))
-            mutate("runtime.step", "\"frames\":1", "Stepped one frame");
-        ImGui::EndDisabled();
-        ImGui::TextColored(editor_color(editor_palette().text_faint), "%.0f FPS",
-                           ImGui::GetIO().Framerate);
-        ImGui::SameLine();
-        toolbar_divider();
+        const float row_y = ImGui::GetCursorScreenPos().y;
         ImGui::BeginDisabled(undo_labels.empty());
         if (toolbar_button("##undo", ToolIcon::undo, false,
                            undo_labels.empty() ? "Nothing to undo" : undo_labels.front().c_str()))
@@ -5485,7 +5537,45 @@ struct EditorUi::Impl {
                                                          : "World axes: switch to local"))
             gizmo_mode = gizmo_mode == ImGuizmo::LOCAL ? ImGuizmo::WORLD : ImGuizmo::LOCAL;
         ImGui::EndDisabled();
+
+        const float left_end = ImGui::GetCursorScreenPos().x;
+        const float button_width = 32.0F * ui_scale;
+        const float group_width = 3.0F * button_width +
+                                  2.0F * ImGui::GetStyle().ItemSpacing.x;
+        const float toolbar_center = ImGui::GetWindowPos().x + ImGui::GetWindowSize().x * 0.5F;
+        ImGui::SetCursorScreenPos({std::max(toolbar_center - group_width * 0.5F, left_end), row_y});
+        const auto* status = runtime_status.object();
+        const bool game = status && string_or(*status, "mode") == "game";
+        const bool paused = status && boolean_or(*status, "paused", false);
+        const bool run_pressed = toolbar_button("##run_game", game ? ToolIcon::stop : ToolIcon::play,
+                                                game, game ? "Stop Game (F8)" : "Run Game (F5)");
+        note_item("toolbar:run");
+        if (run_pressed) {
+            if (game) mutate("runtime.stop", {}, "Game stopped");
+            else request_play();
+        }
+        ImGui::BeginDisabled(!game);
+        if (toolbar_button("##simulation", paused ? ToolIcon::play : ToolIcon::pause, paused,
+                           paused ? "Resume simulation" : "Pause simulation"))
+            mutate(paused ? "runtime.resume" : "runtime.pause", {}, paused ? "Resumed" : "Paused");
+        if (toolbar_button("##step", ToolIcon::step, false, "Advance exactly one game frame"))
+            mutate("runtime.step", "\"frames\":1", "Stepped one frame");
+        ImGui::EndDisabled();
         ImGui::NewLine();
+    }
+
+    void draw_viewport_fps() {
+        if (!viewport_visible || !viewport_draw_list) return;
+        char label[32];
+        std::snprintf(label, sizeof(label), "%.0f FPS", ImGui::GetIO().Framerate);
+        const auto size = ImGui::CalcTextSize(label);
+        const float inset = 10.0F * ui_scale;
+        const ImVec2 at{viewport_max.x - size.x - inset, viewport_min.y + inset};
+        if (at.x < viewport_min.x + inset || at.y + size.y > viewport_max.y - inset) return;
+        viewport_draw_list->PushClipRect(viewport_min, viewport_max, true);
+        viewport_draw_list->AddText({at.x + 1.0F, at.y + 1.0F}, IM_COL32(0, 0, 0, 180), label);
+        viewport_draw_list->AddText(at, IM_COL32(255, 255, 255, 220), label);
+        viewport_draw_list->PopClipRect();
     }
 
     // Keyboard shortcuts, ignored whenever a text field has focus so typing a name never switches
@@ -6450,6 +6540,20 @@ bool EditorUi::handle_event(const void* const sdl_event) {
     }
     const bool playing = impl_->runtime_status.object() &&
                          string_or(*impl_->runtime_status.object(), "mode") == "game";
+    if ((event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
+        (event->key.scancode == SDL_SCANCODE_F5 || event->key.scancode == SDL_SCANCODE_F8) &&
+        !(event->key.mod & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_ALT | SDL_KMOD_GUI))) {
+        if (event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat) {
+            if (event->key.scancode == SDL_SCANCODE_F5 && !playing) {
+                impl_->request_play();
+                impl_->refresh_pending = true;
+            } else if (event->key.scancode == SDL_SCANCODE_F8 && playing) {
+                impl_->set_game_input_focus(false);
+                impl_->mutate("runtime.stop", {}, "Game stopped");
+            }
+        }
+        return true;
+    }
     if (playing && impl_->game_input_focus) {
         if ((event->type == SDL_EVENT_KEY_DOWN && event->key.scancode == SDL_SCANCODE_ESCAPE) ||
             event->type == SDL_EVENT_WINDOW_FOCUS_LOST) {
@@ -6667,6 +6771,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         impl_->draw_scene_nodes();
         impl_->draw_game_input_hint();
         impl_->draw_gizmo();
+        impl_->draw_viewport_fps();
         impl_->update_selection_input();
         ImGui::End();
     } else {

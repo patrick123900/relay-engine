@@ -1,5 +1,6 @@
 #include "relay/physics/collision.hpp"
 #include "relay/editor/editor_math.hpp"
+#include "relay/observe/profiler.hpp"
 
 #include "collider_mesh.hpp"
 
@@ -644,7 +645,10 @@ public:
     }
 
     void step(Scene& scene, double seconds) {
-        if (!built_) build(scene);
+        if (!built_) {
+            RELAY_PROFILE_SCOPE("Build physics world");
+            build(scene);
+        }
         auto& api = system_.GetBodyInterface();
         for (const auto& [entity, id] : bodies_) {
             const auto* record = scene.get(entity);
@@ -656,7 +660,10 @@ public:
                 to_jolt_position(pose->position),
                 pose->rotation, static_cast<float>(seconds));
         }
-        system_.Update(static_cast<float>(seconds), 1, &allocator_, &jobs_);
+        {
+            RELAY_PROFILE_SCOPE("Jolt update");
+            system_.Update(static_cast<float>(seconds), 1, &allocator_, &jobs_);
+        }
         std::stable_sort(contact_filter_.pending.begin(), contact_filter_.pending.end(),
                          [](const ContactEvent& a, const ContactEvent& b) {
             if (a.first != b.first) return a.first < b.first;
@@ -668,6 +675,7 @@ public:
             if (events_.size() > 1024) events_.pop_front();
         }
         contact_filter_.pending.clear();
+        RELAY_PROFILE_SCOPE("Write back body transforms");
         for (const auto& [entity, id] : bodies_) {
             auto* record = scene.get(entity);
             if (!record || !dynamic_body(*record)) continue;

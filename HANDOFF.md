@@ -8,14 +8,14 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v39: 129 native methods. Scene v17, project v2, import manifest v3.
+- Protocol schema v42: 131 native methods. Scene v17, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
   component model with derived node types and templates/prefabs shown in the node type tree, native
   C++ gameplay scripts, per-project input mapping, a scripted first person controller template in
   the demo project, portable project export, and FidelityFX global illumination and hardware ray
-  traced reflections are implemented. Preserve unrelated working-tree
+  traced reflections, and a frame profiler are implemented. Preserve unrelated working-tree
   edits and inspect `git diff` before changing them.
 
 ## Product intent
@@ -160,10 +160,29 @@ without blocking simultaneous human editing.
   editor draws with the collider wireframes (cross, axis, line to the partner). The Inspector's
   Joint section edits every field, lists bodies to connect to, clamps limits to what the type
   accepts, and warns when neither body is dynamic.
-- The live editor presents with FIFO (vsync) and advances the fixed 60 Hz game step from real
-  elapsed time (at most four steps per frame), so frame rate and game speed are independent of
-  the monitor. Mailbox presentation with a fixed 16 ms loop sleep previously dropped a frame
-  about 2.5 times per second on 60 Hz displays.
+- The live editor advances the fixed 60 Hz game step from real elapsed time (at most four steps
+  per frame), so frame rate and game speed are independent of the monitor. Presentation follows
+  the project's `settings.graphics.vsync` (default off; Game Configuration → Graphics,
+  `graphics.set_settings`, `RELAY_VSYNC=0/1` overrides): on is FIFO; off prefers immediate
+  (may tear), then mailbox, then FIFO. `graphics.settings` reports the mode in use under
+  `renderer.presentation`. A change rebuilds the swapchain after the next present. Mailbox with a
+  fixed 16 ms loop sleep once dropped a frame about 2.5 times per second on 60 Hz displays, which
+  is why it is only the fallback. The offscreen SDL driver on RADV offers mailbox and FIFO.
+- Render interpolation: before each game step `Engine` remembers every entity's local transform,
+  animator time and transform-animation time (`RenderInterpolation::remember`). Presented frames
+  pass `Engine::render_interpolation(unsimulated / step)` to the window, and `WorldResolver`
+  blends previous and current: position and scale linearly, rotation by quaternion slerp along
+  the short arc, and looping clip times forward through a wrap. The display therefore runs up to
+  one step (16.7 ms) behind the simulation. It is off in Editor mode, while paused and before the
+  first step, and captures (`capture_buffer`) and every other `build_render_scene` caller draw the
+  exact state, so deterministic output is unchanged. Without it, a 360 Hz display showed each
+  60 Hz step six times and the game looked like 60 FPS.
+- Loop pacing (`run_live_editor_session`): in Editor mode each iteration lasts at least 4 ms
+  (250 FPS). During Run Game the project's `settings.graphics.frame_rate_limit` (0–1000, default
+  0 = unlimited, Game Configuration → Graphics, `graphics.set_settings`) paces the loop instead,
+  with deadlines advanced by whole periods so the average rate is exact; unlimited leaves pacing
+  to presentation (the refresh rate with vsync, none without). When the last draw presented nothing (a minimized window) the 4 ms floor
+  applies in both modes. The profiler names the waits "Frame pacing" and "Frame rate limit".
 - The editor refreshes panels every 0.5 s, spread over four consecutive frames (scene state,
   collider outlines, Agent panel, assets); refreshes right after an edit still run all at once.
   Large periodic replies (`scene.list`, `physics.debug_boxes`, `session.review`,
@@ -186,6 +205,37 @@ without blocking simultaneous human editing.
   project metadata, member scenes, and non-hidden project assets, including import metadata.
   It excludes private state, captures, traces, and prior exports, and refuses overwrites. The
   project panel exposes the same operation. Save scene changes before packaging.
+
+### Frame profiler
+
+- `relay::profiler()` (`include/relay/observe/profiler.hpp`) is a process-wide main-loop
+  profiler. The live editor loop in `apps/relay_demo/main.cpp` brackets each iteration with
+  `begin_frame`/`end_frame`, so a frame's time is the displayed frame time. `RELAY_PROFILE_SCOPE`
+  and `RELAY_PROFILE_WAIT` time a block; waits (GPU fence, swapchain acquire, present, frame
+  pacing) are kept apart from work so the report can tell CPU-bound, GPU-bound and
+  display-limited frames apart (`bottleneck`: busy side at 80% or more of the frame, otherwise
+  `display`). Scopes record only on the thread that opened the frame and only inside a frame;
+  headless engines and tests record nothing unless they open frames themselves.
+- Repeated scopes with one name under one parent merge and count calls (fixed game steps, script
+  instances: each behaviour's `on_update` is one scope). Frames keep at most 4,096 nodes and the
+  ring holds 1,200 frames. Instrumented: input, agent requests, simulation → game step → scripts,
+  animation, physics (build, Jolt update, write-back), contacts, the deterministic software
+  renderer (only when a capture reads it) and video recording; render → uploads, fence wait, acquire, editor UI build, render
+  scene build, frame data upload, command recording (GI, reflections, editor UI), submit, present.
+- The deterministic CPU frame (`SoftwareRenderer`) is a pure function of the frame index and
+  elapsed time. Game steps only record those; the pixels are drawn when a deterministic capture,
+  CPU-source video sample or the SDL fallback window reads the frame. Drawing it on every step
+  was the largest CPU cost of the demo game in the live editor (4.5 ms per frame in the Debug
+  build).
+- GPU passes use up to 16 timestamps per frame in flight (`mark_gpu_pass` in
+  `vulkan_window.cpp`), read back when the frame's fence completes and attached to the profiler
+  frame that recorded them, two frames late.
+- `profiler.read` aggregates the most recent frames (optionally game frames only or one frame)
+  into frame statistics, a depth-first call tree with parent indices, hotspots merged by name
+  across call paths, GPU passes and a frame-time history. `profiler.set` pauses, resumes or
+  clears. The editor's Profiler panel (Tools → Profiler, docked with Diagnostics) polls
+  `profiler.read` four times a second while visible, pauses the profiler when the game stops and
+  resumes it when the next game starts; clicking a graph bar pauses and inspects that frame.
 
 ### Components, node types and templates
 
@@ -552,6 +602,8 @@ without blocking simultaneous human editing.
    separate allocation (no sub-allocation yet). The FidelityFX build is only tested on Linux
    with GCC; the Windows build of the vendored SDK has not been tried. The Graphics page has
    headless coverage only.
+13. GPU timestamps bracket whole passes on the graphics queue; the panel's GPU numbers do not
+   separate work that overlaps inside a pass.
 
 ## Next priorities
 
@@ -582,6 +634,11 @@ once, clones, empty nodes, children, deferred start and self-destruction with `o
 bodies falling, `overlaps` on a resting body, `overlap_sphere` with an ignored entity, a destroyed
 body leaving raycasts and ending its contacts, and Stop Game undoing it all, plus a script driving a
 hinge motor and reading its angle), generated-protocol checks, and 26 ordinary bridge tests. The
+engine suite covers the profiler (scope merging, self and total time, waits, GPU attachment,
+game-only and single-frame reports, pausing, clearing and the protocol), and the headless editor
+suite the Profiler panel (hotspots, pause and resume, inspecting a frame from the graph). The
+profiler was also run on the demo game in the offscreen live editor, where it reported every
+scope and GPU pass on RADV; the panel has not been looked at on a desktop. The
 workflow suite covers component add/remove rules, derived node types, type inheritance and creation
 of every node type, prefab save/instantiate/undo, v12 script migration, joints (protocol validation
 and undo, type defaults, partner removal and undo, copy/paste/duplicate remapping, v17 save/load,
@@ -601,9 +658,13 @@ the palette icon and its "Custom template" tooltip), the Joint section (choosing
 and the type), the Hierarchy search (name search, type filters with subtypes, reveal in the tree,
 collapse and expand all) and the Assets collapse/expand-all button, and the Run Game → trust prompt
 → build → play flow. The demo's First Person Controller, including shooting, was also play-tested by
-hand on a Linux desktop. The workflow suite covers graphics settings (defaults, partial updates,
+hand on a Linux desktop. The workflow suite covers graphics settings (defaults, partial updates, the frame rate limit's
+range and saving,
 saving, per-project reloading, rejecting unknown or mistyped settings) and the headless editor
-suite the Game Configuration Graphics page. With both lighting effects off, offscreen captures of
+suite the Game Configuration Graphics page (including frame rate presets, typed limits and the
+Vsync checkbox). Toggling vsync in the offscreen live editor switched the swapchain between FIFO
+and mailbox. The
+limiter held 60.00 and 144.01 FPS in the offscreen live editor running the demo game. With both lighting effects off, offscreen captures of
 the demo and of the editor viewport match the renderer before the G-buffer rework within one
 level per channel; the model, resize and asynchronous capture smokes also pass offscreen with
 both effects on. Every offscreen Vulkan mode (scene captures with each effect combination, the
@@ -662,6 +723,7 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Editor | `src/editor/`, `include/relay/editor/` |
 | Agent bridge | `tools/mcp-bridge/src/` |
 | Input | `src/core/input.cpp`, `src/platform/sdl_input.cpp` |
+| Frame profiler | `src/observe/profiler.cpp`, `include/relay/observe/profiler.hpp`, Profiler panel in `src/editor/editor_ui.cpp` |
 | Native tests | `tests/engine_tests.cpp`, `tests/script_tests.cpp`, `tests/editor_*tests.cpp` |
 | Bridge tests | `tools/mcp-bridge/tests/` |
 

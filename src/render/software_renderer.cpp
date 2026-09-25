@@ -1,4 +1,5 @@
 #include "relay/render/renderer.hpp"
+#include "relay/observe/profiler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +33,16 @@ SoftwareRenderer::SoftwareRenderer(const std::uint32_t width, const std::uint32_
 }
 
 void SoftwareRenderer::render(const std::uint64_t frame_index, const double elapsed_seconds) {
+    frame_index_ = frame_index;
+    elapsed_seconds_ = elapsed_seconds;
+    stale_ = true;
+}
+
+void SoftwareRenderer::draw() const {
+    RELAY_PROFILE_SCOPE("Software renderer");
+    stale_ = false;
+    const auto frame_index = frame_index_;
+    const auto elapsed_seconds = elapsed_seconds_;
     const auto square_size = std::max<std::uint32_t>(24U, std::min(width_, height_) / 7U);
     const auto travel = width_ > square_size ? width_ - square_size : 1U;
     const auto square_x = static_cast<std::uint32_t>(frame_index * 4U % travel);
@@ -58,10 +69,12 @@ void SoftwareRenderer::render(const std::uint64_t frame_index, const double elap
 }
 
 FrameView SoftwareRenderer::frame() const {
+    if (stale_) draw();
     return FrameView{width_, height_, pixels_};
 }
 
 bool SoftwareRenderer::capture_bmp(const std::filesystem::path& path, std::string& error) const {
+    if (stale_) draw();
     constexpr std::uint32_t header_size = 54U;
     const std::uint64_t pixel_bytes_64 = static_cast<std::uint64_t>(width_) * height_ * 4U;
     if (pixel_bytes_64 > std::numeric_limits<std::uint32_t>::max() - header_size) {

@@ -6,6 +6,7 @@
 #include "relay/editor/editor_ui.hpp"
 #include "relay/editor/chat_media.hpp"
 #include "relay/editor/wrapped_input.hpp"
+#include "relay/observe/profiler.hpp"
 #include "relay/render/scene_render.hpp"
 #include "relay/scene/project.hpp"
 #include "relay/script/script_system.hpp"
@@ -1056,6 +1057,52 @@ void joints_ui() {
     std::cout << "Headless joint Inspector tests passed\n";
 }
 
+// The Profiler panel reads recorded frames through the protocol, lists hotspots, pauses the
+// profiler and inspects a single frame from the frame-time graph.
+void profiler_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize profiler editor without windows");
+    auto& profiler = relay::profiler();
+    profiler.set_paused(false);
+    profiler.clear();
+    const auto slow = profiler.intern("Slow system");
+    // Frames are recorded the way the live editor loop records them.
+    const auto profiled_frames = [&](const int count) {
+        for (int index = 0; index < count; ++index) {
+            profiler.begin_frame();
+            {
+                const relay::ProfileScope scope(slow);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            frame(ui);
+            profiler.end_frame(static_cast<std::uint64_t>(index), true);
+        }
+    };
+    frame(ui, 3);
+    ui.set_panel_visible("Profiler", true);
+    profiled_frames(30);
+    check(ui.headless_item_rect("profiler:graph").has_value() &&
+              ui.headless_item_rect("profiler:hotspot:Slow system").has_value(),
+          "the Profiler panel shows the frame graph and the hotspot");
+    click_center(ui, *ui.headless_item_rect("profiler:pause"));
+    frame(ui, 2);
+    check(profiler.paused(), "Pause stops the profiler recording");
+    const auto graph = *ui.headless_item_rect("profiler:graph");
+    click(ui, {graph[2] - 62.0F, graph[1], graph[2], graph[3]});
+    frame(ui, 2);
+    check(ui.headless_item_rect("profiler:average").has_value(),
+          "clicking the frame graph inspects a single frame");
+    click_center(ui, *ui.headless_item_rect("profiler:pause"));
+    frame(ui, 2);
+    check(!profiler.paused(), "Resume records frames again");
+    std::cout << "Headless profiler tests passed\n";
+}
+
 // Hierarchy search, type filters and collapse/expand all, and the same button in Assets.
 void hierarchy_search_ui() {
     relay::EngineConfig config;
@@ -1236,6 +1283,31 @@ void game_configuration_ui() {
     frame(ui, 2);
     check(engine.graphics_settings().global_illumination,
           "ticking it again turns global illumination back on");
+    click_center(ui, *ui.headless_item_rect("config:graphics:frame_rate_limit:60"));
+    frame(ui, 2);
+    check(engine.graphics_settings().frame_rate_limit == 60U,
+          "a frame rate preset saves the limit");
+    click_center(ui, *ui.headless_item_rect("config:graphics:frame_rate_limit"));
+    key(ui, ImGuiKey_A);
+    type_text(ui, "90");
+    key(ui, ImGuiKey_Enter, false);
+    frame(ui, 2);
+    check(engine.graphics_settings().frame_rate_limit == 90U,
+          "typing a frame rate limit saves it when the field is left");
+    click_center(ui, *ui.headless_item_rect("config:graphics:frame_rate_limit:0"));
+    frame(ui, 2);
+    check(engine.graphics_settings().frame_rate_limit == 0U, "Unlimited clears the limit");
+    click_center(ui, *ui.headless_item_rect("config:graphics:vsync"));
+    frame(ui, 2);
+    {
+        std::string load_error;
+        const auto saved = relay::load_project("projects/configured/project.relayproject", load_error);
+        check(engine.graphics_settings().vsync && saved && saved->graphics && saved->graphics->vsync,
+              "ticking Vsync saves it in the project file");
+    }
+    click_center(ui, *ui.headless_item_rect("config:graphics:vsync"));
+    frame(ui, 2);
+    check(!engine.graphics_settings().vsync, "unticking Vsync turns it off again");
     std::cout << "Headless Game Configuration tests passed\n";
 }
 
@@ -1435,6 +1507,7 @@ int main() {
         fresh(node_templates_ui);
         fresh(joints_ui);
         fresh(hierarchy_search_ui);
+        fresh(profiler_ui);
         fresh(game_configuration_ui);
         fresh(game_input_ui);
         fresh(scripts_ui);

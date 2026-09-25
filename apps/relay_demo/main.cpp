@@ -2,6 +2,7 @@
 #include "relay/control/generated_protocol.hpp"
 #include "relay/control/local_server.hpp"
 #include "relay/core/engine.hpp"
+#include "relay/observe/profiler.hpp"
 #include "relay/render/vulkan_device.hpp"
 
 #ifdef RELAY_HAS_SDL3
@@ -97,8 +98,8 @@ int run_socket_mode(const std::string_view port_text) {
 }
 
 #ifdef RELAY_HAS_VULKAN_WINDOW
-// Applies the project's graphics settings to the renderer. RELAY_GLOBAL_ILLUMINATION and
-// RELAY_REFLECTIONS set to 0 or 1 override them, for comparisons and smoke runs.
+// Applies the project's graphics settings to the renderer. RELAY_GLOBAL_ILLUMINATION,
+// RELAY_REFLECTIONS and RELAY_VSYNC set to 0 or 1 override them, for comparisons and smoke runs.
 void apply_graphics_settings(relay::VulkanWindow& window, const relay::Engine& engine) {
     bool global_illumination = engine.graphics_settings().global_illumination;
     if (const char* value = std::getenv("RELAY_GLOBAL_ILLUMINATION")) {
@@ -112,6 +113,12 @@ void apply_graphics_settings(relay::VulkanWindow& window, const relay::Engine& e
         if (std::string_view(value) == "1") reflections = true;
     }
     window.set_reflections(reflections);
+    bool vsync = engine.graphics_settings().vsync;
+    if (const char* value = std::getenv("RELAY_VSYNC")) {
+        if (std::string_view(value) == "0") vsync = false;
+        if (std::string_view(value) == "1") vsync = true;
+    }
+    window.set_vsync(vsync);
 }
 
 int run_windowed() {
@@ -403,21 +410,32 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
     // real elapsed time, so neither the frame rate nor the game speed depends on the monitor.
     auto previous_frame = std::chrono::steady_clock::now();
     double unsimulated_seconds = 0.0;
+    // The game's frame rate limiter: the current period and the next frame's deadline.
+    std::chrono::steady_clock::duration limiter_period{};
+    std::chrono::steady_clock::time_point limiter_deadline{};
     while (engine.status().running && !window_closed) {
+        // Each loop iteration is one profiled frame, so its duration is the displayed frame time.
+        relay::profiler().begin_frame();
         const auto frame_start = std::chrono::steady_clock::now();
         unsimulated_seconds +=
             std::min(std::chrono::duration<double>(frame_start - previous_frame).count(), 0.25);
         previous_frame = frame_start;
-        window_closed = window.poll_quit();
-        for (auto& input : window.drain_input_events()) engine.apply_input_event(std::move(input));
+        {
+            RELAY_PROFILE_SCOPE("Window events and input");
+            window_closed = window.poll_quit();
+            for (auto& input : window.drain_input_events()) engine.apply_input_event(std::move(input));
+        }
 
         std::deque<std::string> requests;
         {
             std::scoped_lock lock(input_state->mutex);
             requests.swap(input_state->requests);
         }
-        for (const auto& request : requests) {
-            std::cout << protocol.handle_agent(request) << std::endl;
+        if (!requests.empty()) {
+            RELAY_PROFILE_SCOPE("Agent requests");
+            for (const auto& request : requests) {
+                std::cout << protocol.handle_agent(request) << std::endl;
+            }
         }
         if (!engine.status().running || window_closed) break;
 
@@ -431,29 +449,63 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
         }
 
         const double step = engine.fixed_delta_seconds();
-        for (int steps = 0; unsimulated_seconds >= step; ++steps) {
-            // Drop time rather than fall ever further behind after a long frame.
-            if (steps == 4) {
-                unsimulated_seconds = 0.0;
-                break;
+        {
+            RELAY_PROFILE_SCOPE("Simulation");
+            for (int steps = 0; unsimulated_seconds >= step; ++steps) {
+                // Drop time rather than fall ever further behind after a long frame.
+                if (steps == 4) {
+                    unsimulated_seconds = 0.0;
+                    break;
+                }
+                engine.tick();
+                unsimulated_seconds -= step;
             }
-            engine.tick();
-            unsimulated_seconds -= step;
         }
         apply_graphics_settings(window, engine);
-        if (!window.draw(engine.scene(), engine.status().elapsed_seconds)) {
-            std::cerr << "Live editor Vulkan draw failed: " << window.error() << '\n';
-            engine.request_shutdown();
-            break;
+        // Frames between game steps blend the last two steps by the time since the latest one.
+        window.set_render_interpolation(engine.render_interpolation(unsimulated_seconds / step));
+        {
+            RELAY_PROFILE_SCOPE("Render");
+            if (!window.draw(engine.scene(), engine.status().elapsed_seconds)) {
+                std::cerr << "Live editor Vulkan draw failed: " << window.error() << '\n';
+                engine.request_shutdown();
+                break;
+            }
         }
 #ifdef RELAY_HAS_EDITOR_UI
-        if (editor) editor->process_actions();
+        if (editor) {
+            RELAY_PROFILE_SCOPE("Editor actions");
+            editor->process_actions();
+        }
 #endif
         engine.record_render_performance(window.gpu_frame_milliseconds(), window.draw_call_count(),
                                          window.render_resource_count());
-        // Presentation normally blocks until vsync; this only bounds the loop while nothing is
-        // presented, such as a minimized window.
-        std::this_thread::sleep_until(frame_start + 4ms);
+        const auto status = engine.status();
+        const bool game = status.mode == relay::RuntimeMode::game;
+        const auto limit = engine.graphics_settings().frame_rate_limit;
+        if (game && limit != 0U && window.presented()) {
+            // The project's frame rate limit. Deadlines advance by whole periods so the average
+            // rate is exact despite sleep overshoot; a frame that falls behind restarts them.
+            RELAY_PROFILE_WAIT("Frame rate limit");
+            const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(1.0 / limit));
+            const auto now = std::chrono::steady_clock::now();
+            limiter_deadline = limiter_period == period && limiter_deadline + period >= now
+                                   ? limiter_deadline + period
+                                   : frame_start + period;
+            limiter_period = period;
+            std::this_thread::sleep_until(limiter_deadline);
+        } else if (!game || !window.presented()) {
+            // The editor needs no more than 250 frames a second. Without a presented image,
+            // as in a minimized window, nothing else would pace the loop.
+            limiter_period = {};
+            RELAY_PROFILE_WAIT("Frame pacing");
+            std::this_thread::sleep_until(frame_start + 4ms);
+        } else {
+            // Unlimited: presentation (vsync) is the only pacing.
+            limiter_period = {};
+        }
+        relay::profiler().end_frame(status.frame_index, status.mode == relay::RuntimeMode::game);
     }
 
     engine.request_shutdown();

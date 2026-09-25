@@ -3,6 +3,7 @@
 #include "relay/core/engine.hpp"
 #include "relay/core/hash.hpp"
 #include "relay/core/process.hpp"
+#include "relay/observe/profiler.hpp"
 #include "relay/editor/editor_math.hpp"
 #include "relay/scene/scene_edit.hpp"
 #include "relay/scene/templates.hpp"
@@ -590,6 +591,7 @@ struct ScriptSystem::Impl {
         bool failed{};
         bool started{};   // on_start has run; instances spawned mid-game start before their update.
         bool destroyed{}; // on_destroy has run; the instance goes when the entity leaves the scene.
+        std::uint32_t profile_name{}; // The behaviour's profiler scope, interned on first update.
     };
 
     explicit Impl(Engine& host_engine) : engine(host_engine) {
@@ -1479,8 +1481,12 @@ void ScriptSystem::update(const double delta_seconds) {
     const auto count = impl.instances.size();
     for (std::size_t index = 0; index < count; ++index) {
         auto& instance = *impl.instances[index];
-        if (instance.started && scene.contains(instance.entity))
-            impl.call(instance, RELAY_CALLBACK_UPDATE, delta_seconds);
+        if (!instance.started || !scene.contains(instance.entity)) continue;
+        // Instances of one behaviour share a scope, which counts them as calls.
+        if (instance.profile_name == 0U)
+            instance.profile_name = profiler().intern(instance.script.behaviour + ".on_update");
+        const ProfileScope scope(instance.profile_name);
+        impl.call(instance, RELAY_CALLBACK_UPDATE, delta_seconds);
     }
     impl.flush_destroyed();
 }

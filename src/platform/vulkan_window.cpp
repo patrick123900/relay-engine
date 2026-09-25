@@ -2,6 +2,7 @@
 #include "relay/platform/sdl_input.hpp"
 #include "relay/editor/editor_overlay.hpp"
 #include "relay/observe/capture.hpp"
+#include "relay/observe/profiler.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/render/scene_render.hpp"
 #include "relay/render/render_graph.hpp"
@@ -38,6 +39,8 @@ namespace relay {
 namespace {
 
 constexpr std::size_t frames_in_flight = 2;
+// Timestamps per frame: one at the start and one after each measured GPU pass.
+constexpr std::uint32_t gpu_marker_capacity = 16U;
 
 std::string vk_error(const std::string& operation, const VkResult result) {
     return operation + " failed with Vulkan result " + std::to_string(result);
@@ -410,11 +413,21 @@ struct VulkanWindow::Impl {
     std::uint64_t readback_serial{};
     VkQueryPool timestamp_queries{};
     std::array<bool, frames_in_flight> timestamp_submitted{};
+    // Each frame's timestamps, the profiler name of the pass that ends at each one and the
+    // profiler frame that recorded them.
+    std::array<std::uint32_t, frames_in_flight> gpu_marker_counts{};
+    std::array<std::array<std::uint32_t, gpu_marker_capacity>, frames_in_flight> gpu_marker_names{};
+    std::array<std::uint64_t, frames_in_flight> gpu_profile_frames{};
     float timestamp_period_nanoseconds{};
     double latest_gpu_milliseconds{};
+    bool last_draw_presented{};
+    const RenderInterpolation* render_interpolation{};
     std::uint32_t latest_draw_calls{};
     std::size_t current_frame{};
     bool resized{false};
+    // Vsync as requested by the project and the presentation mode the swapchain actually uses.
+    bool vsync_requested{false};
+    VkPresentModeKHR present_mode_in_use{VK_PRESENT_MODE_FIFO_KHR};
     bool submission_failed{false};
     std::string selected_device_name;
     std::string last_error;
@@ -1715,7 +1728,7 @@ struct VulkanWindow::Impl {
         VkQueryPoolCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
         create_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        create_info.queryCount = static_cast<std::uint32_t>(frames_in_flight * 2U);
+        create_info.queryCount = static_cast<std::uint32_t>(frames_in_flight) * gpu_marker_capacity;
         const auto result = vkCreateQueryPool(device, &create_info, nullptr, &timestamp_queries);
         if (result != VK_SUCCESS) {
             last_error = vk_error("timestamp query pool creation", result);
@@ -1730,6 +1743,21 @@ struct VulkanWindow::Impl {
                    format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         });
         return preferred != formats.end() ? *preferred : formats.front();
+    }
+
+    // FIFO is vsync and always available. Without vsync, immediate presentation shows each frame
+    // as soon as it is ready and may tear. Mailbox never tears but discards frames the display had
+    // no time to show, which a loop not locked to the display sees as a stutter a few times a
+    // second, so it is only the fallback.
+    VkPresentModeKHR choose_present_mode() const {
+        if (vsync_requested) return VK_PRESENT_MODE_FIFO_KHR;
+        std::uint32_t count = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &count, nullptr);
+        std::vector<VkPresentModeKHR> modes(count);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &count, modes.data());
+        for (const auto wanted : {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR})
+            if (std::find(modes.begin(), modes.end(), wanted) != modes.end()) return wanted;
+        return VK_PRESENT_MODE_FIFO_KHR;
     }
 
     VkExtent2D choose_extent(const VkSurfaceCapabilitiesKHR& capabilities) const {
@@ -1756,10 +1784,8 @@ struct VulkanWindow::Impl {
         vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, formats.data());
 
         const auto format = choose_surface_format(formats);
-        // FIFO is vsync and always available. Mailbox let a loop that is not locked to the display
-        // run slightly faster than it, discarding a frame a few times per second as visible
-        // stutter.
-        const auto present_mode = VK_PRESENT_MODE_FIFO_KHR;
+        const auto present_mode = choose_present_mode();
+        present_mode_in_use = present_mode;
         const auto extent = choose_extent(capabilities);
         if (extent.width == 0 || extent.height == 0) return true;
         auto image_count = capabilities.minImageCount + 1U;
@@ -3783,9 +3809,53 @@ struct VulkanWindow::Impl {
 #endif
     }
 
+    // Ends the GPU pass that began at the previous timestamp and names it for the profiler.
+    void mark_gpu_pass(const VkCommandBuffer commands, const std::uint32_t name) {
+        auto& count = gpu_marker_counts[current_frame];
+        if (timestamp_queries == VK_NULL_HANDLE || count == 0U || count >= gpu_marker_capacity) return;
+        vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_queries,
+                            static_cast<std::uint32_t>(current_frame) * gpu_marker_capacity + count);
+        gpu_marker_names[current_frame][count++] = name;
+    }
+
+    // Reads the timestamps of the frame whose fence just completed and reports its passes.
+    void read_gpu_timings() {
+        const auto count = gpu_marker_counts[current_frame];
+        if (timestamp_queries == VK_NULL_HANDLE || !timestamp_submitted[current_frame] || count < 2U)
+            return;
+        std::array<std::uint64_t, gpu_marker_capacity> timestamps{};
+        const auto query_result = vkGetQueryPoolResults(
+            device, timestamp_queries, static_cast<std::uint32_t>(current_frame) * gpu_marker_capacity,
+            count, sizeof(std::uint64_t) * count, timestamps.data(), sizeof(std::uint64_t),
+            VK_QUERY_RESULT_64_BIT);
+        if (query_result != VK_SUCCESS || timestamps[count - 1U] < timestamps[0]) return;
+        const auto milliseconds = [&](const std::uint64_t from, const std::uint64_t to) {
+            return to >= from ? static_cast<double>(to - from) * timestamp_period_nanoseconds / 1'000'000.0
+                              : 0.0;
+        };
+        latest_gpu_milliseconds = milliseconds(timestamps[0], timestamps[count - 1U]);
+        std::vector<ProfileGpuPass> passes;
+        passes.reserve(count - 1U);
+        for (std::uint32_t marker = 1; marker < count; ++marker)
+            passes.push_back({gpu_marker_names[current_frame][marker],
+                              milliseconds(timestamps[marker - 1U], timestamps[marker])});
+        profiler().record_gpu(gpu_profile_frames[current_frame], passes, latest_gpu_milliseconds);
+    }
+
     bool record_commands(const VkCommandBuffer commands, const std::uint32_t image_index,
                          const float elapsed_seconds, const Scene* scene,
                          const VkBuffer capture_buffer) {
+        static const auto shadow_pass = profiler().intern("Shadow maps");
+        static const auto point_shadow_pass = profiler().intern("Point light shadows");
+        static const auto geometry_pass = profiler().intern("Geometry (G-buffer)");
+        static const auto global_illumination_pass = profiler().intern("Global illumination");
+        static const auto reflections_pass = profiler().intern("Ray traced reflections");
+        static const auto forward_pass = profiler().intern("Composite, transparency and overlays");
+        static const auto display_pass = profiler().intern("Tone mapping and editor UI");
+        static const auto capture_pass = profiler().intern("Capture copy");
+        static const auto build_stage = profiler().intern("Build render scene");
+        static const auto upload_stage = profiler().intern("Upload frame data");
+        static const auto record_stage = profiler().intern("Record draw commands");
         const auto region = (overlay ? overlay->scene_viewport() : EditorViewport{}).pixels(
             swapchain_extent.width, swapchain_extent.height);
         if (!ensure_scene_targets({region.width, region.height})) return false;
@@ -3797,16 +3867,21 @@ struct VulkanWindow::Impl {
         global_illumination_active = lighting_wanted && history_ready;
         reflections_active = reflections_wanted && history_ready;
         RenderScene render_scene;
+        std::optional<ProfileScope> cpu_stage;
+        cpu_stage.emplace(build_stage);
         if (scene)
             render_scene =
                 build_render_scene(*scene, *assets,
                                    static_cast<float>(region.width) / static_cast<float>(region.height),
                                    overlay != nullptr ? overlay->view_override() : nullptr, false,
-                                   lighting_wanted || reflections_wanted);
+                                   lighting_wanted || reflections_wanted,
+                                   capture_buffer == VK_NULL_HANDLE ? render_interpolation : nullptr);
         if (render_scene.deformation_overflow) {
             last_error = "scene exceeds four million deformed vertices per frame";
             return false;
         }
+        cpu_stage.reset();
+        cpu_stage.emplace(upload_stage);
         // This frame's fence has completed. Host writes never race another frame's reads.
         const VkDeviceSize bytes = render_scene.deformed_vertices.size() * sizeof(MeshVertex);
         if (bytes > deformed_capacities[current_frame]) {
@@ -3968,10 +4043,15 @@ struct VulkanWindow::Impl {
             last_error = vk_error("vkBeginCommandBuffer", result);
             return false;
         }
+        cpu_stage.reset();
+        cpu_stage.emplace(record_stage);
+        gpu_marker_counts[current_frame] = 0U;
+        gpu_profile_frames[current_frame] = profiler().current_frame();
         if (timestamp_queries != VK_NULL_HANDLE) {
-            const auto first_query = static_cast<std::uint32_t>(current_frame * 2U);
-            vkCmdResetQueryPool(commands, timestamp_queries, first_query, 2U);
+            const auto first_query = static_cast<std::uint32_t>(current_frame) * gpu_marker_capacity;
+            vkCmdResetQueryPool(commands, timestamp_queries, first_query, gpu_marker_capacity);
             vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamp_queries, first_query);
+            gpu_marker_counts[current_frame] = 1U;
         }
         latest_draw_calls = 0U;
         VkClearValue shadow_clear{};
@@ -4035,6 +4115,7 @@ struct VulkanWindow::Impl {
             }
             vkCmdEndRenderPass(commands);
         }
+        mark_gpu_pass(commands, shadow_pass);
         for (std::size_t face = 0; face < point_shadow_face_count; ++face) {
             VkRenderPassBeginInfo shadow_info{};
             shadow_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -4084,6 +4165,7 @@ struct VulkanWindow::Impl {
             }
             vkCmdEndRenderPass(commands);
         }
+        mark_gpu_pass(commands, point_shadow_pass);
         std::array<VkClearValue, geometry_color_attachments + 1U> clear{};
         clear[0].color = overlay ? VkClearColorValue{{0.014444F, 0.014444F, 0.014444F, 1.0F}}
                                  : VkClearColorValue{{0.012F, 0.018F, 0.045F, 1.0F}};
@@ -4164,15 +4246,23 @@ struct VulkanWindow::Impl {
             latest_draw_calls = 1U;
         }
         vkCmdEndRenderPass(commands);
-        if (global_illumination_active && !record_global_illumination(commands, render_scene,
-                                                                      instance_keys)) {
-            // The analytic sky light was left out of this frame; later frames fall back to it.
-            global_illumination_active = false;
-            global_illumination_failed = true;
+        mark_gpu_pass(commands, geometry_pass);
+        if (global_illumination_active) {
+            RELAY_PROFILE_SCOPE("Record global illumination");
+            if (!record_global_illumination(commands, render_scene, instance_keys)) {
+                // The analytic sky light was left out of this frame; later frames fall back to it.
+                global_illumination_active = false;
+                global_illumination_failed = true;
+            }
+            mark_gpu_pass(commands, global_illumination_pass);
         }
-        if (reflections_active && !record_reflections(commands, render_scene)) {
-            reflections_active = false;
-            reflections_failed = true;
+        if (reflections_active) {
+            RELAY_PROFILE_SCOPE("Record reflections");
+            if (!record_reflections(commands, render_scene)) {
+                reflections_active = false;
+                reflections_failed = true;
+            }
+            mark_gpu_pass(commands, reflections_pass);
         }
 
         // Forward pass: transparent geometry, then editor-only overlays.
@@ -4267,6 +4357,7 @@ struct VulkanWindow::Impl {
             }
         }
         vkCmdEndRenderPass(commands);
+        mark_gpu_pass(commands, forward_pass);
         scene_targets_rendered[current_frame] = true;
         previous_view = render_scene.camera.view.values;
         previous_projection = render_scene.camera.projection.values;
@@ -4309,11 +4400,14 @@ struct VulkanWindow::Impl {
             vkCmdDraw(commands, 3U, 1U, 0U, 0U);
             ++latest_draw_calls;
         };
-        if (overlay != nullptr && overlay_ready && capture_buffer == VK_NULL_HANDLE)
+        if (overlay != nullptr && overlay_ready && capture_buffer == VK_NULL_HANDLE) {
+            RELAY_PROFILE_SCOPE("Record editor UI");
             overlay->record(commands, draw_tone);
-        else
+        } else {
             draw_tone();
+        }
         vkCmdEndRenderPass(commands);
+        mark_gpu_pass(commands, display_pass);
         if (transfer_source_supported) {
             if (capture_buffer != VK_NULL_HANDLE) {
                 VkBufferImageCopy copy{};
@@ -4339,10 +4433,7 @@ struct VulkanWindow::Impl {
                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
                                  1, &present_barrier);
         }
-        if (timestamp_queries != VK_NULL_HANDLE) {
-            vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_queries,
-                                static_cast<std::uint32_t>(current_frame * 2U + 1U));
-        }
+        if (capture_buffer != VK_NULL_HANDLE) mark_gpu_pass(commands, capture_pass);
         result = vkEndCommandBuffer(commands);
         if (result != VK_SUCCESS) {
             last_error = vk_error("vkEndCommandBuffer", result);
@@ -4353,13 +4444,25 @@ struct VulkanWindow::Impl {
 
     bool draw(const double elapsed, const Scene* scene = nullptr,
               const VkBuffer capture_buffer = VK_NULL_HANDLE) {
+        last_draw_presented = false;
         if (submission_failed) return false;
-        collect_readbacks(false);
-        if (!collect_upload_batch()) return false;
-        if (!refresh_mesh_assets()) return false;
-        if (swapchain == VK_NULL_HANDLE) return recreate_swapchain();
-        auto result = vkWaitForFences(device, 1, &frame_fences[current_frame], VK_TRUE,
-                                      std::numeric_limits<std::uint64_t>::max());
+        {
+            RELAY_PROFILE_SCOPE("Asset uploads and readbacks");
+            collect_readbacks(false);
+            if (!collect_upload_batch()) return false;
+            if (!refresh_mesh_assets()) return false;
+        }
+        if (swapchain == VK_NULL_HANDLE) {
+            RELAY_PROFILE_SCOPE("Recreate swapchain");
+            return recreate_swapchain();
+        }
+        auto result = VK_SUCCESS;
+        {
+            // Long waits here mean the GPU is still busy with the frame submitted two frames ago.
+            RELAY_PROFILE_WAIT("Wait for GPU");
+            result = vkWaitForFences(device, 1, &frame_fences[current_frame], VK_TRUE,
+                                     std::numeric_limits<std::uint64_t>::max());
+        }
         if (result != VK_SUCCESS) {
             last_error = vk_error("vkWaitForFences", result);
             return false;
@@ -4370,20 +4473,15 @@ struct VulkanWindow::Impl {
         old_asset_frame_pending[current_frame] = false;
         if (!collect_upload_batch()) return false;
         collect_readbacks(false);
-        if (timestamp_queries != VK_NULL_HANDLE && timestamp_submitted[current_frame]) {
-            std::array<std::uint64_t, 2> timestamps{};
-            const auto query_result = vkGetQueryPoolResults(
-                device, timestamp_queries, static_cast<std::uint32_t>(current_frame * 2U), 2U,
-                sizeof(timestamps), timestamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
-            if (query_result == VK_SUCCESS && timestamps[1] >= timestamps[0]) {
-                latest_gpu_milliseconds = static_cast<double>(timestamps[1] - timestamps[0]) *
-                                          timestamp_period_nanoseconds / 1'000'000.0;
-            }
-        }
+        read_gpu_timings();
         std::uint32_t image_index = 0;
-        result = vkAcquireNextImageKHR(device, swapchain,
-                                       std::numeric_limits<std::uint64_t>::max(),
-                                       image_available[current_frame], VK_NULL_HANDLE, &image_index);
+        {
+            RELAY_PROFILE_WAIT("Acquire swapchain image");
+            result = vkAcquireNextImageKHR(device, swapchain,
+                                           std::numeric_limits<std::uint64_t>::max(),
+                                           image_available[current_frame], VK_NULL_HANDLE,
+                                           &image_index);
+        }
         if (result == VK_ERROR_OUT_OF_DATE_KHR) return recreate_swapchain();
         if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
             last_error = vk_error("vkAcquireNextImageKHR", result);
@@ -4412,13 +4510,19 @@ struct VulkanWindow::Impl {
                     last_error = "editor overlay unavailable: " + overlay_error;
                 }
             }
-            if (overlay_ready) overlay->build(swapchain_extent.width, swapchain_extent.height);
+            if (overlay_ready) {
+                RELAY_PROFILE_SCOPE("Editor UI");
+                overlay->build(swapchain_extent.width, swapchain_extent.height);
+            }
         }
         vkResetCommandBuffer(command_buffers[current_frame], 0);
-        if (!record_commands(command_buffers[current_frame], image_index, static_cast<float>(elapsed),
-                             scene, capture_buffer)) {
-            submission_failed = true;
-            return false;
+        {
+            RELAY_PROFILE_SCOPE("Prepare frame");
+            if (!record_commands(command_buffers[current_frame], image_index,
+                                 static_cast<float>(elapsed), scene, capture_buffer)) {
+                submission_failed = true;
+                return false;
+            }
         }
         const std::array wait_semaphores{image_available[current_frame], upload_complete};
         const std::array<VkPipelineStageFlags, 2> wait_stages{
@@ -4434,7 +4538,10 @@ struct VulkanWindow::Impl {
         submit_info.signalSemaphoreCount = 1;
         submit_info.pSignalSemaphores = &render_finished[image_index];
         vkResetFences(device, 1, &frame_fences[current_frame]);
-        result = vkQueueSubmit(graphics_queue, 1, &submit_info, frame_fences[current_frame]);
+        {
+            RELAY_PROFILE_SCOPE("Queue submit");
+            result = vkQueueSubmit(graphics_queue, 1, &submit_info, frame_fences[current_frame]);
+        }
         if (result != VK_SUCCESS) {
             submission_failed = true;
             last_error = vk_error("vkQueueSubmit", result);
@@ -4453,7 +4560,12 @@ struct VulkanWindow::Impl {
         present_info.swapchainCount = 1;
         present_info.pSwapchains = &swapchain;
         present_info.pImageIndices = &image_index;
-        result = vkQueuePresentKHR(present_queue, &present_info);
+        {
+            // With vsync, presentation blocks here until the display takes a new image.
+            RELAY_PROFILE_WAIT("Present");
+            result = vkQueuePresentKHR(present_queue, &present_info);
+        }
+        last_draw_presented = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || resized) {
             if (!recreate_swapchain()) return false;
         } else if (result != VK_SUCCESS) {
@@ -4680,6 +4792,12 @@ double VulkanWindow::gpu_frame_milliseconds() const {
     return impl_ ? impl_->latest_gpu_milliseconds : 0.0;
 }
 
+bool VulkanWindow::presented() const { return impl_ && impl_->last_draw_presented; }
+
+void VulkanWindow::set_render_interpolation(const RenderInterpolation* interpolation) {
+    if (impl_) impl_->render_interpolation = interpolation;
+}
+
 std::uint32_t VulkanWindow::draw_call_count() const {
     return impl_ ? impl_->latest_draw_calls : 0U;
 }
@@ -4744,6 +4862,13 @@ void VulkanWindow::set_global_illumination(const bool enabled) {
     impl_->global_illumination_error.clear();
 }
 
+void VulkanWindow::set_vsync(const bool enabled) {
+    if (!impl_ || impl_->vsync_requested == enabled) return;
+    impl_->vsync_requested = enabled;
+    // The swapchain is rebuilt with the new presentation mode after the next present.
+    impl_->resized = true;
+}
+
 void VulkanWindow::set_reflections(const bool enabled) {
     if (!impl_ || impl_->reflections_requested == enabled) return;
     impl_->reflections_requested = enabled;
@@ -4791,6 +4916,16 @@ std::string VulkanWindow::lighting_status_json() const {
                 std::to_string(impl_->acceleration_structures->static_structures());
 #endif
     json += ",\"error\":\"" + escape(impl_->reflections_error) + "\"}";
+    const auto mode = impl_->present_mode_in_use;
+    json += ",\"presentation\":{\"vsync_requested\":";
+    json += impl_->vsync_requested ? "true" : "false";
+    json += ",\"vsync\":";
+    json += mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "true" : "false";
+    json += ",\"mode\":\"";
+    json += mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate"
+            : mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox"
+                                                  : "fifo";
+    json += "\"}";
     return json + '}';
 }
 

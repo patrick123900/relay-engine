@@ -3,6 +3,7 @@
 
 #include "relay/core/engine.hpp"
 #include "relay/core/json.hpp"
+#include "relay/observe/profiler.hpp"
 #include "relay/physics/collision.hpp"
 #include "relay/editor/editor_math.hpp"
 #include "relay/scene/scene_edit.hpp"
@@ -91,6 +92,57 @@ std::optional<Entity> entity_field(const std::string_view json, const std::strin
     const auto encoded = string_field(json, key);
     if (encoded.empty() || encoded == "null") return Entity{};
     return Entity::parse(encoded);
+}
+
+std::string profile_report_json(const ProfileReport& report) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3);
+    const auto kind = [](const ProfileKind value) {
+        return value == ProfileKind::wait ? "\"wait\"" : "\"work\"";
+    };
+    out << "{\"paused\":" << (report.paused ? "true" : "false") << ",\"capacity\":" << report.capacity
+        << ",\"frames\":" << report.frames << ",\"first_frame\":" << report.first_frame
+        << ",\"last_frame\":" << report.last_frame << ",\"average_ms\":" << report.average_ms
+        << ",\"minimum_ms\":" << report.minimum_ms << ",\"maximum_ms\":" << report.maximum_ms
+        << ",\"p95_ms\":" << report.p95_ms << ",\"fps\":" << report.fps
+        << ",\"cpu_ms\":" << report.cpu_ms << ",\"wait_ms\":" << report.wait_ms << ",\"gpu_ms\":";
+    if (report.gpu_ms >= 0.0) out << report.gpu_ms;
+    else out << "null";
+    out << ",\"bottleneck\":\"" << report.bottleneck << "\",\"scopes\":[";
+    for (std::size_t index = 0; index < report.scopes.size(); ++index) {
+        const auto& scope = report.scopes[index];
+        if (index != 0U) out << ',';
+        out << "{\"name\":\"" << escape_json(scope.name) << "\",\"parent\":" << scope.parent
+            << ",\"depth\":" << scope.depth << ",\"kind\":" << kind(scope.kind)
+            << ",\"total_ms\":" << scope.total_ms << ",\"self_ms\":" << scope.self_ms
+            << ",\"max_ms\":" << scope.max_ms << ",\"calls\":" << scope.calls << '}';
+    }
+    out << "],\"hotspots\":[";
+    for (std::size_t index = 0; index < report.hotspots.size(); ++index) {
+        const auto& hotspot = report.hotspots[index];
+        if (index != 0U) out << ',';
+        out << "{\"name\":\"" << escape_json(hotspot.name) << "\",\"kind\":" << kind(hotspot.kind)
+            << ",\"self_ms\":" << hotspot.self_ms << ",\"total_ms\":" << hotspot.total_ms
+            << ",\"calls\":" << hotspot.calls << '}';
+    }
+    out << "],\"gpu_passes\":[";
+    for (std::size_t index = 0; index < report.gpu_passes.size(); ++index) {
+        const auto& pass = report.gpu_passes[index];
+        if (index != 0U) out << ',';
+        out << "{\"name\":\"" << escape_json(pass.name) << "\",\"average_ms\":" << pass.average_ms
+            << ",\"max_ms\":" << pass.max_ms << '}';
+    }
+    out << "],\"history\":[";
+    for (std::size_t index = 0; index < report.history.size(); ++index) {
+        const auto& frame = report.history[index];
+        if (index != 0U) out << ',';
+        out << "{\"frame\":" << frame.index << ",\"ms\":" << frame.milliseconds << ",\"gpu_ms\":";
+        if (frame.gpu_milliseconds >= 0.0) out << frame.gpu_milliseconds;
+        else out << "null";
+        out << ",\"game\":" << (frame.game ? "true" : "false") << '}';
+    }
+    out << "]}";
+    return out.str();
 }
 
 std::string history_json(const SceneHistory& history) {
@@ -562,6 +614,22 @@ std::string ControlProtocol::handle(const std::string_view request) {
         result << "]}}";
         return result.str();
     }
+    if (method == "profiler.read") {
+        ProfileQuery query;
+        query.frames = static_cast<std::size_t>(unsigned_field(request, "frames", 120));
+        query.frame = unsigned_field(request, "frame", 0);
+        query.game_only = boolean_field(request, "game_only", false);
+        query.history = static_cast<std::size_t>(unsigned_field(request, "history", 0));
+        return response_prefix(id) + profile_report_json(profiler().report(query)) + '}';
+    }
+    if (method == "profiler.set") {
+        JsonParser parser(request);
+        const auto parsed = parser.parse();
+        if (const auto* paused = field(*parsed->object(), "paused"); paused && paused->boolean())
+            profiler().set_paused(*paused->boolean());
+        if (boolean_field(request, "clear", false)) profiler().clear();
+        return response_prefix(id) + "{\"paused\":" + (profiler().paused() ? "true" : "false") + "}}";
+    }
     if (method == "graphics.settings") {
         const bool saved = engine_.project() && engine_.project()->graphics.has_value();
         std::string renderer = "null";
@@ -580,6 +648,9 @@ std::string ControlProtocol::handle(const std::string_view request) {
         settings.global_illumination =
             boolean_field(request, "global_illumination", settings.global_illumination);
         settings.reflections = boolean_field(request, "reflections", settings.reflections);
+        settings.vsync = boolean_field(request, "vsync", settings.vsync);
+        settings.frame_rate_limit = static_cast<std::uint32_t>(
+            unsigned_field(request, "frame_rate_limit", settings.frame_rate_limit));
         std::string error;
         if (!engine_.set_graphics_settings(settings, error)) return error_response(id, error);
         engine_.logs().write(LogLevel::info, "Graphics settings saved");

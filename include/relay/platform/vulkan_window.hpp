@@ -12,6 +12,7 @@ namespace relay {
 
 class AssetRegistry;
 class EditorOverlay;
+struct RenderInterpolation;
 class Scene;
 
 class VulkanWindow {
@@ -38,6 +39,11 @@ public:
     [[nodiscard]] bool capture_image(const std::filesystem::path& path, const Scene& scene,
                                      double elapsed_seconds);
     [[nodiscard]] double gpu_frame_milliseconds() const;
+    // Whether the last draw presented an image. A minimized window draws without presenting.
+    [[nodiscard]] bool presented() const;
+    // Game state to blend between steps in presented frames; captures always draw the scene as
+    // it is. Null draws the scene as it is. The pointer must stay valid until it is replaced.
+    void set_render_interpolation(const RenderInterpolation* interpolation);
     [[nodiscard]] std::uint32_t draw_call_count() const;
     [[nodiscard]] std::uint32_t render_resource_count() const;
     [[nodiscard]] std::string render_graph_json() const;
@@ -52,6 +58,9 @@ public:
     void set_global_illumination(bool enabled);
     // Turns hardware ray traced reflections on or off, with the same fallback and reporting.
     void set_reflections(bool enabled);
+    // Presents in step with the display (FIFO) or, off, as soon as a frame is ready (immediate,
+    // else mailbox). A change rebuilds the swapchain after the next present.
+    void set_vsync(bool enabled);
     [[nodiscard]] std::string lighting_status_json() const;
     // Installs the human-facing UI layer. The overlay must outlive the window. It is drawn into the
     // swapchain render pass for presentation only and is deliberately excluded from every capture

@@ -57,6 +57,7 @@ add_library(relay_engine
     src/physics/jolt_world.cpp
     src/observe/capture.cpp
     src/observe/performance.cpp
+    src/observe/profiler.cpp
     src/observe/trace.cpp
     src/render/software_renderer.cpp
     src/render/asset_manifest.cpp

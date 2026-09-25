@@ -14,6 +14,7 @@
 #include "relay/editor/editor_timeline.hpp"
 #include "relay/editor/editor_theme.hpp"
 #include "relay/platform/sdl_input.hpp"
+#include "relay/render/graphics_settings.hpp"
 #include "relay/render/scene_render.hpp"
 
 #include <ImGuizmo.h>
@@ -90,6 +91,13 @@ const JsonValue::Object* component(const JsonValue::Object& entity, const std::s
     const auto* value = field(entity, name);
     return value == nullptr ? nullptr : value->object();
 }
+
+// Dockable panels, in the order of EditorUi::Impl::panel_open.
+constexpr std::array<const char*, 10> panel_names{"Hierarchy", "Inspector", "Assets", "History",
+                                                  "Diagnostics", "Viewport", "Timeline", "Project",
+                                                  "Agent", "Profiler"};
+constexpr std::array<bool, panel_names.size()> default_panels{true, true, true, false, true,
+                                                              true, false, false, false, false};
 
 // A dim caption in a fixed column, so every inspector row lines up down the panel.
 void row_label(const char* const label, const float width) {
@@ -519,6 +527,9 @@ struct EditorUi::Impl {
     JsonValue input_live;
     // The Graphics page: graphics.settings, refreshed while the page is visible for live status.
     JsonValue graphics_status;
+    // The frame rate limit field's text, kept while it is being typed in and saved when it is left.
+    int frame_rate_limit_edit{};
+    bool frame_rate_limit_editing{};
     std::array<char, 65> new_action_name{}, new_axis_name{};
     std::map<std::string, std::array<char, 65>> input_name_buffers;
     struct BindingCapture {
@@ -555,7 +566,7 @@ struct EditorUi::Impl {
     std::string hierarchy_scroll_to;
     std::string assets_root = "assets";
     std::vector<std::string> undo_labels, redo_labels;
-    std::array<bool, 9> panel_open{true, true, true, false, true, true, false, false, false};
+    std::array<bool, panel_names.size()> panel_open{default_panels};
     JsonValue agent_review, agent_audit, chat_status;
     std::array<char, 4001> chat_message{};
     std::array<char, 8003> chat_display{};
@@ -2231,11 +2242,8 @@ struct EditorUi::Impl {
     // Rename helpers shared by the hierarchy and the asset browser.
     // Panel visibility and View menu toggles persist with the dock layout.
     void bind_preferences() {
-        constexpr std::array<const char*, 9> names{"Hierarchy", "Inspector", "Assets", "History",
-                                                   "Diagnostics", "Viewport", "Timeline", "Project",
-                                                   "Agent"};
-        for (std::size_t index = 0; index < names.size(); ++index)
-            layout.bind(std::string("panel.") + names[index], &panel_open[index]);
+        for (std::size_t index = 0; index < panel_names.size(); ++index)
+            layout.bind(std::string("panel.") + panel_names[index], &panel_open[index]);
         layout.bind("view.ground_grid", &grid_enabled);
         layout.bind("view.collider_wireframes", &collider_wireframes_enabled);
         layout.bind("view.node_icons", &node_icons_enabled);
@@ -3856,9 +3864,9 @@ struct EditorUi::Impl {
         ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(3, 3, 3, 255));
         ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(6, 6, 6, 255));
         ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(9, 9, 9, 255));
-        ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(5, 5, 5, 255));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(8, 8, 8, 255));
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(11, 11, 11, 255));
+        ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(8, 8, 8, 255));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(11, 11, 11, 255));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(14, 14, 14, 255));
 
         ImGui::PushFont(fonts.heading, fonts.heading_size);
         ImGui::TextWrapped("%s", string_or(*entity, "name", "Entity").c_str());
@@ -4233,10 +4241,8 @@ struct EditorUi::Impl {
                 camera_enabled = true;
             }
             ImGui::Separator();
-            constexpr const char* names[]{"Hierarchy", "Inspector", "Assets",
-                                          "History", "Diagnostics", "Viewport", "Timeline", "Project", "Agent"};
             for (std::size_t i = 0; i < panel_open.size(); ++i)
-                ImGui::MenuItem(names[i], nullptr, &panel_open[i]);
+                ImGui::MenuItem(panel_names[i], nullptr, &panel_open[i]);
             ImGui::Separator();
             ImGui::MenuItem("Ground grid", nullptr, &grid_enabled);
             ImGui::MenuItem("Collider wireframes", nullptr, &collider_wireframes_enabled);
@@ -4287,12 +4293,13 @@ struct EditorUi::Impl {
             }
             future_action("Shader editor...");
             if (ImGui::MenuItem("Animation timeline")) panel_open[6] = true;
+            if (ImGui::MenuItem("Profiler")) panel_open[9] = true;
             if (ImGui::MenuItem("Agent workspace...", "Ctrl+Shift+A")) { panel_open[8] = true; agent_expand_pending = true; }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Layout")) {
             if (ImGui::MenuItem("Reset layout")) {
-                panel_open = {true, true, true, false, true, true, false, false, false};
+                panel_open = default_panels;
                 layout.reset();
             }
             ImGui::Separator();
@@ -5279,6 +5286,78 @@ struct EditorUi::Impl {
         if (!renderer)
             ImGui::TextColored(editor_color(palette.text_faint),
                                "No GPU renderer is attached, so availability is unknown.");
+
+        ImGui::SeparatorText("Frame rate");
+        bool vsync = settings && boolean_or(*settings, "vsync", false);
+        if (ImGui::Checkbox("Vsync", &vsync)) {
+            if (call("graphics.set_settings", std::string("\"vsync\":") + (vsync ? "true" : "false"))) {
+                set_status(vsync ? "Vsync on" : "Vsync off", false);
+                if (auto refreshed = call("graphics.settings")) graphics_status = std::move(*refreshed);
+            }
+        }
+        note_item("config:graphics:vsync");
+        ImGui::Indent();
+        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+        ImGui::TextWrapped("Shows each frame in step with the display's refresh, so the frame rate "
+                           "never exceeds it. Off shows frames as soon as they are ready: faster and "
+                           "more responsive, but the image can tear.");
+        ImGui::PopStyleColor();
+        const auto* presentation_value = renderer ? field(*renderer, "presentation") : nullptr;
+        if (const auto* presentation = presentation_value ? presentation_value->object() : nullptr) {
+            const auto mode = string_or(*presentation, "mode");
+            if (boolean_or(*presentation, "vsync_requested", false) != vsync)
+                ImGui::TextColored(editor_color(palette.text_faint), "Applies with the next frame");
+            else if (mode == "immediate")
+                ImGui::TextColored(editor_color(palette.success), "Running without vsync");
+            else if (mode == "mailbox")
+                ImGui::TextColored(editor_color(palette.success),
+                                   "Running without vsync (mailbox: no tearing, but frames the "
+                                   "display misses are dropped)");
+            else if (!vsync)
+                ImGui::TextColored(editor_color(palette.warning),
+                                   "Unavailable: this display only presents with vsync");
+            else
+                ImGui::TextColored(editor_color(palette.success), "Running with vsync");
+        }
+        ImGui::Unindent();
+        const int limit = settings ? static_cast<int>(number_or(*settings, "frame_rate_limit", 0.0)) : 0;
+        const auto save_limit = [&](const int value) {
+            const auto clamped = std::clamp(value, 0, static_cast<int>(maximum_frame_rate_limit));
+            if (call("graphics.set_settings", "\"frame_rate_limit\":" + std::to_string(clamped))) {
+                set_status(clamped == 0 ? std::string("Frame rate unlimited")
+                                        : "Frame rate limited to " + std::to_string(clamped) + " FPS",
+                           false);
+                if (auto refreshed = call("graphics.settings")) graphics_status = std::move(*refreshed);
+            }
+        };
+        if (!frame_rate_limit_editing) frame_rate_limit_edit = limit;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Frame rate limit");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90.0F * ui_scale);
+        ImGui::InputInt("##frame_rate_limit", &frame_rate_limit_edit, 0, 0);
+        note_item("config:graphics:frame_rate_limit");
+        frame_rate_limit_editing = ImGui::IsItemActive();
+        if (ImGui::IsItemDeactivatedAfterEdit() && frame_rate_limit_edit != limit)
+            save_limit(frame_rate_limit_edit);
+        ImGui::SameLine();
+        ImGui::TextColored(editor_color(palette.text_dim), "FPS");
+        for (const int preset : {0, 30, 60, 120, 144, 240}) {
+            ImGui::SameLine();
+            const auto label = preset == 0 ? std::string("Unlimited") : std::to_string(preset);
+            const bool current = preset == limit;
+            if (current) ImGui::PushStyleColor(ImGuiCol_Button, palette.accent);
+            if (ImGui::SmallButton(label.c_str()) && !current) save_limit(preset);
+            if (current) ImGui::PopStyleColor();
+            note_item("config:graphics:frame_rate_limit:" + std::to_string(preset));
+        }
+        ImGui::Indent();
+        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+        ImGui::TextWrapped("The most frames per second while the game runs; 0 is unlimited. With vsync "
+                           "on, the display's refresh rate is the ceiling either way. The editor "
+                           "itself draws at most 250 frames per second.");
+        ImGui::PopStyleColor();
+        ImGui::Unindent();
     }
 
     // Project-wide game settings, one page per area. Input is the first; others follow.
@@ -6318,6 +6397,480 @@ struct EditorUi::Impl {
         ImGui::Separator();
     }
 
+    // Profiler panel. It reads profiler.read like any other protocol client, a few times a
+    // second while visible, so the numbers it shows are the ones an agent would see.
+    JsonValue profile;
+    double seconds_since_profile{1.0};
+    bool profile_dirty{true};
+    int profile_window{120};
+    bool profile_game_only{true};
+    std::uint64_t profile_frame{};
+    bool profile_paused{};
+    bool profile_auto_paused{};
+    bool profile_saw_game{};
+    static constexpr std::size_t profile_history = 300U;
+
+    [[nodiscard]] bool game_running() const {
+        return runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game";
+    }
+
+    void set_profiler_paused(const bool paused) {
+        if (auto reply = call("profiler.set", paused ? "\"paused\":true" : "\"paused\":false");
+            reply && reply->object())
+            profile_paused = boolean_or(*reply->object(), "paused", paused);
+        profile_auto_paused = false;
+        profile_dirty = true;
+    }
+
+    // Stopping the game keeps its frames: the profiler pauses so editor frames do not push them
+    // out, and resumes by itself when the next game starts.
+    void update_profiler_session() {
+        if (!panel_open[9]) {
+            profile_saw_game = false;
+            return;
+        }
+        const bool game = game_running();
+        if (game && !profile_saw_game && profile_auto_paused) {
+            set_profiler_paused(false);
+            profile_frame = 0U;
+        } else if (!game && profile_saw_game && !profile_paused) {
+            set_profiler_paused(true);
+            profile_auto_paused = true;
+        }
+        profile_saw_game = game;
+    }
+
+    void read_profile() {
+        seconds_since_profile = 0.0;
+        profile_dirty = false;
+        std::string fields = "\"frames\":" + std::to_string(profile_window) +
+                             ",\"history\":" + std::to_string(profile_history) +
+                             ",\"game_only\":" + (profile_game_only ? "true" : "false");
+        if (profile_frame != 0U) fields += ",\"frame\":" + std::to_string(profile_frame);
+        if (auto reply = call("profiler.read", fields, false)) {
+            profile = std::move(*reply);
+            if (const auto* object = profile.object())
+                profile_paused = boolean_or(*object, "paused", profile_paused);
+        }
+    }
+
+    // A share of a total, drawn as a filled bar with the percentage over it.
+    void share_bar(const double part, const double whole, const ImU32 colour) {
+        const auto fraction = whole > 0.0 ? static_cast<float>(std::clamp(part / whole, 0.0, 1.0)) : 0.0F;
+        char label[16];
+        std::snprintf(label, sizeof(label), "%.1f%%", static_cast<double>(fraction) * 100.0);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, colour);
+        ImGui::ProgressBar(fraction, ImVec2(-FLT_MIN, ImGui::GetTextLineHeight()), label);
+        ImGui::PopStyleColor();
+    }
+
+    // Tables fill the panel but keep a usable height in a short dock, where the panel scrolls.
+    [[nodiscard]] ImVec2 profile_table_size() const {
+        return {0.0F, std::max(ImGui::GetContentRegionAvail().y, 160.0F * ui_scale)};
+    }
+
+    static std::string profile_ms(const double milliseconds) {
+        char text[32];
+        std::snprintf(text, sizeof(text), milliseconds >= 10.0 ? "%.1f ms" : "%.2f ms", milliseconds);
+        return text;
+    }
+
+    void draw_profiler() {
+        seconds_since_profile += static_cast<double>(ImGui::GetIO().DeltaTime);
+        if (profile_dirty || (!profile_paused && seconds_since_profile >= 0.25)) read_profile();
+        const auto* report = profile.object();
+        // The default dock along the bottom is wide and short, so the overview and the tables sit
+        // side by side there and stack in a narrow panel.
+        const auto available = ImGui::GetContentRegionAvail();
+        if (available.x >= 760.0F * ui_scale) {
+            if (begin_region("##profile_overview", ImVec2(std::floor(available.x * 0.42F), 0.0F)))
+                draw_profile_overview(report, true);
+            ImGui::EndChild();
+            ImGui::SameLine();
+            if (begin_region("##profile_details")) draw_profile_details(report);
+            ImGui::EndChild();
+        } else {
+            draw_profile_overview(report, false);
+            draw_profile_details(report);
+        }
+    }
+
+    [[nodiscard]] static double profile_gpu_ms(const JsonValue::Object& report) {
+        const auto* value = field(report, "gpu_ms");
+        return value && value->number() ? *value->number() : -1.0;
+    }
+
+    // Controls, frame-time summary, verdict and the frame graph. A filling graph takes the height
+    // left in its column.
+    void draw_profile_overview(const JsonValue::Object* const report, const bool fill) {
+        const auto& palette = editor_palette();
+        // Controls.
+        if (ImGui::Button(profile_paused ? "Resume" : "Pause")) {
+            set_profiler_paused(!profile_paused);
+            if (!profile_paused) profile_frame = 0U;
+        }
+        note_item("profiler:pause");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(profile_paused ? "Record new frames again"
+                                             : "Stop recording to inspect the frames recorded so far");
+        ImGui::SameLine();
+        if (ImGui::Button("Clear")) {
+            (void)call("profiler.set", "\"clear\":true");
+            profile_frame = 0U;
+            profile_dirty = true;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(130.0F * ui_scale);
+        constexpr std::array windows{60, 120, 300, 600, 1200};
+        const auto window_label = std::to_string(profile_window) + " frames";
+        if (ImGui::BeginCombo("##profile_window", window_label.c_str())) {
+            for (const auto frames : windows) {
+                const auto label = "Last " + std::to_string(frames) + " frames";
+                if (ImGui::Selectable(label.c_str(), frames == profile_window)) {
+                    profile_window = frames;
+                    profile_frame = 0U;
+                    profile_dirty = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many recent frames the averages cover");
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Game frames only", &profile_game_only)) {
+            profile_frame = 0U;
+            profile_dirty = true;
+        }
+        if (profile_frame != 0U) {
+            ImGui::SameLine();
+            if (ImGui::Button("Back to average")) {
+                profile_frame = 0U;
+                profile_dirty = true;
+            }
+            note_item("profiler:average");
+        }
+
+        if (report == nullptr) {
+            ImGui::TextDisabled("The profiler is not available in this session.");
+            return;
+        }
+        if (profile_auto_paused && profile_paused)
+            ImGui::TextColored(editor_color(palette.text_dim),
+                               "Paused when the game stopped, keeping its frames. Running the game "
+                               "again resumes recording.");
+
+        const auto frames = number_or(*report, "frames", 0.0);
+        const auto average = number_or(*report, "average_ms", 0.0);
+        const auto cpu = number_or(*report, "cpu_ms", 0.0);
+        const auto wait = number_or(*report, "wait_ms", 0.0);
+        const auto gpu = profile_gpu_ms(*report);
+        if (frames > 0.0) {
+            ImGui::PushFont(fonts.heading, fonts.heading_size);
+            if (profile_frame != 0U)
+                ImGui::Text("Frame %llu  ·  %s", static_cast<unsigned long long>(profile_frame),
+                            profile_ms(average).c_str());
+            else
+                ImGui::Text("%.0f FPS  ·  %s", number_or(*report, "fps", 0.0), profile_ms(average).c_str());
+            ImGui::PopFont();
+            if (profile_frame == 0U)
+                ImGui::TextColored(editor_color(palette.text_dim), "p95 %s  ·  max %s  ·  %.0f frames",
+                                   profile_ms(number_or(*report, "p95_ms", 0.0)).c_str(),
+                                   profile_ms(number_or(*report, "maximum_ms", 0.0)).c_str(), frames);
+            ImGui::TextColored(editor_color(palette.text_dim), "CPU busy %s  ·  GPU %s  ·  waiting %s",
+                               profile_ms(cpu).c_str(), gpu >= 0.0 ? profile_ms(gpu).c_str() : "n/a",
+                               profile_ms(wait).c_str());
+            draw_profile_verdict(*report, average, cpu, gpu);
+        } else if (profile_game_only) {
+            ImGui::TextColored(editor_color(palette.text_dim),
+                               "No game frames recorded. Run the game (F5) to profile it, or clear "
+                               "\"Game frames only\" to see editor frames.");
+        } else {
+            ImGui::TextColored(editor_color(palette.text_dim), "No frames recorded yet.");
+        }
+        const float height = fill ? std::clamp(ImGui::GetContentRegionAvail().y, 64.0F * ui_scale,
+                                               220.0F * ui_scale)
+                                  : 84.0F * ui_scale;
+        draw_profile_graph(*report, height);
+    }
+
+    void draw_profile_details(const JsonValue::Object* const report) {
+        if (report == nullptr || number_or(*report, "frames", 0.0) <= 0.0) return;
+        const auto average = number_or(*report, "average_ms", 0.0);
+        if (!ImGui::BeginTabBar("##profiler_tabs")) return;
+        if (ImGui::BeginTabItem("Hotspots")) {
+            draw_profile_hotspots(*report, average);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Call tree")) {
+            draw_profile_tree(*report, average);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("GPU passes")) {
+            draw_profile_gpu(*report, profile_gpu_ms(*report));
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    void draw_profile_verdict(const JsonValue::Object& report, const double average,
+                              const double cpu, const double gpu) {
+        const auto& palette = editor_palette();
+        const auto bottleneck = string_or(report, "bottleneck");
+        std::string text;
+        ImU32 colour = palette.text;
+        if (bottleneck == "gpu") {
+            std::string pass;
+            double pass_ms = -1.0;
+            if (const auto* passes = field(report, "gpu_passes"); passes && passes->array())
+                for (const auto& item : *passes->array())
+                    if (const auto* entry = item.object(); entry && number_or(*entry, "average_ms", 0.0) > pass_ms) {
+                        pass_ms = number_or(*entry, "average_ms", 0.0);
+                        pass = string_or(*entry, "name");
+                    }
+            text = "GPU bound: the GPU needs " + profile_ms(gpu) + " of each " + profile_ms(average) + " frame.";
+            if (!pass.empty()) text += " Most expensive pass: " + pass + " (" + profile_ms(pass_ms) + ").";
+            colour = palette.warning;
+        } else if (bottleneck == "cpu") {
+            std::string hotspot;
+            double hotspot_ms = 0.0;
+            if (const auto* hotspots = field(report, "hotspots"); hotspots && hotspots->array())
+                for (const auto& item : *hotspots->array())
+                    if (const auto* entry = item.object(); entry && string_or(*entry, "kind") == "work") {
+                        hotspot = string_or(*entry, "name");
+                        hotspot_ms = number_or(*entry, "self_ms", 0.0);
+                        break;
+                    }
+            text = "CPU bound: the CPU works " + profile_ms(cpu) + " of each " + profile_ms(average) + " frame.";
+            if (!hotspot.empty()) text += " Biggest hotspot: " + hotspot + " (" + profile_ms(hotspot_ms) + ").";
+            colour = palette.warning;
+        } else {
+            // Name the wait that fills the frame: vsync shows as Present or Acquire, the editor's
+            // 250 FPS cap as Frame pacing and the game's limit as Frame rate limit.
+            std::string waiting = "the display";
+            if (const auto* hotspots = field(report, "hotspots"); hotspots && hotspots->array())
+                for (const auto& item : *hotspots->array())
+                    if (const auto* entry = item.object(); entry && string_or(*entry, "kind") == "wait") {
+                        waiting = string_or(*entry, "name");
+                        break;
+                    }
+            text = "Not limited by the CPU (" + profile_ms(cpu) + ") or GPU (" +
+                   (gpu >= 0.0 ? profile_ms(gpu) : std::string("n/a")) +
+                   "): both finish early and the rest of the frame waits in " + waiting + ".";
+            colour = palette.success;
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, colour);
+        ImGui::TextWrapped("%s", text.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    // Recent frame times as bars, with 60 and 30 FPS guides. Clicking a bar inspects that frame.
+    void draw_profile_graph(const JsonValue::Object& report, const float height) {
+        const auto& palette = editor_palette();
+        const auto* history = field(report, "history");
+        if (!history || !history->array() || history->array()->empty()) return;
+        const auto& samples = *history->array();
+        const float width = std::max(ImGui::GetContentRegionAvail().x, 1.0F);
+        const auto origin = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##profile_graph", ImVec2(width, height));
+        note_item("profiler:graph");
+        const bool hovered = ImGui::IsItemHovered();
+        auto* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), palette.input);
+        double peak = 0.0;
+        for (const auto& sample : samples)
+            if (const auto* entry = sample.object()) peak = std::max(peak, number_or(*entry, "ms", 0.0));
+        const auto scale = static_cast<float>(std::clamp(peak * 1.15, 36.0, 250.0));
+        const auto y_for = [&](const double milliseconds) {
+            return origin.y + height - height * std::min(1.0F, static_cast<float>(milliseconds) / scale);
+        };
+        const auto slots = static_cast<float>(std::max<std::size_t>(samples.size(), profile_history));
+        const float bar = width / slots;
+        const float first = origin.x + width - bar * static_cast<float>(samples.size());
+        const auto mouse = ImGui::GetIO().MousePos;
+        std::optional<std::size_t> hovered_index;
+        for (std::size_t index = 0; index < samples.size(); ++index) {
+            const auto* entry = samples[index].object();
+            if (!entry) continue;
+            const auto milliseconds = number_or(*entry, "ms", 0.0);
+            const auto frame = static_cast<std::uint64_t>(number_or(*entry, "frame", 0.0));
+            const bool game = boolean_or(*entry, "game", false);
+            const float left = first + bar * static_cast<float>(index);
+            const float right = left + std::max(bar - 1.0F, 1.0F);
+            const bool over = hovered && mouse.x >= left && mouse.x < left + bar;
+            if (over) hovered_index = index;
+            ImU32 colour = milliseconds > 33.4   ? palette.danger
+                           : milliseconds > 16.8 ? palette.warning
+                           : game               ? palette.accent_hovered
+                                                : palette.surface_active;
+            if (profile_game_only && !game) colour = palette.surface_hovered;
+            if (frame == profile_frame || over) colour = palette.text;
+            draw->AddRectFilled(ImVec2(left, y_for(milliseconds)), ImVec2(right, origin.y + height), colour);
+            if (const auto* gpu = field(*entry, "gpu_ms"); gpu && gpu->number()) {
+                const float y = y_for(*gpu->number());
+                draw->AddLine(ImVec2(left, y), ImVec2(right, y), palette.success);
+            }
+        }
+        for (const auto [milliseconds, label] : {std::pair{1000.0 / 60.0, "60 FPS"}, std::pair{1000.0 / 30.0, "30 FPS"}}) {
+            if (milliseconds > scale) continue;
+            const float y = y_for(milliseconds);
+            draw->AddLine(ImVec2(origin.x, y), ImVec2(origin.x + width, y), palette.text_faint);
+            draw->AddText(ImVec2(origin.x + 4.0F * ui_scale, y - ImGui::GetTextLineHeight()),
+                          palette.text_faint, label);
+        }
+        if (hovered_index) {
+            const auto& entry = *samples[*hovered_index].object();
+            const auto* gpu = field(entry, "gpu_ms");
+            ImGui::SetTooltip("Frame %llu%s\n%s%s%s\nClick to inspect this frame. The green line is GPU time.",
+                              static_cast<unsigned long long>(number_or(entry, "frame", 0.0)),
+                              boolean_or(entry, "game", false) ? " (game)" : " (editor)",
+                              profile_ms(number_or(entry, "ms", 0.0)).c_str(),
+                              gpu && gpu->number() ? ", GPU " : "",
+                              gpu && gpu->number() ? profile_ms(*gpu->number()).c_str() : "");
+            if (ImGui::IsItemClicked()) {
+                profile_frame = static_cast<std::uint64_t>(number_or(entry, "frame", 0.0));
+                // Keep the frame from leaving the recording while it is inspected.
+                if (!profile_paused) set_profiler_paused(true);
+                profile_dirty = true;
+            }
+        }
+    }
+
+    void draw_profile_hotspots(const JsonValue::Object& report, const double average) {
+        const auto& palette = editor_palette();
+        const auto* hotspots = field(report, "hotspots");
+        if (!hotspots || !hotspots->array()) return;
+        constexpr auto flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                               ImGuiTableFlags_SizingStretchProp;
+        if (!ImGui::BeginTable("##profile_hotspots", 5, flags, profile_table_size())) return;
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Scope", ImGuiTableColumnFlags_WidthStretch, 3.0F);
+        ImGui::TableSetupColumn("Self", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+        ImGui::TableSetupColumn("Share of frame", ImGuiTableColumnFlags_WidthStretch, 2.0F);
+        ImGui::TableSetupColumn("Total", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+        ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthStretch, 0.8F);
+        ImGui::TableHeadersRow();
+        for (const auto& item : *hotspots->array()) {
+            const auto* entry = item.object();
+            if (!entry) continue;
+            const auto self = number_or(*entry, "self_ms", 0.0);
+            if (self < 0.005) continue;
+            const bool waiting = string_or(*entry, "kind") == "wait";
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            const auto name = string_or(*entry, "name");
+            if (waiting) ImGui::TextColored(editor_color(palette.text_dim), "%s (waiting)", name.c_str());
+            else ImGui::TextUnformatted(name.c_str());
+            note_item("profiler:hotspot:" + name);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(profile_ms(self).c_str());
+            ImGui::TableNextColumn();
+            share_bar(self, average, waiting ? palette.surface_active : palette.accent_hovered);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(profile_ms(number_or(*entry, "total_ms", 0.0)).c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%.3g", number_or(*entry, "calls", 0.0));
+        }
+        ImGui::EndTable();
+    }
+
+    void draw_profile_tree(const JsonValue::Object& report, const double average) {
+        const auto& palette = editor_palette();
+        const auto* scopes_value = field(report, "scopes");
+        if (!scopes_value || !scopes_value->array() || scopes_value->array()->empty()) return;
+        const auto& scopes = *scopes_value->array();
+        constexpr auto flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                               ImGuiTableFlags_SizingStretchProp;
+        if (!ImGui::BeginTable("##profile_tree", 6, flags, profile_table_size())) return;
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Scope", ImGuiTableColumnFlags_WidthStretch, 3.2F);
+        ImGui::TableSetupColumn("Total", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+        ImGui::TableSetupColumn("Self", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+        ImGui::TableSetupColumn("Share of frame", ImGuiTableColumnFlags_WidthStretch, 1.8F);
+        ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthStretch, 0.7F);
+        ImGui::TableSetupColumn("Max", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+        ImGui::TableHeadersRow();
+        // Scopes arrive depth first with parent indices; a scope's children follow it directly.
+        const auto parent_of = [&](const std::size_t index) {
+            const auto* entry = scopes[index].object();
+            return entry ? static_cast<std::int64_t>(number_or(*entry, "parent", -1.0)) : -2;
+        };
+        const auto draw_scope = [&](auto&& self, const std::size_t index) -> void {
+            const auto* entry = scopes[index].object();
+            if (!entry) return;
+            const bool has_children = index + 1U < scopes.size() &&
+                                      parent_of(index + 1U) == static_cast<std::int64_t>(index);
+            const bool waiting = string_or(*entry, "kind") == "wait";
+            const auto depth = number_or(*entry, "depth", 0.0);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGuiTreeNodeFlags node_flags = ImGuiTreeNodeFlags_SpanFullWidth;
+            if (!has_children) node_flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+            if (depth < 2.0) node_flags |= ImGuiTreeNodeFlags_DefaultOpen;
+            if (waiting) ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+            const auto name = string_or(*entry, "name");
+            const bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<std::uintptr_t>(index + 1U)),
+                                                node_flags, "%s", name.c_str());
+            if (waiting) ImGui::PopStyleColor();
+            const auto total = number_or(*entry, "total_ms", 0.0);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(profile_ms(total).c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(profile_ms(number_or(*entry, "self_ms", 0.0)).c_str());
+            ImGui::TableNextColumn();
+            share_bar(total, average, waiting ? palette.surface_active : palette.accent_hovered);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.3g", number_or(*entry, "calls", 0.0));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(profile_ms(number_or(*entry, "max_ms", 0.0)).c_str());
+            if (!has_children || !open) return;
+            for (std::size_t child = index + 1U; child < scopes.size(); ++child) {
+                const auto* child_entry = scopes[child].object();
+                if (!child_entry || number_or(*child_entry, "depth", 0.0) <= depth) break;
+                if (parent_of(child) == static_cast<std::int64_t>(index)) self(self, child);
+            }
+            ImGui::TreePop();
+        };
+        draw_scope(draw_scope, 0U);
+        ImGui::EndTable();
+    }
+
+    void draw_profile_gpu(const JsonValue::Object& report, const double gpu) {
+        const auto& palette = editor_palette();
+        const auto* passes = field(report, "gpu_passes");
+        if (!passes || !passes->array() || passes->array()->empty() || gpu < 0.0) {
+            ImGui::TextColored(editor_color(palette.text_dim),
+                               "No GPU timings for these frames. They need a device with timestamp "
+                               "queries and arrive two frames after a frame is drawn.");
+            return;
+        }
+        constexpr auto flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                               ImGuiTableFlags_SizingStretchProp;
+        if (!ImGui::BeginTable("##profile_gpu", 4, flags, profile_table_size())) return;
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Pass", ImGuiTableColumnFlags_WidthStretch, 3.0F);
+        ImGui::TableSetupColumn("Average", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+        ImGui::TableSetupColumn("Share of GPU time", ImGuiTableColumnFlags_WidthStretch, 2.0F);
+        ImGui::TableSetupColumn("Max", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+        ImGui::TableHeadersRow();
+        for (const auto& item : *passes->array()) {
+            const auto* entry = item.object();
+            if (!entry) continue;
+            const auto milliseconds = number_or(*entry, "average_ms", 0.0);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(string_or(*entry, "name").c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(profile_ms(milliseconds).c_str());
+            ImGui::TableNextColumn();
+            share_bar(milliseconds, gpu, palette.accent_hovered);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(profile_ms(number_or(*entry, "max_ms", 0.0)).c_str());
+        }
+        ImGui::EndTable();
+    }
+
     void draw_diagnostics() {
         const auto& palette = editor_palette();
         if (!status_message.empty()) {
@@ -6466,9 +7019,8 @@ void EditorUi::process_actions() {
 }
 
 void EditorUi::set_panel_visible(const std::string_view name, const bool visible) {
-    constexpr std::array<std::string_view, 9> names{"Hierarchy", "Inspector", "Assets", "History", "Diagnostics", "Viewport", "Timeline", "Project", "Agent"};
-    for (std::size_t i = 0; i < names.size(); ++i)
-        if (names[i] == name) impl_->panel_open[i] = visible;
+    for (std::size_t i = 0; i < panel_names.size(); ++i)
+        if (panel_names[i] == name) impl_->panel_open[i] = visible;
 }
 
 void EditorUi::set_file_browser_handler(FileBrowserHandler handler) {
@@ -6476,9 +7028,8 @@ void EditorUi::set_file_browser_handler(FileBrowserHandler handler) {
 }
 
 bool EditorUi::panel_visible(const std::string_view name) const {
-    constexpr std::array<std::string_view, 9> names{"Hierarchy", "Inspector", "Assets", "History", "Diagnostics", "Viewport", "Timeline", "Project", "Agent"};
-    for (std::size_t i = 0; i < names.size(); ++i)
-        if (names[i] == name) return impl_->panel_open[i];
+    for (std::size_t i = 0; i < panel_names.size(); ++i)
+        if (panel_names[i] == name) return impl_->panel_open[i];
     return false;
 }
 
@@ -6800,6 +7351,16 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
             ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - size.x - 16 * impl_->ui_scale, viewport->WorkPos.y + 16 * impl_->ui_scale));
         }
         if (panel("Agent", 8)) impl_->draw_agent();
+        ImGui::End();
+    }
+    impl_->update_profiler_session();
+    if (impl_->panel_open[9]) {
+        // Layouts saved before the profiler existed have no place for it; it joins Diagnostics.
+        if (!ImGui::FindWindowSettingsByID(ImHashStr("Profiler")))
+            if (const auto* diagnostics = ImGui::FindWindowByName("Diagnostics");
+                diagnostics && diagnostics->DockId)
+                ImGui::SetNextWindowDockID(diagnostics->DockId, ImGuiCond_FirstUseEver);
+        if (panel("Profiler", 9)) impl_->draw_profiler();
         ImGui::End();
     }
     impl_->draw_dialogs();

@@ -35,9 +35,12 @@ in control of the same project.
   FidelityFX Brixelizer GI, and smooth surfaces show hardware ray traced reflections denoised with
   FidelityFX. Both are per-project settings and fall back to the analytic sky light on GPUs that
   cannot run them.
-- **One typed API** — 129 versioned native methods cover scene editing, rendering, projects,
+- **One typed API** — 131 versioned native methods cover scene editing, rendering, projects,
   observability, capture, and session authorization. A generated MCP bridge exposes the supported
   model-facing subset.
+- **Frame profiler** — a Profiler panel shows what limits the frame rate: whether the CPU, the
+  GPU or the display holds the frame back, the most expensive CPU scopes (down to each script
+  behaviour), a call tree, and per-pass GPU timings. Agents read the same data.
 - **Deterministic core** — fixed-step simulation, transactional undo/redo, strict scene validation,
   and a CPU renderer used as a headless test oracle.
 - **Editor and game modes** — the editor does not advance simulation. **Run Game** starts a
@@ -137,12 +140,24 @@ surroundings and rough surfaces reflect them softly. **Ray traced reflections** 
 rays for smooth surfaces and denoise them with FidelityFX. Both are on by default and are saved
 in the project file under `settings.graphics`. The page says whether each effect is running; on a
 GPU without the Vulkan features they need (ray queries for reflections), Relay keeps the analytic
-sky light. Agents use `graphics.settings` and `graphics.set_settings`.
+sky light. **Vsync** (off by default) shows frames in step with the display; off, frames appear as
+soon as they are ready, which is faster but can tear. **Frame rate limit** caps frames per second
+while the game runs; pick a preset or type a value, and 0 (**Unlimited**) removes the cap. The editor itself draws at most 250
+frames per second. Agents use `graphics.settings` and `graphics.set_settings`.
 
 Use **Run Game** (F5) from the toolbar or Run menu to test the current scene, and **Stop Game**
 (F8) to end it; both keys work while the game has input. The game viewport uses the
-active scene camera. Scene edits and saves are unavailable during the run; **Stop Game** restores
+active scene camera. The game logic runs at a fixed 60 steps per second; frames drawn between
+steps blend the last two, so motion stays smooth on high refresh rate displays. Scene edits and
+saves are unavailable during the run; **Stop Game** restores
 the scene as it was when the run began. Pause and frame step control the running game only.
+To see what slows the game down, open **Tools → Profiler** (also under **View**) and run the game.
+The panel names the bottleneck (CPU, GPU, or waiting on the display) and graphs recent frame
+times; click a bar to inspect a single frame. **Hotspots** ranks CPU work by self time, **Call
+tree** shows where each millisecond goes (simulation, each script behaviour, physics, rendering,
+editor UI, and waits), and **GPU passes** times shadows, the G-buffer, global illumination,
+reflections and the rest on the GPU. Stopping the game pauses the profiler so its frames stay
+available. Agents use `profiler.read` and `profiler.set`.
 Select an entity and open **Collider** in the Inspector to add a box, sphere, capsule, convex hull,
 or triangle mesh. Convex and mesh colliders use the entity's renderer mesh unless you choose a
 separate collision mesh; the other shapes are independent of the visible mesh. Its layer and mask determine which other colliders it can overlap; raycasts can also

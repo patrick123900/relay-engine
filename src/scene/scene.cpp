@@ -417,15 +417,20 @@ bool Scene::set_transform_animation(const Entity entity,
 
 Transform sample_transform_animation(const TransformAnimation& animation,
                                      const Transform& fallback) {
+    return sample_transform_animation(animation, fallback, animation.time_seconds);
+}
+
+Transform sample_transform_animation(const TransformAnimation& animation,
+                                     const Transform& fallback, const double time_seconds) {
     if (animation.keys.empty()) return fallback;
     const auto& keys = animation.keys;
-    const auto upper = std::upper_bound(keys.begin(), keys.end(), animation.time_seconds,
+    const auto upper = std::upper_bound(keys.begin(), keys.end(), time_seconds,
         [](const double time, const TransformKeyframe& key) { return time < key.time_seconds; });
     if (upper == keys.begin()) return keys.front().value;
     if (upper == keys.end()) return keys.back().value;
     const auto& right = *upper;
     const auto& left = *(upper - 1);
-    const auto t = (animation.time_seconds - left.time_seconds) /
+    const auto t = (time_seconds - left.time_seconds) /
                    (right.time_seconds - left.time_seconds);
     const auto interpolate = [t](const Vec3& a, const Vec3& b) {
         return Vec3{a.x + (b.x - a.x) * t,

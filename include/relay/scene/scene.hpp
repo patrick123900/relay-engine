@@ -295,5 +295,8 @@ private:
 
 [[nodiscard]] Transform sample_transform_animation(const TransformAnimation& animation,
                                                    const Transform& fallback);
+// The same at an explicit time, such as one blended between two game steps for display.
+[[nodiscard]] Transform sample_transform_animation(const TransformAnimation& animation,
+                                                  const Transform& fallback, double time_seconds);
 
 } // namespace relay

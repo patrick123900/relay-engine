@@ -476,6 +476,44 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "profiler_read",
+    {
+      title: "Read frame profile",
+      description: "Find what limits the frame rate of the live editor or running game. Aggregates recent profiled frames into frame-time statistics, a CPU/GPU/display bottleneck verdict, a call tree of timed CPU scopes (simulation, scripts per behaviour, physics, rendering, editor UI and waits), hotspots by self time and per-pass GPU timings. Only a live editor records frames.",
+      inputSchema: z.object({
+        "frames": z.number().int().min(1).max(1200).default(120).describe("Most recent frames to aggregate"),
+        "frame": z.number().int().min(0).default(0).describe("Report one profiled frame by index instead; 0 aggregates"),
+        "gameOnly": z.boolean().default(false).describe("Aggregate only frames recorded while the game was running"),
+        "history": z.number().int().min(0).max(1200).default(0).describe("Recent frame times to include, oldest first")
+      }),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["profiler_read"];
+        if (override) return override(input as JsonObject);
+        return invoke("profiler.read", {"frames": input["frames"], "frame": input["frame"], "game_only": input["gameOnly"], "history": input["history"]});
+      },
+  );
+
+  server.registerTool(
+    "profiler_set",
+    {
+      title: "Pause frame profiler",
+      description: "Pause the frame profiler to keep its recorded frames for inspection, or resume recording. Clearing discards recorded frames.",
+      inputSchema: z.object({
+        "paused": z.boolean().optional().describe("Stop or resume recording new frames"),
+        "clear": z.boolean().default(false).describe("Discard all recorded frames")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false,idempotentHint:true},
+    },
+    async (input) => {
+        const override = overrides["profiler_set"];
+        if (override) return override(input as JsonObject);
+        return invoke("profiler.set", {"paused": input["paused"], "clear": input["clear"]});
+      },
+  );
+
+  server.registerTool(
     "input_recent",
     {
       title: "Read recent Relay input",
@@ -494,7 +532,7 @@ export function registerGeneratedTools(
     "graphics_settings",
     {
       title: "Read graphics settings",
-      description: "Read the project's graphics settings (settings.graphics in the .relayproject): global illumination and ray traced reflections, with the defaults. When a live renderer is attached, also reports whether each effect is supported and running on this GPU and why not.",
+      description: "Read the project's graphics settings (settings.graphics in the .relayproject): global illumination, ray traced reflections, vsync and the game's frame rate limit, with the defaults. When a live renderer is attached, also reports whether each effect is supported and running on this GPU and why not, and the presentation mode in use.",
       inputSchema: z.object({}),
       annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
     },
@@ -509,17 +547,19 @@ export function registerGeneratedTools(
     "graphics_set_settings",
     {
       title: "Change graphics settings",
-      description: "Turn global illumination or ray traced reflections on or off and save the choice in the open project. Omitted settings keep their current values. Effects the GPU cannot run stay off and are reported by graphics.settings.",
+      description: "Turn global illumination, ray traced reflections or vsync on or off, or set the frame rate limit used while the game runs, and save the choice in the open project. Omitted settings keep their current values. Effects the GPU cannot run stay off and are reported by graphics.settings.",
       inputSchema: z.object({
         "global_illumination": z.boolean().optional().describe("FidelityFX Brixelizer global illumination"),
-        "reflections": z.boolean().optional().describe("Hardware ray traced reflections")
+        "reflections": z.boolean().optional().describe("Hardware ray traced reflections"),
+        "frame_rate_limit": z.number().int().min(0).max(1000).optional().describe("Maximum frames per second during Run Game; 0 is unlimited"),
+        "vsync": z.boolean().optional().describe("Present in step with the display; off can tear but is faster")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
     },
     async (input) => {
         const override = overrides["graphics_set_settings"];
         if (override) return override(input as JsonObject);
-        return invoke("graphics.set_settings", {"global_illumination": input["global_illumination"], "reflections": input["reflections"]});
+        return invoke("graphics.set_settings", {"global_illumination": input["global_illumination"], "reflections": input["reflections"], "frame_rate_limit": input["frame_rate_limit"], "vsync": input["vsync"]});
       },
   );
 

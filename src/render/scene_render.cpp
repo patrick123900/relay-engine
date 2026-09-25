@@ -95,6 +95,96 @@ RenderMatrix rotation_z(const float radians) {
     return result;
 }
 
+using Quaternion = std::array<double, 4>; // x, y, z, w
+
+Quaternion multiply_quaternions(const Quaternion& a, const Quaternion& b) {
+    return {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+            a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+            a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+            a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
+}
+
+// The rotation local_matrix builds from Euler degrees: Z, then Y, then X.
+Quaternion quaternion_from_euler(const Vec3& degrees) {
+    const auto axis = [](const double angle, const std::size_t index) {
+        Quaternion result{0.0, 0.0, 0.0, std::cos(angle * 0.5)};
+        result[index] = std::sin(angle * 0.5);
+        return result;
+    };
+    constexpr double to_radians = 3.14159265358979323846 / 180.0;
+    return multiply_quaternions(axis(degrees.z * to_radians, 2U),
+                                multiply_quaternions(axis(degrees.y * to_radians, 1U),
+                                                     axis(degrees.x * to_radians, 0U)));
+}
+
+RenderMatrix rotation_from_quaternion(const Quaternion& q) {
+    const auto [x, y, z, w] = q;
+    auto rotation = identity();
+    rotation.values[0] = static_cast<float>(1 - 2 * (y * y + z * z));
+    rotation.values[1] = static_cast<float>(2 * (x * y + w * z));
+    rotation.values[2] = static_cast<float>(2 * (x * z - w * y));
+    rotation.values[4] = static_cast<float>(2 * (x * y - w * z));
+    rotation.values[5] = static_cast<float>(1 - 2 * (x * x + z * z));
+    rotation.values[6] = static_cast<float>(2 * (y * z + w * x));
+    rotation.values[8] = static_cast<float>(2 * (x * z + w * y));
+    rotation.values[9] = static_cast<float>(2 * (y * z - w * x));
+    rotation.values[10] = static_cast<float>(1 - 2 * (x * x + y * y));
+    return rotation;
+}
+
+// Spherical interpolation along the shorter arc, so a heading crossing 180 degrees turns the
+// short way rather than spinning around.
+Quaternion slerp(const Quaternion& from, Quaternion to, const double t) {
+    double dot = 0.0;
+    for (std::size_t k = 0; k < 4U; ++k) dot += from[k] * to[k];
+    if (dot < 0.0) {
+        for (auto& value : to) value = -value;
+        dot = -dot;
+    }
+    double a = 1.0 - t, b = t;
+    if (dot < 0.9995) {
+        const double angle = std::acos(std::clamp(dot, -1.0, 1.0));
+        a = std::sin((1.0 - t) * angle) / std::sin(angle);
+        b = std::sin(t * angle) / std::sin(angle);
+    }
+    Quaternion result{};
+    double length = 0.0;
+    for (std::size_t k = 0; k < 4U; ++k) {
+        result[k] = a * from[k] + b * to[k];
+        length += result[k] * result[k];
+    }
+    length = std::sqrt(length);
+    for (auto& value : result) value /= length;
+    return result;
+}
+
+Vec3 lerp(const Vec3& a, const Vec3& b, const double t) {
+    return {a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t};
+}
+
+// Playback time between two steps. A looping clip that wrapped during the step continues
+// forward past its end instead of running backwards through the whole clip.
+double blended_time(const double previous, const double current, const double duration,
+                    const bool loop, const double t) {
+    double delta = current - previous;
+    if (loop && duration > 0.0 && std::abs(delta) > duration * 0.5)
+        delta -= std::copysign(duration, delta);
+    const double time = previous + delta * t;
+    if (!loop || duration <= 0.0) return time;
+    const double wrapped = std::fmod(time, duration);
+    return wrapped < 0.0 ? wrapped + duration : wrapped;
+}
+
+RenderMatrix local_matrix(const Transform& transform);
+
+RenderMatrix blended_local(const Transform& previous, const Transform& current, const double t) {
+    const auto rotation = rotation_from_quaternion(
+        slerp(quaternion_from_euler(previous.rotation_degrees),
+              quaternion_from_euler(current.rotation_degrees), t));
+    return multiply(translation(lerp(previous.position, current.position, t)),
+                    multiply(rotation, scaling(lerp(previous.scale, current.scale, t))));
+}
+
 RenderMatrix local_matrix(const Transform& transform) {
     const auto radians = [](const double degrees) {
         return static_cast<float>(degrees) * pi / 180.0F;
@@ -278,18 +368,8 @@ RenderMatrix animated_local(const Transform& base, const NodeTrack& track, doubl
     if (length < 1e-12) return local_matrix(transform);
     for (auto& v : q)
         v /= length;
-    const auto [x, y, z, w] = q;
-    auto rotation = identity();
-    rotation.values[0] = static_cast<float>(1 - 2 * (y * y + z * z));
-    rotation.values[1] = static_cast<float>(2 * (x * y + w * z));
-    rotation.values[2] = static_cast<float>(2 * (x * z - w * y));
-    rotation.values[4] = static_cast<float>(2 * (x * y - w * z));
-    rotation.values[5] = static_cast<float>(1 - 2 * (x * x + z * z));
-    rotation.values[6] = static_cast<float>(2 * (y * z + w * x));
-    rotation.values[8] = static_cast<float>(2 * (x * z + w * y));
-    rotation.values[9] = static_cast<float>(2 * (y * z - w * x));
-    rotation.values[10] = static_cast<float>(1 - 2 * (x * x + y * y));
-    return multiply(translation(transform.position), multiply(rotation, scaling(transform.scale)));
+    return multiply(translation(transform.position),
+                    multiply(rotation_from_quaternion(q), scaling(transform.scale)));
 }
 
 Vec3 transform_point(const RenderMatrix& m, Vec3 p, bool direction = false) {
@@ -360,15 +440,20 @@ RenderMatrix look_at_world(const Vec3& eye, const Vec3& target) {
 // queries all go through this, so they cannot disagree about where an entity actually is.
 class WorldResolver {
   public:
-    WorldResolver(const Scene& scene, const AssetRegistry& assets)
-        : scene_(scene), assets_(assets) {}
+    WorldResolver(const Scene& scene, const AssetRegistry& assets,
+                  const RenderInterpolation* interpolation = nullptr)
+        : scene_(scene), assets_(assets), interpolation_(interpolation) {}
 
     RenderMatrix world(const Entity entity) {
         if (const auto found = cache_.find(entity.packed()); found != cache_.end()) {
             return found->second;
         }
         const auto* record = scene_.get(entity);
-        auto result = record == nullptr ? identity() : local_matrix(record->transform);
+        const auto* previous = previous_state(entity);
+        auto result = record == nullptr ? identity()
+                      : previous != nullptr && previous->transform != record->transform
+                          ? blended_local(previous->transform, record->transform, interpolation_->alpha)
+                          : local_matrix(record->transform);
         if (record != nullptr && record->model_node) {
             const auto [clip, time] = clip_for(*record->model_node);
             if (clip != nullptr) {
@@ -382,8 +467,13 @@ class WorldResolver {
         }
         if (record != nullptr && record->transform_animation &&
             !record->transform_animation->keys.empty()) {
-            result = local_matrix(sample_transform_animation(*record->transform_animation,
-                                                             record->transform));
+            const auto& animation = *record->transform_animation;
+            const auto time = previous != nullptr && previous->has_animation
+                                  ? blended_time(previous->animation_time, animation.time_seconds,
+                                                 animation.duration_seconds, animation.loop,
+                                                 interpolation_->alpha)
+                                  : animation.time_seconds;
+            result = local_matrix(sample_transform_animation(animation, record->transform, time));
         }
         if (record != nullptr && record->parent.valid()) {
             result = multiply(world(record->parent), result);
@@ -399,12 +489,23 @@ class WorldResolver {
         const auto& animator = *root->animator;
         const auto* model = assets_.find_model(animator.model);
         if (model == nullptr || animator.clip >= model->clips.size()) return {nullptr, 0.0};
-        return {&model->clips[animator.clip], animator.time_seconds};
+        const auto& clip = model->clips[animator.clip];
+        const auto* previous = previous_state(binding.root);
+        if (previous == nullptr || !previous->has_animator) return {&clip, animator.time_seconds};
+        return {&clip, blended_time(previous->animator_time, animator.time_seconds,
+                                    clip.duration_seconds, animator.loop, interpolation_->alpha)};
     }
 
   private:
+    [[nodiscard]] const RenderInterpolation::Previous* previous_state(const Entity entity) const {
+        if (interpolation_ == nullptr) return nullptr;
+        const auto found = interpolation_->previous.find(entity.packed());
+        return found == interpolation_->previous.end() ? nullptr : &found->second;
+    }
+
     const Scene& scene_;
     const AssetRegistry& assets_;
+    const RenderInterpolation* interpolation_;
     std::unordered_map<std::uint64_t, RenderMatrix> cache_;
 };
 
@@ -524,9 +625,28 @@ SceneBounds compute_scene_bounds(const Scene& scene, const AssetRegistry& assets
     return result;
 }
 
+void RenderInterpolation::remember(const Scene& scene) {
+    previous.clear();
+    for (const auto entity : scene.entities()) {
+        const auto* record = scene.get(entity);
+        Previous state;
+        state.transform = record->transform;
+        if (record->animator) {
+            state.has_animator = true;
+            state.animator_time = record->animator->time_seconds;
+        }
+        if (record->transform_animation) {
+            state.has_animation = true;
+            state.animation_time = record->transform_animation->time_seconds;
+        }
+        previous.emplace(entity.packed(), state);
+    }
+}
+
 RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
                                const float aspect_ratio, const ViewOverride* const view,
-                               const bool collect_bounds, const bool keep_culled) {
+                               const bool collect_bounds, const bool keep_culled,
+                               const RenderInterpolation* const interpolation) {
     RenderScene output;
     const auto entities = scene.entities();
     std::unordered_map<std::uint64_t, std::unordered_map<std::uint32_t, Entity>> model_nodes;
@@ -534,7 +654,7 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         if (const auto& binding = scene.get(entity)->model_node)
             model_nodes[binding->root.packed()][binding->node] = entity;
     }
-    WorldResolver resolver(scene, assets);
+    WorldResolver resolver(scene, assets, interpolation);
     const auto resolve_world = [&resolver](const Entity entity) { return resolver.world(entity); };
 
     Camera selected_camera;

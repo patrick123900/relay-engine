@@ -9,6 +9,7 @@
 #include "relay/physics/collision.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/render/renderer.hpp"
+#include "relay/render/scene_render.hpp"
 #include "relay/scene/scene.hpp"
 #include "relay/scene/scene_edit.hpp"
 #include "relay/scene/project.hpp"
@@ -104,11 +105,15 @@ public:
     [[nodiscard]] GraphicsSettings graphics_settings() const;
     // Saves graphics settings in the open project. The renderer picks them up on its next frame.
     [[nodiscard]] bool set_graphics_settings(const GraphicsSettings& settings, std::string& error);
+    // The state before the latest game step, blended `alpha` of the way to the current one, for
+    // drawing between steps. Null outside a running, unpaused game or before its first step.
+    [[nodiscard]] const RenderInterpolation* render_interpolation(double alpha);
     // Why the last run_game() refused to start, or empty.
     [[nodiscard]] const std::string& run_game_error() const { return run_game_error_; }
 
 private:
     void advance_one_frame();
+    void advance_animations();
 
     EngineConfig config_;
     SoftwareRenderer renderer_;
@@ -134,6 +139,7 @@ private:
     double elapsed_seconds_{0.0};
     std::string run_game_error_;
     InputState input_;
+    RenderInterpolation interpolation_;
     std::optional<std::filesystem::path> input_root_;
     bool input_loaded_{};
     void sync_input_map();

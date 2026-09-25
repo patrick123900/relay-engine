@@ -1,4 +1,5 @@
 #include "relay/core/engine.hpp"
+#include "relay/observe/profiler.hpp"
 #include <algorithm>
 #include <cmath>
 
@@ -25,7 +26,10 @@ Engine::~Engine() {
 }
 
 void Engine::tick() {
-    scripts_.poll();
+    {
+        RELAY_PROFILE_SCOPE("Script hot reload poll");
+        scripts_.poll();
+    }
     sync_input_map();
     if (running_ && mode_ == RuntimeMode::game && !paused_) {
         advance_one_frame();
@@ -43,6 +47,7 @@ bool Engine::run_game() {
     input_.clear_edges();
     authored_scene_ = scene_.capture_state();
     physics_.reset();
+    interpolation_.previous.clear();
     mode_ = RuntimeMode::game;
     paused_ = false;
     frame_index_ = 0;
@@ -63,6 +68,7 @@ bool Engine::stop_game() {
     physics_.reset();
     authored_scene_.reset();
     mode_ = RuntimeMode::editor;
+    interpolation_.previous.clear();
     paused_ = false;
     frame_index_ = 0;
     elapsed_seconds_ = 0.0;
@@ -253,12 +259,56 @@ bool Engine::set_graphics_settings(const GraphicsSettings& settings, std::string
 
 const AssetRegistry& Engine::assets() const { return assets_; }
 
+const RenderInterpolation* Engine::render_interpolation(const double alpha) {
+    if (mode_ != RuntimeMode::game || paused_ || interpolation_.previous.empty())
+        return nullptr;
+    interpolation_.alpha = std::clamp(alpha, 0.0, 1.0);
+    return &interpolation_;
+}
+
 void Engine::advance_one_frame() {
+    RELAY_PROFILE_SCOPE("Game step");
     const auto start = std::chrono::steady_clock::now();
+    interpolation_.remember(scene_);
     ++frame_index_;
     elapsed_seconds_ += config_.fixed_delta_seconds;
     input_.begin_step();
-    scripts_.update(config_.fixed_delta_seconds);
+    {
+        RELAY_PROFILE_SCOPE("Scripts");
+        scripts_.update(config_.fixed_delta_seconds);
+    }
+    advance_animations();
+    {
+        RELAY_PROFILE_SCOPE("Physics");
+        physics_.step(scene_, config_.fixed_delta_seconds);
+    }
+    {
+        RELAY_PROFILE_SCOPE("Script contact callbacks");
+        scripts_.dispatch_contacts();
+    }
+    // Only records the step; the deterministic CPU frame is drawn when a capture reads it.
+    renderer_.render(frame_index_, elapsed_seconds_);
+    {
+        RELAY_PROFILE_SCOPE("Video recording");
+        if (video_.status().recording && video_.status().source == "vulkan") {
+            if (video_.sample_due()) {
+                std::string error;
+                if (!gpu_source_([this](OwnedFrame frame, std::string failure) {
+                    if (failure.empty()) video_.record_sample(frame.view()); else video_.drop();
+                }, error)) video_.drop();
+            }
+        } else if (video_.sample_due()) {
+            // Checked first, so steps between samples do not draw the CPU frame.
+            video_.record_sample(renderer_.frame());
+        }
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const auto milliseconds = std::chrono::duration<double, std::milli>(end - start).count();
+    performance_.record_cpu(frame_index_, milliseconds, scene_.entities().size());
+}
+
+void Engine::advance_animations() {
+    RELAY_PROFILE_SCOPE("Animation");
     for (const auto entity : scene_.entities()) {
         auto *record = scene_.get(entity);
         if (record->transform_animation && record->transform_animation->playing) {
@@ -298,20 +348,6 @@ void Engine::advance_one_frame() {
             animator.time_seconds = std::clamp(animator.time_seconds, 0.0, duration);
         }
     }
-    physics_.step(scene_, config_.fixed_delta_seconds);
-    scripts_.dispatch_contacts();
-    renderer_.render(frame_index_, elapsed_seconds_);
-    if (video_.status().recording && video_.status().source == "vulkan") {
-        if (video_.sample_due()) {
-            std::string error;
-            if (!gpu_source_([this](OwnedFrame frame, std::string failure) {
-                if (failure.empty()) video_.record_sample(frame.view()); else video_.drop();
-            }, error)) video_.drop();
-        }
-    } else video_.record(renderer_.frame());
-    const auto end = std::chrono::steady_clock::now();
-    const auto milliseconds = std::chrono::duration<double, std::milli>(end - start).count();
-    performance_.record_cpu(frame_index_, milliseconds, scene_.entities().size());
 }
 
 } // namespace relay

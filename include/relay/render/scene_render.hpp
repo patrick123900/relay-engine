@@ -5,6 +5,8 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace relay {
@@ -121,10 +123,30 @@ struct ViewOverride {
     Camera camera{};
 };
 
+// The game state from before the latest fixed step. The game steps at a fixed rate while the
+// display may draw more often; drawing a blend of the previous and current step makes motion
+// smooth at any frame rate, one step behind the simulation at most.
+struct RenderInterpolation {
+    struct Previous {
+        Transform transform;
+        double animator_time{};
+        double animation_time{};
+        bool has_animator{};
+        bool has_animation{};
+    };
+    // How far display time is from the previous step (0) to the current one (1).
+    double alpha{1.0};
+    std::unordered_map<std::uint64_t, Previous> previous;
+
+    // Replaces the previous state with the scene's current one, before a step changes it.
+    void remember(const Scene& scene);
+};
+
 [[nodiscard]] RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
                                              float aspect_ratio,
                                              const ViewOverride* view = nullptr, bool collect_bounds = false,
-                                             bool keep_culled = false);
+                                             bool keep_culled = false,
+                                             const RenderInterpolation* interpolation = nullptr);
 
 struct ScenePick {
     std::string error;

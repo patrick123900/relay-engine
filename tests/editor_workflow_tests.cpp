@@ -757,12 +757,35 @@ void graphics_settings() {
     check(engine.graphics_settings().global_illumination && !engine.graphics_settings().reflections,
           "reopening a project restores its graphics settings");
     request(protocol, "graphics.set_settings", "\"global_illumination\":\"yes\"", false);
+    check(engine.graphics_settings().frame_rate_limit == 0U && !engine.graphics_settings().vsync,
+          "the frame rate is unlimited and vsync is off by default");
+    request(protocol, "graphics.set_settings", "\"vsync\":true");
+    request(protocol, "graphics.set_settings", "\"vsync\":1", false);
+    check(engine.graphics_settings().vsync, "graphics.set_settings turns vsync on");
+    request(protocol, "graphics.set_settings", "\"frame_rate_limit\":144");
+    request(protocol, "graphics.set_settings", "\"frame_rate_limit\":1001", false);
+    request(protocol, "graphics.set_settings", "\"frame_rate_limit\":-1", false);
+    {
+        std::string load_error;
+        const auto saved = relay::load_project("projects/lighting/project.relayproject", load_error);
+        check(engine.graphics_settings().frame_rate_limit == 144U && saved && saved->graphics &&
+                  saved->graphics->frame_rate_limit == 144U &&
+                  saved->graphics->vsync &&
+                  saved->graphics->global_illumination && !saved->graphics->reflections,
+              "the frame rate limit is saved in the project and out-of-range limits are refused");
+    }
 
     std::string error;
     relay::JsonParser parser(R"({"global_illumination":true,"shadows":false})");
     check(!relay::parse_graphics_settings(*parser.parse(), error) &&
               error.find("shadows") != std::string::npos,
           "unknown graphics settings are rejected");
+    for (const auto* text : {R"({"frame_rate_limit":2.5})", R"({"frame_rate_limit":true})"}) {
+        relay::JsonParser limit_parser(text);
+        check(!relay::parse_graphics_settings(*limit_parser.parse(), error) &&
+                  error.find("frame_rate_limit") != std::string::npos,
+              "a fractional or non-numeric frame rate limit is rejected");
+    }
     std::filesystem::create_directories("projects/typo");
     std::ofstream("projects/typo/project.relayproject")
         << R"({"format":"relay.project","version":2,"filename":"projects/typo/project.relayproject",)"

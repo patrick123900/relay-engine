@@ -149,6 +149,7 @@ void EditorLayout::build(const float scale) {
         ImGui::DockBuilderDockWindow("Timeline", bottom);
         ImGui::DockBuilderDockWindow("Project", assets);
         ImGui::DockBuilderDockWindow("Diagnostics", bottom);
+        ImGui::DockBuilderDockWindow("Profiler", bottom);
         ImGui::DockBuilderDockWindow("Viewport", main);
         ImGui::DockBuilderFinish(id);
     }
@@ -157,7 +158,7 @@ void EditorLayout::build(const float scale) {
     if (!optional_migrated_) {
         optional_migrated_ = true;
         if (!preferences_loaded) {
-            for (const auto& pair : {std::pair{"Timeline", "Diagnostics"}, std::pair{"History", "Diagnostics"}, std::pair{"Agent", "Inspector"}, std::pair{"Project", "Assets"}}) {
+            for (const auto& pair : {std::pair{"Timeline", "Diagnostics"}, std::pair{"History", "Diagnostics"}, std::pair{"Agent", "Inspector"}, std::pair{"Project", "Assets"}, std::pair{"Profiler", "Diagnostics"}}) {
                 const auto* optional = ImGui::FindWindowSettingsByID(ImHashStr(pair.first));
                 const auto* anchor = ImGui::FindWindowSettingsByID(ImHashStr(pair.second));
                 if ((!optional || !optional->DockId) && anchor && anchor->DockId)

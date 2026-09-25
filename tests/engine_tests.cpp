@@ -5,6 +5,7 @@
 #include "relay/editor/editor_state.hpp"
 #include "relay/editor/editor_viewport.hpp"
 #include "relay/core/engine.hpp"
+#include "relay/observe/profiler.hpp"
 #include "relay/physics/collision.hpp"
 #include "relay/render/scene_render.hpp"
 #include "relay/render/asset_manifest.hpp"
@@ -292,6 +293,83 @@ int main() {
                "render snapshot carries mesh and material asset identifiers");
     }
     expect(render_snapshot.culled == 0U, "a visible entity is not culled");
+
+    {
+        // Frames drawn between game steps blend the previous and the current step.
+        relay::Scene motion;
+        relay::AssetRegistry assets;
+        const auto mover = motion.create("Mover");
+        (void)motion.set_mesh_renderer(mover, relay::MeshRenderer{"builtin.quad", "builtin.violet"});
+        relay::Transform start;
+        start.position = {0.0, 0.0, -4.0};
+        start.rotation_degrees = {0.0, 170.0, 0.0};
+        (void)motion.set_transform(mover, start);
+        relay::RenderInterpolation interpolation;
+        interpolation.remember(motion);
+        auto end = start;
+        end.position.x = 2.0;
+        end.rotation_degrees.y = -170.0;
+        (void)motion.set_transform(mover, end);
+        const auto model_at = [&](const double alpha) {
+            interpolation.alpha = alpha;
+            return relay::build_render_scene(motion, assets, 1.0F, nullptr, false, true, &interpolation)
+                .instances.front().model.values;
+        };
+        const auto exact = relay::build_render_scene(motion, assets, 1.0F, nullptr, false, true)
+                               .instances.front().model.values;
+        const auto current = model_at(1.0);
+        bool matches = true;
+        for (std::size_t index = 0; index < 16U; ++index)
+            matches = matches && std::abs(current[index] - exact[index]) < 1e-5F;
+        const auto previous = model_at(0.0);
+        const auto halfway = model_at(0.5);
+        expect(matches && std::abs(previous[12]) < 1e-5F &&
+                   std::abs(previous[0] - std::cos(170.0F * 3.14159265F / 180.0F)) < 1e-5F,
+               "render interpolation draws the previous step at 0 and the current step at 1");
+        expect(std::abs(halfway[12] - 1.0F) < 1e-5F && std::abs(halfway[0] + 1.0F) < 1e-4F &&
+                   std::abs(halfway[8]) < 1e-4F,
+               "render interpolation blends position and turns the short way across 180 degrees");
+
+        const auto animated = motion.create("Animated");
+        (void)motion.set_mesh_renderer(animated, relay::MeshRenderer{"builtin.quad", "builtin.violet"});
+        relay::TransformAnimation animation;
+        animation.loop = true;
+        animation.duration_seconds = 1.0;
+        relay::Transform first;
+        first.position.z = -4.0;
+        auto last = first;
+        last.position.x = 10.0;
+        animation.keys = {{0.0, first}, {1.0, last}};
+        animation.time_seconds = 0.8;
+        (void)motion.set_transform_animation(animated, animation);
+        interpolation.remember(motion);
+        animation.time_seconds = 0.1;
+        (void)motion.set_transform_animation(animated, animation);
+        interpolation.alpha = 0.5;
+        const auto blended = relay::build_render_scene(motion, assets, 1.0F, nullptr, false, true,
+                                                       &interpolation);
+        const auto found = std::find_if(blended.instances.begin(), blended.instances.end(),
+                                        [&](const auto& instance) { return instance.entity == animated; });
+        expect(found != blended.instances.end() && std::abs(found->model.values[12] - 9.5F) < 1e-4F,
+               "a looping animation that wrapped during the step blends forward through its end");
+
+        relay::EngineConfig game_config{64, 48, 1.0 / 60.0};
+        game_config.editor_mode = true;
+        relay::Engine game(game_config);
+        expect(game.render_interpolation(0.5) == nullptr, "the editor draws without interpolation");
+        expect(game.run_game() && game.render_interpolation(0.5) == nullptr,
+               "a game draws without interpolation before its first step");
+        (void)game.scene().create("Stepped");
+        game.tick();
+        const auto* live = game.render_interpolation(0.25);
+        expect(live != nullptr && live->alpha == 0.25 && game.render_interpolation(3.0)->alpha == 1.0,
+               "a running game blends its last two steps");
+        game.pause();
+        expect(game.render_interpolation(0.5) == nullptr, "a paused game draws its current step");
+        game.resume();
+        expect(game.stop_game() && game.render_interpolation(0.5) == nullptr,
+               "stopping the game ends interpolation");
+    }
 
     // Frustum culling: an entity behind the camera must be rejected before it reaches a draw call.
     auto behind_transform = render_source.get(rendered_entity)->transform;
@@ -2020,7 +2098,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 39U && relay::protocol_methods().size() == 129U,
+    expect(relay::protocol_schema_version == 42U && relay::protocol_methods().size() == 131U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");
@@ -2314,6 +2392,106 @@ int main() {
     expect(protocol.handle(R"({"id":20,"method":"performance.read"})").find(
                R"("resident_memory_bytes":)") != std::string::npos,
            "protocol exposes structured performance telemetry");
+
+    {
+        // The frame profiler merges repeated scopes by call path, separates waiting from work
+        // and attaches GPU timings to the frame that recorded them.
+        auto& profiler = relay::profiler();
+        profiler.set_paused(false);
+        profiler.clear();
+        const auto work = profiler.intern("Test work");
+        const auto inner = profiler.intern("Test inner");
+        const auto wait = profiler.intern("Test wait", relay::ProfileKind::wait);
+        const auto pass = profiler.intern("Test pass");
+        expect(!profiler.begin_scope(work), "profiler ignores scopes outside a frame");
+        std::uint64_t first_frame = 0;
+        for (std::uint64_t frame = 0; frame < 3U; ++frame) {
+            profiler.begin_frame();
+            if (frame == 0U) first_frame = profiler.current_frame();
+            {
+                const relay::ProfileScope outer(work);
+                for (int call = 0; call < 2; ++call) {
+                    const relay::ProfileScope nested(inner);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            {
+                const relay::ProfileScope blocked(wait);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            engine.step(1);
+            profiler.end_frame(frame, frame > 0U);
+        }
+        expect(profiler.current_frame() == 0U, "profiler reports no frame between frames");
+        {
+            relay::Engine reader;
+            reader.step(2);
+            profiler.set_paused(true);
+            profiler.begin_frame();
+            const auto pixels = reader.frame();
+            profiler.end_frame(0U, false);
+            profiler.set_paused(false);
+            relay::SoftwareRenderer eager(reader.status().width, reader.status().height);
+            eager.render(reader.status().frame_index, reader.status().elapsed_seconds);
+            const auto expected = eager.frame();
+            expect(std::equal(pixels.rgba.begin(), pixels.rgba.end(), expected.rgba.begin(),
+                              expected.rgba.end()),
+                   "the deterministic CPU frame is drawn on demand for the latest step");
+        }
+        profiler.record_gpu(first_frame, {{pass, 30.0}}, 30.0);
+        const auto report = profiler.report({});
+        const auto find = [&](const std::string& name) {
+            return std::find_if(report.scopes.begin(), report.scopes.end(),
+                                [&](const auto& scope) { return scope.name == name; });
+        };
+        expect(report.frames == 3U && !report.scopes.empty() && report.scopes.front().name == "Frame" &&
+                   report.average_ms >= 4.0 && report.minimum_ms <= report.p95_ms &&
+                   report.p95_ms <= report.maximum_ms,
+               "profiler reports frame statistics under a Frame root");
+        const auto nested = find("Test inner");
+        const auto outer = find("Test work");
+        expect(nested != report.scopes.end() && outer != report.scopes.end() &&
+                   nested->calls == 2.0 && nested->total_ms >= 2.0 &&
+                   report.scopes[static_cast<std::size_t>(nested->parent)].name == "Test work" &&
+                   outer->self_ms < outer->total_ms,
+               "profiler merges repeated nested scopes and separates self from total time");
+        const auto step = find("Game step");
+        expect(step != report.scopes.end() && find("Physics") != report.scopes.end() &&
+                   find("Scripts") != report.scopes.end(),
+               "engine game steps record their systems in the profile");
+        expect(find("Software renderer") == report.scopes.end(),
+               "game steps do not draw the deterministic CPU frame while nothing reads it");
+        expect(report.wait_ms >= 2.0 && report.cpu_ms <= report.average_ms &&
+                   std::any_of(report.hotspots.begin(), report.hotspots.end(), [](const auto& hotspot) {
+                       return hotspot.name == "Test wait" && hotspot.kind == relay::ProfileKind::wait;
+                   }),
+               "profiler separates waiting from CPU work");
+        expect(report.gpu_passes.size() == 1U && report.gpu_passes.front().name == "Test pass" &&
+                   std::abs(report.gpu_ms - 30.0) < 1e-9 && report.bottleneck == "gpu",
+               "profiler attaches GPU passes to their frame and names the GPU as the bottleneck");
+        relay::ProfileQuery game_only;
+        game_only.game_only = true;
+        relay::ProfileQuery single;
+        single.frame = first_frame;
+        expect(profiler.report(game_only).frames == 2U && profiler.report(single).frames == 1U,
+               "profiler filters game frames and reports single frames");
+        profiler.set_paused(true);
+        profiler.begin_frame();
+        profiler.end_frame(9U, true);
+        expect(profiler.report({}).frames == 3U, "a paused profiler keeps its frames");
+        const auto read = protocol.handle(R"({"id":22,"method":"profiler.read","history":5})");
+        expect(read.find(R"("bottleneck":"gpu")") != std::string::npos &&
+                   read.find(R"("name":"Test inner")") != std::string::npos &&
+                   read.find(R"("history":[{"frame":)") != std::string::npos &&
+                   read.find(R"("paused":true)") != std::string::npos,
+               "protocol reports the frame profile");
+        expect(protocol.handle(R"({"id":23,"method":"profiler.set","paused":false})")
+                       .find(R"("paused":false)") != std::string::npos &&
+                   !profiler.paused(),
+               "protocol resumes the profiler");
+        (void)protocol.handle(R"({"id":24,"method":"profiler.set","clear":true})");
+        expect(profiler.report({}).frames == 0U, "protocol clears recorded frames");
+    }
 
     const auto trace_start = protocol.handle(
         R"({"id":21,"method":"trace.start","filename":"test.relay-trace.jsonl"})");

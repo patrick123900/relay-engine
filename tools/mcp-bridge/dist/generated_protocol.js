@@ -257,6 +257,73 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             return override(input);
         return invoke("assets.import_model", { "filename": input["filename"], "instantiate": input["instantiate"], "preset": input["preset"] });
     });
+    server.registerTool("asset_browse", {
+        title: "Browse project files",
+        description: "List the folders and files in one project folder, folders first, with each entry's asset kind. Hidden entries, symlinks and .relayproject files are omitted; importable models are marked.",
+        inputSchema: z.object({
+            "directory": z.string().max(128).regex(new RegExp("^([A-Za-z0-9][A-Za-z0-9._ /-]*)?$")).default("").describe("Project-relative folder; empty lists the project root")
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["asset_browse"];
+        if (override)
+            return override(input);
+        return invoke("assets.browse", { "directory": input["directory"] });
+    });
+    server.registerTool("asset_search", {
+        title: "Search project files",
+        description: "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.",
+        inputSchema: z.object({
+            "query": z.string().max(64).default("").describe("Case-insensitive name fragment; empty matches every name"),
+            "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|shader|script|text|media|other)$"))).max(11).optional().describe("Asset kinds to include; omitted or empty includes all")
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["asset_search"];
+        if (override)
+            return override(input);
+        return invoke("assets.search", { "query": input["query"], "kinds": input["kinds"] });
+    });
+    server.registerTool("asset_create_folder", {
+        title: "Create project folder",
+        description: "Create a new, empty folder inside an existing project folder.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._ /-]*$")).describe("Project-relative path of the new folder")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["asset_create_folder"];
+        if (override)
+            return override(input);
+        return invoke("assets.create_folder", { "path": input["path"] });
+    });
+    server.registerTool("asset_move", {
+        title: "Rename or move project file",
+        description: "Rename or move a project file or folder without overwriting. Import records follow moved models; project scene files and the project file cannot move.",
+        inputSchema: z.object({
+            "from": z.string().max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._ /-]*$")).describe("Existing project-relative path"),
+            "to": z.string().max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._ /-]*$")).describe("New project-relative path; its folder must exist")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["asset_move"];
+        if (override)
+            return override(input);
+        return invoke("assets.move", { "from": input["from"], "to": input["to"] });
+    });
+    server.registerTool("asset_delete", {
+        title: "Delete project file",
+        description: "Move a project file or folder into the hidden .relay-trash folder, where it can be recovered by hand. Project scene files and the project file cannot be deleted.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._ /-]*$")).describe("Project-relative file or folder")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["asset_delete"];
+        if (override)
+            return override(input);
+        return invoke("assets.delete", { "path": input["path"] });
+    });
     server.registerTool("logs_read", {
         title: "Read Relay logs",
         description: "Read structured engine log entries newer than a sequence number.",
@@ -284,6 +351,36 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             return override(input);
         return invoke("performance.read", { "after_frame": input["afterFrame"], "limit": input["limit"] });
     });
+    server.registerTool("profiler_read", {
+        title: "Read frame profile",
+        description: "Find what limits the frame rate of the live editor or running game. Aggregates recent profiled frames into frame-time statistics, a CPU/GPU/display bottleneck verdict, a call tree of timed CPU scopes (simulation, scripts per behaviour, physics, rendering, editor UI and waits), hotspots by self time and per-pass GPU timings. Only a live editor records frames.",
+        inputSchema: z.object({
+            "frames": z.number().int().min(1).max(1200).default(120).describe("Most recent frames to aggregate"),
+            "frame": z.number().int().min(0).default(0).describe("Report one profiled frame by index instead; 0 aggregates"),
+            "gameOnly": z.boolean().default(false).describe("Aggregate only frames recorded while the game was running"),
+            "history": z.number().int().min(0).max(1200).default(0).describe("Recent frame times to include, oldest first")
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["profiler_read"];
+        if (override)
+            return override(input);
+        return invoke("profiler.read", { "frames": input["frames"], "frame": input["frame"], "game_only": input["gameOnly"], "history": input["history"] });
+    });
+    server.registerTool("profiler_set", {
+        title: "Pause frame profiler",
+        description: "Pause the frame profiler to keep its recorded frames for inspection, or resume recording. Clearing discards recorded frames.",
+        inputSchema: z.object({
+            "paused": z.boolean().optional().describe("Stop or resume recording new frames"),
+            "clear": z.boolean().default(false).describe("Discard all recorded frames")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+    }, async (input) => {
+        const override = overrides["profiler_set"];
+        if (override)
+            return override(input);
+        return invoke("profiler.set", { "paused": input["paused"], "clear": input["clear"] });
+    });
     server.registerTool("input_recent", {
         title: "Read recent Relay input",
         description: "Read the bounded normalized keyboard, mouse and gamepad input event history.",
@@ -294,6 +391,83 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override({});
         return invoke("input.recent", {});
+    });
+    server.registerTool("graphics_settings", {
+        title: "Read graphics settings",
+        description: "Read the project's graphics settings (settings.graphics in the .relayproject): global illumination, ray traced reflections, vsync and the game's frame rate limit, with the defaults. When a live renderer is attached, also reports whether each effect is supported and running on this GPU and why not, and the presentation mode in use.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["graphics_settings"];
+        if (override)
+            return override({});
+        return invoke("graphics.settings", {});
+    });
+    server.registerTool("graphics_set_settings", {
+        title: "Change graphics settings",
+        description: "Turn global illumination, ray traced reflections or vsync on or off, or set the frame rate limit used while the game runs, and save the choice in the open project. Omitted settings keep their current values. Effects the GPU cannot run stay off and are reported by graphics.settings.",
+        inputSchema: z.object({
+            "global_illumination": z.boolean().optional().describe("FidelityFX Brixelizer global illumination"),
+            "reflections": z.boolean().optional().describe("Hardware ray traced reflections"),
+            "frame_rate_limit": z.number().int().min(0).max(1000).optional().describe("Maximum frames per second during Run Game; 0 is unlimited"),
+            "vsync": z.boolean().optional().describe("Present in step with the display; off can tear but is faster")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["graphics_set_settings"];
+        if (override)
+            return override(input);
+        return invoke("graphics.set_settings", { "global_illumination": input["global_illumination"], "reflections": input["reflections"], "frame_rate_limit": input["frame_rate_limit"], "vsync": input["vsync"] });
+    });
+    server.registerTool("input_map", {
+        title: "Read input map",
+        description: "Read the project's input map: named actions bound to keys, mouse buttons or gamepad buttons, and axes built from button pairs or gamepad sticks. Also returns the engine defaults. Controls look like key:space, key:left_shift, mouse:left, gamepad:a or gamepad:leftx.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["input_map"];
+        if (override)
+            return override({});
+        return invoke("input.map", {});
+    });
+    server.registerTool("input_set_map", {
+        title: "Replace input map",
+        description: "Validate, save in the project file (settings.input in the .relayproject) and apply a complete input map document (format relay.input, version 1) as returned by input.map.",
+        inputSchema: z.object({
+            "map": z.string().min(2).max(262144).describe("The whole input map as JSON text")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["input_set_map"];
+        if (override)
+            return override(input);
+        return invoke("input.set_map", { "map": input["map"] });
+    });
+    server.registerTool("input_state", {
+        title: "Inspect game input",
+        description: "Read the current game step's input: each action's held and pressed state, each axis value, held controls and mouse movement.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["input_state"];
+        if (override)
+            return override({});
+        return invoke("input.state", {});
+    });
+    server.registerTool("input_simulate", {
+        title: "Simulate game input",
+        description: "Hold an action, or set an axis value, for a number of game steps during Run Game, as if a player pressed it. Use it with runtime.step to play-test scripts.",
+        inputSchema: z.object({
+            "name": z.string().max(64).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).describe("Action or axis name from input.map"),
+            "value": z.number().finite().min(-1).max(1).default(1).describe("Axis value; actions ignore it"),
+            "frames": z.number().int().min(1).max(3600).default(1)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["input_simulate"];
+        if (override)
+            return override(input);
+        return invoke("input.simulate", { "name": input["name"], "value": input["value"], "frames": input["frames"] });
     });
     server.registerTool("video_start", {
         title: "Start Relay video",
@@ -369,18 +543,19 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         return invoke("scene.inspect", { "entity": input["entity"] });
     });
     server.registerTool("scene_create", {
-        title: "Create scene entity",
-        description: "Create a named entity, optionally parented to another live entity.",
+        title: "Create scene node",
+        description: "Create a node, optionally of a node type from nodes.types (which gives it that type's components, inherited from its ancestors) and optionally parented to another live node.",
         inputSchema: z.object({
-            "name": z.string().min(1).max(128).default("Entity"),
-            "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity handle")
+            "name": z.string().min(1).max(128).optional().describe("Node name; defaults to the type's name, or Entity"),
+            "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity handle"),
+            "type": z.enum(["Node", "Camera", "DirectionalLight", "PointLight", "SpotLight", "RigidBody", "StaticBody", "StaticMesh"]).optional().describe("Node type to create; omitted creates a plain Node")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["scene_create"];
         if (override)
             return override(input);
-        return invoke("scene.create", { "name": input["name"], "parent": input["parent"] });
+        return invoke("scene.create", { "name": input["name"], "parent": input["parent"], "type": input["type"] });
     });
     server.registerTool("scene_destroy", {
         title: "Destroy scene entity",
@@ -550,18 +725,22 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         return invoke("scene.set_morph", { "entity": input["entity"], "target": input["target"], "weight": input["weight"], "reset": input["reset"] });
     });
     server.registerTool("scene_set_collider", {
-        title: "Configure box collider",
-        description: "Add, edit or remove an authored box collider. The box follows the entity hierarchy and scene-owned transform animation. Undoable and saved with the scene.",
+        title: "Configure collider",
+        description: "Add, edit or remove an authored box, sphere, capsule, convex or triangle-mesh collider. Sphere and capsule use the largest world scale uniformly. Convex and mesh shapes use a registered mesh, defaulting to the entity renderer mesh. Undoable and saved with the scene.",
         inputSchema: z.object({
             "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
             "attached": z.boolean().optional(),
             "enabled": z.boolean().optional(),
+            "type": z.enum(["box", "sphere", "capsule", "convex", "mesh"]).optional(),
             "centerX": z.number().finite().min(-1000000).max(1000000).optional(),
             "centerY": z.number().finite().min(-1000000).max(1000000).optional(),
             "centerZ": z.number().finite().min(-1000000).max(1000000).optional(),
             "halfX": z.number().finite().min(1e-06).max(1000000).optional(),
             "halfY": z.number().finite().min(1e-06).max(1000000).optional(),
             "halfZ": z.number().finite().min(1e-06).max(1000000).optional(),
+            "radius": z.number().finite().min(1e-06).max(1000000).optional(),
+            "halfHeight": z.number().finite().min(1e-06).max(1000000).optional(),
+            "mesh": z.string().max(128).regex(new RegExp("^[A-Za-z0-9._:-]*$")).optional().describe("Registered mesh for convex and mesh shapes; empty uses the entity renderer mesh"),
             "layer": z.number().int().min(1).max(4294967295).optional(),
             "mask": z.number().int().min(0).max(4294967295).optional()
         }),
@@ -570,11 +749,11 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         const override = overrides["scene_set_collider"];
         if (override)
             return override(input);
-        return invoke("scene.set_collider", { "entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "center_x": input["centerX"], "center_y": input["centerY"], "center_z": input["centerZ"], "half_x": input["halfX"], "half_y": input["halfY"], "half_z": input["halfZ"], "layer": input["layer"], "mask": input["mask"] });
+        return invoke("scene.set_collider", { "entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "center_x": input["centerX"], "center_y": input["centerY"], "center_z": input["centerZ"], "half_x": input["halfX"], "half_y": input["halfY"], "half_z": input["halfZ"], "radius": input["radius"], "half_height": input["halfHeight"], "mesh": input["mesh"], "layer": input["layer"], "mask": input["mask"] });
     });
     server.registerTool("physics_raycast", {
-        title: "Raycast box colliders",
-        description: "Find the nearest enabled authored box collider hit by a world-space ray. Returns hit point and surface normal; does not move objects.",
+        title: "Raycast colliders",
+        description: "Find the nearest enabled authored collider of any shape hit by a world-space ray. Returns hit point and surface normal; does not move objects.",
         inputSchema: z.object({
             "originX": z.number().finite().min(-1000000).max(1000000),
             "originY": z.number().finite().min(-1000000).max(1000000),
@@ -594,7 +773,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("physics_overlaps", {
         title: "Find overlapping colliders",
-        description: "List up to 128 enabled box colliders overlapping an entity collider. Both colliders must pass their layer masks; reports truncation.",
+        description: "List up to 128 enabled colliders of any shape overlapping an entity collider. Both colliders must pass their layer masks; reports truncation. Triangle-mesh colliders report surface contact only.",
         inputSchema: z.object({
             "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
         }),
@@ -617,6 +796,19 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override(input);
         return invoke("physics.body_status", { "entity": input["entity"] });
+    });
+    server.registerTool("physics_contact_events", {
+        title: "Read collision contacts",
+        description: "Read bounded contact begin and end events from the current game session, using a sequence cursor. Events are cleared on Stop Game.",
+        inputSchema: z.object({
+            "after": z.number().int().min(0).default(0).describe("Last contact event sequence already seen")
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["physics_contact_events"];
+        if (override)
+            return override(input);
+        return invoke("physics.contact_events", { "after": input["after"] });
     });
     server.registerTool("physics_apply_impulse", {
         title: "Apply rigid body impulse",
@@ -649,14 +841,252 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "restitution": z.number().finite().min(0).max(1).optional(),
             "friction": z.number().finite().min(0).max(10).optional(),
             "linearDamping": z.number().finite().min(0).max(100).optional(),
-            "angularDamping": z.number().finite().min(0).max(100).optional()
+            "angularDamping": z.number().finite().min(0).max(100).optional(),
+            "lockRotation": z.boolean().optional().describe("Keep a dynamic body upright, as character controllers need")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["scene_set_physics_body"];
         if (override)
             return override(input);
-        return invoke("scene.set_physics_body", { "entity": input["entity"], "attached": input["attached"], "type": input["type"], "mass": input["mass"], "gravity_scale": input["gravityScale"], "restitution": input["restitution"], "friction": input["friction"], "linear_damping": input["linearDamping"], "angular_damping": input["angularDamping"] });
+        return invoke("scene.set_physics_body", { "entity": input["entity"], "attached": input["attached"], "type": input["type"], "mass": input["mass"], "gravity_scale": input["gravityScale"], "restitution": input["restitution"], "friction": input["friction"], "linear_damping": input["linearDamping"], "angular_damping": input["angularDamping"], "lock_rotation": input["lockRotation"] });
+    });
+    server.registerTool("scripts_status", {
+        title: "Inspect gameplay scripts",
+        description: "Read native C++ script state: project trust, build state, whether sources changed since the last build, registered behaviours, compiler diagnostics with file and line, and runtime errors from behaviour callbacks.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["scripts_status"];
+        if (override)
+            return override({});
+        return invoke("scripts.status", {});
+    });
+    server.registerTool("scripts_build", {
+        title: "Build gameplay scripts",
+        description: "Compile the project's scripts/ C++ files into a native library in the background; unchanged files are reused. Poll scripts.status until the state is ready or failed. A build that finishes during Run Game hot reloads the running behaviours. Requires a project a person has trusted.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["scripts_build"];
+        if (override)
+            return override({});
+        return invoke("scripts.build", {});
+    });
+    server.registerTool("scripts_sdk", {
+        title: "Read script SDK",
+        description: "Return relay_script.hpp, the complete C++ API available to gameplay scripts, with usage notes and frame order. Read it before writing a script.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["scripts_sdk"];
+        if (override)
+            return override({});
+        return invoke("scripts.sdk", {});
+    });
+    server.registerTool("scripts_read", {
+        title: "Read script source",
+        description: "Read a C++ source or header from the project's scripts/ folder.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9._/-]*\\.(cpp|cc|cxx|hpp|h|hh)$")).describe("Path inside scripts/, such as player.cpp or ai/enemy.hpp")
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scripts_read"];
+        if (override)
+            return override(input);
+        return invoke("scripts.read", { "path": input["path"] });
+    });
+    server.registerTool("scripts_write", {
+        title: "Write script source",
+        description: "Create or replace a C++ source or header in the project's scripts/ folder, creating subfolders. Allowed during Run Game; build afterwards to compile it or hot reload it.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9._/-]*\\.(cpp|cc|cxx|hpp|h|hh)$")).describe("Path inside scripts/, such as player.cpp or ai/enemy.hpp"),
+            "source": z.string().max(262144).describe("Complete file contents")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scripts_write"];
+        if (override)
+            return override(input);
+        return invoke("scripts.write", { "path": input["path"], "source": input["source"] });
+    });
+    server.registerTool("scripts_create", {
+        title: "Create behaviour script",
+        description: "Create scripts/<behaviour>.cpp from a starter template defining and registering that behaviour class. Refuses to overwrite.",
+        inputSchema: z.object({
+            "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).describe("C++ class name of the new behaviour")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scripts_create"];
+        if (override)
+            return override(input);
+        return invoke("scripts.create", { "behaviour": input["behaviour"] });
+    });
+    server.registerTool("component_types", {
+        title: "List component types",
+        description: "List every component a node can carry: engine components with their category and whether they can be added, removed or repeated, plus each built script behaviour with its declared properties and code defaults.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["component_types"];
+        if (override)
+            return override({});
+        return invoke("component.types", {});
+    });
+    server.registerTool("scene_set_joint", {
+        title: "Configure joint",
+        description: "Add, edit or remove an undoable joint linking this node's physics body to another node's body, or to the world when connected is empty, during Run Game. Types: fixed (weld), point (ball and socket), hinge (turns about axis, optional angle limits in degrees with min in [-180, 0] and max in [0, 180], optional motor), slider (moves along axis, optional travel limits in metres with min <= 0 <= max, optional motor) and distance (rope or spring between anchor and connected_anchor; limits are lengths, otherwise the starting length is kept). Anchor and axis are in this node's local space; connected_anchor is in the connected node's space, or world space for the world. At least one body must be dynamic. Joined bodies do not collide unless collide_connected is set. Changing type resets the limits to that type's defaults unless limits are given too.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "attached": z.boolean().optional(),
+            "enabled": z.boolean().optional(),
+            "type": z.enum(["fixed", "point", "hinge", "slider", "distance"]).optional(),
+            "connected": z.string().regex(new RegExp("^(\\d+:\\d+)?$")).optional().describe("Handle of the node to join; empty for the world"),
+            "anchorX": z.number().finite().min(-1000000).max(1000000).optional(),
+            "anchorY": z.number().finite().min(-1000000).max(1000000).optional(),
+            "anchorZ": z.number().finite().min(-1000000).max(1000000).optional(),
+            "axisX": z.number().finite().min(-1000000).max(1000000).optional(),
+            "axisY": z.number().finite().min(-1000000).max(1000000).optional(),
+            "axisZ": z.number().finite().min(-1000000).max(1000000).optional(),
+            "connectedAnchorX": z.number().finite().min(-1000000).max(1000000).optional(),
+            "connectedAnchorY": z.number().finite().min(-1000000).max(1000000).optional(),
+            "connectedAnchorZ": z.number().finite().min(-1000000).max(1000000).optional(),
+            "limits": z.boolean().optional(),
+            "limitMin": z.number().finite().min(-1000000).max(1000000).optional(),
+            "limitMax": z.number().finite().min(-1000000).max(1000000).optional(),
+            "motor": z.boolean().optional(),
+            "motorSpeed": z.number().finite().min(-1000000).max(1000000).optional().describe("Degrees per second for hinges, metres per second for sliders"),
+            "motorForce": z.number().finite().min(0).max(1000000000).optional().describe("Maximum torque (N m) for hinges, force (N) for sliders"),
+            "springFrequency": z.number().finite().min(0).max(1000).optional().describe("Distance joints: spring frequency in Hz; 0 is rigid"),
+            "springDamping": z.number().finite().min(0).max(100).optional(),
+            "collideConnected": z.boolean().optional()
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_joint"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_joint", { "entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "connected": input["connected"], "anchor_x": input["anchorX"], "anchor_y": input["anchorY"], "anchor_z": input["anchorZ"], "axis_x": input["axisX"], "axis_y": input["axisY"], "axis_z": input["axisZ"], "connected_anchor_x": input["connectedAnchorX"], "connected_anchor_y": input["connectedAnchorY"], "connected_anchor_z": input["connectedAnchorZ"], "limits": input["limits"], "limit_min": input["limitMin"], "limit_max": input["limitMax"], "motor": input["motor"], "motor_speed": input["motorSpeed"], "motor_force": input["motorForce"], "spring_frequency": input["springFrequency"], "spring_damping": input["springDamping"], "collide_connected": input["collideConnected"] });
+    });
+    server.registerTool("component_add", {
+        title: "Add component",
+        description: "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "joint", "keyframes", "script"]),
+            "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).optional().describe("Behaviour class name; required for script")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["component_add"];
+        if (override)
+            return override(input);
+        return invoke("component.add", { "entity": input["entity"], "component": input["component"], "behaviour": input["behaviour"] });
+    });
+    server.registerTool("component_remove", {
+        title: "Remove component",
+        description: "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "joint", "keyframes", "script"]),
+            "index": z.number().int().min(0).max(31).optional().describe("Which script component, from zero")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["component_remove"];
+        if (override)
+            return override(input);
+        return invoke("component.remove", { "entity": input["entity"], "component": input["component"], "index": input["index"] });
+    });
+    server.registerTool("scene_set_script", {
+        title: "Configure script component",
+        description: "Change the behaviour or enabled state of one of a node's script components, as an undoable transaction.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "index": z.number().int().min(0).max(31).describe("Position among the node's script components, from zero"),
+            "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).optional(),
+            "enabled": z.boolean().optional()
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_script"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_script", { "entity": input["entity"], "index": input["index"], "behaviour": input["behaviour"], "enabled": input["enabled"] });
+    });
+    server.registerTool("scene_set_script_property", {
+        title: "Set script property",
+        description: "Store a value for a behaviour property on one script component, or reset it to the code default. Send exactly one of number, boolean, text or vector unless resetting.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "index": z.number().int().min(0).max(31).describe("Position among the node's script components, from zero"),
+            "property": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")),
+            "number": z.number().finite().min(-1000000000000000.0).max(1000000000000000.0).optional(),
+            "boolean": z.boolean().optional(),
+            "text": z.string().max(1024).optional(),
+            "vector": z.array(z.number().finite()).min(3).max(3).optional(),
+            "reset": z.boolean().default(false)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_script_property"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_script_property", { "entity": input["entity"], "index": input["index"], "property": input["property"], "number": input["number"], "boolean": input["boolean"], "text": input["text"], "vector": input["vector"], "reset": input["reset"] });
+    });
+    server.registerTool("nodes_types", {
+        title: "List node types",
+        description: "List the node type tree. Each type adds components to its parent's; creatable types can be passed to scene.create. A node's reported type is the deepest type whose components it has.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["nodes_types"];
+        if (override)
+            return override({});
+        return invoke("nodes.types", {});
+    });
+    server.registerTool("templates_list", {
+        title: "List node templates",
+        description: "List the project's saved templates (prefabs) with the node type each root inherits and the root's components and script behaviours. Built-in node types are listed by nodes.types.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["templates_list"];
+        if (override)
+            return override({});
+        return invoke("templates.list", {});
+    });
+    server.registerTool("templates_instantiate", {
+        title: "Create node from template",
+        description: "Create a saved node tree from a project template as one undoable transaction and return its root. The result is an independent copy.",
+        inputSchema: z.object({
+            "template": z.string().max(80).regex(new RegExp("^project:[A-Za-z0-9_][A-Za-z0-9 _-]*$")).describe("Template id from templates.list, such as project:Enemy"),
+            "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity"),
+            "name": z.string().min(1).max(128).optional().describe("Optional name for the root node")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["templates_instantiate"];
+        if (override)
+            return override(input);
+        return invoke("templates.instantiate", { "template": input["template"], "parent": input["parent"], "name": input["name"] });
+    });
+    server.registerTool("templates_save", {
+        title: "Save node as template",
+        description: "Save a node and its children as a project template in templates/<name>.relay-template.json, usable from the Create menu and templates.instantiate.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "name": z.string().max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")),
+            "replace": z.boolean().default(false).describe("Overwrite an existing template of that name")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["templates_save"];
+        if (override)
+            return override(input);
+        return invoke("templates.save", { "entity": input["entity"], "name": input["name"], "replace": input["replace"] });
     });
     server.registerTool("scene_set_light", {
         title: "Configure scene light",

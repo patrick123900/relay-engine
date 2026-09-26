@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <initializer_list>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -656,6 +657,198 @@ std::string ControlProtocol::handle(const std::string_view request) {
         engine_.logs().write(LogLevel::info, "Graphics settings saved");
         return response_prefix(id) + "{\"settings\":" + graphics_settings_json(settings) + "}}";
     }
+    if (method == "audio.settings") {
+        const bool saved = engine_.project() && engine_.project()->audio.has_value();
+        return response_prefix(id) + "{\"settings\":" +
+               audio_settings_json(engine_.audio_settings()) +
+               ",\"saved\":" + (saved ? "true" : "false") +
+               ",\"previewing\":" + (engine_.previewing_audio_settings() ? "true" : "false") +
+               ",\"defaults\":" + audio_settings_json(default_audio_settings()) + "}}";
+    }
+    if (method == "audio.set_bus" || method == "audio.remove_bus") {
+        auto settings = engine_.audio_settings();
+        const auto name = string_field(request, "name");
+        auto& buses = settings.buses;
+        auto found = std::find_if(buses.begin(), buses.end(),
+                                  [&](const AudioBus& bus) { return bus.name == name; });
+        if (method == "audio.remove_bus") {
+            if (found == buses.end()) return error_response(id, "no bus is named " + name);
+            if (name == master_audio_bus) return error_response(id, "Master cannot be removed");
+            const auto parent = found->parent;
+            for (auto& bus : buses)
+                if (bus.parent == name) bus.parent = parent;
+            buses.erase(found);
+        } else {
+            if (found == buses.end()) {
+                buses.push_back({name, std::string(master_audio_bus), 0.0, false, false, {}});
+                found = std::prev(buses.end());
+            }
+            auto& bus = *found;
+            if (const auto parent = optional_string_field(request, "parent")) {
+                if (bus.name == master_audio_bus) return error_response(id, "Master cannot have a parent");
+                bus.parent = *parent;
+            }
+            if (const auto volume = number_field(request, "volume_db")) bus.volume_db = *volume;
+            bus.mute = boolean_field(request, "mute", bus.mute);
+            bus.solo = boolean_field(request, "solo", bus.solo);
+            if (const auto renamed = optional_string_field(request, "new_name");
+                renamed && *renamed != bus.name) {
+                if (bus.name == master_audio_bus) return error_response(id, "Master cannot be renamed");
+                const auto old_name = bus.name;
+                for (auto& other : buses)
+                    if (other.parent == old_name) other.parent = *renamed;
+                found->name = *renamed;
+            }
+        }
+        std::string error;
+        const bool preview = method == "audio.set_bus" && boolean_field(request, "preview", false);
+        if (!(preview ? engine_.preview_audio_settings(settings, error)
+                      : engine_.set_audio_settings(settings, error)))
+            return error_response(id, error);
+        return response_prefix(id) + "{\"settings\":" +
+               audio_settings_json(engine_.audio_settings()) + "}}";
+    }
+    if (method == "audio.set_effect" || method == "audio.remove_effect" ||
+        method == "audio.move_effect") {
+        auto settings = engine_.audio_settings();
+        const auto name = string_field(request, "bus");
+        const auto bus = std::find_if(settings.buses.begin(), settings.buses.end(),
+                                      [&](const AudioBus& item) { return item.name == name; });
+        if (bus == settings.buses.end()) return error_response(id, "no bus is named " + name);
+        auto& effects = bus->effects;
+        const auto index = number_field(request, "index");
+        const auto position = index ? static_cast<std::size_t>(*index) : effects.size();
+        if (index && position >= effects.size())
+            return error_response(id, "bus " + name + " has no effect " + std::to_string(position));
+        std::size_t changed = position;
+        if (method == "audio.remove_effect") {
+            effects.erase(effects.begin() + static_cast<std::ptrdiff_t>(position));
+        } else if (method == "audio.move_effect") {
+            const auto to = std::min(static_cast<std::size_t>(unsigned_field(request, "to", 0U)),
+                                     effects.size() - 1U);
+            auto moved = effects[position];
+            effects.erase(effects.begin() + static_cast<std::ptrdiff_t>(position));
+            effects.insert(effects.begin() + static_cast<std::ptrdiff_t>(to), moved);
+            changed = to;
+        } else {
+            const auto type_name = optional_string_field(request, "type");
+            const auto type = type_name ? audio_effect_type_from_name(*type_name) : std::nullopt;
+            if (type_name && !type) return error_response(id, "unknown effect type " + *type_name);
+            if (!index) {
+                if (!type) return error_response(id, "a new effect needs a type");
+                if (effects.size() >= maximum_bus_effects)
+                    return error_response(id, "a bus holds at most 8 effects");
+                AudioEffect effect;
+                effect.type = *type;
+                effects.push_back(effect);
+            } else if (type) {
+                effects[position].type = *type;
+            }
+            auto& effect = effects[changed];
+            effect.enabled = boolean_field(request, "enabled", effect.enabled);
+            for (const char* parameter :
+                 {"mix", "room_size", "damping", "width", "pre_delay_ms", "time_ms", "feedback",
+                  "low_db", "mid_db", "mid_frequency", "high_db", "threshold_db", "ratio",
+                  "attack_ms", "release_ms", "makeup_db", "ceiling_db", "cutoff_hz", "resonance"})
+                if (const auto value = number_field(request, parameter))
+                    *audio_effect_parameter(effect, parameter) = *value;
+        }
+        std::string error;
+        const bool preview = boolean_field(request, "preview", false);
+        if (!(preview ? engine_.preview_audio_settings(settings, error)
+                      : engine_.set_audio_settings(settings, error)))
+            return error_response(id, error);
+        return response_prefix(id) + "{\"bus\":\"" + escape_json(name) +
+               "\",\"index\":" + std::to_string(changed) + ",\"settings\":" +
+               audio_settings_json(engine_.audio_settings()) + "}}";
+    }
+    if (method == "audio.debug_shapes") {
+        return response_prefix(id) + AudioSystem::debug_shapes_json(engine_.scene()) + '}';
+    }
+    if (method == "audio.status") {
+        return response_prefix(id) + engine_.audio().status_json(engine_.scene()) + '}';
+    }
+    if (method == "audio.play") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::string error;
+        const bool game = engine_.status().mode == RuntimeMode::game;
+        if (!engine_.audio().play(engine_.scene(), *entity, game, error))
+            return error_response(id, error);
+        return response_prefix(id) + "{\"entity\":\"" + entity->to_string() +
+               "\",\"playing\":true,\"preview\":" + (game ? "false" : "true") + "}}";
+    }
+    if (method == "audio.stop") {
+        const auto handle = optional_string_field(request, "entity");
+        if (const auto sound = number_field(request, "sound"); sound && !handle) {
+            const bool was_playing = engine_.audio().stop_sound(static_cast<std::uint64_t>(*sound));
+            return response_prefix(id) + "{\"sound\":" + std::to_string(static_cast<std::uint64_t>(*sound)) +
+                   ",\"was_playing\":" + (was_playing ? "true" : "false") + "}}";
+        }
+        if (!handle) {
+            engine_.audio().stop_all();
+            return response_prefix(id) + "{\"stopped\":\"all\"}}";
+        }
+        const auto entity = Entity::parse(*handle);
+        if (!entity) return error_response(id, "invalid entity handle");
+        const bool was_playing = engine_.audio().stop(*entity);
+        return response_prefix(id) + "{\"entity\":\"" + entity->to_string() +
+               "\",\"was_playing\":" + (was_playing ? "true" : "false") + "}}";
+    }
+    if (method == "audio.play_clip") {
+        AudioOneShot options;
+        const auto x = number_field(request, "x"), y = number_field(request, "y"),
+                   z = number_field(request, "z");
+        if (x || y || z) options.position = Vec3{x.value_or(0.0), y.value_or(0.0), z.value_or(0.0)};
+        options.volume_db = number_field(request, "volume_db").value_or(0.0);
+        options.pitch = number_field(request, "pitch").value_or(1.0);
+        options.bus = optional_string_field(request, "bus").value_or("SFX");
+        options.min_distance = number_field(request, "min_distance").value_or(1.0);
+        options.max_distance = number_field(request, "max_distance").value_or(50.0);
+        std::string error;
+        const auto sound = engine_.audio().play_clip(engine_.scene(), string_field(request, "clip"),
+                                                     options, error);
+        if (sound == 0U) return error_response(id, error);
+        return response_prefix(id) + "{\"sound\":" + std::to_string(sound) + "}}";
+    }
+    if (method == "audio.music") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        const auto action = string_field(request, "action");
+        if (action == "stop") {
+            if (!engine_.audio().music_stop(*entity, number_field(request, "fade_seconds").value_or(1.0)))
+                return error_response(id, "the music player is not playing");
+            return response_prefix(id) + "{\"entity\":\"" + entity->to_string() + "\",\"track\":-1}}";
+        }
+        std::optional<MusicPlayer::Sync> sync;
+        if (const auto name = optional_string_field(request, "sync")) sync = music_sync_from_name(*name);
+        const auto track = action == "play" && number_field(request, "track")
+                               ? static_cast<int>(*number_field(request, "track"))
+                               : -1;
+        std::string error;
+        if (!engine_.audio().music_play(engine_.scene(), *entity, track, sync, error))
+            return error_response(id, error);
+        return response_prefix(id) + "{\"entity\":\"" + entity->to_string() + "\",\"track\":" +
+               std::to_string(engine_.audio().music_track(*entity)) + "}}";
+    }
+    if (method == "audio.set_spatialization") {
+        auto settings = engine_.audio_settings();
+        settings.spatialization = string_field(request, "mode") == "binaural"
+                                      ? AudioSettings::Spatialization::binaural
+                                      : AudioSettings::Spatialization::stereo;
+        std::string error;
+        if (!engine_.set_audio_settings(settings, error)) return error_response(id, error);
+        return response_prefix(id) + "{\"settings\":" + audio_settings_json(engine_.audio_settings()) + "}}";
+    }
+    if (method == "audio.clip") {
+        std::string error;
+        const auto peaks = static_cast<std::size_t>(unsigned_field(request, "peaks", 0U));
+        const auto clip = engine_.audio().clip_json(string_field(request, "clip"), peaks, error);
+        if (!clip) return error_response(id, error);
+        return response_prefix(id) + *clip + '}';
+    }
     if (method == "input.map") {
         const bool saved = engine_.project() && engine_.project()->input.has_value();
         return response_prefix(id) + "{\"map\":" + input_map_json(engine_.input().map()) +
@@ -1153,7 +1346,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         const auto filename = string_field(request, "filename");
         std::string warning;
         auto project = method == "project.open" ? load_project(filename, error, warning)
-                                                : std::optional{Project{filename, string_field(request, "name"), {}, {}, {}, false, {}}};
+                                                : std::optional{Project{filename, string_field(request, "name"), {}, {}, {}, false, {}, {}}};
         if (!project) return error_response(id, error);
         if (!warning.empty()) engine_.logs().write(LogLevel::warning, warning);
         SceneState state;
@@ -1456,7 +1649,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         }
         if (!engine_.scene_history().execute(
                 std::string(enabled ? "Configure camera " : "Remove camera ") + entity->to_string(),
-                [&](Scene& scene) { return scene.set_camera(*entity, camera); })) {
+                [&](Scene& scene) { return scene.set_camera(*entity, camera); }, unsigned_field(request, "gesture", 0U))) {
             return error_response(id, "could not update camera component");
         }
         engine_.logs().write(LogLevel::info,
@@ -1547,7 +1740,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
             body->lock_rotation = boolean_field(request, "lock_rotation", body->lock_rotation);
         }
         if (!engine_.scene_history().execute("Configure physics body " + entity->to_string(),
-                [&](Scene& scene) { return scene.set_physics_body(*entity, body); }))
+                [&](Scene& scene) { return scene.set_physics_body(*entity, body); }, unsigned_field(request, "gesture", 0U)))
             return error_response(id, "invalid physics body values");
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
@@ -1602,10 +1795,138 @@ std::string ControlProtocol::handle(const std::string_view request) {
             joint->enabled = boolean_field(request, "enabled", joint->enabled);
         }
         if (!engine_.scene_history().execute("Configure joint " + entity->to_string(),
-                [&](Scene& scene) { return scene.set_joint(*entity, joint); }))
+                [&](Scene& scene) { return scene.set_joint(*entity, joint); }, unsigned_field(request, "gesture", 0U)))
             return error_response(id, "invalid joint values: the connected node must differ from "
                                       "this one, the axis must not be zero, and limits must fit "
                                       "the joint type");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.set_audio_source") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::optional<AudioSource> source;
+        if (boolean_field(request, "attached", true)) {
+            source = engine_.scene().get(*entity)->audio_source.value_or(AudioSource{});
+            if (const auto clip = optional_string_field(request, "clip")) source->clip = *clip;
+            if (const auto bus = optional_string_field(request, "bus")) source->bus = *bus;
+            if (const auto rolloff = optional_string_field(request, "rolloff")) {
+                const auto parsed = audio_rolloff_from_name(*rolloff);
+                if (!parsed) return error_response(id, "unknown rolloff");
+                source->rolloff = *parsed;
+            }
+            const auto number = [&](const char* key, double& target) {
+                if (const auto value = number_field(request, key)) target = *value;
+            };
+            number("volume_db", source->volume_db);
+            number("pitch", source->pitch);
+            number("pan", source->pan);
+            number("min_distance", source->min_distance);
+            number("max_distance", source->max_distance);
+            number("doppler", source->doppler);
+            source->loop = boolean_field(request, "loop", source->loop);
+            source->play_on_start = boolean_field(request, "play_on_start", source->play_on_start);
+            source->spatial = boolean_field(request, "spatial", source->spatial);
+            source->occlusion = boolean_field(request, "occlusion", source->occlusion);
+            number("reverb_send", source->reverb_send);
+        }
+        if (!engine_.scene_history().execute(
+                std::string(source ? "Configure audio source " : "Remove audio source ") +
+                    entity->to_string(),
+                [&](Scene& scene) { return scene.set_audio_source(*entity, source); },
+                unsigned_field(request, "gesture", 0U)))
+            return error_response(id, "invalid audio source values: the maximum distance must "
+                                      "not be below the minimum distance");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.set_reverb_zone") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::optional<ReverbZone> zone;
+        if (boolean_field(request, "attached", true)) {
+            zone = engine_.scene().get(*entity)->reverb_zone.value_or(ReverbZone{});
+            if (const auto shape = optional_string_field(request, "shape")) {
+                const auto parsed = reverb_shape_from_name(*shape);
+                if (!parsed) return error_response(id, "unknown reverb zone shape");
+                zone->shape = *parsed;
+            }
+            const auto number = [&](const char* key, double& target) {
+                if (const auto value = number_field(request, key)) target = *value;
+            };
+            number("radius", zone->radius);
+            number("half_x", zone->half_extents.x);
+            number("half_y", zone->half_extents.y);
+            number("half_z", zone->half_extents.z);
+            number("fade", zone->fade);
+            // Editing the sound by hand leaves the preset behind.
+            bool tuned = false;
+            for (const auto& [key, target] :
+                 std::initializer_list<std::pair<const char*, double*>>{
+                     {"room_size", &zone->room_size}, {"damping", &zone->damping},
+                     {"wet_db", &zone->wet_db}, {"pre_delay_ms", &zone->pre_delay_ms}})
+                if (const auto value = number_field(request, key)) {
+                    *target = *value;
+                    tuned = true;
+                }
+            if (tuned) zone->preset = "custom";
+            if (const auto preset = optional_string_field(request, "preset")) {
+                if (*preset == "custom") zone->preset = "custom";
+                else if (!apply_reverb_preset(*zone, *preset))
+                    return error_response(id, "unknown reverb preset " + *preset);
+            }
+        }
+        if (!engine_.scene_history().execute(
+                std::string(zone ? "Configure reverb zone " : "Remove reverb zone ") +
+                    entity->to_string(),
+                [&](Scene& scene) { return scene.set_reverb_zone(*entity, zone); },
+                unsigned_field(request, "gesture", 0U)))
+            return error_response(id, "invalid reverb zone values");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.set_music_player") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::optional<MusicPlayer> player;
+        if (boolean_field(request, "attached", true)) {
+            player = engine_.scene().get(*entity)->music_player.value_or(MusicPlayer{});
+            JsonParser parser(request);
+            const auto parsed = parser.parse();
+            if (const auto* tracks = parsed && parsed->object() ? field(*parsed->object(), "tracks") : nullptr;
+                tracks && tracks->array()) {
+                player->tracks.clear();
+                for (const auto& track : *tracks->array())
+                    if (track.string()) player->tracks.push_back(*track.string());
+            }
+            if (const auto bus = optional_string_field(request, "bus")) player->bus = *bus;
+            if (const auto sync = optional_string_field(request, "sync")) {
+                const auto parsed_sync = music_sync_from_name(*sync);
+                if (!parsed_sync) return error_response(id, "unknown music sync");
+                player->sync = *parsed_sync;
+            }
+            const auto number = [&](const char* key, double& target) {
+                if (const auto value = number_field(request, key)) target = *value;
+            };
+            number("volume_db", player->volume_db);
+            number("crossfade_seconds", player->crossfade_seconds);
+            number("bpm", player->bpm);
+            number("first_beat_seconds", player->first_beat_seconds);
+            if (const auto beats = number_field(request, "beats_per_bar"))
+                player->beats_per_bar = static_cast<std::uint32_t>(*beats);
+            player->shuffle = boolean_field(request, "shuffle", player->shuffle);
+            player->loop_playlist = boolean_field(request, "loop_playlist", player->loop_playlist);
+            player->play_on_start = boolean_field(request, "play_on_start", player->play_on_start);
+        }
+        if (!engine_.scene_history().execute(
+                std::string(player ? "Configure music player " : "Remove music player ") +
+                    entity->to_string(),
+                [&](Scene& scene) { return scene.set_music_player(*entity, player); },
+                unsigned_field(request, "gesture", 0U)))
+            return error_response(id, "invalid music player values");
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }
@@ -1707,7 +2028,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
                 return false;
             };
         }
-        if (!engine_.scene_history().execute(label, change))
+        if (!engine_.scene_history().execute(label, change, unsigned_field(request, "gesture", 0U)))
             return error_response(id, error.empty() ? "component change failed" : error);
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
@@ -1824,7 +2145,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
                 unsigned_field(request, "mask", collider->mask));
         }
         if (!engine_.scene_history().execute("Configure collider " + entity->to_string(),
-                [&](Scene& scene) { return scene.set_collider(*entity, collider); }))
+                [&](Scene& scene) { return scene.set_collider(*entity, collider); }, unsigned_field(request, "gesture", 0U)))
             return error_response(id, "invalid collider values");
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
@@ -1880,7 +2201,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
             }
             changed = engine_.scene_history().execute("Configure morph weights", [&](Scene &scene) {
                 return scene.set_mesh_renderer(*entity, renderer);
-            });
+            }, unsigned_field(request, "gesture", 0U));
         } else {
             std::optional<Light> light;
             if (boolean_field(request, "enabled", true)) {
@@ -1906,7 +2227,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
                 assign("range", light->range);
             }
             changed = engine_.scene_history().execute(
-                "Configure light", [&](Scene &scene) { return scene.set_light(*entity, light); });
+                "Configure light", [&](Scene &scene) { return scene.set_light(*entity, light); }, unsigned_field(request, "gesture", 0U));
         }
         if (!changed)
             return error_response(id, "invalid component configuration");

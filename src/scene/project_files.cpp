@@ -24,8 +24,9 @@ std::string lowercase(std::string value) {
     return value;
 }
 
-constexpr std::array<std::string_view, 10> kind_names{
-    "folder", "model", "scene", "template", "image", "shader", "script", "text", "media", "other"};
+constexpr std::array<std::string_view, 11> kind_names{
+    "folder", "model", "scene", "template", "image", "shader", "script", "text", "media", "audio",
+    "other"};
 
 // Hidden entries, and project files, which the Project panel manages rather than the browser.
 bool hidden_from_assets(const std::string& name, const bool directory) {
@@ -62,7 +63,8 @@ AssetKind asset_kind_of(const std::string_view filename, const bool directory) {
     if (any({"cpp", "cc", "cxx", "hpp", "h", "hh", "lua", "js", "ts", "py", "wasm"}))
         return AssetKind::script;
     if (any({"txt", "md", "json", "yaml", "yml", "toml", "csv", "ini", "log"})) return AssetKind::text;
-    if (any({"webm", "mp4", "mkv", "wav", "ogg", "mp3", "flac"})) return AssetKind::media;
+    if (any({"wav", "ogg", "mp3", "flac"})) return AssetKind::audio;
+    if (any({"webm", "mp4", "mkv"})) return AssetKind::media;
     return AssetKind::other;
 }
 

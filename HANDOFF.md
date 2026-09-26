@@ -8,14 +8,16 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v42: 131 native methods. Scene v17, project v2, import manifest v3.
+- Protocol schema v45: 148 native methods. Scene v20, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
   component model with derived node types and templates/prefabs shown in the node type tree, native
   C++ gameplay scripts, per-project input mapping, a scripted first person controller template in
   the demo project, portable project export, and FidelityFX global illumination and hardware ray
-  traced reflections, and a frame profiler are implemented. Preserve unrelated working-tree
+  traced reflections, a frame profiler, and audio (sources, listeners, spatialisation and mixer
+  buses, bus effects, reverb zones, occlusion, streaming, music players and headphone output) are
+  implemented. Preserve unrelated working-tree
   edits and inspect `git diff` before changing them.
 
 ## Product intent
@@ -344,6 +346,179 @@ without blocking simultaneous human editing.
   inside the prompt, clicking elsewhere cancels), key-pair and stick bindings, invert, deadzone,
   live values during Run Game, mouse lock and Reset to defaults.
 
+### Audio
+
+- `src/audio/` (engine library, no UI): `AudioClip`/`AudioClipCache` decode .wav, .flac, .mp3 and
+  .ogg with miniaudio 0.11.25 (public domain / MIT-0, fetched by CMake; Ogg through its bundled
+  stb_vorbis, compiled once in `miniaudio_impl.c`) to float PCM at the file's own rate, stereo at
+  most. Files are capped at 256 MiB and decoded clips at 256 MiB of samples, though anything over
+  10 s streams instead (phase 3, below); the cache holds 1 GiB, evicting unused clips least recently used first, and reloads
+  a file whose size or time changes. Clips resolve under the project folder, or `./assets` without
+  a project, exactly where the asset browser lists files. Assets of kind `audio` (new) are those
+  four extensions; `media` is now video only.
+- `AudioMixer` is a deterministic software mixer with no thread or device: voices resampled
+  (linear) into a bus tree, rendered in 256-frame blocks to interleaved stereo float at 48 kHz.
+  Voice gains, bus gains, pauses and stops ramp over one block so nothing clicks; voices start at
+  full level so attacks stay sharp. Buses fold into their parents children first. Each bus runs
+  its effect chain (below) before its fader; Master's output is then clamped to [-1, 1] as a
+  guard, which its default limiter keeps from mattering. Solo: while any bus is soloed, only soloed buses,
+  their ancestors and descendants are heard. Meters are post-fader peak per channel and RMS with a
+  300 ms release, read without consuming them. At most 256 voices.
+- `AudioSettings` (`settings.audio` in the project file, parsed strictly like graphics): buses
+  with name, parent, volume (-80 to +24 dB, -80 is silent), mute and solo, normalised parents first;
+  exactly one parentless Master. Defaults: Master > Music, SFX, Ambience, Voice. Engine
+  `audio_settings`/`set_audio_settings` save them like the input map. Protocol `audio.settings`,
+  `audio.set_bus` (creates, renames keeping children, reparents, volume, mute, solo) and
+  `audio.remove_bus` (children move up).
+- Components: `AudioSource` (clip, bus by name — unknown buses play into Master — volume dB, pitch,
+  pan for flat sources, loop, play_on_start, spatial, min/max distance, rolloff inverse /
+  inverse_square / linear, doppler 0-5) and `AudioListener` (no fields). Scene v18 stores both
+  (`audio_source`, `audio_listener`; stable ids 0x0f and 0x10). The creatable node type
+  `AudioSource` ("Audio Source") adds a source; `scene.set_audio_source` edits it (undoable, with
+  the inspector's drag gestures).
+- `AudioSystem` (owned by `Engine`, `Engine::audio()`): the listener is the first node with a
+  listener, else the active camera, else the origin. Spatial sources use distance gain (full inside
+  min_distance, silent from max_distance; the curved models fade out over the last tenth of the
+  range so crossing max_distance does not cut off), equal-power pan from the listener's right
+  vector, stereo clips mixed to mono, and doppler from position changes per game step (speed of
+  sound 343 m/s, ratio clamped to 0.5-2). Flat sources use a balance pan. play_on_start sources
+  start on the first game step (and when spawned); each node starts once per game. Voices stop
+  when their node, source or clip goes. Pause pauses game voices; Stop Game stops everything.
+  In the editor nothing plays by itself: `audio.play` previews a source flat, `audio.stop` stops one
+  or all. `audio.status` reports the device, listener, voices (gains, position, preview) and bus
+  levels; `audio.clip` reports a file's format and min/max peak pairs for waveforms.
+- Output: `EngineConfig::audio_output` opens the default device through miniaudio (f32 stereo 48
+  kHz) whose callback renders the mixer under a mutex held only for mixing; clips decode before the
+  lock. Windowed `relay_demo` sessions turn it on unless `RELAY_AUDIO=0`; tests and headless modes
+  never open a device. Without a device each game step renders its own duration of audio and throws
+  it away, so voices and meters advance deterministically with the simulation.
+- Bus effects (`src/audio/audio_effects.cpp`, `AudioEffect` in `audio_settings.hpp`): up to 8
+  per bus, saved in `settings.audio` with only each type's own parameters. Reverb is Jezar's
+  Freeverb (public domain; 8 damped combs and 4 allpasses per channel, tunings scaled to 48 kHz,
+  pre-delay up to 250 ms); delay (up to 2 s, damped feedback); 3-band EQ (RBJ cookbook shelves
+  at 200 Hz and 5 kHz and a peak at mid_frequency); stereo-linked peak compressor; instant-attack
+  peak limiter without lookahead; low-pass and high-pass biquads. `configure` keeps state so tails
+  ring through parameter changes; a bus that keeps its name keeps its processors across layout
+  changes. Default Master: a limiter at -1 dBFS. Protocol `audio.set_effect` (append without
+  index, or change by index; a type change keeps shared parameters), `audio.remove_effect`,
+  `audio.move_effect`. `audio.set_bus` and `audio.set_effect` take `preview`: `Engine`
+  keeps previewed settings in memory (reported by `audio.settings` with `previewing`) until the
+  next saved change or a project switch, so faders are heard live and the project file is written
+  once on release.
+- Reverb zones: `ReverbZone` component (sphere radius or box half extents in the node's space,
+  fade in metres, preset room / small_room / bathroom / hall / cathedral / cave / arena / forest or
+  custom, room_size, damping, wet_db, pre_delay_ms; stable id 0x11, creatable node type
+  `ReverbZone`; `scene.set_reverb_zone`, where a preset copies its values and any hand-set
+  parameter makes the zone custom). `reverb_zone_weight` is 1 inside the shape (box: clamped in
+  local space and measured back in world space, so rotation and scale are exact; sphere: radius
+  times the largest axis scale) falling linearly to 0 at `fade` outside; 0.1 mm of round-off
+  counts as inside. Only during the game, each zone near the listener or a playing placed sound
+  gets one of 8 mixer reverb slots (Freeverb, width 1; a zone keeps its slot while it matters,
+  and extra zones beyond 8 are dry). A placed sound sends to the zones it is in, weighted by how
+  far inside; outside every zone it sends to the zones the listener is in, by the listener's
+  weights. Sends pass through the same bus faders as the dry sound and each slot returns into
+  Master before its effects at `wet_db`; a slot let go rings out, then clears so an old tail cannot
+  return with a new zone.
+- Sources: `AudioSource` gained `occlusion` (default on) and `reverb_send` (0-1, default 1).
+  Spatial game voices send `volume * distance gain * reverb_send`; flat sources and editor previews
+  send nothing. Occlusion casts a ray from the listener to each occluding spatial source every game
+  step (at most 64 per step, taking turns), skipping the nearest collider-bearing ancestor of the
+  listener (the player's capsule) and hits on the source itself, its ancestors or descendants. The
+  amount moves to 0 or 1 over 0.15 s; fully occluded is -12 dB with a one-pole low-pass sweeping
+  from 20 kHz to 800 Hz. The send is not occluded, so a muffled sound still fills the room.
+  `audio.status` adds each voice's send (all slots summed), cutoff and occlusion, and `reverb`
+  (each slotted zone with its parameters and the listener's weight). `audio.debug_shapes` reports zones (centre,
+  box half-edge vectors, world radius, fade) and spatial sources (centre, min/max distance).
+- Editor: the Inspector's Audio source section (clip picker listing the project's sound files, also
+  a drop target for sound files from Assets; waveform with a playhead; Play/Stop preview; bus picker
+  warning about unknown buses; volume, pitch, loop, play on start, spatial with distances, rolloff
+  and doppler, or pan) and Audio listener section (warns when several nodes have one). **Game
+  Configuration → Audio** shows the output device and a bus table (tree indent, double-click
+  rename, parent, volume slider saved when released, mute/solo, level meters, remove, add). audio
+  status is polled only while a source is selected or the page is open.
+  Phase 2 added: Occlusion and Reverb send on spatial sources; a Reverb zone section (shape, radius
+  or half size, fade, preset, room size, damping, level, pre-delay, and during the game how much of
+  the zone the listener hears); viewport outlines from `audio.debug_shapes` (every zone faintly,
+  the selected one bright with its fade margin, and the selected source's min/max spheres, drawn
+  by the new `ViewportPen` helper; the older collider and joint overlays still project on their
+  own); and a dockable **Mixer** panel (Tools → Audio mixer, joining Diagnostics on first open, or
+  the Audio page's Open the Mixer button). Its strips fill the panel height (the fader takes what
+  is left) with name, mute/solo, parent, fader and stereo meter, the effect chain and a + Effect
+  picker; the selected effect's settings open beside the strips (enable, move, remove, sliders,
+  logarithmic for frequencies). Faders and sliders preview while held and save on release.
+- Scripts: `RelayHostApi` gained `audio_play(entity, volume_db, pitch)`, `audio_stop` and
+  `audio_playing` (appended; ABI version unchanged), wrapped as `entity.play_sound`, `stop_sound`
+  and `sound_playing`. The volume and pitch adjust that playing only, on top of the authored source.
+- Demo sound tests (built by `tools/demo_project/build_demo_project.cpp`; the sounds are
+  synthesised by `tools/generate_demo_project.py`, so they carry no third-party licence):
+  `sounds/thump.wav`, `tone.wav` and a seamlessly looping `hum.wav`. Every dynamic body in the
+  physics and joints playgrounds, and the Ball template, has a spatial thump source on SFX and
+  `scripts/ImpactSound.cpp`, which plays it on contact begin with volume from the body's velocity
+  change over that step (silent below 0.6 m/s, full at 8 m/s, -30 dB at the quietest), a
+  deterministic pitch spread of 8% and a 60 ms cooldown; heavier bodies have lower source pitches.
+  The spinning torus hums (Ambience, looping, play on start). A "Hall reverb" box zone (16 x 6 x 7
+  m, 3 m fade, hall preset) surrounds the joints playground. A "Tone button" (glowing cap on a
+  chrome stand at (1.5, 1.05, 6.5), front right of the player's start) runs
+  `scripts/ToneButton.cpp`: looking at it within 3 m and pressing interact, or hitting it with
+  anything but the player, plays the next note of a major pentatonic scale (pitch ratios on a C5
+  bell) and dips the cap. The player's camera (and the template's) has the audio listener. The
+  script suite plays the showcase and checks thumps from at least five bodies, the hum, the
+  listener and a button press.
+
+Phase 3:
+- Streaming: files over 10 s (`audio_stream_threshold_seconds`, decided from the decoder's length,
+  or over 4 MiB when it cannot say; cached per file version) play through `AudioStream`, a
+  four-second ring the game thread refills every update (and between 4096-frame slices when
+  rendering headless) outside the mixer's lock and commits inside it. The mixer reads streams by
+  running frame index, waits in silence rather than skipping when the ring runs dry, and loops by
+  seeking the decoder. `audio.clip` on a long file summarises it in one pass
+  (`summarize_audio_file`) instead of keeping it, and reports `streams`.
+- `AudioSystem` keeps one table of playbacks by handle: node sources, one-shots and music tracks.
+  One-shots (`play_clip`, protocol `audio.play_clip`, which returns `sound` for `audio.stop`) carry
+  their own settings: SFX by default, spatial when given a position (and only during the game),
+  occluded and sending to zones like sources, no doppler.
+- Mixer voices can start `delay_frames` late and run a sample-accurate scheduled fade
+  (`fade(voice, to, delay, duration, stop)`), which music uses.
+- Music: `MusicPlayer` component (tracks, bus Music, volume, crossfade 0-30 s, shuffle,
+  loop_playlist, play_on_start, bpm, beats_per_bar, first_beat_seconds, sync immediate / beat / bar
+  / track_end; scene v20, stable id 0x12, creatable node type `MusicPlayer`,
+  `scene.set_music_player`). During the game the first track starts at full volume; a change
+  (`music_play`, protocol `audio.music` play/next/stop) computes the next beat or bar from the
+  current track's position, starts the new track that many frames later and fades it in while the
+  old one fades out and stops, all in mixer frames. About 0.25 s before a track's crossfade is due
+  the next is scheduled the same way (track_end), so playlists crossfade into each other; a
+  one-track looping playlist is one looping voice. Shuffle is a repeatable order per pass.
+- Script bus changes (`set_bus_volume` with a fade in game time, `set_bus_mute`,
+  `set_bus_effect`) are overrides on top of the saved (or previewed) mixer, applied only during
+  the game and cleared by Stop Game.
+- Headphones: `AudioSettings::spatialization` (`settings.audio.spatialization`, stereo or
+  binaural; `audio.set_spatialization`). Binaural voices mix to mono and pass through a
+  Brown–Duda head model per ear: a fractional interaural delay (Woodworth, up to about 0.66 ms)
+  and a one-pole/one-zero head-shadow filter set from the angle between the ear and the sound,
+  with a low-pass towards 6 kHz for sounds behind as a front/back cue. Elevation only enters
+  through that angle; there is no pinna model or measured HRTF.
+- Scripts: `RelayHostApi` appended `audio_position`, `audio_play_clip`, `audio_sound_stop`,
+  `audio_sound_playing`, `audio_sound_position`, `audio_bus_volume`, `audio_get_bus_volume`,
+  `audio_bus_mute`, `audio_bus_effect`, `music_play`, `music_stop` and `music_track`, wrapped in
+  the SDK as `relay::audio::play` / `play_flat` (returning `relay::audio::Sound`),
+  `set_bus_volume`, `bus_volume`, `set_bus_mute`, `set_bus_effect`, and `entity.sound_position`,
+  `play_music`, `stop_music`, `music_track` with `relay::audio::Sync`.
+- Editor: dropping a sound file into the viewport creates an Audio Source node (named after the
+  file, 1 m above the drop point) playing it; double-clicking a sound in Assets previews it flat,
+  and its context menu has Preview and Stop previews; a Music player section (playlist with
+  play-this-track during the game, move up and remove, an add picker that also takes dropped
+  files, Next and Stop during the game, bus, volume, crossfade, play on start, shuffle, loop,
+  BPM, beats per bar, first beat and when changes land); and Speakers / Headphones on the Audio
+  page.
+- Demo: `music/daylight.wav` and `music/dusk.wav` (16 s each at 24 kHz, 120 BPM in 4/4:
+  pad, bass on one and three, eighth-note arpeggios; generated, so no licence) stream through a
+  "Soundtrack" music player (-8 dB, 1 s crossfade, changes on the bar). A "Music switch" pad on a
+  stand at (-1.5, 1.05, 6.5), mirroring the tone button, runs `scripts/MusicSwitch.cpp`, moving the
+  soundtrack on at the next bar. The tone button now ducks the Music bus 10 dB for 0.8 s under
+  each note. The First Person Controller plays `sounds/shot.wav` as a one-shot from the muzzle on
+  each shot (`shot_sound` property). The script suite checks the soundtrack, the switch landing a
+  new track, the shot one-shot and the duck and its recovery.
+
 ### Gameplay scripting
 
 - Scripts are C++20 under a project's `scripts/` folder, written against the single SDK header
@@ -604,9 +779,22 @@ without blocking simultaneous human editing.
    headless coverage only.
 13. GPU timestamps bracket whole passes on the graphics queue; the panel's GPU numbers do not
    separate work that overlaps inside a pass.
+14. Audio phases 1 to 3 are built. Not in it: portals or diffraction (occlusion is one ray, on or
+   off, so a sound behind a thin post is fully muffled for a moment; partial occlusion was
+   deliberately left out), a measured HRTF (the headphone mode is a head model, weak on elevation),
+   a limiter lookahead, effect presets, and more than 8 zones heard at once. Zones only colour Run
+   Game, not editor previews. Short clips still decode whole the first time they play (at most
+   10 s, so the stall is small); streams read their files from disk as they play. Music timing is
+   sample-accurate headless; with a device it is exact within the mixer, and the request itself
+   is taken at the next game step. Audio has headless, protocol, compiled-script and
+   headless-editor coverage only: sound through a real device has not been heard, and none of the
+   audio UI has been looked at on a desktop. Resampling is linear. Dropping a sound into the
+   viewport makes three undo steps (create, place, clip) rather than one.
 
 ## Next priorities
 
+0. A desktop listening pass for audio, to tune the demo's levels, occlusion strength, zone
+   presets and music mix, and to check the headphone mode by ear.
 1. Extend the script API further where games need it: adding and configuring components,
    reparenting, and shape casts. More example controllers (third-person, orbit) can follow the
    demo's scripted first person controller.
@@ -687,6 +875,19 @@ spot, and cubemap point shadows; the general visual smoke covers capture isolati
 resizing with all shadow resources active. These results do not prove live-provider stability or the
 newest Agent-panel presentation quality.
 
+Audio is covered offline, never through a sound device: the workflow suite renders the mixer
+(bus gain, mute, solo, meters, loops, every effect, zone reverb sends, occlusion's low-pass, the
+binaural head model's delay and shadow), zone weights and blending, streaming, one-shots,
+sample-accurate beat and bar music changes and playlist crossfades, script bus fades, and the
+protocol and saving for sources, zones, music players and the mixer (including in-game
+occlusion behind a real collider and live previews saved on release). The script suite compiles
+the demo's audio scripts and plays the showcase: thumps from falling bodies, the hum, the tone
+button's note and music duck, the music switch landing a new track, and the shot one-shot. The
+headless editor suite drives the Audio source, Reverb zone and Music player sections, the Audio
+page (buses, speakers and headphones) and the Mixer panel (mute, effects, a parameter dragged live
+and saved on release). The release build caught an editor bug the dev build hid (a panel reading
+settings it had just replaced), so run both.
+
 Run native suites sequentially because some fixtures share temporary import paths:
 
 ```sh
@@ -723,6 +924,7 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Editor | `src/editor/`, `include/relay/editor/` |
 | Agent bridge | `tools/mcp-bridge/src/` |
 | Input | `src/core/input.cpp`, `src/platform/sdl_input.cpp` |
+| Audio | `src/audio/`, `include/relay/audio/`, Audio source Inspector section and Audio page in `src/editor/editor_ui.cpp` |
 | Frame profiler | `src/observe/profiler.cpp`, `include/relay/observe/profiler.hpp`, Profiler panel in `src/editor/editor_ui.cpp` |
 | Native tests | `tests/engine_tests.cpp`, `tests/script_tests.cpp`, `tests/editor_*tests.cpp` |
 | Bridge tests | `tools/mcp-bridge/tests/` |

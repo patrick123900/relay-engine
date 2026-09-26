@@ -840,6 +840,95 @@ struct ScriptSystem::Impl {
             return owner.physics().set_joint_motor(owner.scene(), unpack(entity), on != 0, speed)
                        ? 1 : 0;
         };
+        host.audio_play = [](void* context, RelayEntity entity, double volume_db, double pitch) {
+            auto& impl = self(context);
+            auto& owner = impl.engine;
+            std::string error;
+            if (owner.audio().play(owner.scene(), unpack(entity), true, error, volume_db, pitch))
+                return 1;
+            impl.warn("play_sound on " + unpack(entity).to_string() + ": " + error);
+            return 0;
+        };
+        host.audio_stop = [](void* context, RelayEntity entity) {
+            return self(context).engine.audio().stop(unpack(entity)) ? 1 : 0;
+        };
+        host.audio_playing = [](void* context, RelayEntity entity) {
+            return self(context).engine.audio().playing(unpack(entity)) ? 1 : 0;
+        };
+        host.audio_position = [](void* context, RelayEntity entity) {
+            return self(context).engine.audio().position(unpack(entity)).value_or(-1.0);
+        };
+        host.audio_play_clip = [](void* context, const char* clip, size_t clip_length,
+                                  const RelayVec3* position, double volume_db, double pitch,
+                                  const char* bus, size_t bus_length, double min_distance,
+                                  double max_distance) -> uint64_t {
+            auto& impl = self(context);
+            AudioOneShot options;
+            if (position) options.position = Vec3{position->x, position->y, position->z};
+            options.volume_db = volume_db;
+            options.pitch = pitch;
+            options.bus = std::string(bus, bus_length);
+            options.min_distance = min_distance;
+            options.max_distance = max_distance;
+            std::string error;
+            const std::string_view name(clip, clip_length);
+            const auto sound = impl.engine.audio().play_clip(impl.engine.scene(), name, options, error);
+            if (sound == 0U) impl.warn("play " + std::string(name) + ": " + error);
+            return sound;
+        };
+        host.audio_sound_stop = [](void* context, uint64_t sound) {
+            return self(context).engine.audio().stop_sound(sound) ? 1 : 0;
+        };
+        host.audio_sound_playing = [](void* context, uint64_t sound) {
+            return self(context).engine.audio().sound_playing(sound) ? 1 : 0;
+        };
+        host.audio_sound_position = [](void* context, uint64_t sound) {
+            return self(context).engine.audio().sound_position(sound).value_or(-1.0);
+        };
+        host.audio_bus_volume = [](void* context, const char* bus, size_t length, double volume_db,
+                                   double fade_seconds) {
+            auto& impl = self(context);
+            std::string error;
+            if (impl.engine.audio().set_bus_volume({bus, length}, volume_db, fade_seconds, error)) return 1;
+            impl.warn("set_bus_volume: " + error);
+            return 0;
+        };
+        host.audio_get_bus_volume = [](void* context, const char* bus, size_t length) {
+            return self(context).engine.audio().bus_volume({bus, length}).value_or(-1000.0);
+        };
+        host.audio_bus_mute = [](void* context, const char* bus, size_t length, int mute) {
+            auto& impl = self(context);
+            std::string error;
+            if (impl.engine.audio().set_bus_mute({bus, length}, mute != 0, error)) return 1;
+            impl.warn("set_bus_mute: " + error);
+            return 0;
+        };
+        host.audio_bus_effect = [](void* context, const char* bus, size_t length, uint32_t index,
+                                   const char* parameter, size_t parameter_length, double value) {
+            auto& impl = self(context);
+            std::string error;
+            if (impl.engine.audio().set_bus_effect({bus, length}, index, {parameter, parameter_length},
+                                                   value, error))
+                return 1;
+            impl.warn("set_bus_effect: " + error);
+            return 0;
+        };
+        host.music_play = [](void* context, RelayEntity entity, int track, int sync) {
+            auto& impl = self(context);
+            std::optional<MusicPlayer::Sync> when;
+            if (sync >= 0 && sync <= 3) when = static_cast<MusicPlayer::Sync>(sync);
+            std::string error;
+            if (impl.engine.audio().music_play(impl.engine.scene(), unpack(entity), track, when, error))
+                return 1;
+            impl.warn("play_music on " + unpack(entity).to_string() + ": " + error);
+            return 0;
+        };
+        host.music_stop = [](void* context, RelayEntity entity, double fade_seconds) {
+            return self(context).engine.audio().music_stop(unpack(entity), fade_seconds) ? 1 : 0;
+        };
+        host.music_track = [](void* context, RelayEntity entity) {
+            return self(context).engine.audio().music_track(unpack(entity));
+        };
         host.overlap_sphere = [](void* context, RelayVec3 center, double radius,
                                  uint32_t layer_mask, RelayEntity ignore, RelayEntity* out,
                                  size_t capacity) -> size_t {

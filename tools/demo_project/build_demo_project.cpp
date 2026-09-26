@@ -1,7 +1,8 @@
 // Authors the dev-build demo project through the trusted control protocol, using the same requests
 // the editor and agents send. Run by tools/generate_demo_project.py from the repository root, after
-// it has written models/primitives.glb into the project folder. The committed scripts
-// (FirstPersonController.cpp, Projectile.cpp) are project source and are left as they are.
+// it has written models/primitives.glb and the sounds into the project folder. The committed scripts
+// (FirstPersonController.cpp, Projectile.cpp, ImpactSound.cpp, ToneButton.cpp, MusicSwitch.cpp)
+// are project source and are left as they are.
 
 #include "relay/control/control_protocol.hpp"
 #include "relay/core/engine.hpp"
@@ -81,6 +82,21 @@ struct Builder {
                                            ",\"type\":\"dynamic\",\"mass\":" + number(mass) +
                                            ",\"restitution\":" + number(restitution) +
                                            ",\"friction\":" + number(friction));
+    }
+    void sound(const std::string& entity, const std::string& fields) {
+        call("scene.set_audio_source", "\"entity\":" + text(entity) + ',' + fields);
+    }
+    void script(const std::string& entity, const std::string& behaviour) {
+        call("component.add", "\"entity\":" + text(entity) +
+                                  ",\"component\":\"script\",\"behaviour\":" + text(behaviour));
+    }
+    // A thump from where the body is whenever it hits something (scripts/ImpactSound.cpp). Heavier
+    // things get a lower `pitch`.
+    void impact(const std::string& entity, const double pitch, const double volume_db = 0.0) {
+        sound(entity, "\"clip\":\"sounds/thump.wav\",\"bus\":\"SFX\",\"play_on_start\":false,"
+                      "\"spatial\":true,\"min_distance\":1.5,\"max_distance\":30,\"pitch\":" +
+                          number(pitch) + ",\"volume_db\":" + number(volume_db));
+        script(entity, "ImpactSound");
     }
     // Euler degrees that turn the -Z forward axis from `from` towards `to`.
     static std::array<double, 3> look(std::array<double, 3> from, std::array<double, 3> to) {
@@ -219,11 +235,13 @@ int main(const int argument_count, char** arguments) {
                 {x, 0.41 + level * 0.81, 1.5}, {}, {0.8, 0.8, 0.8});
             demo.collider(entity, "\"type\":\"box\"");
             demo.body(entity, 1.0, 0.05, 0.6);
+            demo.impact(entity, 1.0);
         }
     const auto wrecking = demo.mesh_entity("Wrecking ball", playground, "Sphere", "Chrome",
                                            {-4.3, 6.0, 1.6});
     demo.collider(wrecking, "\"type\":\"sphere\",\"radius\":0.5");
     demo.body(wrecking, 4.0, 0.3, 0.4);
+    demo.impact(wrecking, 0.55, 3.0);
     const std::vector<std::pair<std::string, std::string>> balls{
         {"Gold ball", "Gold"}, {"Bouncy ball", "Rubber"}, {"Brick ball", "Brick"}};
     for (std::size_t index = 0; index < balls.size(); ++index) {
@@ -234,15 +252,18 @@ int main(const int argument_count, char** arguments) {
                                              {0.6, 0.6, 0.6});
         demo.collider(entity, "\"type\":\"sphere\",\"radius\":0.5");
         demo.body(entity, 0.8, balls[index].second == "Rubber" ? 0.85 : 0.2, 0.4);
+        demo.impact(entity, 1.25 + 0.15 * static_cast<double>(index), -3.0);
     }
     const auto capsule = demo.mesh_entity("Tumbling capsule", playground, "Capsule", "Copper",
                                           {1.5, 3.5, 3.8}, {0, 0, 60});
     demo.collider(capsule, "\"type\":\"capsule\",\"radius\":0.25,\"half_height\":0.5");
     demo.body(capsule, 1.2, 0.1, 0.5);
+    demo.impact(capsule, 1.15);
     const auto barrel = demo.mesh_entity("Barrel (convex hull)", playground, "Cylinder", "Ocean",
                                          {0.5, 5.0, 2.2}, {80, 0, 20}, {0.7, 0.9, 0.7});
     demo.collider(barrel, "\"type\":\"convex\"");
     demo.body(barrel, 2.0, 0.1, 0.5);
+    demo.impact(barrel, 0.8);
 
     // Material showcase: PBR spheres on pedestals under the spot light.
     const auto showcase = demo.create("Material showcase");
@@ -271,6 +292,10 @@ int main(const int argument_count, char** arguments) {
                                             Builder::number(value[2]) + ",\"rz\":0");
     demo.call("scene.keyframes.playback", "\"entity\":" + Builder::text(torus) +
                                               ",\"playing\":true,\"loop\":true,\"duration_seconds\":4");
+    // It hums as it turns: walk around it to hear the sound pan and fade.
+    demo.sound(torus, "\"clip\":\"sounds/hum.wav\",\"bus\":\"Ambience\",\"loop\":true,"
+                      "\"play_on_start\":true,\"spatial\":true,\"volume_db\":-6,"
+                      "\"min_distance\":1.5,\"max_distance\":16");
 
     // Joints playground, behind the material row: a swinging chain, a hinged door, a motorised
     // spinner and a ball on a spring.
@@ -289,6 +314,7 @@ int main(const int argument_count, char** arguments) {
                                              {0.4, 0.4, 0.4});
         demo.collider(entity, "\"type\":\"sphere\",\"radius\":0.5");
         demo.body(entity, 1.0, 0.1, 0.4);
+        demo.impact(entity, 1.8, -6.0);
         joint(entity, "\"type\":\"point\",\"connected\":" + Builder::text(previous) +
                           ",\"anchor_x\":-1.5");
         previous = entity;
@@ -300,20 +326,60 @@ int main(const int argument_count, char** arguments) {
                                        {1.0, 2.2, 0.1});
     demo.collider(door, "\"type\":\"box\"");
     demo.body(door, 5.0, 0.1, 0.5);
+    demo.impact(door, 0.7);
     joint(door, "\"type\":\"hinge\",\"connected\":" + Builder::text(post) +
                     ",\"anchor_x\":-0.5,\"limits\":true,\"limit_min\":-100,\"limit_max\":100");
     const auto spinner = demo.mesh_entity("Spinner", joints, "Cube", "Ocean", {4, 0.35, -9}, {},
                                           {2.4, 0.2, 0.3});
     demo.collider(spinner, "\"type\":\"box\"");
     demo.body(spinner, 20.0, 0.1, 0.5);
+    demo.impact(spinner, 0.6);
     joint(spinner, "\"type\":\"hinge\",\"motor\":true,\"motor_speed\":60,\"motor_force\":5000");
     const auto bungee = demo.mesh_entity("Bungee ball", joints, "Sphere", "Gold", {7.5, 2.5, -9}, {},
                                          {0.6, 0.6, 0.6});
     demo.collider(bungee, "\"type\":\"sphere\",\"radius\":0.5");
     demo.body(bungee, 1.0, 0.3, 0.4);
+    demo.impact(bungee, 1.4, -3.0);
     joint(bungee, "\"type\":\"distance\",\"connected_anchor_x\":7.5,\"connected_anchor_y\":5,"
                   "\"connected_anchor_z\":-9,\"limits\":true,\"limit_min\":0,\"limit_max\":1.5,"
                   "\"spring_frequency\":1.2,\"spring_damping\":0.1");
+
+    // Tone button, just ahead and to the right of where the player starts: look at the cap and
+    // press interact, or hit it with a ball, to play the next note (scripts/ToneButton.cpp).
+    const auto sounds = demo.create("Sound tests");
+    const auto stand = demo.mesh_entity("Button stand", sounds, "Cylinder", "Chrome", {1.5, 0.5, 6.5},
+                                        {}, {0.5, 1.0, 0.5});
+    demo.collider(stand, "\"type\":\"convex\"");
+    const auto button = demo.mesh_entity("Tone button", sounds, "Cylinder", "Glow", {1.5, 1.05, 6.5},
+                                         {}, {0.35, 0.1, 0.35});
+    demo.collider(button, "\"type\":\"convex\"");
+    demo.sound(button, "\"clip\":\"sounds/tone.wav\",\"bus\":\"SFX\",\"play_on_start\":false,"
+                       "\"spatial\":true,\"min_distance\":2,\"max_distance\":25");
+    demo.script(button, "ToneButton");
+
+    // The soundtrack: two 16 s tracks (they stream), crossfading on the bar, and a pad to the
+    // left of the start that moves on to the next track (scripts/MusicSwitch.cpp).
+    const auto soundtrack = demo.create("Soundtrack", sounds);
+    demo.call("component.add", "\"entity\":" + Builder::text(soundtrack) + ",\"component\":\"music_player\"");
+    demo.call("scene.set_music_player", "\"entity\":" + Builder::text(soundtrack) +
+                                            ",\"tracks\":[\"music/daylight.wav\",\"music/dusk.wav\"],"
+                                            "\"volume_db\":-8,\"crossfade_seconds\":1,\"bpm\":120,"
+                                            "\"beats_per_bar\":4,\"sync\":\"bar\"");
+    const auto switch_stand = demo.mesh_entity("Switch stand", sounds, "Cylinder", "Chrome",
+                                               {-1.5, 0.5, 6.5}, {}, {0.5, 1.0, 0.5});
+    demo.collider(switch_stand, "\"type\":\"convex\"");
+    const auto music_switch = demo.mesh_entity("Music switch", sounds, "Cube", "Ocean",
+                                               {-1.5, 1.05, 6.5}, {}, {0.4, 0.1, 0.4});
+    demo.collider(music_switch, "\"type\":\"box\"");
+    demo.script(music_switch, "MusicSwitch");
+
+    // A hall's reverb around the joints playground: walk in from the start to hear the thumps
+    // and the button ring on.
+    const auto hall = demo.create("Hall reverb", sounds);
+    demo.transform(hall, {1.5, 3, -9});
+    demo.call("scene.set_reverb_zone", "\"entity\":" + Builder::text(hall) +
+                                           ",\"shape\":\"box\",\"half_x\":8,\"half_y\":3,"
+                                           "\"half_z\":3.5,\"fade\":3,\"preset\":\"hall\"");
 
     // Input: the engine's default map, locking the mouse so first-person look can turn freely.
     auto input = relay::default_input_map();
@@ -339,6 +405,9 @@ int main(const int argument_count, char** arguments) {
                                               "\"behaviour\":\"FirstPersonController\"");
     const auto player_camera = demo.create("Camera", player);
     demo.transform(player_camera, {0, 0.7, 0});
+    // The game hears from the player's eyes.
+    demo.call("component.add", "\"entity\":" + Builder::text(player_camera) +
+                                   ",\"component\":\"audio_listener\"");
     demo.call("scene.set_camera", "\"entity\":" + Builder::text(player_camera) +
                                       ",\"enabled\":true,\"active\":false,"
                                       "\"field_of_view_y_degrees\":75,\"near_plane\":0.05");
@@ -358,11 +427,12 @@ int main(const int argument_count, char** arguments) {
     demo.collider(ball, "\"type\":\"sphere\",\"radius\":0.5,\"layer\":2");
     demo.body(ball, 0.5, 0.5, 0.4);
     demo.call("component.add", ball_field + ",\"component\":\"script\",\"behaviour\":\"Projectile\"");
+    demo.impact(ball, 1.5, -4.0);
     demo.call("templates.save", ball_field + ",\"name\":\"Ball\",\"replace\":true");
     demo.call("scene.destroy", ball_field);
 
     std::cout << "Wrote " << project_file
-              << " with scenes/showcase.relay.json (with a First Person Controller) and the "
-                 "First Person Controller and Ball templates\n";
+              << " with scenes/showcase.relay.json (with a First Person Controller and sound tests) "
+                 "and the First Person Controller and Ball templates\n";
     return 0;
 }

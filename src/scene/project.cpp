@@ -52,7 +52,7 @@ std::string Project::json(const bool with_settings) const {
         files += '"' + json_escape(scene) + '"';
     }
     std::string settings;
-    if (with_settings && (input || graphics)) {
+    if (with_settings && (input || graphics || audio)) {
         std::string entries;
         if (input) {
             // The map keeps its own format and version; indented to sit inside the project object.
@@ -65,6 +65,10 @@ std::string Project::json(const bool with_settings) const {
         if (graphics) {
             if (!entries.empty()) entries += ',';
             entries += "\n    \"graphics\": " + graphics_settings_json(*graphics);
+        }
+        if (audio) {
+            if (!entries.empty()) entries += ',';
+            entries += "\n    \"audio\": " + audio_settings_json(*audio);
         }
         settings = ",\n  \"settings\": {" + entries + "\n  }";
     }
@@ -123,7 +127,7 @@ std::optional<Project> load_project(const std::string_view filename, std::string
         return {};
     }
     Project project{std::string(filename), string_at("name"), {}, string_at("startup_scene"), {}, false,
-                    {}};
+                    {}, {}};
     for (const auto& scene : *scenes->array()) {
         if (!scene.string()) { error = "project scenes must be filenames"; return {}; }
         project.scenes.push_back(*scene.string());
@@ -143,6 +147,11 @@ std::optional<Project> load_project(const std::string_view filename, std::string
         std::string problem;
         project.graphics = parse_graphics_settings(*graphics, problem);
         if (!project.graphics) { error = "invalid graphics settings in the project: " + problem; return {}; }
+    }
+    if (const auto* audio = settings ? field(*settings->object(), "audio") : nullptr) {
+        std::string problem;
+        project.audio = parse_audio_settings(*audio, problem);
+        if (!project.audio) { error = "invalid audio settings in the project: " + problem; return {}; }
     }
     error.clear();
     return project;

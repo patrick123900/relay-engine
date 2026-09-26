@@ -2098,7 +2098,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 42U && relay::protocol_methods().size() == 131U,
+    expect(relay::protocol_schema_version == 45U && relay::protocol_methods().size() == 148U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");
@@ -2180,7 +2180,7 @@ int main() {
         std::filesystem::create_directories(package_root / "captures");
         const auto project_file = package_root / "sample.relayproject";
         relay::Project package{project_file.generic_string(), "Portable test", {"main.relay.json"},
-                               "main.relay.json", {}, false, {}};
+                               "main.relay.json", {}, false, {}, {}};
         std::string package_error;
         expect(relay::save_project(package, package_error, true), "test project metadata saves");
         expect(relay::save_scene_file_atomic(engine.scene(), package_root / "scenes/main.relay.json",
@@ -2704,6 +2704,27 @@ int main() {
                               R"(","px":10,"gesture":78})");
         expect(engine.scene_history().undo_depth() == second_drag_start + 1U,
                "a new gesture token starts a new undo entry instead of extending the previous drag");
+
+        // Inspector drags apply every frame to component fields too, so the scene follows the
+        // mouse, yet each drag still undoes as one step.
+        const auto camera_drag_start = engine.scene_history().undo_depth();
+        for (int step = 0; step < 4; ++step) {
+            (void)protocol.handle(R"({"id":216,"method":"scene.set_camera","entity":")" + entity +
+                                  R"(","field_of_view_y_degrees":)" + std::to_string(60 + step) +
+                                  R"(,"gesture":79})");
+        }
+        (void)protocol.handle(R"({"id":217,"method":"scene.set_light","entity":")" + entity +
+                              R"(","type":"point"})");
+        const auto light_drag_start = engine.scene_history().undo_depth();
+        for (int step = 1; step <= 4; ++step) {
+            (void)protocol.handle(R"({"id":218,"method":"scene.set_light","entity":")" + entity +
+                                  R"(","intensity":)" + std::to_string(step) + R"(,"gesture":80})");
+        }
+        expect(light_drag_start == camera_drag_start + 2U &&
+                   engine.scene_history().undo_depth() == light_drag_start + 1U &&
+                   std::abs(engine.scene().get(parsed_entity)->camera->field_of_view_y_degrees -
+                            63.0) < 1e-9,
+               "inspector drags on component fields fold into one undo entry per drag");
 
         // Viewport picking is a stateless world-space ray, so agents can pick without an editor.
         // The probe is parked away from the entities earlier tests left behind, so the assertion

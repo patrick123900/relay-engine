@@ -24,6 +24,18 @@ const std::vector<ComponentKind>& engine_components() {
         {"joint", "Joint", "Physics", true, true, false,
          "Links this node's physics body to another body or to the world during Run Game: fixed, "
          "point (ball and socket), hinge, slider or distance (rope or spring)."},
+        {"audio_source", "Audio source", "Audio", true, true, false,
+         "Plays a sound file from the project during Run Game, positioned in the world or flat, "
+         "through a mixer bus."},
+        {"audio_listener", "Audio listener", "Audio", true, true, false,
+         "Where the game hears from, usually on the player's camera. Without one, the active "
+         "camera listens."},
+        {"reverb_zone", "Reverb zone", "Audio", true, true, false,
+         "A space with its own reverb, like a room, hall or cave, heard while the listener is "
+         "inside it and fading out around it."},
+        {"music_player", "Music player", "Audio", true, true, false,
+         "Plays a playlist of music files, crossfading between tracks, with changes that can wait "
+         "for the next beat or bar."},
         {"keyframes", "Transform keyframes", "Animation", true, true, false,
          "Animates position, rotation and scale between keys you set on a timeline."},
         {"animator", "Model animation", "Animation", false, false, false,
@@ -50,6 +62,10 @@ bool has_component(const EntityRecord& record, const std::string_view id) {
     if (id == "physics_body") return record.physics_body.has_value();
     if (id == "keyframes") return record.transform_animation.has_value();
     if (id == "joint") return record.joint.has_value();
+    if (id == "audio_source") return record.audio_source.has_value();
+    if (id == "audio_listener") return record.audio_listener.has_value();
+    if (id == "reverb_zone") return record.reverb_zone.has_value();
+    if (id == "music_player") return record.music_player.has_value();
     if (id == "animator") return record.animator.has_value();
     if (id == "script") return !record.scripts.empty();
     return false;
@@ -86,6 +102,14 @@ bool add_component(Scene& scene, const Entity entity, const std::string_view id,
         added = scene.set_physics_body(entity, PhysicsBody{});
     } else if (id == "joint") {
         added = scene.set_joint(entity, Joint{});
+    } else if (id == "audio_source") {
+        added = scene.set_audio_source(entity, AudioSource{});
+    } else if (id == "audio_listener") {
+        added = scene.set_audio_listener(entity, AudioListener{});
+    } else if (id == "reverb_zone") {
+        added = scene.set_reverb_zone(entity, ReverbZone{});
+    } else if (id == "music_player") {
+        added = scene.set_music_player(entity, MusicPlayer{});
     } else if (id == "keyframes") {
         TransformAnimation animation;
         animation.keys.push_back({0.0, record->transform});
@@ -131,6 +155,10 @@ bool remove_component(Scene& scene, const Entity entity, const std::string_view 
     if (id == "physics_body") return scene.set_physics_body(entity, std::nullopt);
     if (id == "keyframes") return scene.set_transform_animation(entity, std::nullopt);
     if (id == "joint") return scene.set_joint(entity, std::nullopt);
+    if (id == "audio_source") return scene.set_audio_source(entity, std::nullopt);
+    if (id == "audio_listener") return scene.set_audio_listener(entity, std::nullopt);
+    if (id == "reverb_zone") return scene.set_reverb_zone(entity, std::nullopt);
+    if (id == "music_player") return scene.set_music_player(entity, std::nullopt);
     auto scripts = record->scripts;
     scripts.erase(scripts.begin() + static_cast<std::ptrdiff_t>(index));
     return scene.set_scripts(entity, std::move(scripts));

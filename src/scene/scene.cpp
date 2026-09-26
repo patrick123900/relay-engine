@@ -1,9 +1,12 @@
 #include "relay/scene/scene.hpp"
 #include "relay/scene/scene_io.hpp"
+#include "relay/audio/audio_clip.hpp"
+#include "relay/audio/audio_settings.hpp"
 
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <filesystem>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -196,6 +199,48 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
                << ",\"spring_damping\":" << joint.spring_damping
                << ",\"collide_connected\":" << (joint.collide_connected ? "true" : "false")
                << ",\"enabled\":" << (joint.enabled ? "true" : "false") << '}';
+    } else output << "null";
+    output << ",\"audio_source\":";
+    if (record.audio_source) {
+        const auto& source = *record.audio_source;
+        output << "{\"clip\":\"" << escape_json(source.clip) << "\",\"bus\":\""
+               << escape_json(source.bus) << "\",\"volume_db\":" << source.volume_db
+               << ",\"pitch\":" << source.pitch << ",\"pan\":" << source.pan
+               << ",\"loop\":" << (source.loop ? "true" : "false")
+               << ",\"play_on_start\":" << (source.play_on_start ? "true" : "false")
+               << ",\"spatial\":" << (source.spatial ? "true" : "false")
+               << ",\"min_distance\":" << source.min_distance
+               << ",\"max_distance\":" << source.max_distance
+               << ",\"rolloff\":\"" << audio_rolloff_name(source.rolloff)
+               << "\",\"doppler\":" << source.doppler
+               << ",\"occlusion\":" << (source.occlusion ? "true" : "false")
+               << ",\"reverb_send\":" << source.reverb_send << '}';
+    } else output << "null";
+    output << ",\"audio_listener\":" << (record.audio_listener ? "{}" : "null");
+    output << ",\"reverb_zone\":";
+    if (record.reverb_zone) {
+        const auto& zone = *record.reverb_zone;
+        output << "{\"shape\":\"" << reverb_shape_name(zone.shape) << "\",\"radius\":" << zone.radius
+               << ",\"half_extents\":";
+        append_vec3(output, zone.half_extents);
+        output << ",\"fade\":" << zone.fade << ",\"preset\":\"" << escape_json(zone.preset)
+               << "\",\"room_size\":" << zone.room_size << ",\"damping\":" << zone.damping
+               << ",\"wet_db\":" << zone.wet_db << ",\"pre_delay_ms\":" << zone.pre_delay_ms << '}';
+    } else output << "null";
+    output << ",\"music_player\":";
+    if (record.music_player) {
+        const auto& player = *record.music_player;
+        output << "{\"tracks\":[";
+        for (std::size_t index = 0; index < player.tracks.size(); ++index)
+            output << (index ? "," : "") << '"' << escape_json(player.tracks[index]) << '"';
+        output << "],\"bus\":\"" << escape_json(player.bus) << "\",\"volume_db\":" << player.volume_db
+               << ",\"crossfade_seconds\":" << player.crossfade_seconds
+               << ",\"shuffle\":" << (player.shuffle ? "true" : "false")
+               << ",\"loop_playlist\":" << (player.loop_playlist ? "true" : "false")
+               << ",\"play_on_start\":" << (player.play_on_start ? "true" : "false")
+               << ",\"bpm\":" << player.bpm << ",\"beats_per_bar\":" << player.beats_per_bar
+               << ",\"first_beat_seconds\":" << player.first_beat_seconds
+               << ",\"sync\":\"" << music_sync_name(player.sync) << "\"}";
     } else output << "null";
     output << '}';
 }
@@ -570,6 +615,160 @@ std::optional<Joint::Type> joint_type_from_name(const std::string_view name) {
     return std::nullopt;
 }
 
+std::string_view audio_rolloff_name(const AudioSource::Rolloff rolloff) {
+    switch (rolloff) {
+    case AudioSource::Rolloff::inverse: return "inverse";
+    case AudioSource::Rolloff::linear: return "linear";
+    case AudioSource::Rolloff::inverse_square: return "inverse_square";
+    }
+    return "inverse";
+}
+
+std::optional<AudioSource::Rolloff> audio_rolloff_from_name(const std::string_view name) {
+    for (const auto rolloff : {AudioSource::Rolloff::inverse, AudioSource::Rolloff::linear,
+                               AudioSource::Rolloff::inverse_square})
+        if (audio_rolloff_name(rolloff) == name) return rolloff;
+    return std::nullopt;
+}
+
+// The path is checked for shape here; whether the file exists is only known at play time.
+bool valid_audio_clip_path(const std::string_view path) {
+    if (path.empty() || path.size() > 128U || !audio_file_extension(path)) return false;
+    const std::filesystem::path relative{std::string(path)};
+    if (relative.is_absolute()) return false;
+    for (const auto& part : relative) {
+        const auto name = part.string();
+        if (name.empty() || name.front() == '.') return false;
+        for (const char c : name)
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '-' || c == '_' || c == '.' || c == ' '))
+                return false;
+    }
+    return true;
+}
+
+std::string_view music_sync_name(const MusicPlayer::Sync sync) {
+    switch (sync) {
+    case MusicPlayer::Sync::immediate: return "immediate";
+    case MusicPlayer::Sync::beat: return "beat";
+    case MusicPlayer::Sync::bar: return "bar";
+    case MusicPlayer::Sync::track_end: return "track_end";
+    }
+    return "bar";
+}
+
+std::optional<MusicPlayer::Sync> music_sync_from_name(const std::string_view name) {
+    for (const auto sync : {MusicPlayer::Sync::immediate, MusicPlayer::Sync::beat,
+                            MusicPlayer::Sync::bar, MusicPlayer::Sync::track_end})
+        if (music_sync_name(sync) == name) return sync;
+    return std::nullopt;
+}
+
+bool valid_music_player(const MusicPlayer& player) {
+    const auto within = [](const double value, const double minimum, const double maximum) {
+        return std::isfinite(value) && value >= minimum && value <= maximum;
+    };
+    return static_cast<unsigned>(player.sync) <= 3U && player.tracks.size() <= maximum_music_tracks &&
+           std::all_of(player.tracks.begin(), player.tracks.end(),
+                       [](const std::string& track) { return valid_audio_clip_path(track); }) &&
+           valid_audio_bus_name(player.bus) &&
+           within(player.volume_db, minimum_audio_volume_db, maximum_audio_volume_db) &&
+           within(player.crossfade_seconds, 0.0, 30.0) && within(player.bpm, 20.0, 400.0) &&
+           player.beats_per_bar >= 1U && player.beats_per_bar <= 16U &&
+           within(player.first_beat_seconds, 0.0, 60.0);
+}
+
+bool Scene::set_music_player(const Entity entity, std::optional<MusicPlayer> player) {
+    auto* record = get(entity);
+    if (!record || (player && !valid_music_player(*player))) return false;
+    record->music_player = std::move(player);
+    return true;
+}
+
+bool valid_audio_source(const AudioSource& source) {
+    const auto within = [](const double value, const double minimum, const double maximum) {
+        return std::isfinite(value) && value >= minimum && value <= maximum;
+    };
+    return static_cast<unsigned>(source.rolloff) <= 2U &&
+           (source.clip.empty() || valid_audio_clip_path(source.clip)) &&
+           valid_audio_bus_name(source.bus) &&
+           within(source.volume_db, minimum_audio_volume_db, maximum_audio_volume_db) &&
+           within(source.pitch, 0.1, 4.0) && within(source.pan, -1.0, 1.0) &&
+           within(source.min_distance, 0.01, 1e6) &&
+           within(source.max_distance, source.min_distance, 1e6) &&
+           within(source.doppler, 0.0, 5.0) && within(source.reverb_send, 0.0, 1.0);
+}
+
+const std::vector<ReverbPreset>& reverb_presets() {
+    static const std::vector<ReverbPreset> presets{
+        {"room", 0.5, 0.5, -8.0, 8.0},       {"small_room", 0.3, 0.6, -10.0, 3.0},
+        {"bathroom", 0.55, 0.15, -5.0, 2.0}, {"hall", 0.82, 0.4, -7.0, 20.0},
+        {"cathedral", 0.95, 0.35, -5.0, 45.0}, {"cave", 0.9, 0.2, -4.0, 15.0},
+        {"arena", 0.88, 0.55, -8.0, 30.0},   {"forest", 0.25, 0.85, -18.0, 12.0},
+    };
+    return presets;
+}
+
+bool apply_reverb_preset(ReverbZone& zone, const std::string_view name) {
+    for (const auto& preset : reverb_presets()) {
+        if (preset.name != name) continue;
+        zone.preset = std::string(name);
+        zone.room_size = preset.room_size;
+        zone.damping = preset.damping;
+        zone.wet_db = preset.wet_db;
+        zone.pre_delay_ms = preset.pre_delay_ms;
+        return true;
+    }
+    return false;
+}
+
+std::string_view reverb_shape_name(const ReverbZone::Shape shape) {
+    return shape == ReverbZone::Shape::sphere ? "sphere" : "box";
+}
+
+std::optional<ReverbZone::Shape> reverb_shape_from_name(const std::string_view name) {
+    if (name == "sphere") return ReverbZone::Shape::sphere;
+    if (name == "box") return ReverbZone::Shape::box;
+    return std::nullopt;
+}
+
+bool valid_reverb_zone(const ReverbZone& zone) {
+    const auto within = [](const double value, const double minimum, const double maximum) {
+        return std::isfinite(value) && value >= minimum && value <= maximum;
+    };
+    const bool known_preset =
+        zone.preset == "custom" ||
+        std::any_of(reverb_presets().begin(), reverb_presets().end(),
+                    [&](const ReverbPreset& preset) { return preset.name == zone.preset; });
+    return static_cast<unsigned>(zone.shape) <= 1U && known_preset &&
+           within(zone.radius, 0.01, 1e5) && within(zone.half_extents.x, 0.01, 1e5) &&
+           within(zone.half_extents.y, 0.01, 1e5) && within(zone.half_extents.z, 0.01, 1e5) &&
+           within(zone.fade, 0.0, 1e4) && within(zone.room_size, 0.0, 1.0) &&
+           within(zone.damping, 0.0, 1.0) && within(zone.wet_db, minimum_audio_volume_db, 6.0) &&
+           within(zone.pre_delay_ms, 0.0, 250.0);
+}
+
+bool Scene::set_reverb_zone(const Entity entity, std::optional<ReverbZone> zone) {
+    auto* record = get(entity);
+    if (!record || (zone && !valid_reverb_zone(*zone))) return false;
+    record->reverb_zone = std::move(zone);
+    return true;
+}
+
+bool Scene::set_audio_source(const Entity entity, std::optional<AudioSource> source) {
+    auto* record = get(entity);
+    if (!record || (source && !valid_audio_source(*source))) return false;
+    record->audio_source = std::move(source);
+    return true;
+}
+
+bool Scene::set_audio_listener(const Entity entity, std::optional<AudioListener> listener) {
+    auto* record = get(entity);
+    if (!record) return false;
+    record->audio_listener = listener;
+    return true;
+}
+
 bool Scene::set_joint(const Entity entity, std::optional<Joint> joint) {
     auto* record = get(entity);
     if (!record) return false;
@@ -876,6 +1075,44 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
           {"spring_damping", ReflectedFieldType::number},
           {"collide_connected", ReflectedFieldType::boolean},
           {"enabled", ReflectedFieldType::boolean}}},
+        {"AudioSource", 0x0fU,
+         {{"clip", ReflectedFieldType::string},
+          {"bus", ReflectedFieldType::string},
+          {"volume_db", ReflectedFieldType::number},
+          {"pitch", ReflectedFieldType::number},
+          {"pan", ReflectedFieldType::number},
+          {"loop", ReflectedFieldType::boolean},
+          {"play_on_start", ReflectedFieldType::boolean},
+          {"spatial", ReflectedFieldType::boolean},
+          {"min_distance", ReflectedFieldType::number},
+          {"max_distance", ReflectedFieldType::number},
+          {"rolloff", ReflectedFieldType::string},
+          {"doppler", ReflectedFieldType::number},
+          {"occlusion", ReflectedFieldType::boolean},
+          {"reverb_send", ReflectedFieldType::number}}},
+        {"AudioListener", 0x10U, {}},
+        {"ReverbZone", 0x11U,
+         {{"shape", ReflectedFieldType::string},
+          {"radius", ReflectedFieldType::number},
+          {"half_extents", ReflectedFieldType::vec3},
+          {"fade", ReflectedFieldType::number},
+          {"preset", ReflectedFieldType::string},
+          {"room_size", ReflectedFieldType::number},
+          {"damping", ReflectedFieldType::number},
+          {"wet_db", ReflectedFieldType::number},
+          {"pre_delay_ms", ReflectedFieldType::number}}},
+        {"MusicPlayer", 0x12U,
+         {{"tracks", ReflectedFieldType::object_array},
+          {"bus", ReflectedFieldType::string},
+          {"volume_db", ReflectedFieldType::number},
+          {"crossfade_seconds", ReflectedFieldType::number},
+          {"shuffle", ReflectedFieldType::boolean},
+          {"loop_playlist", ReflectedFieldType::boolean},
+          {"play_on_start", ReflectedFieldType::boolean},
+          {"bpm", ReflectedFieldType::number},
+          {"beats_per_bar", ReflectedFieldType::number},
+          {"first_beat_seconds", ReflectedFieldType::number},
+          {"sync", ReflectedFieldType::string}}},
         {"Scripts", 0x0cU,
          {{"behaviour", ReflectedFieldType::string},
           {"enabled", ReflectedFieldType::boolean},

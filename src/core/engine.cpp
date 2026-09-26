@@ -15,6 +15,17 @@ Engine::Engine(EngineConfig config)
     std::ostringstream message;
     message << "Relay runtime initialized at " << config_.width << 'x' << config_.height;
     logs_.write(LogLevel::info, message.str());
+    if (config_.audio_output) {
+        std::string error;
+        if (audio_.open_output(error)) {
+            const auto output = audio_.output_status();
+            logs_.write(LogLevel::info, "Audio output: " + output.device + " (" + output.backend + ')');
+        } else {
+            logs_.write(LogLevel::warning, "Audio output unavailable: " + error);
+        }
+    }
+    // A standalone game runs from the start, so its sources start with it.
+    if (mode_ == RuntimeMode::game) audio_.start_game();
 }
 
 Engine::~Engine() {
@@ -31,8 +42,13 @@ void Engine::tick() {
         scripts_.poll();
     }
     sync_input_map();
+    sync_audio();
     if (running_ && mode_ == RuntimeMode::game && !paused_) {
         advance_one_frame();
+    } else {
+        // Keeps editor previews and paused voices following their sources' settings.
+        RELAY_PROFILE_SCOPE("Audio");
+        audio_.update(scene_, mode_ == RuntimeMode::game, 0.0);
     }
 }
 
@@ -53,6 +69,8 @@ bool Engine::run_game() {
     frame_index_ = 0;
     elapsed_seconds_ = 0.0;
     logs_.write(LogLevel::info, "Game started");
+    sync_audio();
+    audio_.start_game();
     scripts_.start();
     return true;
 }
@@ -64,6 +82,7 @@ bool Engine::stop_game() {
         if (!stop_video(error)) return false;
     }
     scripts_.stop();
+    audio_.stop_game();
     scene_.restore_state(std::move(*authored_scene_));
     physics_.reset();
     authored_scene_.reset();
@@ -89,12 +108,14 @@ void Engine::step(const std::uint32_t frame_count) {
 void Engine::pause() {
     if (mode_ != RuntimeMode::game) return;
     paused_ = true;
+    audio_.set_paused(true);
     logs_.write(LogLevel::info, "Runtime paused");
 }
 
 void Engine::resume() {
     if (mode_ != RuntimeMode::game) return;
     paused_ = false;
+    audio_.set_paused(false);
     logs_.write(LogLevel::info, "Runtime resumed");
 }
 
@@ -259,6 +280,47 @@ bool Engine::set_graphics_settings(const GraphicsSettings& settings, std::string
 
 const AssetRegistry& Engine::assets() const { return assets_; }
 
+AudioSystem& Engine::audio() {
+    sync_audio();
+    return audio_;
+}
+
+void Engine::sync_audio() {
+    // Clips resolve where the asset browser lists files: the project folder, or ./assets.
+    const auto root = std::filesystem::absolute(project_ ? project_->root() : "assets").lexically_normal();
+    if (root != audio_root_) audio_preview_.reset();
+    audio_root_ = root;
+    audio_.set_project_root(root);
+    audio_.set_settings(audio_settings());
+}
+
+AudioSettings Engine::audio_settings() const {
+    if (audio_preview_) return *audio_preview_;
+    return project_ && project_->audio ? *project_->audio : default_audio_settings();
+}
+
+bool Engine::preview_audio_settings(AudioSettings settings, std::string& error) {
+    if (!normalize_audio_settings(settings, error)) return false;
+    audio_preview_ = settings;
+    audio_.set_settings(settings);
+    return true;
+}
+
+bool Engine::set_audio_settings(AudioSettings settings, std::string& error) {
+    if (!project_) {
+        error = "mixer buses are saved with a project; open one first";
+        return false;
+    }
+    if (!normalize_audio_settings(settings, error)) return false;
+    auto updated = *project_;
+    updated.audio = settings;
+    if (!save_project(updated, error)) return false;
+    *project_ = std::move(updated);
+    audio_preview_.reset();
+    audio_.set_settings(settings);
+    return true;
+}
+
 const RenderInterpolation* Engine::render_interpolation(const double alpha) {
     if (mode_ != RuntimeMode::game || paused_ || interpolation_.previous.empty())
         return nullptr;
@@ -285,6 +347,18 @@ void Engine::advance_one_frame() {
     {
         RELAY_PROFILE_SCOPE("Script contact callbacks");
         scripts_.dispatch_contacts();
+    }
+    {
+        RELAY_PROFILE_SCOPE("Audio");
+        sync_audio();
+        audio_.update(scene_, true, config_.fixed_delta_seconds,
+                      [this](const Vec3 origin, const Vec3 direction, const double distance,
+                             const Entity ignore) -> std::optional<Entity> {
+                          const auto hit = physics_.raycast(scene_, origin, direction, distance,
+                                                            0xffffffffU, ignore);
+                          if (!hit.hit) return std::nullopt;
+                          return hit.entity;
+                      });
     }
     // Only records the step; the deterministic CPU frame is drawn when a capture reads it.
     renderer_.render(frame_index_, elapsed_seconds_);

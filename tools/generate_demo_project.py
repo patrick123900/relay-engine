@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """Regenerate the dev-build demo project in examples/demo.
 
-Writes examples/demo/models/primitives.glb (unit primitives and a small PBR material library), then
-runs the native builder, which imports it through the control protocol and authors the showcase
+Writes examples/demo/models/primitives.glb (unit primitives and a small PBR material library) and
+the synthesised sounds in examples/demo/sounds, then runs the native builder, which imports it through the control protocol and authors the showcase
 scene. Run from the repository root after building the dev preset:
 
     python3 tools/generate_demo_project.py
 """
 import json
 import math
+import random
 import pathlib
 import struct
 import subprocess
 import sys
+import wave
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PROJECT = ROOT / "examples" / "demo"
@@ -188,10 +190,138 @@ def build_glb():
     return struct.pack("<III", 0x46546C67, 2, 12 + len(chunks)) + chunks
 
 
+SAMPLE_RATE = 48000
+
+
+def write_wav(path, samples, rate=SAMPLE_RATE):
+    """Mono 16-bit PCM; samples are floats in [-1, 1], scaled to peak at 0.9."""
+    peak = max(1e-9, max(abs(value) for value in samples))
+    scale = min(1.0, 0.9 / peak) * 32767
+    frames = b"".join(struct.pack("<h", round(value * scale)) for value in samples)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(rate)
+        output.writeframes(frames)
+
+
+def tone():
+    """A soft bell at C5: a few inharmonic partials that ring out over a second."""
+    samples = []
+    for index in range(int(SAMPLE_RATE * 1.2)):
+        time = index / SAMPLE_RATE
+        attack = min(1.0, time / 0.004)
+        value = 0.0
+        for ratio, level, decay in ((1.0, 1.0, 2.8), (2.0, 0.35, 4.5), (2.76, 0.18, 6.0),
+                                    (5.4, 0.06, 9.0)):
+            value += level * math.exp(-decay * time) * math.sin(2 * math.pi * 523.25 * ratio * time)
+        samples.append(attack * value)
+    return samples
+
+
+def thump():
+    """A short low knock: a falling sine with a burst of filtered noise at the start."""
+    generator = random.Random(0x7E1A)
+    samples, noise = [], 0.0
+    for index in range(int(SAMPLE_RATE * 0.35)):
+        time = index / SAMPLE_RATE
+        # The pitch falls from 150 Hz to 55 Hz; this is the integral of that frequency.
+        phase = 2 * math.pi * (55 * time + 95 * (1 - math.exp(-time * 30)) / 30)
+        noise += 0.25 * (generator.uniform(-1, 1) - noise)
+        body = math.sin(phase) * math.exp(-time * 14)
+        click = noise * math.exp(-time * 90) * 0.6
+        samples.append(min(1.0, time / 0.001) * (body + click))
+    return samples
+
+
+def hum():
+    """A two-second drone that loops seamlessly: every partial completes whole cycles."""
+    duration = 2.0
+    samples = []
+    for index in range(int(SAMPLE_RATE * duration)):
+        time = index / SAMPLE_RATE
+        swell = 0.75 + 0.25 * math.sin(2 * math.pi * 0.5 * time)
+        value = (math.sin(2 * math.pi * 110 * time) + 0.5 * math.sin(2 * math.pi * 165 * time) +
+                 0.3 * math.sin(2 * math.pi * 220.5 * time) + 0.15 * math.sin(2 * math.pi * 330 * time))
+        samples.append(swell * value)
+    return samples
+
+
+def shot():
+    """A short "pew": a sine sweeping down from 1.4 kHz with a breath of noise."""
+    generator = random.Random(0x5407)
+    samples, phase = [], 0.0
+    for index in range(int(SAMPLE_RATE * 0.22)):
+        time = index / SAMPLE_RATE
+        frequency = 300 + 1100 * math.exp(-time * 22)
+        phase += 2 * math.pi * frequency / SAMPLE_RATE
+        envelope = min(1.0, time / 0.002) * math.exp(-time * 16)
+        samples.append(envelope * (math.sin(phase) + 0.15 * generator.uniform(-1, 1)))
+    return samples
+
+
+MUSIC_RATE = 24000
+BEAT = 0.5  # 120 BPM.
+
+
+def note(semitones_from_a4):
+    return 440.0 * 2 ** (semitones_from_a4 / 12)
+
+
+def track(chords, arpeggio):
+    """Eight bars at 120 BPM in 4/4 (16 s): a soft pad on each chord (two bars each), a plucked
+    bass on beats one and three, and an eighth-note arpeggio. Chords are lists of semitones from
+    A4; arpeggio indexes into each chord."""
+    duration = 16.0
+    samples = [0.0] * int(MUSIC_RATE * duration)
+    chord_seconds = 4 * BEAT * 2
+    for number, chord in enumerate(chords):
+        start = number * chord_seconds
+        # Pad: the chord's tones an octave down, swelling in and out over its two bars.
+        for tone in chord:
+            frequency = note(tone - 12)
+            for index in range(int(start * MUSIC_RATE), int((start + chord_seconds) * MUSIC_RATE)):
+                time = index / MUSIC_RATE - start
+                swell = math.sin(math.pi * time / chord_seconds) ** 0.6
+                samples[index] += 0.08 * swell * (math.sin(2 * math.pi * frequency * index / MUSIC_RATE) +
+                                                  0.3 * math.sin(4 * math.pi * frequency * index / MUSIC_RATE))
+        # Bass on beats one and three, two octaves below the root.
+        for beat in range(0, 8, 2):
+            onset = start + beat * BEAT
+            frequency = note(chord[0] - 24)
+            for index in range(int(onset * MUSIC_RATE), int((onset + 0.9) * MUSIC_RATE)):
+                time = index / MUSIC_RATE - onset
+                samples[index] += 0.35 * math.exp(-time * 4) * min(1.0, time / 0.005) * \
+                    math.sin(2 * math.pi * frequency * time)
+        # Arpeggio on every eighth note.
+        for step in range(16):
+            onset = start + step * BEAT / 2
+            # Degrees past the chord's last tone climb an octave.
+            degree = arpeggio[step % len(arpeggio)]
+            frequency = note(chord[degree % len(chord)] + 12 * (degree // len(chord)))
+            for index in range(int(onset * MUSIC_RATE), int((onset + 0.24) * MUSIC_RATE)):
+                time = index / MUSIC_RATE - onset
+                wave = 2 / math.pi * math.asin(math.sin(2 * math.pi * frequency * time))  # Triangle.
+                samples[index] += 0.12 * math.exp(-time * 12) * min(1.0, time / 0.003) * wave
+    return samples
+
+
 def main():
     models = PROJECT / "models"
     models.mkdir(parents=True, exist_ok=True)
     (models / "primitives.glb").write_bytes(build_glb())
+    sounds = PROJECT / "sounds"
+    sounds.mkdir(parents=True, exist_ok=True)
+    write_wav(sounds / "tone.wav", tone())
+    write_wav(sounds / "thump.wav", thump())
+    write_wav(sounds / "hum.wav", hum())
+    write_wav(sounds / "shot.wav", shot())
+    music = PROJECT / "music"
+    music.mkdir(parents=True, exist_ok=True)
+    # C major (C, Am, F, G) and its darker turn (Am, F, C, G); semitones from A4.
+    c, a_minor, f, g = [3, 7, 10], [0, 3, 7], [-4, 0, 3], [-2, 2, 5]
+    write_wav(music / "daylight.wav", track([c, a_minor, f, g], [0, 1, 2, 3, 2, 1]), MUSIC_RATE)
+    write_wav(music / "dusk.wav", track([a_minor, f, c, g], [0, 2, 1, 3, 4, 3, 1, 2]), MUSIC_RATE)
     if not BUILDER.exists():
         sys.exit(f"Build the dev preset first; {BUILDER.relative_to(ROOT)} is missing")
     subprocess.run([str(BUILDER), str(PROJECT.relative_to(ROOT))], cwd=ROOT, check=True)

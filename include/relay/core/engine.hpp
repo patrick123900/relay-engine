@@ -1,6 +1,7 @@
 #pragma once
 #include <functional>
 
+#include "relay/audio/audio_system.hpp"
 #include "relay/core/input.hpp"
 #include "relay/core/log.hpp"
 #include "relay/observe/capture.hpp"
@@ -30,6 +31,9 @@ struct EngineConfig {
     double fixed_delta_seconds{1.0 / 60.0};
     std::uint64_t random_seed{0x52454C4159ULL};
     bool editor_mode{false};
+    // Play sound through the default device. Off for tests and headless sessions, where audio is
+    // mixed by the game steps instead and nothing reaches the speakers.
+    bool audio_output{false};
 };
 
 enum class RuntimeMode { editor, game };
@@ -96,6 +100,15 @@ public:
     [[nodiscard]] AssetRegistry& assets();
     [[nodiscard]] const AssetRegistry& assets() const;
     [[nodiscard]] ScriptSystem& scripts() { return scripts_; }
+    [[nodiscard]] AudioSystem& audio();
+    // The open project's mixer buses, or the defaults without a project or saved settings.
+    [[nodiscard]] AudioSettings audio_settings() const;
+    // Validates and saves mixer buses in the open project; the mixer follows immediately.
+    [[nodiscard]] bool set_audio_settings(AudioSettings settings, std::string& error);
+    // Applies mixer settings without saving, for live fader and effect drags; the next save (or
+    // opening another project) ends the preview. audio_settings() reports the previewed values.
+    [[nodiscard]] bool preview_audio_settings(AudioSettings settings, std::string& error);
+    [[nodiscard]] bool previewing_audio_settings() const { return audio_preview_.has_value(); }
     // Game input: live devices latched once per game step, read through the project's input map.
     [[nodiscard]] InputState& input();
     [[nodiscard]] const InputState& input() const { return input_; }
@@ -143,6 +156,11 @@ private:
     std::optional<std::filesystem::path> input_root_;
     bool input_loaded_{};
     void sync_input_map();
+    // Points audio at the open project's files and buses.
+    void sync_audio();
+    AudioSystem audio_;
+    std::optional<AudioSettings> audio_preview_;
+    std::optional<std::filesystem::path> audio_root_;
     // Declared last: script callbacks reach every other member, so it is destroyed first.
     ScriptSystem scripts_{*this};
 };

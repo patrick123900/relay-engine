@@ -1057,6 +1057,221 @@ void joints_ui() {
     std::cout << "Headless joint Inspector tests passed\n";
 }
 
+// A one-second 440 Hz mono tone as 16-bit PCM WAV.
+void write_tone(const std::filesystem::path& path) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream output(path, std::ios::binary);
+    const auto u32 = [&](std::uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8) output.put(static_cast<char>((value >> shift) & 0xFFU));
+    };
+    const auto u16 = [&](std::uint16_t value) {
+        output.put(static_cast<char>(value & 0xFFU));
+        output.put(static_cast<char>(value >> 8U));
+    };
+    constexpr std::uint32_t rate = 48000;
+    output << "RIFF";
+    u32(36U + rate * 2U);
+    output << "WAVEfmt ";
+    u32(16U); u16(1U); u16(1U); u32(rate); u32(rate * 2U); u16(2U); u16(16U);
+    output << "data";
+    u32(rate * 2U);
+    for (std::uint32_t frame = 0; frame < rate; ++frame)
+        u16(static_cast<std::uint16_t>(static_cast<std::int16_t>(
+            12000.0 * std::sin(frame * 2.0 * 3.14159265358979 * 440.0 / rate))));
+}
+
+// The Audio source Inspector section picks clips and buses and previews; the Game Configuration
+// Audio page edits the project's mixer buses.
+void audio_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/audio/project.relayproject","name":"Audio"})")
+              .find("\"ok\":true") != std::string::npos, "create audio project");
+    write_tone("projects/audio/sounds/tone.wav");
+    auto& scene = engine.scene();
+    const auto speaker = scene.create("Speaker");
+    (void)scene.set_audio_source(speaker, relay::AudioSource{});
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize audio editor without windows");
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + speaker.to_string()));
+    frame(ui, 3);
+    check(ui.headless_item_rect("inspector:component:audio_source") &&
+              ui.headless_item_rect("inspector:audio:clip"),
+          "the Inspector shows the Audio source section");
+    click_center(ui, *ui.headless_item_rect("inspector:audio:clip"));
+    const auto option = ui.headless_item_rect("inspector:audio:clip:sounds/tone.wav");
+    check(option.has_value(), "the clip picker lists the project's sound files");
+    click_center(ui, *option);
+    frame(ui, 3);
+    check(scene.get(speaker)->audio_source->clip == "sounds/tone.wav",
+          "choosing a clip sets it on the source");
+    click_center(ui, *ui.headless_item_rect("inspector:audio:bus"));
+    click_center(ui, *ui.headless_item_rect("inspector:audio:bus:Ambience"));
+    frame(ui, 3);
+    check(scene.get(speaker)->audio_source->bus == "Ambience", "choosing a bus routes the source");
+    click_center(ui, *ui.headless_item_rect("inspector:audio:play"));
+    check(engine.audio().playing(speaker), "Play previews the source in the editor");
+    click_center(ui, *ui.headless_item_rect("inspector:audio:play"));
+    check(!engine.audio().playing(speaker), "Stop ends the preview");
+
+    click_center(ui, *ui.headless_item_rect("menu:edit"));
+    click_center(ui, *ui.headless_item_rect("menu:edit:game_configuration"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("config:page:audio"));
+    frame(ui, 3);
+    const auto mute = ui.headless_item_rect("config:audio:bus:Music:mute");
+    check(mute.has_value(), "the Audio page lists the mixer buses");
+    click_center(ui, *mute);
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("config:audio:new_bus"));
+    type_text(ui, "Footsteps");
+    click_center(ui, *ui.headless_item_rect("config:audio:add_bus"));
+    frame(ui, 3);
+    {
+        std::string load_error;
+        const auto saved = relay::load_project("projects/audio/project.relayproject", load_error);
+        const auto& buses = saved->audio->buses;
+        const auto music = std::find_if(buses.begin(), buses.end(),
+                                        [](const auto& bus) { return bus.name == "Music"; });
+        const auto steps = std::find_if(buses.begin(), buses.end(),
+                                        [](const auto& bus) { return bus.name == "Footsteps"; });
+        check(saved && music != buses.end() && music->mute && steps != buses.end() &&
+                  steps->parent == "Master",
+              "muting and adding buses save the mixer in the project");
+    }
+    check(ui.headless_item_rect("config:audio:bus:Footsteps:remove").has_value(),
+          "a new bus appears with a remove button");
+    click_center(ui, *ui.headless_item_rect("config:audio:bus:Footsteps:remove"));
+    frame(ui, 3);
+    check(!ui.headless_item_rect("config:audio:bus:Footsteps:remove").has_value(),
+          "removing a bus takes it off the page");
+    std::cout << "Headless audio UI tests passed\n";
+}
+
+// The Reverb zone Inspector section applies presets and the Mixer panel edits buses and effects.
+void mixer_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/mixing/project.relayproject","name":"Mixing"})")
+              .find("\"ok\":true") != std::string::npos, "create mixing project");
+    auto& scene = engine.scene();
+    const auto zone = scene.create("Hall");
+    (void)scene.set_reverb_zone(zone, relay::ReverbZone{});
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize mixer editor without windows");
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + zone.to_string()));
+    frame(ui, 3);
+    check(ui.headless_item_rect("inspector:component:reverb_zone") &&
+              ui.headless_item_rect("inspector:reverb:preset"),
+          "the Inspector shows the Reverb zone section");
+    click_center(ui, *ui.headless_item_rect("inspector:reverb:preset"));
+    click_center(ui, *ui.headless_item_rect("inspector:reverb:preset:cave"));
+    frame(ui, 3);
+    check(scene.get(zone)->reverb_zone->preset == "cave" && scene.get(zone)->reverb_zone->room_size == 0.9,
+          "choosing a preset gives the zone its sound");
+
+    ui.set_panel_visible("Mixer", true);
+    frame(ui, 5);
+    check(ui.headless_item_rect("mixer:bus:Master:fader") && ui.headless_item_rect("mixer:bus:SFX:fader"),
+          "the Mixer shows a strip for each bus");
+    click_center(ui, *ui.headless_item_rect("mixer:bus:SFX:mute"));
+    frame(ui, 3);
+    const auto sfx = [&] {
+        const auto buses = engine.audio_settings().buses;
+        return *std::find_if(buses.begin(), buses.end(), [](const auto& bus) { return bus.name == "SFX"; });
+    };
+    check(sfx().mute, "the strip's M button mutes the bus");
+    click_center(ui, *ui.headless_item_rect("mixer:bus:SFX:add"));
+    click_center(ui, *ui.headless_item_rect("mixer:bus:SFX:add:delay"));
+    frame(ui, 3);
+    check(sfx().effects.size() == 1U && sfx().effects[0].type == relay::AudioEffect::Type::delay &&
+              ui.headless_item_rect("mixer:effect:param:time_ms").has_value(),
+          "adding an effect puts it on the bus and opens its settings");
+    // Dragging a parameter is heard at once and saved when released.
+    const auto slider = *ui.headless_item_rect("mixer:effect:param:time_ms");
+    auto& io = ImGui::GetIO();
+    io.AddMousePosEvent(slider[0] + 10, (slider[1] + slider[3]) / 2);
+    frame(ui);
+    io.AddMouseButtonEvent(0, true);
+    frame(ui);
+    io.AddMousePosEvent(slider[0] + (slider[2] - slider[0]) * 0.5F, (slider[1] + slider[3]) / 2);
+    frame(ui, 2);
+    const auto dragged = sfx().effects[0].time_ms;
+    const auto saved_time = [] {
+        std::string load_error;
+        const auto buses = relay::load_project("projects/mixing/project.relayproject", load_error)->audio->buses;
+        return std::find_if(buses.begin(), buses.end(), [](const auto& bus) { return bus.name == "SFX"; })->effects[0].time_ms;
+    };
+    check(dragged > 500.0 && engine.previewing_audio_settings() && saved_time() == 350.0,
+          "a parameter being dragged changes the sound without saving yet");
+    io.AddMouseButtonEvent(0, false);
+    frame(ui, 3);
+    check(!engine.previewing_audio_settings() && std::abs(saved_time() - dragged) < 50.0,
+          "releasing the parameter saves it in the project");
+    click_center(ui, *ui.headless_item_rect("mixer:effect:remove"));
+    frame(ui, 3);
+    check(sfx().effects.empty(), "Remove takes the effect off the bus");
+    std::cout << "Headless mixer UI tests passed\n";
+}
+
+// The Music player section builds a playlist, and the Audio page switches to headphones.
+void music_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/tunes/project.relayproject","name":"Tunes"})")
+              .find("\"ok\":true") != std::string::npos, "create music project");
+    write_tone("projects/tunes/music/a.wav");
+    write_tone("projects/tunes/music/b.wav");
+    auto& scene = engine.scene();
+    const auto jukebox = scene.create("Jukebox");
+    (void)scene.set_music_player(jukebox, relay::MusicPlayer{});
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize music editor without windows");
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + jukebox.to_string()));
+    frame(ui, 3);
+    check(ui.headless_item_rect("inspector:component:music_player") &&
+              ui.headless_item_rect("inspector:music:add"),
+          "the Inspector shows the Music player section");
+    for (const char* file : {"music/a.wav", "music/b.wav"}) {
+        click_center(ui, *ui.headless_item_rect("inspector:music:add"));
+        click_center(ui, *ui.headless_item_rect(std::string("inspector:music:add:") + file));
+        frame(ui, 3);
+    }
+    check(scene.get(jukebox)->music_player->tracks == std::vector<std::string>{"music/a.wav", "music/b.wav"},
+          "choosing files builds the playlist in order");
+    click_center(ui, *ui.headless_item_rect("inspector:music:remove:0"));
+    frame(ui, 3);
+    check(scene.get(jukebox)->music_player->tracks == std::vector<std::string>{"music/b.wav"},
+          "a track's x removes it");
+
+    click_center(ui, *ui.headless_item_rect("menu:edit"));
+    click_center(ui, *ui.headless_item_rect("menu:edit:game_configuration"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("config:page:audio"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("config:audio:headphones"));
+    frame(ui, 3);
+    check(engine.audio_settings().spatialization == relay::AudioSettings::Spatialization::binaural,
+          "choosing Headphones switches to binaural output");
+    click_center(ui, *ui.headless_item_rect("config:audio:speakers"));
+    frame(ui, 3);
+    check(engine.audio_settings().spatialization == relay::AudioSettings::Spatialization::stereo,
+          "and Speakers switches back");
+    std::cout << "Headless music UI tests passed\n";
+}
+
 // The Profiler panel reads recorded frames through the protocol, lists hotspots, pauses the
 // profiler and inspects a single frame from the frame-time graph.
 void profiler_ui() {
@@ -1506,6 +1721,9 @@ int main() {
         fresh(components_ui);
         fresh(node_templates_ui);
         fresh(joints_ui);
+        fresh(audio_ui);
+        fresh(mixer_ui);
+        fresh(music_ui);
         fresh(hierarchy_search_ui);
         fresh(profiler_ui);
         fresh(game_configuration_ui);

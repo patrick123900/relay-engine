@@ -1,3 +1,6 @@
+#include "relay/audio/audio_effects.hpp"
+#include "relay/audio/audio_mixer.hpp"
+#include "relay/audio/audio_system.hpp"
 #include "relay/control/control_protocol.hpp"
 #include "relay/core/engine.hpp"
 #include "relay/core/input.hpp"
@@ -552,8 +555,9 @@ void demo_project() {
           "the showcase starts with a first person controller whose camera is the scene's camera");
     check(!engine.run_game() && engine.run_game_error().find("trust") != std::string::npos,
           "the showcase's controller script needs the project to be trusted");
-    // The rest checks the physics alone; relay_script_tests plays the scene with its script.
-    (void)engine.scene().set_scripts(player, {});
+    // The rest checks the physics alone; relay_script_tests plays the scene with its scripts
+    // (the controller, impact sounds and the tone button).
+    for (const auto entity : engine.scene().entities()) (void)engine.scene().set_scripts(entity, {});
     check(engine.run_game(), "demo scene runs");
     engine.step(120);
     check(engine.scene().get(wrecking_ball)->transform.position.y < start - 2.0 &&
@@ -1011,11 +1015,11 @@ void first_person_migration() {
     input.close();
     const auto replace = [&](const std::string& from, const std::string& to) {
         const auto at = text.find(from);
-        check(at != std::string::npos, "the v17 file has the expected shape");
+        check(at != std::string::npos, "the current file has the expected shape");
         text.replace(at, from.size(), to);
     };
-    replace("\"version\":17", "\"version\":15");
-    replace("\"scripts\":[],\"joint\":null}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
+    replace("\"version\":" + std::to_string(relay::scene_file_version), "\"version\":15");
+    replace("\"scripts\":[],\"joint\":null,\"audio_source\":null,\"audio_listener\":null,\"reverb_zone\":null,\"music_player\":null}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
                                "\"sprint_speed\":8,\"jump_speed\":4,\"mouse_sensitivity\":0.2,"
                                "\"stick_look_speed\":120,\"invert_y\":true,\"ground_distance\":1.1,"
                                "\"camera\":\"Eyes\"}}");
@@ -1213,6 +1217,720 @@ void joints() {
           "Stop Game restores the authored joint scene");
 }
 
+// Writes 16-bit PCM WAV: `channels` interleaved, each sample from `wave(frame, channel)`.
+template <typename Wave>
+void write_wav(const std::filesystem::path& path, const std::uint32_t rate,
+               const std::uint16_t channels, const std::uint32_t frames, Wave wave) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream output(path, std::ios::binary);
+    const auto u32 = [&](std::uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8) output.put(static_cast<char>((value >> shift) & 0xFFU));
+    };
+    const auto u16 = [&](std::uint16_t value) {
+        output.put(static_cast<char>(value & 0xFFU));
+        output.put(static_cast<char>(value >> 8U));
+    };
+    const std::uint32_t data = frames * channels * 2U;
+    output << "RIFF";
+    u32(36U + data);
+    output << "WAVEfmt ";
+    u32(16U);
+    u16(1U);
+    u16(channels);
+    u32(rate);
+    u32(rate * channels * 2U);
+    u16(static_cast<std::uint16_t>(channels * 2U));
+    u16(16U);
+    output << "data";
+    u32(data);
+    for (std::uint32_t frame = 0; frame < frames; ++frame)
+        for (std::uint16_t channel = 0; channel < channels; ++channel)
+            u16(static_cast<std::uint16_t>(static_cast<std::int16_t>(
+                std::lround(std::clamp(wave(frame, channel), -1.0, 1.0) * 32767.0))));
+}
+
+// Audio: bus settings, decoding, the mixer's arithmetic, distance curves, and sources driven by
+// the game through the protocol. Everything is rendered offline; nothing reaches a sound device.
+void audio() {
+    // Bus layouts are validated and put parents first.
+    {
+        auto settings = relay::default_audio_settings();
+        std::string error;
+        check(relay::normalize_audio_settings(settings, error) && settings.buses.size() == 5U &&
+                  settings.buses.front().name == "Master",
+              "the default mixer is Master with four buses beneath it");
+        relay::AudioSettings reordered{{{"Steps", "SFX", 0, false, false, {}},
+                                        {"SFX", "Master", 0, false, false, {}},
+                                        {"Master", "", 0, false, false, {}}}};
+        check(relay::normalize_audio_settings(reordered, error) &&
+                  reordered.buses[0].name == "Master" && reordered.buses[2].name == "Steps",
+              "buses are ordered so every parent comes before its children");
+        relay::AudioSettings cycle{{{"Master", "", 0, false, false, {}},
+                                    {"A", "B", 0, false, false, {}},
+                                    {"B", "A", 0, false, false, {}}}};
+        check(!relay::normalize_audio_settings(cycle, error) &&
+                  error.find("cycle") != std::string::npos,
+              "a parent cycle is refused");
+        relay::AudioSettings loud{{{"Master", "", 30, false, false, {}}}};
+        check(!relay::normalize_audio_settings(loud, error), "volumes above +24 dB are refused");
+        const auto json = relay::audio_settings_json(reordered);
+        relay::JsonParser parser(json);
+        const auto parsed = relay::parse_audio_settings(*parser.parse(), error);
+        check(parsed && *parsed == reordered, "mixer settings survive a JSON round trip");
+    }
+
+    // A 48 kHz mono clip of known samples decodes exactly (within 16-bit rounding).
+    write_wav("assets/sounds/ramp.wav", 48000, 1, 4800, [](std::uint32_t frame, std::uint16_t) {
+        return 0.5 * std::sin(frame * 0.05);
+    });
+    write_wav("assets/sounds/stereo.wav", 44100, 2, 44100, [](std::uint32_t, std::uint16_t channel) {
+        return channel == 0 ? 0.25 : -0.25;
+    });
+    std::string error;
+    const auto ramp = relay::decode_audio_file("assets/sounds/ramp.wav", error);
+    check(ramp && ramp->channels == 1U && ramp->sample_rate == 48000U && ramp->frames() == 4800U &&
+              std::abs(ramp->samples[100] - 0.5 * std::sin(5.0)) < 1e-3,
+          "a mono WAV decodes to its samples at its own rate");
+    const auto stereo = relay::decode_audio_file("assets/sounds/stereo.wav", error);
+    check(stereo && stereo->channels == 2U && std::abs(stereo->duration_seconds() - 1.0) < 1e-9,
+          "a stereo WAV keeps both channels and its duration");
+    std::ofstream("assets/sounds/broken.wav") << "not audio";
+    check(!relay::decode_audio_file("assets/sounds/broken.wav", error) && !error.empty(),
+          "a file that is not audio is refused with a reason");
+
+    // The mixer reproduces a clip at unity gain and applies bus volume, mute and solo.
+    {
+        auto clip = std::make_shared<const relay::AudioClip>(*ramp);
+        relay::AudioMixer mixer;
+        relay::AudioVoiceTarget target;
+        target.bus = "SFX";
+        const auto voice = mixer.play(clip, target);
+        std::vector<float> output(512U * 2U);
+        mixer.render(output);
+        check(voice != 0U && std::abs(output[200] - clip->samples[100]) < 1e-6 &&
+                  std::abs(output[201] - clip->samples[100]) < 1e-6,
+              "a centred voice at unity reaches both output channels unchanged");
+        auto settings = relay::default_audio_settings();
+        settings.buses[2].volume_db = -6.0206; // SFX
+        mixer.set_buses(settings);
+        mixer.render(output); // The bus gain ramps over this block.
+        mixer.render(output);
+        const auto position = 1024U; // The third 512-frame block starts here.
+        check(std::abs(output[0] - 0.5F * clip->samples[position]) < 1e-4,
+              "a bus at -6 dB halves what plays through it");
+        settings.buses[2].mute = true;
+        mixer.set_buses(settings);
+        mixer.render(output);
+        mixer.render(output);
+        check(std::all_of(output.begin(), output.end(), [](float value) { return value == 0.0F; }),
+              "a muted bus is silent");
+        settings.buses[2].mute = false;
+        settings.buses[1].solo = true; // Music
+        mixer.set_buses(settings);
+        mixer.render(output);
+        mixer.render(output);
+        check(std::all_of(output.begin(), output.end(), [](float value) { return value == 0.0F; }),
+              "soloing another bus silences this one");
+        settings.buses[1].solo = false;
+        settings.buses[2].solo = true;
+        mixer.set_buses(settings);
+        mixer.render(output);
+        mixer.render(output);
+        check(std::any_of(output.begin(), output.end(), [](float value) { return value != 0.0F; }),
+              "a soloed bus is heard through its parent");
+        const auto levels = mixer.levels();
+        check(levels[2].peak_left_db > -12.0 && levels[1].peak_left_db <= -79.0,
+              "meters show the playing bus and not the silent one");
+        mixer.stop(voice);
+        mixer.render(output);
+        check(mixer.voice_count() == 0U, "a stopped voice fades out within a block and is freed");
+        const auto once = mixer.play(clip, relay::AudioVoiceTarget{});
+        std::vector<float> long_output(6000U * 2U);
+        mixer.render(long_output);
+        check(once != 0U && mixer.voice_count() == 0U && long_output[5000U * 2U] == 0.0F,
+              "a voice that is not looping ends with its clip");
+        relay::AudioVoiceTarget looping;
+        looping.loop = true;
+        const auto loop = mixer.play(clip, looping);
+        mixer.render(long_output);
+        check(mixer.active(loop) &&
+                  std::abs(long_output[5000U * 2U] - clip->samples[200]) < 1e-6,
+              "a looping voice wraps to the start of its clip");
+    }
+
+    // Distance curves.
+    {
+        relay::AudioSource source;
+        source.min_distance = 2.0;
+        source.max_distance = 100.0;
+        check(relay::audio_distance_gain(source, 1.0) == 1.0 &&
+                  std::abs(relay::audio_distance_gain(source, 4.0) - 0.5) < 1e-12 &&
+                  relay::audio_distance_gain(source, 100.0) == 0.0,
+              "inverse rolloff halves with each doubling beyond the minimum distance");
+        check(relay::audio_distance_gain(source, 97.0) < 0.5 * (2.0 / 97.0),
+              "curved rolloffs fade out over the last tenth of the range");
+        source.rolloff = relay::AudioSource::Rolloff::linear;
+        check(std::abs(relay::audio_distance_gain(source, 51.0) - 0.5) < 1e-12,
+              "linear rolloff is halfway down halfway across the range");
+        source.rolloff = relay::AudioSource::Rolloff::inverse_square;
+        check(std::abs(relay::audio_distance_gain(source, 4.0) - 0.25) < 1e-12,
+              "inverse square rolloff quarters with each doubling");
+    }
+
+    // Sources in a scene, driven through the protocol.
+    relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+    relay::ControlProtocol protocol(engine);
+    const auto created = request(protocol, "scene.create", "\"name\":\"Speaker\",\"type\":\"AudioSource\"");
+    const auto speaker = relay::Entity::parse(
+        *relay::field(*created.object(), "entity")->string()).value();
+    check(engine.scene().get(speaker)->audio_source.has_value() &&
+              relay::node_type(*engine.scene().get(speaker)) == "AudioSource",
+          "an Audio Source node carries an audio source component");
+    const auto handle = "\"entity\":\"" + speaker.to_string() + "\"";
+    request(protocol, "scene.set_audio_source", handle + ",\"clip\":\"../escape.wav\"", false);
+    request(protocol, "scene.set_audio_source", handle + ",\"min_distance\":10,\"max_distance\":5", false);
+    const auto depth = engine.scene_history().undo_depth();
+    for (int step = 0; step < 3; ++step)
+        request(protocol, "scene.set_audio_source",
+                handle + ",\"volume_db\":" + std::to_string(-step) + ",\"gesture\":501");
+    request(protocol, "scene.set_audio_source",
+            handle + ",\"clip\":\"sounds/ramp.wav\",\"loop\":true,\"bus\":\"SFX\",\"min_distance\":1,"
+                     "\"max_distance\":50");
+    check(engine.scene_history().undo_depth() == depth + 2U &&
+              engine.scene().get(speaker)->audio_source->volume_db == -2.0,
+          "audio source edits are undoable and one drag is one undo step");
+    request(protocol, "scene.set_transform", handle + ",\"px\":4");
+    const auto listener = relay::Entity::parse(*relay::field(
+        *request(protocol, "scene.create", "\"name\":\"Ears\"").object(), "entity")->string()).value();
+    request(protocol, "component.add",
+            "\"entity\":\"" + listener.to_string() + "\",\"component\":\"audio_listener\"");
+
+    // The scene file keeps both components.
+    {
+        std::string save_error;
+        check(relay::save_scene_file_atomic(engine.scene(), "audio.relay.json", save_error),
+              "an audio scene saves");
+        const auto loaded = relay::load_scene_file("audio.relay.json");
+        const auto& record = loaded.state->slots[speaker.index].record;
+        check(loaded && record.audio_source == engine.scene().get(speaker)->audio_source &&
+                  loaded.state->slots[listener.index].record.audio_listener.has_value(),
+              "audio sources and listeners survive saving and loading");
+    }
+
+    // In the editor nothing plays by itself; a preview plays flat.
+    engine.tick();
+    auto status = request(protocol, "audio.status");
+    check(relay::field(*status.object(), "voices")->array()->empty() &&
+              !*relay::field(*relay::field(*status.object(), "output")->object(), "open")->boolean(),
+          "the editor plays nothing on its own and tests open no sound device");
+    request(protocol, "audio.play", handle);
+    status = request(protocol, "audio.status");
+    const auto* preview = relay::field(*status.object(), "voices")->array();
+    check(preview->size() == 1U && *relay::field(*preview->front().object(), "preview")->boolean() &&
+              *relay::field(*preview->front().object(), "gain_left")->number() ==
+                  *relay::field(*preview->front().object(), "gain_right")->number(),
+          "an editor preview plays the source flat");
+    request(protocol, "audio.stop");
+
+    // Run Game starts play_on_start sources positioned around the listener.
+    request(protocol, "runtime.play");
+    engine.step(2);
+    status = request(protocol, "audio.status");
+    const auto* voices = relay::field(*status.object(), "voices")->array();
+    check(voices->size() == 1U && *relay::field(*status.object(), "listener")->string() ==
+                                      listener.to_string(),
+          "Run Game starts the source and hears it from the listener node");
+    const auto& voice = *voices->front().object();
+    const auto left = *relay::field(voice, "gain_left")->number();
+    const auto right = *relay::field(voice, "gain_right")->number();
+    check(std::abs(right - 0.25 * std::pow(10.0, -2.0 / 20.0)) < 1e-4 && left < 1e-6 &&
+              *relay::field(voice, "bus")->string() == "SFX",
+          "a source to the listener's right plays on the right, quieter with distance");
+    check(*relay::field(voice, "position_seconds")->number() > 0.0,
+          "without a device the game steps advance the audio");
+    const auto sfx = relay::field(*status.object(), "buses")->array()->at(2).object();
+    const auto music = relay::field(*status.object(), "buses")->array()->at(1).object();
+    check(*relay::field(*sfx, "peak_right_db")->number() > -30.0 &&
+              *relay::field(*music, "peak_right_db")->number() <= -79.0,
+          "the SFX meter shows the sound and the unused Music bus stays silent");
+    request(protocol, "runtime.pause");
+    engine.tick();
+    status = request(protocol, "audio.status");
+    check(*relay::field(*relay::field(*status.object(), "voices")->array()->front().object(),
+                        "paused")->boolean(),
+          "pausing the game pauses its sounds");
+    request(protocol, "runtime.resume");
+    // The authored scene is locked during the game, so remove it as a game-time change would.
+    check(engine.scene().set_audio_source(speaker, std::nullopt), "remove the source in game");
+    engine.step(1);
+    check(relay::field(*request(protocol, "audio.status").object(), "voices")->array()->empty(),
+          "removing a playing source stops its sound");
+    request(protocol, "runtime.stop");
+    check(engine.scene().get(speaker)->audio_source.has_value(),
+          "stopping the game restores the authored source");
+
+    // Clip inspection and mixer buses in a project.
+    const auto clip = request(protocol, "audio.clip", "\"clip\":\"sounds/stereo.wav\",\"peaks\":8");
+    check(*relay::field(*clip.object(), "channels")->number() == 2.0 &&
+              relay::field(*clip.object(), "peaks")->array()->size() == 16U,
+          "audio.clip reports the format and min/max peak pairs");
+    request(protocol, "audio.set_bus", "\"name\":\"Footsteps\",\"parent\":\"SFX\"", false);
+    request(protocol, "project.create",
+            "\"filename\":\"projects/sound/project.relayproject\",\"name\":\"Sound\"");
+    request(protocol, "audio.set_bus", "\"name\":\"Footsteps\",\"parent\":\"SFX\",\"volume_db\":-3");
+    request(protocol, "audio.set_bus", "\"name\":\"SFX\",\"new_name\":\"Effects\"");
+    request(protocol, "audio.set_bus", "\"name\":\"Master\",\"parent\":\"Music\"", false);
+    request(protocol, "audio.set_bus", "\"name\":\"Music\",\"parent\":\"Nowhere\"", false);
+    request(protocol, "audio.remove_bus", "\"name\":\"Master\"", false);
+    {
+        std::string load_error;
+        const auto saved = relay::load_project("projects/sound/project.relayproject", load_error);
+        const auto& buses = saved->audio->buses;
+        const auto steps = std::find_if(buses.begin(), buses.end(),
+                                        [](const auto& bus) { return bus.name == "Footsteps"; });
+        check(saved && steps != buses.end() && steps->parent == "Effects" && steps->volume_db == -3.0,
+              "buses are saved in the project, and renaming a bus keeps its children");
+    }
+    request(protocol, "audio.remove_bus", "\"name\":\"Effects\"");
+    const auto after = request(protocol, "audio.settings");
+    const auto* remaining = relay::field(*relay::field(*after.object(), "settings")->object(), "buses")->array();
+    const auto moved = std::find_if(remaining->begin(), remaining->end(), [](const auto& bus) {
+        return *relay::field(*bus.object(), "name")->string() == "Footsteps";
+    });
+    check(moved != remaining->end() &&
+              *relay::field(*moved->object(), "parent")->string() == "Master",
+          "removing a bus moves its children to its parent");
+}
+
+// Peak absolute sample from `begin` (a sample index) to the end.
+float peak_after(const std::vector<float>& samples, const std::size_t begin = 0) {
+    float peak = 0.0F;
+    for (std::size_t index = begin; index < samples.size(); ++index)
+        peak = std::max(peak, std::abs(samples[index]));
+    return peak;
+}
+
+// Root mean square from `begin` (a sample index) to the end; a sine of peak 1 gives about 0.707.
+float rms_after(const std::vector<float>& samples, const std::size_t begin = 0) {
+    double sum = 0.0;
+    for (std::size_t index = begin; index < samples.size(); ++index)
+        sum += static_cast<double>(samples[index]) * samples[index];
+    return static_cast<float>(std::sqrt(sum / static_cast<double>(samples.size() - begin)));
+}
+
+// Interleaved stereo sine at `frequency`, `amplitude` peak.
+std::vector<float> sine(const double frequency, const double amplitude, const std::size_t frames) {
+    std::vector<float> samples(frames * 2U);
+    for (std::size_t frame = 0; frame < frames; ++frame)
+        samples[frame * 2U] = samples[frame * 2U + 1U] = static_cast<float>(
+            amplitude * std::sin(2.0 * 3.14159265358979 * frequency * static_cast<double>(frame) / 48000.0));
+    return samples;
+}
+
+// Audio phase 2: bus effects, the zone reverb, occlusion, reverb zones and mixer editing.
+void audio_effects() {
+    const auto run = [](relay::AudioEffect effect, std::vector<float> samples) {
+        auto processor = relay::make_audio_effect(effect);
+        processor->process(samples);
+        return samples;
+    };
+    using Type = relay::AudioEffect::Type;
+    {
+        relay::AudioEffect limiter;
+        limiter.type = Type::limiter;
+        limiter.ceiling_db = -6.0;
+        check(peak_after(run(limiter, sine(440, 1.5, 4800))) <= 0.502F,
+              "the limiter holds peaks at its ceiling");
+        check(std::abs(peak_after(run(limiter, sine(440, 0.3, 4800))) - 0.3F) < 1e-3F,
+              "the limiter leaves quieter signals untouched");
+        relay::AudioEffect compressor;
+        compressor.type = Type::compressor;
+        compressor.threshold_db = -20.0;
+        compressor.ratio = 10.0;
+        compressor.attack_ms = 1.0;
+        check(peak_after(run(compressor, sine(440, 1.0, 9600)), 4800U * 2U) < 0.3F,
+              "the compressor turns a loud signal down");
+        check(std::abs(peak_after(run(compressor, sine(440, 0.05, 9600)), 4800U * 2U) - 0.05F) < 2e-3F,
+              "the compressor leaves signals below its threshold alone");
+        relay::AudioEffect eq;
+        eq.type = Type::eq;
+        eq.low_db = -24.0;
+        check(rms_after(run(eq, sine(40, 1.0, 9600)), 4800U * 2U) < 0.08F &&
+                  rms_after(run(eq, sine(8000, 1.0, 9600)), 4800U * 2U) > 0.69F,
+              "the EQ's low shelf cuts bass and leaves treble");
+        relay::AudioEffect lowpass;
+        lowpass.type = Type::lowpass;
+        lowpass.cutoff_hz = 500.0;
+        check(rms_after(run(lowpass, sine(8000, 1.0, 9600)), 4800U * 2U) < 0.01F &&
+                  rms_after(run(lowpass, sine(100, 1.0, 9600)), 4800U * 2U) > 0.69F,
+              "a low-pass filter removes treble");
+        relay::AudioEffect delay;
+        delay.type = Type::delay;
+        delay.time_ms = 100.0;
+        delay.feedback = 0.0;
+        delay.mix = 0.5;
+        std::vector<float> impulse(9600U * 2U, 0.0F);
+        impulse[0] = impulse[1] = 1.0F;
+        const auto echoed = run(delay, impulse);
+        check(std::abs(echoed[4800U * 2U] - 0.5F) < 1e-6F && echoed[4000U * 2U] == 0.0F,
+              "the delay repeats a sound after its time");
+        relay::AudioEffect reverb;
+        reverb.type = Type::reverb;
+        reverb.mix = 1.0;
+        std::vector<float> long_impulse(48000U * 2U, 0.0F);
+        long_impulse[0] = long_impulse[1] = 1.0F;
+        check(peak_after(run(reverb, long_impulse), 4800U * 2U) > 1e-3F,
+              "the reverb rings on after a click");
+        reverb.mix = 0.0;
+        check(run(reverb, long_impulse) == long_impulse, "a reverb at zero mix is dry");
+    }
+
+    // Effects in settings: the default Master limiter, round trips and range checks.
+    {
+        auto settings = relay::default_audio_settings();
+        check(settings.buses.front().effects.size() == 1U &&
+                  settings.buses.front().effects.front().type == Type::limiter,
+              "Master starts with a limiter");
+        relay::AudioEffect echo;
+        echo.type = Type::delay;
+        echo.time_ms = 250.0;
+        settings.buses[2].effects.push_back(echo);
+        const auto json = relay::audio_settings_json(settings);
+        relay::JsonParser parser(json);
+        std::string error;
+        const auto parsed = relay::parse_audio_settings(*parser.parse(), error);
+        check(parsed && *parsed == settings, "bus effects survive a JSON round trip");
+        settings.buses[2].effects.back().feedback = 1.5;
+        check(!relay::normalize_audio_settings(settings, error) &&
+                  error.find("feedback") != std::string::npos,
+              "effect parameters outside their range are refused");
+    }
+
+    // The zone reverb hears voices' sends; occlusion's low-pass dulls a voice.
+    {
+        relay::AudioClip click{48000, 1, std::vector<float>(480, 0.0F)};
+        click.samples[0] = 1.0F;
+        const auto clip = std::make_shared<const relay::AudioClip>(click);
+        const auto tail = [&](const bool zone) {
+            relay::AudioMixer mixer;
+            relay::AudioVoiceTarget target;
+            target.sends[3] = 1.0F;
+            std::array<std::optional<relay::AudioReverbParameters>, relay::maximum_reverb_slots> reverbs{};
+            if (zone) reverbs[3] = relay::AudioReverbParameters{0.8, 0.3, 0.0, 0.0};
+            mixer.set_reverbs(reverbs);
+            (void)mixer.play(clip, target);
+            std::vector<float> output(24000U * 2U);
+            mixer.render(output);
+            return peak_after(output, 4800U * 2U);
+        };
+        check(!tail(false) && tail(true) > 1e-3F,
+              "a voice's send rings in its zone's reverb, and only while that zone has one");
+        const auto bright = std::make_shared<const relay::AudioClip>(
+            relay::AudioClip{48000, 1, [] {
+                std::vector<float> samples(9600);
+                for (std::size_t index = 0; index < samples.size(); ++index)
+                    samples[index] = static_cast<float>(0.5 * std::sin(2.0 * 3.14159265358979 * 6000.0 * static_cast<double>(index) / 48000.0));
+                return samples;
+            }()});
+        const auto level = [&](const float cutoff) {
+            relay::AudioMixer mixer;
+            relay::AudioVoiceTarget target;
+            target.cutoff_hz = cutoff;
+            (void)mixer.play(bright, target);
+            std::vector<float> output(9600U * 2U);
+            mixer.render(output);
+            return rms_after(output, 4800U * 2U);
+        };
+        check(level(20000.0F) > 0.3F && level(800.0F) < 0.08F,
+              "an occluded voice's low-pass takes the treble away");
+    }
+
+    // Reverb zone weights: full inside, fading linearly over `fade` outside, blended.
+    relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+    relay::ControlProtocol protocol(engine);
+    auto& scene = engine.scene();
+    const auto created = [&](const std::string& fields) {
+        return relay::Entity::parse(*relay::field(
+            *request(protocol, "scene.create", fields).object(), "entity")->string()).value();
+    };
+    const auto hall = created("\"name\":\"Hall\",\"type\":\"ReverbZone\"");
+    const auto hall_field = "\"entity\":\"" + hall.to_string() + "\"";
+    request(protocol, "scene.set_reverb_zone", hall_field + ",\"shape\":\"sphere\",\"radius\":2,\"fade\":2,\"preset\":\"hall\"");
+    check(scene.get(hall)->reverb_zone->preset == "hall" && scene.get(hall)->reverb_zone->room_size == 0.82,
+          "a preset sets the zone's parameters");
+    check(relay::reverb_zone_weight(scene, hall, {1, 0, 0}) == 1.0 &&
+              std::abs(relay::reverb_zone_weight(scene, hall, {3, 0, 0}) - 0.5) < 1e-9 &&
+              relay::reverb_zone_weight(scene, hall, {5, 0, 0}) == 0.0,
+          "a sphere zone is full inside and fades out over its fade distance");
+    const auto cave = created("\"name\":\"Cave\",\"type\":\"ReverbZone\"");
+    const auto cave_field = "\"entity\":\"" + cave.to_string() + "\"";
+    request(protocol, "scene.set_reverb_zone", cave_field + ",\"shape\":\"box\",\"half_x\":1,\"half_y\":1,\"half_z\":1,\"fade\":1,\"room_size\":0.2");
+    check(scene.get(cave)->reverb_zone->preset == "custom", "tuning a parameter makes the zone custom");
+    request(protocol, "scene.set_transform", cave_field + ",\"px\":10,\"ry\":45,\"sx\":2");
+    // Scaled 2x along its local X, which the 45 degree turn points diagonally.
+    check(relay::reverb_zone_weight(scene, cave, {10 + 1.9 * std::sqrt(0.5), 0, -1.9 * std::sqrt(0.5)}) == 1.0 &&
+              std::abs(relay::reverb_zone_weight(scene, cave, {10 + 2.5 * std::sqrt(0.5), 0, -2.5 * std::sqrt(0.5)}) - 0.5) < 1e-4,
+          "a box zone follows its node's rotation and scale");
+    request(protocol, "scene.set_transform", cave_field + ",\"px\":3.5,\"ry\":0,\"sx\":1");
+    {
+        std::string save_error;
+        check(relay::save_scene_file_atomic(scene, "zones.relay.json", save_error), "save zones");
+        const auto loaded = relay::load_scene_file("zones.relay.json");
+        check(loaded && loaded.state->slots[hall.index].record.reverb_zone == scene.get(hall)->reverb_zone,
+              "reverb zones survive saving and loading");
+    }
+
+    // Occlusion and the environment in a running game: a wall between the listener and one source.
+    write_wav("assets/sounds/drone.wav", 48000, 1, 48000, [](std::uint32_t frame, std::uint16_t) {
+        return 0.5 * std::sin(frame * 0.2);
+    });
+    const auto ears = created("\"name\":\"Ears\"");
+    request(protocol, "component.add", "\"entity\":\"" + ears.to_string() + "\",\"component\":\"audio_listener\"");
+    const auto wall = created("\"name\":\"Wall\"");
+    request(protocol, "scene.set_transform", "\"entity\":\"" + wall.to_string() + "\",\"pz\":-3");
+    request(protocol, "scene.set_collider", "\"entity\":\"" + wall.to_string() + "\",\"type\":\"box\",\"half_x\":2,\"half_y\":2,\"half_z\":0.1");
+    const auto source = [&](const char* name, const double x, const double z) {
+        const auto entity = created(std::string("\"name\":\"") + name + "\",\"type\":\"AudioSource\"");
+        const auto field = "\"entity\":\"" + entity.to_string() + "\"";
+        request(protocol, "scene.set_transform", field + ",\"px\":" + std::to_string(x) + ",\"pz\":" + std::to_string(z));
+        request(protocol, "scene.set_audio_source", field + ",\"clip\":\"sounds/drone.wav\",\"loop\":true,\"max_distance\":100");
+        return entity;
+    };
+    const auto hidden = source("Behind the wall", 0, -6);
+    const auto open = source("In the open", 6, 0);
+    const auto echoing = source("In the cave", 3.5, 0);
+    request(protocol, "runtime.play");
+    engine.step(30);
+    const auto status = request(protocol, "audio.status");
+    const auto voice = [&](const relay::Entity entity) {
+        for (const auto& item : *relay::field(*status.object(), "voices")->array())
+            if (*relay::field(*item.object(), "entity")->string() == entity.to_string()) return *item.object();
+        throw std::runtime_error("missing voice for " + entity.to_string());
+    };
+    const auto& hidden_voice = voice(hidden);
+    const auto& open_voice = voice(open);
+    check(*relay::field(hidden_voice, "occlusion")->number() == 1.0 &&
+              *relay::field(hidden_voice, "cutoff_hz")->number() < 1000.0 &&
+              *relay::field(open_voice, "occlusion")->number() == 0.0 &&
+              *relay::field(open_voice, "cutoff_hz")->number() == 20000.0,
+          "a wall between the listener and a source muffles it; a clear line does not");
+    // The listener stands in the hall; one sound is in the cave next door.
+    const auto* zones = relay::field(*relay::field(*status.object(), "reverb")->object(), "zones")->array();
+    const auto zone = [&](const relay::Entity entity) -> const relay::JsonValue::Object* {
+        for (const auto& item : *zones)
+            if (*relay::field(*item.object(), "entity")->string() == entity.to_string()) return item.object();
+        return nullptr;
+    };
+    check(zones->size() == 2U && zone(hall) &&
+              *relay::field(*zone(hall), "listener_weight")->number() == 1.0 && zone(cave) &&
+              *relay::field(*zone(cave), "listener_weight")->number() == 0.0 &&
+              std::abs(*relay::field(*zone(cave), "room_size")->number() - 0.2) < 1e-9,
+          "each zone in play gets its own reverb: the listener's hall and the cave a sound is in");
+    check(*relay::field(hidden_voice, "send")->number() > 0.0 &&
+              *relay::field(voice(echoing), "send")->number() > 0.0,
+          "sounds outside every zone feed the listener's; a sound in the cave feeds the cave's");
+    request(protocol, "runtime.stop");
+
+    // Mixer editing through the protocol: effects, ordering, and live previews that save later.
+    request(protocol, "project.create", "\"filename\":\"projects/mixer/project.relayproject\",\"name\":\"Mixer\"");
+    request(protocol, "audio.set_effect", "\"bus\":\"SFX\"", false);
+    request(protocol, "audio.set_effect", "\"bus\":\"SFX\",\"type\":\"reverb\",\"mix\":0.4");
+    request(protocol, "audio.set_effect", "\"bus\":\"SFX\",\"type\":\"eq\",\"low_db\":-6");
+    request(protocol, "audio.set_effect", "\"bus\":\"SFX\",\"index\":0,\"mix\":2", false);
+    request(protocol, "audio.move_effect", "\"bus\":\"SFX\",\"index\":1,\"to\":0");
+    request(protocol, "audio.set_effect", "\"bus\":\"SFX\",\"index\":1,\"room_size\":0.9,\"preview\":true");
+    request(protocol, "audio.set_bus", "\"name\":\"Music\",\"volume_db\":-12,\"preview\":true");
+    const auto saved_effects = [] {
+        std::string load_error;
+        return relay::load_project("projects/mixer/project.relayproject", load_error)->audio->buses;
+    };
+    const auto sfx_bus = [](const std::vector<relay::AudioBus>& buses) {
+        return *std::find_if(buses.begin(), buses.end(), [](const auto& bus) { return bus.name == "SFX"; });
+    };
+    check(sfx_bus(saved_effects()).effects.size() == 2U &&
+              sfx_bus(saved_effects()).effects[0].type == Type::eq &&
+              sfx_bus(saved_effects()).effects[1].room_size == 0.6 &&
+              sfx_bus(engine.audio_settings().buses).effects[1].room_size == 0.9 &&
+              engine.previewing_audio_settings(),
+          "effects are added and reordered in the project; previews apply without saving");
+    request(protocol, "audio.remove_effect", "\"bus\":\"SFX\",\"index\":0");
+    const auto buses = saved_effects();
+    const auto music = std::find_if(buses.begin(), buses.end(), [](const auto& bus) { return bus.name == "Music"; });
+    check(sfx_bus(buses).effects.size() == 1U && sfx_bus(buses).effects[0].room_size == 0.9 &&
+              music->volume_db == -12.0 && !engine.previewing_audio_settings(),
+          "the next saved change keeps what was previewed");
+}
+
+// Audio phase 3: streaming, one-shots, music players, script bus changes and binaural output.
+void audio_music_and_streams() {
+    // The head model: a click to the listener's right reaches the right ear first and louder.
+    {
+        relay::AudioClip click{48000, 1, std::vector<float>(480, 0.0F)};
+        click.samples[0] = 1.0F;
+        relay::AudioMixer mixer;
+        relay::AudioVoiceTarget target;
+        target.binaural = true;
+        target.azimuth = static_cast<float>(3.14159265358979 / 2.0);
+        (void)mixer.play(std::make_shared<const relay::AudioClip>(click), target);
+        std::vector<float> output(480U * 2U);
+        mixer.render(output);
+        const auto arrival = [&](const std::size_t channel) {
+            std::size_t best = 0;
+            for (std::size_t frame = 0; frame < 480U; ++frame)
+                if (std::abs(output[frame * 2U + channel]) > std::abs(output[best * 2U + channel])) best = frame;
+            return best;
+        };
+        check(arrival(1) <= 1U && arrival(0) >= 28U && arrival(0) <= 34U,
+              "binaural sound to the right reaches the left ear about 0.65 ms later");
+        check(peak_after(std::vector<float>{output[arrival(1) * 2U + 1U]}) >
+                  peak_after(std::vector<float>{output[arrival(0) * 2U]}),
+              "the far ear hears the sound through the head's shadow, quieter");
+    }
+
+    relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+    relay::ControlProtocol protocol(engine);
+    request(protocol, "project.create", "\"filename\":\"projects/music/project.relayproject\",\"name\":\"Music\"");
+    // A 12 s file streams; the 3 s tracks decode whole.
+    write_wav("projects/music/sounds/long.wav", 22050, 1, 22050 * 12, [](std::uint32_t frame, std::uint16_t) {
+        return 0.3 * std::sin(frame * 0.05);
+    });
+    for (const char* name : {"one", "two"})
+        write_wav(std::string("projects/music/music/") + name + ".wav", 48000, 1, 48000 * 3,
+                  [](std::uint32_t frame, std::uint16_t) { return 0.2 * std::sin(frame * 0.03); });
+    const auto clip = request(protocol, "audio.clip", "\"clip\":\"sounds/long.wav\",\"peaks\":4");
+    check(*relay::field(*clip.object(), "streams")->boolean() &&
+              std::abs(*relay::field(*clip.object(), "duration_seconds")->number() - 12.0) < 1e-9 &&
+              relay::field(*clip.object(), "peaks")->array()->size() == 8U,
+          "a file longer than ten seconds streams, and is summarised without being kept");
+    const auto created = [&](const std::string& fields) {
+        return relay::Entity::parse(*relay::field(
+            *request(protocol, "scene.create", fields).object(), "entity")->string()).value();
+    };
+    const auto radio = created("\"name\":\"Radio\",\"type\":\"AudioSource\"");
+    request(protocol, "scene.set_audio_source",
+            "\"entity\":\"" + radio.to_string() + "\",\"clip\":\"sounds/long.wav\",\"spatial\":false");
+    const auto jukebox = created("\"name\":\"Jukebox\",\"type\":\"MusicPlayer\"");
+    const auto jukebox_field = "\"entity\":\"" + jukebox.to_string() + "\"";
+    request(protocol, "scene.set_music_player", jukebox_field +
+            ",\"tracks\":[\"music/one.wav\",\"music/two.wav\"],\"crossfade_seconds\":0.5,\"bpm\":120,"
+            "\"beats_per_bar\":4,\"sync\":\"bar\"");
+    {
+        std::string error;
+        check(relay::save_scene_file_atomic(engine.scene(), "music.relay.json", error), "save music");
+        const auto loaded = relay::load_scene_file("music.relay.json");
+        check(loaded && loaded.state->slots[jukebox.index].record.music_player ==
+                            engine.scene().get(jukebox)->music_player,
+              "music players survive saving and loading");
+    }
+    const auto voices = [&] {
+        return *relay::field(*request(protocol, "audio.status").object(), "voices")->array();
+    };
+    const auto music_voices = [&] {
+        std::vector<relay::JsonValue::Object> found;
+        for (const auto& voice : voices())
+            if (*relay::field(*voice.object(), "kind")->string() == "music") found.push_back(*voice.object());
+        return found;
+    };
+    request(protocol, "audio.music", jukebox_field + ",\"action\":\"next\"", false);
+
+    request(protocol, "runtime.play");
+    engine.step(18); // 0.3 s
+    auto music = music_voices();
+    check(music.size() == 1U && *relay::field(music[0], "track")->number() == 0.0 &&
+              engine.audio().music_track(jukebox) == 0,
+          "a music player starts its first track with the game");
+    for (const auto& voice : voices())
+        if (*relay::field(*voice.object(), "entity")->string() == radio.to_string())
+            check(*relay::field(*voice.object(), "streaming")->boolean() &&
+                      std::abs(*relay::field(*voice.object(), "position_seconds")->number() - 0.3) < 0.02,
+                  "the long file plays from its stream in step with the game");
+    // At 0.3 s, a change synced to the bar (2 s at 120 bpm in 4/4) waits 1.7 s.
+    const auto changed = request(protocol, "audio.music", jukebox_field + ",\"action\":\"play\",\"track\":1");
+    check(*relay::field(*changed.object(), "track")->number() == 1.0, "audio.music queues track 1");
+    music = music_voices();
+    check(music.size() == 2U && *relay::field(music[1], "waiting")->boolean(),
+          "the new track waits for the bar");
+    engine.step(100); // 1.97 s: still waiting.
+    music = music_voices();
+    check(music.size() == 2U && *relay::field(music[1], "waiting")->boolean() &&
+              *relay::field(music[0], "fade")->number() == 1.0,
+          "nothing changes before the bar line");
+    engine.step(15); // 2.22 s: crossfading.
+    music = music_voices();
+    check(music.size() == 2U && !*relay::field(music[1], "waiting")->boolean() &&
+              *relay::field(music[0], "fade")->number() < 1.0 &&
+              *relay::field(music[1], "fade")->number() > 0.0,
+          "on the bar the tracks crossfade");
+    engine.step(30); // 2.72 s: the crossfade (0.5 s from 2.0 s) is over.
+    music = music_voices();
+    check(music.size() == 1U && *relay::field(music[0], "track")->number() == 1.0 &&
+              std::abs(*relay::field(music[0], "position_seconds")->number() - 0.72) < 0.02,
+          "after the crossfade only the new track plays, started exactly on the bar");
+    // Track 1 is 3 s long: 0.5 s before it ends, the playlist moves on, back to track 0.
+    engine.step(150); // Track 1 at 3.22 s: ended; track 0 started at 2.5 s.
+    music = music_voices();
+    check(music.size() == 1U && *relay::field(music[0], "track")->number() == 0.0 &&
+              std::abs(*relay::field(music[0], "position_seconds")->number() - 0.72) < 0.02,
+          "the playlist crossfades into the next track before the current one ends, and loops");
+
+    // One-shots.
+    const auto shot = request(protocol, "audio.play_clip", "\"clip\":\"music/one.wav\",\"x\":3,\"y\":0,\"z\":0");
+    const auto sound = static_cast<std::uint64_t>(*relay::field(*shot.object(), "sound")->number());
+    bool listed = false;
+    for (const auto& voice : voices())
+        listed |= *relay::field(*voice.object(), "kind")->string() == "one_shot" &&
+                  *relay::field(*voice.object(), "gain_right")->number() >
+                      *relay::field(*voice.object(), "gain_left")->number();
+    check(sound != 0U && engine.audio().sound_playing(sound) && listed,
+          "a one-shot plays at its position without a node");
+    engine.step(6);
+    check(std::abs(engine.audio().sound_position(sound).value_or(0.0) - 0.1) < 0.02,
+          "a one-shot reports its position");
+    request(protocol, "audio.stop", "\"sound\":" + std::to_string(sound));
+    check(!engine.audio().sound_playing(sound), "audio.stop stops a one-shot by its handle");
+    request(protocol, "audio.play_clip", "\"clip\":\"../outside.wav\"", false);
+
+    // Script bus changes fade with game time and end with the game.
+    std::string error;
+    check(engine.audio().set_bus_volume("Music", -20.0, 1.0, error), "fade the Music bus");
+    engine.step(30);
+    check(std::abs(engine.audio().bus_volume("Music").value_or(0.0) + 10.0) < 0.5,
+          "halfway through its fade the bus is halfway down");
+    engine.step(40);
+    check(engine.audio().bus_volume("Music") == -20.0 &&
+              engine.audio_settings().buses[1].volume_db == 0.0,
+          "the fade ends at its target without touching the saved mixer");
+    check(engine.audio().set_bus_effect("Master", 0, "ceiling_db", -3.0, error) &&
+              !engine.audio().set_bus_effect("Master", 0, "room_size", 0.5, error) &&
+              !engine.audio().set_bus_volume("Nowhere", 0.0, 0.0, error),
+          "scripts can set effect parameters their effect has, on buses that exist");
+    request(protocol, "audio.music", jukebox_field + ",\"action\":\"stop\",\"fade_seconds\":0.25");
+    engine.step(20);
+    check(music_voices().empty() && engine.audio().music_track(jukebox) == -1,
+          "stopping the music fades it out");
+    request(protocol, "runtime.stop");
+    check(engine.audio().bus_volume("Music") == 0.0, "Stop Game undoes the scripts' bus changes");
+
+    // Headphones.
+    request(protocol, "audio.set_spatialization", "\"mode\":\"binaural\"");
+    check(engine.audio_settings().spatialization == relay::AudioSettings::Spatialization::binaural,
+          "binaural output is saved in the project");
+    const auto ears = created("\"name\":\"Ears\"");
+    request(protocol, "component.add", "\"entity\":\"" + ears.to_string() + "\",\"component\":\"audio_listener\"");
+    request(protocol, "scene.set_audio_source",
+            "\"entity\":\"" + radio.to_string() + "\",\"spatial\":true,\"occlusion\":false");
+    request(protocol, "scene.set_transform", "\"entity\":\"" + radio.to_string() + "\",\"px\":2,\"pz\":2");
+    request(protocol, "runtime.play");
+    engine.step(2);
+    for (const auto& voice : voices())
+        if (*relay::field(*voice.object(), "entity")->string() == radio.to_string())
+            check(*relay::field(*voice.object(), "gain_left")->number() ==
+                          *relay::field(*voice.object(), "gain_right")->number() &&
+                      *relay::field(*voice.object(), "cutoff_hz")->number() < 20000.0,
+                  "binaural sources leave placement to the head model, and sound behind is duller");
+    request(protocol, "runtime.stop");
+}
+
 int main() {
     const auto original = std::filesystem::current_path();
     const auto temporary = std::filesystem::temp_directory_path() /
@@ -1235,6 +1953,9 @@ int main() {
         demo_first_person_template();
         first_person_migration();
         joints();
+        audio();
+        audio_effects();
+        audio_music_and_streams();
         std::cout << "Background editor workflow tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

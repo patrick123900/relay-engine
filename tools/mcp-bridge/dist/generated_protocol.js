@@ -275,7 +275,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         description: "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.",
         inputSchema: z.object({
             "query": z.string().max(64).default("").describe("Case-insensitive name fragment; empty matches every name"),
-            "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|shader|script|text|media|other)$"))).max(11).optional().describe("Asset kinds to include; omitted or empty includes all")
+            "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|shader|script|text|media|audio|other)$"))).max(12).optional().describe("Asset kinds to include; omitted or empty includes all")
         }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
@@ -548,7 +548,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         inputSchema: z.object({
             "name": z.string().min(1).max(128).optional().describe("Node name; defaults to the type's name, or Entity"),
             "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity handle"),
-            "type": z.enum(["Node", "Camera", "DirectionalLight", "PointLight", "SpotLight", "RigidBody", "StaticBody", "StaticMesh"]).optional().describe("Node type to create; omitted creates a plain Node")
+            "type": z.enum(["Node", "Camera", "DirectionalLight", "PointLight", "SpotLight", "RigidBody", "StaticBody", "StaticMesh", "AudioSource", "ReverbZone", "MusicPlayer"]).optional().describe("Node type to create; omitted creates a plain Node")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
@@ -628,14 +628,15 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "nearPlane": z.number().finite().min(0.0001).max(1000).default(0.1),
             "farPlane": z.number().finite().min(0.001).max(1000000).default(1000),
             "orthographicHeight": z.number().finite().min(0).max(1000000).optional().describe("Full viewport height; zero selects perspective"),
-            "exposureEv": z.number().finite().min(-16).max(16).optional().describe("Exposure compensation in stops; zero is the reference exposure")
+            "exposureEv": z.number().finite().min(-16).max(16).optional().describe("Exposure compensation in stops; zero is the reference exposure"),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["scene_set_camera"];
         if (override)
             return override(input);
-        return invoke("scene.set_camera", { "entity": input["entity"], "enabled": input["enabled"], "active": input["active"], "field_of_view_y_degrees": input["fieldOfViewY"], "near_plane": input["nearPlane"], "far_plane": input["farPlane"], "orthographic_height": input["orthographicHeight"], "exposure_ev": input["exposureEv"] });
+        return invoke("scene.set_camera", { "entity": input["entity"], "enabled": input["enabled"], "active": input["active"], "field_of_view_y_degrees": input["fieldOfViewY"], "near_plane": input["nearPlane"], "far_plane": input["farPlane"], "orthographic_height": input["orthographicHeight"], "exposure_ev": input["exposureEv"], "gesture": input["gesture"] });
     });
     server.registerTool("scene_set_renderer", {
         title: "Configure entity renderer",
@@ -715,14 +716,15 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
             "target": z.number().int().min(0).max(63).default(0),
             "weight": z.number().finite().min(-100).max(100).default(0),
-            "reset": z.boolean().default(false)
+            "reset": z.boolean().default(false),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["scene_set_morph"];
         if (override)
             return override(input);
-        return invoke("scene.set_morph", { "entity": input["entity"], "target": input["target"], "weight": input["weight"], "reset": input["reset"] });
+        return invoke("scene.set_morph", { "entity": input["entity"], "target": input["target"], "weight": input["weight"], "reset": input["reset"], "gesture": input["gesture"] });
     });
     server.registerTool("scene_set_collider", {
         title: "Configure collider",
@@ -742,14 +744,15 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "halfHeight": z.number().finite().min(1e-06).max(1000000).optional(),
             "mesh": z.string().max(128).regex(new RegExp("^[A-Za-z0-9._:-]*$")).optional().describe("Registered mesh for convex and mesh shapes; empty uses the entity renderer mesh"),
             "layer": z.number().int().min(1).max(4294967295).optional(),
-            "mask": z.number().int().min(0).max(4294967295).optional()
+            "mask": z.number().int().min(0).max(4294967295).optional(),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["scene_set_collider"];
         if (override)
             return override(input);
-        return invoke("scene.set_collider", { "entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "center_x": input["centerX"], "center_y": input["centerY"], "center_z": input["centerZ"], "half_x": input["halfX"], "half_y": input["halfY"], "half_z": input["halfZ"], "radius": input["radius"], "half_height": input["halfHeight"], "mesh": input["mesh"], "layer": input["layer"], "mask": input["mask"] });
+        return invoke("scene.set_collider", { "entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "center_x": input["centerX"], "center_y": input["centerY"], "center_z": input["centerZ"], "half_x": input["halfX"], "half_y": input["halfY"], "half_z": input["halfZ"], "radius": input["radius"], "half_height": input["halfHeight"], "mesh": input["mesh"], "layer": input["layer"], "mask": input["mask"], "gesture": input["gesture"] });
     });
     server.registerTool("physics_raycast", {
         title: "Raycast colliders",
@@ -842,14 +845,15 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "friction": z.number().finite().min(0).max(10).optional(),
             "linearDamping": z.number().finite().min(0).max(100).optional(),
             "angularDamping": z.number().finite().min(0).max(100).optional(),
-            "lockRotation": z.boolean().optional().describe("Keep a dynamic body upright, as character controllers need")
+            "lockRotation": z.boolean().optional().describe("Keep a dynamic body upright, as character controllers need"),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["scene_set_physics_body"];
         if (override)
             return override(input);
-        return invoke("scene.set_physics_body", { "entity": input["entity"], "attached": input["attached"], "type": input["type"], "mass": input["mass"], "gravity_scale": input["gravityScale"], "restitution": input["restitution"], "friction": input["friction"], "linear_damping": input["linearDamping"], "angular_damping": input["angularDamping"], "lock_rotation": input["lockRotation"] });
+        return invoke("scene.set_physics_body", { "entity": input["entity"], "attached": input["attached"], "type": input["type"], "mass": input["mass"], "gravity_scale": input["gravityScale"], "restitution": input["restitution"], "friction": input["friction"], "linear_damping": input["linearDamping"], "angular_damping": input["angularDamping"], "lock_rotation": input["lockRotation"], "gesture": input["gesture"] });
     });
     server.registerTool("scripts_status", {
         title: "Inspect gameplay scripts",
@@ -961,21 +965,103 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "motorForce": z.number().finite().min(0).max(1000000000).optional().describe("Maximum torque (N m) for hinges, force (N) for sliders"),
             "springFrequency": z.number().finite().min(0).max(1000).optional().describe("Distance joints: spring frequency in Hz; 0 is rigid"),
             "springDamping": z.number().finite().min(0).max(100).optional(),
-            "collideConnected": z.boolean().optional()
+            "collideConnected": z.boolean().optional(),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["scene_set_joint"];
         if (override)
             return override(input);
-        return invoke("scene.set_joint", { "entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "connected": input["connected"], "anchor_x": input["anchorX"], "anchor_y": input["anchorY"], "anchor_z": input["anchorZ"], "axis_x": input["axisX"], "axis_y": input["axisY"], "axis_z": input["axisZ"], "connected_anchor_x": input["connectedAnchorX"], "connected_anchor_y": input["connectedAnchorY"], "connected_anchor_z": input["connectedAnchorZ"], "limits": input["limits"], "limit_min": input["limitMin"], "limit_max": input["limitMax"], "motor": input["motor"], "motor_speed": input["motorSpeed"], "motor_force": input["motorForce"], "spring_frequency": input["springFrequency"], "spring_damping": input["springDamping"], "collide_connected": input["collideConnected"] });
+        return invoke("scene.set_joint", { "entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "connected": input["connected"], "anchor_x": input["anchorX"], "anchor_y": input["anchorY"], "anchor_z": input["anchorZ"], "axis_x": input["axisX"], "axis_y": input["axisY"], "axis_z": input["axisZ"], "connected_anchor_x": input["connectedAnchorX"], "connected_anchor_y": input["connectedAnchorY"], "connected_anchor_z": input["connectedAnchorZ"], "limits": input["limits"], "limit_min": input["limitMin"], "limit_max": input["limitMax"], "motor": input["motor"], "motor_speed": input["motorSpeed"], "motor_force": input["motorForce"], "spring_frequency": input["springFrequency"], "spring_damping": input["springDamping"], "collide_connected": input["collideConnected"], "gesture": input["gesture"] });
+    });
+    server.registerTool("scene_set_audio_source", {
+        title: "Configure audio source",
+        description: "Add, edit or remove a node's audio source: a project sound file (.wav, .flac, .mp3 or .ogg) played through a mixer bus during Run Game. Spatial sources fade with distance from the listener (inverse, inverse square or linear rolloff between the minimum and maximum distance), pan around it and shift pitch with relative motion (doppler); flat sources play as stereo with a balance. Undoable and saved with the scene.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "attached": z.boolean().default(true).describe("False removes the audio source"),
+            "clip": z.string().max(128).regex(new RegExp("^([A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(wav|WAV|flac|FLAC|mp3|MP3|ogg|OGG))?$")).optional().describe("Project-relative sound file; empty for none"),
+            "bus": z.string().min(1).max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")).optional().describe("Mixer bus name; an unknown bus plays into Master"),
+            "volumeDb": z.number().finite().min(-80).max(24).optional(),
+            "pitch": z.number().finite().min(0.1).max(4).optional(),
+            "pan": z.number().finite().min(-1).max(1).optional().describe("Balance for flat sources"),
+            "loop": z.boolean().optional(),
+            "playOnStart": z.boolean().optional(),
+            "spatial": z.boolean().optional(),
+            "minDistance": z.number().finite().min(0.01).max(1000000).optional(),
+            "maxDistance": z.number().finite().min(0.01).max(1000000).optional(),
+            "rolloff": z.enum(["inverse", "inverse_square", "linear"]).optional(),
+            "doppler": z.number().finite().min(0).max(5).optional(),
+            "occlusion": z.boolean().optional().describe("Muffle and quieten the sound when colliders stand between it and the listener"),
+            "reverbSend": z.number().finite().min(0).max(1).optional().describe("How much reaches the reverb of the zone the listener is in"),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_audio_source"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_audio_source", { "entity": input["entity"], "attached": input["attached"], "clip": input["clip"], "bus": input["bus"], "volume_db": input["volumeDb"], "pitch": input["pitch"], "pan": input["pan"], "loop": input["loop"], "play_on_start": input["playOnStart"], "spatial": input["spatial"], "min_distance": input["minDistance"], "max_distance": input["maxDistance"], "rolloff": input["rolloff"], "doppler": input["doppler"], "occlusion": input["occlusion"], "reverb_send": input["reverbSend"], "gesture": input["gesture"] });
+    });
+    server.registerTool("scene_set_reverb_zone", {
+        title: "Configure reverb zone",
+        description: "Add, edit or remove a reverb zone: a sphere or box (following the node's position, rotation and scale) where spatial sounds take on a room's reverb while the listener is inside, fading out over fade metres outside it. Choosing a preset (room, small_room, bathroom, hall, cathedral, cave, arena, forest) sets its parameters; changing a parameter makes the zone custom. Undoable and saved with the scene.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "attached": z.boolean().default(true).describe("False removes the reverb zone"),
+            "shape": z.enum(["sphere", "box"]).optional(),
+            "radius": z.number().finite().min(0.01).max(100000).optional(),
+            "halfX": z.number().finite().min(0.01).max(100000).optional(),
+            "halfY": z.number().finite().min(0.01).max(100000).optional(),
+            "halfZ": z.number().finite().min(0.01).max(100000).optional(),
+            "fade": z.number().finite().min(0).max(10000).optional(),
+            "preset": z.enum(["room", "small_room", "bathroom", "hall", "cathedral", "cave", "arena", "forest", "custom"]).optional(),
+            "roomSize": z.number().finite().min(0).max(1).optional(),
+            "damping": z.number().finite().min(0).max(1).optional(),
+            "wetDb": z.number().finite().min(-80).max(6).optional(),
+            "preDelayMs": z.number().finite().min(0).max(250).optional(),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_reverb_zone"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_reverb_zone", { "entity": input["entity"], "attached": input["attached"], "shape": input["shape"], "radius": input["radius"], "half_x": input["halfX"], "half_y": input["halfY"], "half_z": input["halfZ"], "fade": input["fade"], "preset": input["preset"], "room_size": input["roomSize"], "damping": input["damping"], "wet_db": input["wetDb"], "pre_delay_ms": input["preDelayMs"], "gesture": input["gesture"] });
+    });
+    server.registerTool("scene_set_music_player", {
+        title: "Configure music player",
+        description: "Add, edit or remove a music player: a playlist of project sound files played flat on a bus during Run Game, one after another with a crossfade, optionally shuffled and looping. Long files stream. Changes asked for with audio.music wait for the player's sync point (immediate, beat, bar or track_end) counted at bpm from first_beat_seconds. Undoable and saved with the scene.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "attached": z.boolean().default(true).describe("False removes the music player"),
+            "tracks": z.array(z.string().regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(wav|WAV|flac|FLAC|mp3|MP3|ogg|OGG)$"))).max(64).optional().describe("Playlist of project-relative sound files, replacing the current one"),
+            "bus": z.string().min(1).max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")).optional(),
+            "volumeDb": z.number().finite().min(-80).max(24).optional(),
+            "crossfadeSeconds": z.number().finite().min(0).max(30).optional(),
+            "shuffle": z.boolean().optional(),
+            "loopPlaylist": z.boolean().optional(),
+            "playOnStart": z.boolean().optional(),
+            "bpm": z.number().finite().min(20).max(400).optional(),
+            "beatsPerBar": z.number().int().min(1).max(16).optional(),
+            "firstBeatSeconds": z.number().finite().min(0).max(60).optional(),
+            "sync": z.enum(["immediate", "beat", "bar", "track_end"]).optional(),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_music_player"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_music_player", { "entity": input["entity"], "attached": input["attached"], "tracks": input["tracks"], "bus": input["bus"], "volume_db": input["volumeDb"], "crossfade_seconds": input["crossfadeSeconds"], "shuffle": input["shuffle"], "loop_playlist": input["loopPlaylist"], "play_on_start": input["playOnStart"], "bpm": input["bpm"], "beats_per_bar": input["beatsPerBar"], "first_beat_seconds": input["firstBeatSeconds"], "sync": input["sync"], "gesture": input["gesture"] });
     });
     server.registerTool("component_add", {
         title: "Add component",
         description: "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.",
         inputSchema: z.object({
             "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-            "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "joint", "keyframes", "script"]),
+            "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script"]),
             "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).optional().describe("Behaviour class name; required for script")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
@@ -990,7 +1076,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         description: "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.",
         inputSchema: z.object({
             "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-            "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "joint", "keyframes", "script"]),
+            "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script"]),
             "index": z.number().int().min(0).max(31).optional().describe("Which script component, from zero")
         }),
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
@@ -1027,14 +1113,15 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "boolean": z.boolean().optional(),
             "text": z.string().max(1024).optional(),
             "vector": z.array(z.number().finite()).min(3).max(3).optional(),
-            "reset": z.boolean().default(false)
+            "reset": z.boolean().default(false),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["scene_set_script_property"];
         if (override)
             return override(input);
-        return invoke("scene.set_script_property", { "entity": input["entity"], "index": input["index"], "property": input["property"], "number": input["number"], "boolean": input["boolean"], "text": input["text"], "vector": input["vector"], "reset": input["reset"] });
+        return invoke("scene.set_script_property", { "entity": input["entity"], "index": input["index"], "property": input["property"], "number": input["number"], "boolean": input["boolean"], "text": input["text"], "vector": input["vector"], "reset": input["reset"], "gesture": input["gesture"] });
     });
     server.registerTool("nodes_types", {
         title: "List node types",
@@ -1104,14 +1191,15 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "quadratic": z.number().finite().min(0).max(100000).optional(),
             "innerCone": z.number().finite().min(0).max(1.5707963267948966).optional(),
             "outerCone": z.number().finite().min(0.0001).max(1.5707963267948966).optional(),
-            "range": z.number().finite().min(0).max(1000000).optional().describe("Light range; zero means infinite")
+            "range": z.number().finite().min(0).max(1000000).optional().describe("Light range; zero means infinite"),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["scene_set_light"];
         if (override)
             return override(input);
-        return invoke("scene.set_light", { "entity": input["entity"], "enabled": input["enabled"], "type": input["type"], "red": input["red"], "green": input["green"], "blue": input["blue"], "intensity": input["intensity"], "constant": input["constant"], "linear": input["linear"], "quadratic": input["quadratic"], "inner_cone": input["innerCone"], "outer_cone": input["outerCone"], "range": input["range"] });
+        return invoke("scene.set_light", { "entity": input["entity"], "enabled": input["enabled"], "type": input["type"], "red": input["red"], "green": input["green"], "blue": input["blue"], "intensity": input["intensity"], "constant": input["constant"], "linear": input["linear"], "quadratic": input["quadratic"], "inner_cone": input["innerCone"], "outer_cone": input["outerCone"], "range": input["range"], "gesture": input["gesture"] });
     });
     server.registerTool("scene_rename", {
         title: "Rename scene entity",
@@ -1595,6 +1683,228 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override(input);
         return invoke("session.request", { "scope": input["scope"], "kind": input["kind"], "target": input["target"] });
+    });
+    server.registerTool("audio_status", {
+        title: "Inspect audio",
+        description: "Read the audio output device, the listener, every playing voice (clip, bus, position, gains) and each mixer bus with its post-fader peak and RMS levels in dB.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["audio_status"];
+        if (override)
+            return override({});
+        return invoke("audio.status", {});
+    });
+    server.registerTool("audio_settings", {
+        title: "Read mixer buses",
+        description: "Read the project's mixer buses (settings.audio in the .relayproject): name, parent, volume in dB, mute and solo, with the defaults.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["audio_settings"];
+        if (override)
+            return override({});
+        return invoke("audio.settings", {});
+    });
+    server.registerTool("audio_set_bus", {
+        title: "Create or change a mixer bus",
+        description: "Create a bus, or change one's name, parent, volume, mute or solo, and save the mixer in the open project. A new bus defaults to Master as its parent. While any bus is soloed only soloed buses, their parents and their children are heard. Renaming keeps children attached; sources naming the old bus fall back to Master until they are changed.",
+        inputSchema: z.object({
+            "name": z.string().min(1).max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")),
+            "newName": z.string().min(1).max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")).optional(),
+            "parent": z.string().min(1).max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")).optional(),
+            "volumeDb": z.number().finite().min(-80).max(24).optional(),
+            "mute": z.boolean().optional(),
+            "solo": z.boolean().optional(),
+            "preview": z.boolean().default(false).describe("Apply to the mixer without saving the project, for live dragging; a later request without preview saves")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_set_bus"];
+        if (override)
+            return override(input);
+        return invoke("audio.set_bus", { "name": input["name"], "new_name": input["newName"], "parent": input["parent"], "volume_db": input["volumeDb"], "mute": input["mute"], "solo": input["solo"], "preview": input["preview"] });
+    });
+    server.registerTool("audio_remove_bus", {
+        title: "Remove a mixer bus",
+        description: "Remove a bus other than Master and save the mixer; its children move to its parent and sources routed to it play into Master.",
+        inputSchema: z.object({
+            "name": z.string().min(1).max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$"))
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_remove_bus"];
+        if (override)
+            return override(input);
+        return invoke("audio.remove_bus", { "name": input["name"] });
+    });
+    server.registerTool("audio_play", {
+        title: "Play an audio source",
+        description: "Start or restart a node's audio source. During Run Game it plays as authored; in the editor it plays as a flat preview.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_play"];
+        if (override)
+            return override(input);
+        return invoke("audio.play", { "entity": input["entity"] });
+    });
+    server.registerTool("audio_stop", {
+        title: "Stop audio",
+        description: "Stop a node's audio source, a one-shot by the handle audio.play_clip returned, or every playing sound when neither is given.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")).optional(),
+            "sound": z.number().int().min(1).max(1000000000000).optional()
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_stop"];
+        if (override)
+            return override(input);
+        return invoke("audio.stop", { "entity": input["entity"], "sound": input["sound"] });
+    });
+    server.registerTool("audio_clip", {
+        title: "Inspect a sound file",
+        description: "Decode a project sound file and report its duration, sample rate, channels and frames, with optional min/max peak pairs across it for drawing a waveform.",
+        inputSchema: z.object({
+            "clip": z.string().min(1).max(128).regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(wav|WAV|flac|FLAC|mp3|MP3|ogg|OGG)$")),
+            "peaks": z.number().int().min(0).max(2048).default(0)
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_clip"];
+        if (override)
+            return override(input);
+        return invoke("audio.clip", { "clip": input["clip"], "peaks": input["peaks"] });
+    });
+    server.registerTool("audio_set_effect", {
+        title: "Add or change a bus effect",
+        description: "Add an effect to a mixer bus's chain (omit index), or change the effect at index, and save the mixer in the open project. Types and their parameters: reverb (room_size, damping, width, pre_delay_ms, mix), delay (time_ms, feedback, damping, mix), eq (low_db shelf at 200 Hz, mid_db at mid_frequency, high_db shelf at 5 kHz), compressor (threshold_db, ratio, attack_ms, release_ms, makeup_db), limiter (ceiling_db, release_ms), lowpass and highpass (cutoff_hz, resonance). Effects run in order before the bus volume; at most 8 per bus.",
+        inputSchema: z.object({
+            "bus": z.string().min(1).max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")),
+            "index": z.number().int().min(0).max(7).optional().describe("Effect to change; omitted adds one at the end"),
+            "type": z.enum(["reverb", "delay", "eq", "compressor", "limiter", "lowpass", "highpass"]).optional().describe("Required when adding; changing it on an existing effect keeps shared parameters"),
+            "enabled": z.boolean().optional(),
+            "mix": z.number().finite().min(0).max(1).optional(),
+            "roomSize": z.number().finite().min(0).max(1).optional(),
+            "damping": z.number().finite().min(0).max(1).optional(),
+            "width": z.number().finite().min(0).max(1).optional(),
+            "preDelayMs": z.number().finite().min(0).max(250).optional(),
+            "timeMs": z.number().finite().min(1).max(2000).optional(),
+            "feedback": z.number().finite().min(0).max(0.95).optional(),
+            "lowDb": z.number().finite().min(-24).max(24).optional(),
+            "midDb": z.number().finite().min(-24).max(24).optional(),
+            "midFrequency": z.number().finite().min(100).max(10000).optional(),
+            "highDb": z.number().finite().min(-24).max(24).optional(),
+            "thresholdDb": z.number().finite().min(-60).max(0).optional(),
+            "ratio": z.number().finite().min(1).max(20).optional(),
+            "attackMs": z.number().finite().min(0.1).max(500).optional(),
+            "releaseMs": z.number().finite().min(1).max(5000).optional(),
+            "makeupDb": z.number().finite().min(0).max(24).optional(),
+            "ceilingDb": z.number().finite().min(-24).max(0).optional(),
+            "cutoffHz": z.number().finite().min(20).max(20000).optional(),
+            "resonance": z.number().finite().min(0.1).max(10).optional(),
+            "preview": z.boolean().default(false).describe("Apply to the mixer without saving the project, for live dragging")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_set_effect"];
+        if (override)
+            return override(input);
+        return invoke("audio.set_effect", { "bus": input["bus"], "index": input["index"], "type": input["type"], "enabled": input["enabled"], "mix": input["mix"], "room_size": input["roomSize"], "damping": input["damping"], "width": input["width"], "pre_delay_ms": input["preDelayMs"], "time_ms": input["timeMs"], "feedback": input["feedback"], "low_db": input["lowDb"], "mid_db": input["midDb"], "mid_frequency": input["midFrequency"], "high_db": input["highDb"], "threshold_db": input["thresholdDb"], "ratio": input["ratio"], "attack_ms": input["attackMs"], "release_ms": input["releaseMs"], "makeup_db": input["makeupDb"], "ceiling_db": input["ceilingDb"], "cutoff_hz": input["cutoffHz"], "resonance": input["resonance"], "preview": input["preview"] });
+    });
+    server.registerTool("audio_remove_effect", {
+        title: "Remove a bus effect",
+        description: "Remove the effect at index from a bus's chain and save the mixer.",
+        inputSchema: z.object({
+            "bus": z.string().min(1).max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")),
+            "index": z.number().int().min(0).max(7)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_remove_effect"];
+        if (override)
+            return override(input);
+        return invoke("audio.remove_effect", { "bus": input["bus"], "index": input["index"] });
+    });
+    server.registerTool("audio_move_effect", {
+        title: "Reorder a bus effect",
+        description: "Move the effect at index to position to in the same bus's chain and save the mixer.",
+        inputSchema: z.object({
+            "bus": z.string().min(1).max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")),
+            "index": z.number().int().min(0).max(7),
+            "to": z.number().int().min(0).max(7)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_move_effect"];
+        if (override)
+            return override(input);
+        return invoke("audio.move_effect", { "bus": input["bus"], "index": input["index"], "to": input["to"] });
+    });
+    server.registerTool("audio_debug_shapes", {
+        title: "Inspect audio shapes",
+        description: "Read reverb zones (centre, box edge vectors or sphere radius in world space, fade) and spatial sources (centre, minimum and maximum distance) for drawing them in a viewport.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["audio_debug_shapes"];
+        if (override)
+            return override({});
+        return invoke("audio.debug_shapes", {});
+    });
+    server.registerTool("audio_music", {
+        title: "Control a music player",
+        description: "During Run Game: play a track (by playlist index), go to the next one, or stop with a fade. A change crossfades from the current track and lands on the next beat, bar or track end, or at once, as sync says (the player's own setting when omitted).",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "action": z.enum(["play", "next", "stop"]),
+            "track": z.number().int().min(0).max(63).optional().describe("For play: the playlist index; omitted plays the next"),
+            "sync": z.enum(["immediate", "beat", "bar", "track_end"]).optional(),
+            "fadeSeconds": z.number().finite().min(0).max(30).default(1).describe("For stop")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_music"];
+        if (override)
+            return override(input);
+        return invoke("audio.music", { "entity": input["entity"], "action": input["action"], "track": input["track"], "sync": input["sync"], "fade_seconds": input["fadeSeconds"] });
+    });
+    server.registerTool("audio_play_clip", {
+        title: "Play a sound file",
+        description: "Play a project sound file once without a node: placed at x, y, z in the world during Run Game (flat in the editor, where it previews), or flat when no position is given. Returns a handle for audio.stop.",
+        inputSchema: z.object({
+            "clip": z.string().min(1).max(128).regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(wav|WAV|flac|FLAC|mp3|MP3|ogg|OGG)$")),
+            "x": z.number().finite().min(-1000000).max(1000000).optional(),
+            "y": z.number().finite().min(-1000000).max(1000000).optional(),
+            "z": z.number().finite().min(-1000000).max(1000000).optional(),
+            "volumeDb": z.number().finite().min(-80).max(24).default(0),
+            "pitch": z.number().finite().min(0.1).max(4).default(1),
+            "bus": z.string().min(1).max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")).default("SFX"),
+            "minDistance": z.number().finite().min(0.01).max(1000000).default(1),
+            "maxDistance": z.number().finite().min(0.01).max(1000000).default(50)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_play_clip"];
+        if (override)
+            return override(input);
+        return invoke("audio.play_clip", { "clip": input["clip"], "x": input["x"], "y": input["y"], "z": input["z"], "volume_db": input["volumeDb"], "pitch": input["pitch"], "bus": input["bus"], "min_distance": input["minDistance"], "max_distance": input["maxDistance"] });
+    });
+    server.registerTool("audio_set_spatialization", {
+        title: "Choose speakers or headphones",
+        description: "Set how positioned sounds reach the ears and save it in the open project: stereo panning for speakers, or binaural for headphones, where a head model gives each ear its own delay and shadow and sounds behind are slightly duller.",
+        inputSchema: z.object({
+            "mode": z.enum(["stereo", "binaural"])
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["audio_set_spatialization"];
+        if (override)
+            return override(input);
+        return invoke("audio.set_spatialization", { "mode": input["mode"] });
     });
 }
 //# sourceMappingURL=generated_protocol.js.map

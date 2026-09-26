@@ -97,6 +97,18 @@ int run_socket_mode(const std::string_view port_text) {
     return 0;
 }
 
+// Windowed sessions play sound unless RELAY_AUDIO is 0, for automated runs that must stay quiet.
+bool audio_output_enabled() {
+    const char* value = std::getenv("RELAY_AUDIO");
+    return value == nullptr || std::string_view(value) != "0";
+}
+
+relay::EngineConfig windowed_config() {
+    relay::EngineConfig config;
+    config.audio_output = audio_output_enabled();
+    return config;
+}
+
 #ifdef RELAY_HAS_VULKAN_WINDOW
 // Applies the project's graphics settings to the renderer. RELAY_GLOBAL_ILLUMINATION,
 // RELAY_REFLECTIONS and RELAY_VSYNC set to 0 or 1 override them, for comparisons and smoke runs.
@@ -122,7 +134,7 @@ void apply_graphics_settings(relay::VulkanWindow& window, const relay::Engine& e
 }
 
 int run_windowed() {
-    relay::Engine engine;
+    relay::Engine engine(windowed_config());
     relay::VulkanWindow window("Relay Engine — Vulkan First Light", 1280, 720, engine.assets());
     if (!window.valid()) {
         std::cerr << "Could not create the Vulkan window: " << window.error() << '\n';
@@ -328,7 +340,7 @@ struct LiveInputState {
 // installs the human editor. They are independent because a human and an agent are expected to
 // operate the same runtime, and because both paths must issue identical ControlProtocol requests.
 int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& reader_detached) {
-    relay::EngineConfig config;
+    auto config = windowed_config();
     config.editor_mode = true;
     relay::Engine engine(config);
     relay::VulkanWindow window(with_ui ? "Relay Editor" : "Relay Live Editor", 1280, 720,
@@ -542,7 +554,7 @@ int run_live_editor(const bool with_ui, const bool read_stdin) {
 }
 #elif defined(RELAY_HAS_SDL3)
 int run_windowed() {
-    relay::Engine engine;
+    relay::Engine engine(windowed_config());
     relay::SdlWindow window("Relay Engine — CPU fallback", 1280, 720);
     if (!window.valid()) {
         std::cerr << "Could not create a window: " << window.error() << '\n';

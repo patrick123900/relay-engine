@@ -1,5 +1,6 @@
 #include "relay/editor/editor_ui.hpp"
 #include "relay/editor/chat_media.hpp"
+#include "relay/audio/audio_settings.hpp"
 
 #include "relay/core/input.hpp"
 #include "relay/core/json.hpp"
@@ -39,6 +40,7 @@
 #include <span>
 #include <sstream>
 #include <tuple>
+#include <utility>
 #include <vector>
 #include <mutex>
 #include <filesystem>
@@ -93,11 +95,12 @@ const JsonValue::Object* component(const JsonValue::Object& entity, const std::s
 }
 
 // Dockable panels, in the order of EditorUi::Impl::panel_open.
-constexpr std::array<const char*, 10> panel_names{"Hierarchy", "Inspector", "Assets", "History",
+constexpr std::array<const char*, 11> panel_names{"Hierarchy", "Inspector", "Assets", "History",
                                                   "Diagnostics", "Viewport", "Timeline", "Project",
-                                                  "Agent", "Profiler"};
+                                                  "Agent", "Profiler", "Mixer"};
 constexpr std::array<bool, panel_names.size()> default_panels{true, true, true, false, true,
-                                                              true, false, false, false, false};
+                                                              true, false, false, false, false,
+                                                              false};
 
 // A dim caption in a fixed column, so every inspector row lines up down the panel.
 void row_label(const char* const label, const float width) {
@@ -265,6 +268,8 @@ struct EditorUi::Impl {
         return ImGui::BeginCombo(id.c_str(), preview);
     }
 
+    // Reports every change while the field is dragged, so the scene follows the mouse. The whole
+    // drag shares one gesture token, which the next mutation carries so it stays one undo step.
     bool drag_scalar(const char* label, double& current, float speed, const char* format = "%.6f") {
         auto& draft = drafts[ImGui::GetID(label)];
         const bool inspector_field = drawing_inspector && label[0] != '#';
@@ -272,10 +277,12 @@ struct EditorUi::Impl {
             ImGui::PushID(label);
             inspector_field_label(label);
         }
-        ImGui::DragScalar(inspector_field ? "##value" : label, ImGuiDataType_Double,
-                          &draft.begin(current), speed, nullptr, nullptr,
-                          inspector_field && std::string_view(format) == "%.6f" ? "%.3f" : format);
-        const bool commit = ImGui::IsItemDeactivatedAfterEdit();
+        const bool changed = ImGui::DragScalar(
+            inspector_field ? "##value" : label, ImGuiDataType_Double, &draft.begin(current), speed,
+            nullptr, nullptr, inspector_field && std::string_view(format) == "%.6f" ? "%.3f" : format);
+        if (ImGui::IsItemActivated()) inspector_gesture = ++gesture_serial;
+        const bool commit = changed || ImGui::IsItemDeactivatedAfterEdit();
+        if (commit) pending_gesture = inspector_gesture;
         current = draft.value;
         draft.finish(ImGui::IsItemActive());
         if (inspector_field) ImGui::PopID();
@@ -294,7 +301,7 @@ struct EditorUi::Impl {
         const bool changed = ImGui::SliderScalar(
             inspector_field ? "##value" : label, ImGuiDataType_Double, &draft.begin(current),
             &minimum, &maximum, format);
-        if (ImGui::IsItemActivated()) ++animation_gesture;
+        if (ImGui::IsItemActivated()) animation_gesture = ++gesture_serial;
         current = std::clamp(draft.value, minimum, maximum);
         draft.finish(ImGui::IsItemActive());
         if (inspector_field) ImGui::PopID();
@@ -366,7 +373,10 @@ struct EditorUi::Impl {
     // Cached runtime state. The editor never touches Scene, SceneHistory or AssetRegistry directly.
     JsonValue scene_list;
     JsonValue collider_boxes;
+    // audio.debug_shapes: reverb zones and spatial source ranges for the viewport.
+    JsonValue audio_shapes;
     std::string scene_list_reply, collider_boxes_reply, agent_review_reply, agent_audit_reply;
+    std::string audio_shapes_reply;
     static constexpr int refresh_stages = 4;
     int startup_frames{}; // Frames built since the ImGui context and saved layout were created.
     int refresh_stage{-1}; // Next periodic refresh stage, or -1 between refreshes.
@@ -440,10 +450,15 @@ struct EditorUi::Impl {
     float ui_scale{1.0F};
     bool gizmo_active{false};
     // A fresh token per drag. Updates sharing it collapse into one undo entry; a new drag must not
-    // fold into an earlier, unrelated edit of the same entity.
+    // fold into an earlier, unrelated edit of the same entity. Every kind of drag draws its token
+    // from one counter, so a gizmo drag and an inspector drag can never share a token.
+    std::uint64_t gesture_serial{0};
     std::uint64_t gizmo_gesture{0};
     std::uint64_t animation_gesture{0};
     std::uint64_t timeline_gesture{0};
+    std::uint64_t inspector_gesture{0};
+    // Set by an inspector drag that changed its value this frame; the next mutation carries it.
+    std::uint64_t pending_gesture{0};
     int timeline_fps{30};
     bool timeline_snap{false};
     double timeline_preview_time{};
@@ -527,6 +542,22 @@ struct EditorUi::Impl {
     JsonValue input_live;
     // The Graphics page: graphics.settings, refreshed while the page is visible for live status.
     JsonValue graphics_status;
+    // Audio: the project's sound files and mixer buses for pickers, audio.settings for the Audio
+    // page, audio.status (voices and meters) while a source is selected or the page is open, and
+    // decoded clip summaries for the Inspector's waveform.
+    std::vector<std::string> audio_files;
+    JsonValue audio_settings;
+    JsonValue audio_status;
+    std::map<std::string, JsonValue, std::less<>> audio_clip_info;
+    std::array<char, 65> new_bus_name{};
+    std::string bus_rename_target;
+    std::array<char, 65> bus_rename{};
+    // A bus volume being dragged, saved to the project when the drag ends.
+    std::string bus_volume_target;
+    double bus_volume_edit{};
+    // The Mixer panel's selected effect: a bus name and an index into its chain, or -1.
+    std::string mixer_bus;
+    int mixer_effect{-1};
     // The frame rate limit field's text, kept while it is being typed in and saved when it is left.
     int frame_rate_limit_edit{};
     bool frame_rate_limit_editing{};
@@ -720,6 +751,66 @@ struct EditorUi::Impl {
             if (auto settings = call("graphics.settings", {}, false))
                 graphics_status = std::move(*settings);
         }
+        refresh_audio_status();
+    }
+
+    // Sound files for the clip picker, and the buses sources can play into.
+    void refresh_audio_files() {
+        std::vector<std::string> files;
+        if (auto found = call("assets.search", "\"kinds\":[\"audio\"]", false); found && found->object())
+            if (const auto* entries = field(*found->object(), "entries"); entries && entries->array())
+                for (const auto& entry : *entries->array())
+                    if (const auto* object = entry.object(); object && string_or(*object, "type") == "file")
+                        files.push_back(string_or(*object, "path"));
+        // A changed file list may mean a changed file, so its waveform is read again.
+        if (files != audio_files) audio_clip_info.clear();
+        audio_files = std::move(files);
+        if (auto settings = call("audio.settings", {}, false)) audio_settings = std::move(*settings);
+    }
+
+    std::vector<std::string> audio_bus_names() const {
+        std::vector<std::string> names;
+        const auto* object = audio_settings.object();
+        const auto* settings = object ? field(*object, "settings") : nullptr;
+        const auto* buses = settings && settings->object() ? field(*settings->object(), "buses") : nullptr;
+        if (buses && buses->array())
+            for (const auto& bus : *buses->array())
+                if (const auto* entry = bus.object()) names.push_back(string_or(*entry, "name"));
+        return names;
+    }
+
+    // Voices and meters are only fetched while something shows them.
+    void refresh_audio_status() {
+        const auto* entity = selection.empty() ? nullptr : find_entity(selection);
+        const bool shown = (game_config_open && game_config_page == 2) || panel_open[10] ||
+                           (entity && (component(*entity, "audio_source") ||
+                                       component(*entity, "reverb_zone") ||
+                                       component(*entity, "music_player")));
+        if (!shown) {
+            audio_status = JsonValue{};
+            return;
+        }
+        if (auto status = call("audio.status", {}, false)) audio_status = std::move(*status);
+    }
+
+    // The playing voice for `handle`, if audio.status lists one.
+    const JsonValue::Object* audio_voice(const std::string& handle) const {
+        const auto* status = audio_status.object();
+        const auto* voices = status ? field(*status, "voices") : nullptr;
+        if (voices && voices->array())
+            for (const auto& voice : *voices->array())
+                if (const auto* object = voice.object(); object && string_or(*object, "entity") == handle)
+                    return object;
+        return nullptr;
+    }
+
+    const JsonValue::Object* audio_clip_summary(const std::string& clip) {
+        auto found = audio_clip_info.find(clip);
+        if (found == audio_clip_info.end()) {
+            auto info = call("audio.clip", "\"clip\":\"" + json_escape(clip) + "\",\"peaks\":96", false);
+            found = audio_clip_info.emplace(clip, info ? std::move(*info) : JsonValue{}).first;
+        }
+        return found->second.object();
     }
 
     void set_game_input_focus(const bool focus) {
@@ -808,7 +899,12 @@ struct EditorUi::Impl {
     // untraced path into the scene.
     bool mutate(const std::string_view method, const std::string_view fields,
                 const std::string_view success) {
-        if (!call(method, fields).has_value()) return false;
+        const auto gesture = std::exchange(pending_gesture, 0U);
+        const bool tagged = gesture != 0U && fields.find("\"gesture\"") == std::string_view::npos;
+        if (!call(method, tagged ? std::string(fields) + ",\"gesture\":" + std::to_string(gesture)
+                                 : std::string(fields))
+                 .has_value())
+            return false;
         set_status(std::string(success), false);
         refresh_pending = true;
         if (method == "scene.load" || method == "scene.undo" || method == "scene.redo")
@@ -1423,6 +1519,14 @@ struct EditorUi::Impl {
                 collider_boxes_reply.clear();
                 collider_boxes = JsonValue{};
             }
+            if (panel_open[5] && camera_enabled &&
+                !(runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game")) {
+                if (auto shapes = call_if_changed("audio.debug_shapes", audio_shapes_reply))
+                    audio_shapes = std::move(*shapes);
+            } else {
+                audio_shapes_reply.clear();
+                audio_shapes = JsonValue{};
+            }
             return;
         }
         if (stage == 2) {
@@ -1449,6 +1553,7 @@ struct EditorUi::Impl {
         }
         refresh_asset_listing();
         refresh_templates();
+        refresh_audio_files();
         assets_pending = false;
     }
 
@@ -1765,6 +1870,150 @@ struct EditorUi::Impl {
                 if (type == "hinge" || type == "slider")
                     segment(add(anchor, scaled(axis, -0.4)), add(anchor, scaled(axis, 0.4)));
                 if (read_vector(field(*joint, "partner"), partner)) segment(anchor, partner);
+            }
+        viewport_draw_list->PopClipRect();
+    }
+
+    // Draws world-space lines over the viewport from the editor camera, clipped at its near plane.
+    struct ViewportPen {
+        EditorMatrix eye;
+        double focal{}, near{}, width{}, height{};
+        ImVec2 origin;
+        ImDrawList* list{};
+
+        Vec3 to_eye(const Vec3 point) const {
+            return {eye[0] * point.x + eye[4] * point.y + eye[8] * point.z + eye[12],
+                    eye[1] * point.x + eye[5] * point.y + eye[9] * point.z + eye[13],
+                    eye[2] * point.x + eye[6] * point.y + eye[10] * point.z + eye[14]};
+        }
+        ImVec2 project(const Vec3 point) const {
+            const double depth = -point.z;
+            return {static_cast<float>(origin.x + width * 0.5 + point.x * focal * height * 0.5 / depth),
+                    static_cast<float>(origin.y + height * 0.5 - point.y * focal * height * 0.5 / depth)};
+        }
+        void line(const Vec3 from, const Vec3 to, const ImU32 color, const float thickness) const {
+            auto a = to_eye(from), b = to_eye(to);
+            if (a.z > -near && b.z > -near) return;
+            if (a.z > -near || b.z > -near) {
+                const double fraction = (-near - a.z) / (b.z - a.z);
+                const Vec3 clipped{a.x + fraction * (b.x - a.x), a.y + fraction * (b.y - a.y), -near};
+                if (a.z > -near) a = clipped; else b = clipped;
+            }
+            const auto first = project(a), last = project(b);
+            if (std::isfinite(first.x) && std::isfinite(first.y) && std::isfinite(last.x) &&
+                std::isfinite(last.y))
+                list->AddLine(first, last, color, thickness);
+        }
+        // A circle of `radius` about `center` in the plane of unit vectors u and v.
+        void circle(const Vec3 center, const Vec3 u, const Vec3 v, const double radius,
+                    const ImU32 color, const float thickness) const {
+            constexpr int segments = 48;
+            Vec3 previous{};
+            for (int step = 0; step <= segments; ++step) {
+                const double angle = 2.0 * 3.14159265358979323846 * step / segments;
+                const Vec3 point{center.x + radius * (u.x * std::cos(angle) + v.x * std::sin(angle)),
+                                 center.y + radius * (u.y * std::cos(angle) + v.y * std::sin(angle)),
+                                 center.z + radius * (u.z * std::cos(angle) + v.z * std::sin(angle))};
+                if (step) line(previous, point, color, thickness);
+                previous = point;
+            }
+        }
+        void sphere(const Vec3 center, const double radius, const ImU32 color, const float thickness) const {
+            circle(center, {1, 0, 0}, {0, 1, 0}, radius, color, thickness);
+            circle(center, {0, 1, 0}, {0, 0, 1}, radius, color, thickness);
+            circle(center, {0, 0, 1}, {1, 0, 0}, radius, color, thickness);
+        }
+        // A box from its centre and three half-edge vectors.
+        void box(const Vec3 center, const std::array<Vec3, 3>& edges, const ImU32 color,
+                 const float thickness) const {
+            std::array<Vec3, 8> corners{};
+            for (unsigned corner = 0; corner < 8U; ++corner) {
+                Vec3 point = center;
+                for (unsigned axis = 0; axis < 3U; ++axis) {
+                    const double sign = corner & (1U << axis) ? 1.0 : -1.0;
+                    point = {point.x + sign * edges[axis].x, point.y + sign * edges[axis].y,
+                             point.z + sign * edges[axis].z};
+                }
+                corners[corner] = point;
+            }
+            for (unsigned corner = 0; corner < 8U; ++corner)
+                for (unsigned axis = 0; axis < 3U; ++axis)
+                    if (const unsigned other = corner ^ (1U << axis); corner < other)
+                        line(corners[corner], corners[other], color, thickness);
+        }
+    };
+
+    [[nodiscard]] std::optional<ViewportPen> viewport_pen() const {
+        if (!camera_enabled || !viewport_visible || !viewport_draw_list) return std::nullopt;
+        const double width = viewport_max.x - viewport_min.x;
+        const double height = viewport_max.y - viewport_min.y;
+        if (width <= 0.0 || height <= 0.0) return std::nullopt;
+        return ViewportPen{editor_view(view.position, view.target),
+                           1.0 / std::tan(view.camera.field_of_view_y_degrees *
+                                          3.14159265358979323846 / 360.0),
+                           view.camera.near_plane, width, height, viewport_min, viewport_draw_list};
+    }
+
+    // Reverb zones (every one faintly, the selected one bright, with its fade margin) and the
+    // selected spatial source's minimum and maximum distance.
+    void draw_audio_shapes() {
+        if (runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game") return;
+        const auto pen = viewport_pen();
+        const auto* result = audio_shapes.object();
+        if (!pen || !result) return;
+        const auto vector = [](const JsonValue* value, Vec3& output) {
+            const auto* array = value ? value->array() : nullptr;
+            if (!array || array->size() != 3U) return false;
+            for (const auto& item : *array)
+                if (!item.number()) return false;
+            output = {*(*array)[0].number(), *(*array)[1].number(), *(*array)[2].number()};
+            return true;
+        };
+        viewport_draw_list->PushClipRect(viewport_min, viewport_max, true);
+        if (const auto* zones = field(*result, "zones"); zones && zones->array())
+            for (const auto& value : *zones->array()) {
+                const auto* zone = value.object();
+                Vec3 center{};
+                if (!zone || !vector(field(*zone, "center"), center)) continue;
+                const bool selected = string_or(*zone, "entity") == selection;
+                const ImU32 inner = selected ? IM_COL32(186, 140, 255, 255) : IM_COL32(160, 130, 230, 110);
+                const ImU32 outer = selected ? IM_COL32(186, 140, 255, 140) : IM_COL32(160, 130, 230, 45);
+                const float thickness = selected ? 2.0F : 1.2F;
+                const double fade = number_or(*zone, "fade", 0.0);
+                if (string_or(*zone, "shape") == "sphere") {
+                    const double radius = number_or(*zone, "radius", 0.0);
+                    pen->sphere(center, radius, inner, thickness);
+                    if (fade > 0.0) pen->sphere(center, radius + fade, outer, 1.0F);
+                    continue;
+                }
+                const auto* edge_values = field(*zone, "edges");
+                std::array<Vec3, 3> edges{};
+                if (!edge_values || !edge_values->array() || edge_values->array()->size() != 3U ||
+                    !vector(&(*edge_values->array())[0], edges[0]) ||
+                    !vector(&(*edge_values->array())[1], edges[1]) ||
+                    !vector(&(*edge_values->array())[2], edges[2]))
+                    continue;
+                pen->box(center, edges, inner, thickness);
+                if (fade <= 0.0) continue;
+                // The fade margin lies `fade` metres outside each face.
+                std::array<Vec3, 3> grown = edges;
+                for (auto& edge : grown) {
+                    const double length = std::sqrt(edge.x * edge.x + edge.y * edge.y + edge.z * edge.z);
+                    if (length <= 0.0) continue;
+                    const double scale = (length + fade) / length;
+                    edge = {edge.x * scale, edge.y * scale, edge.z * scale};
+                }
+                pen->box(center, grown, outer, 1.0F);
+            }
+        if (const auto* sources = field(*result, "sources"); sources && sources->array())
+            for (const auto& value : *sources->array()) {
+                const auto* source = value.object();
+                Vec3 center{};
+                if (!source || string_or(*source, "entity") != selection ||
+                    !vector(field(*source, "center"), center))
+                    continue;
+                pen->sphere(center, number_or(*source, "min_distance", 1.0), IM_COL32(255, 204, 92, 230), 1.6F);
+                pen->sphere(center, number_or(*source, "max_distance", 50.0), IM_COL32(255, 204, 92, 90), 1.0F);
             }
         viewport_draw_list->PopClipRect();
     }
@@ -2205,7 +2454,7 @@ struct EditorUi::Impl {
                                                gizmo_operation, gizmo_mode, world.data());
         draw_list->PopClipRect();
         const bool using_gizmo = ImGuizmo::IsUsing();
-        if (using_gizmo && !gizmo_active) ++gizmo_gesture;
+        if (using_gizmo && !gizmo_active) gizmo_gesture = ++gesture_serial;
         if (used && using_gizmo) {
             Vec3 translation{};
             Vec3 rotation{};
@@ -2435,6 +2684,46 @@ struct EditorUi::Impl {
         if (handle.empty()) return;
         select(handle);
         begin_rename(RenameKind::entity, handle, "Entity");
+    }
+
+    [[nodiscard]] static bool sound_file(const std::string_view path) {
+        const auto dot = path.rfind('.');
+        std::string extension(dot == std::string_view::npos ? std::string_view{} : path.substr(dot + 1U));
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return extension == "wav" || extension == "flac" || extension == "mp3" || extension == "ogg";
+    }
+
+    // Accepts a dragged sound file inside a drag and drop target. Returns its path when dropped.
+    [[nodiscard]] std::optional<std::string> accept_sound_drop() {
+        const auto* payload = ImGui::GetDragDropPayload();
+        if (!payload || !payload->IsDataType("relay.asset")) return std::nullopt;
+        std::string path(static_cast<const char*>(payload->Data));
+        if (!sound_file(path) || !ImGui::AcceptDragDropPayload("relay.asset")) return std::nullopt;
+        return path;
+    }
+
+    // A sound dropped into the viewport becomes an Audio Source node a metre above the point.
+    void create_sound_node(const std::string& clip, const Vec3 at) {
+        const auto name = base_name(clip);
+        const auto created = call("scene.create", "\"name\":\"" + json_escape(name.substr(0, name.rfind('.'))) +
+                                                      "\",\"type\":\"AudioSource\"");
+        if (!created || !created->object()) return;
+        const auto handle = string_or(*created->object(), "entity");
+        (void)call("scene.set_transform", entity_field(handle) + ",\"px\":" + number_text(at.x) +
+                                              ",\"py\":" + number_text(at.y + 1.0) +
+                                              ",\"pz\":" + number_text(at.z));
+        (void)call("scene.set_audio_source", entity_field(handle) + ",\"clip\":\"" + json_escape(clip) + '"');
+        set_status("Placed " + name, false);
+        refresh_pending = true;
+        refresh();
+        select(handle);
+    }
+
+    // Plays a sound file flat, as a preview, from the Assets panel.
+    void preview_sound(const std::string& clip) {
+        if (call("audio.play_clip", "\"clip\":\"" + json_escape(clip) + '"'))
+            set_status("Previewing " + base_name(clip), false);
     }
 
     // Accepts a dragged importable asset. Returns its path when dropped.
@@ -3328,6 +3617,392 @@ struct EditorUi::Impl {
         }
     }
 
+    void draw_audio_source_section(const JsonValue::Object& entity) {
+        const auto* source = component(entity, "audio_source");
+        if (!source || !component_header("Audio source", "audio_source")) return;
+        const auto& palette = editor_palette();
+        const auto request_fields = entity_field(selection);
+        const auto set = [&](const std::string& fields, const char* label) {
+            mutate("scene.set_audio_source", request_fields + fields, label);
+        };
+        const auto clip = string_or(*source, "clip");
+        const auto pick_clip = [&](const std::string& chosen) {
+            set(",\"clip\":\"" + json_escape(chosen) + '"', chosen.empty() ? "Clip cleared" : "Clip set");
+        };
+        if (inspector_begin_combo("Clip", clip.empty() ? "<none>" : clip.c_str())) {
+            if (ImGui::Selectable("<none>", clip.empty())) pick_clip({});
+            for (const auto& file : audio_files) {
+                if (ImGui::Selectable(file.c_str(), file == clip)) pick_clip(file);
+                note_item("inspector:audio:clip:" + file);
+            }
+            if (audio_files.empty())
+                ImGui::TextDisabled("No .wav, .flac, .mp3 or .ogg files in the project");
+            ImGui::EndCombo();
+        }
+        note_item("inspector:audio:clip");
+        // Sound files dragged from the Assets panel drop onto the picker.
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto dropped = accept_sound_drop()) pick_clip(*dropped);
+            ImGui::EndDragDropTarget();
+        }
+
+        const auto* voice = audio_voice(selection);
+        if (!clip.empty()) {
+            const auto* info = audio_clip_summary(clip);
+            if (info) {
+                draw_waveform(*info, voice ? number_or(*voice, "position_seconds", -1.0) : -1.0);
+                ImGui::TextColored(editor_color(palette.text_faint), "%.2f s  ·  %s  ·  %d Hz",
+                                   number_or(*info, "duration_seconds", 0.0),
+                                   number_or(*info, "channels", 1.0) > 1.0 ? "stereo" : "mono",
+                                   static_cast<int>(number_or(*info, "sample_rate", 0.0)));
+            } else {
+                ImGui::TextColored(editor_color(palette.warning), "This file cannot be played");
+            }
+        }
+        const bool playing = voice != nullptr;
+        ImGui::BeginDisabled(clip.empty());
+        if (ImGui::Button(playing ? "Stop" : "Play", ImVec2(80.0F * ui_scale, 0.0F))) {
+            if (playing)
+                (void)call("audio.stop", request_fields);
+            else if (call("audio.play", request_fields))
+                set_status("Previewing " + clip, false);
+            refresh_audio_status();
+        }
+        ImGui::EndDisabled();
+        note_item("inspector:audio:play");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(clip.empty() ? "Choose a clip first"
+                                           : "In the editor the source previews flat; Run Game "
+                                             "plays it from its position");
+
+        const auto bus = string_or(*source, "bus", "Master");
+        const auto buses = audio_bus_names();
+        const bool known_bus = std::find(buses.begin(), buses.end(), bus) != buses.end();
+        if (inspector_begin_combo("Bus", bus.c_str())) {
+            for (const auto& name : buses) {
+                if (ImGui::Selectable(name.c_str(), name == bus))
+                    set(",\"bus\":\"" + json_escape(name) + '"', "Bus changed");
+                note_item("inspector:audio:bus:" + name);
+            }
+            ImGui::EndCombo();
+        }
+        note_item("inspector:audio:bus");
+        if (!known_bus && !buses.empty())
+            ImGui::TextColored(editor_color(palette.warning),
+                               "No bus is called %s; this source plays into Master", bus.c_str());
+
+        const auto scalar = [&](const char* label, const char* wire, double value, float speed,
+                                const char* format, double minimum, double maximum) {
+            if (drag_scalar(label, value, speed, format))
+                set(",\"" + std::string(wire) + "\":" + number_text(std::clamp(value, minimum, maximum)),
+                    "Audio source updated");
+        };
+        scalar("Volume", "volume_db", number_or(*source, "volume_db", 0.0), 0.1F, "%.1f dB",
+               minimum_audio_volume_db, maximum_audio_volume_db);
+        scalar("Pitch", "pitch", number_or(*source, "pitch", 1.0), 0.005F, "%.3fx", 0.1, 4.0);
+        const auto flag = [&](const char* label, const char* wire, const char* tooltip) {
+            bool value = boolean_or(*source, wire, false);
+            inspector_field_label(label);
+            if (ImGui::Checkbox((std::string("##") + wire).c_str(), &value))
+                set(",\"" + std::string(wire) + "\":" + (value ? "true" : "false"),
+                    "Audio source updated");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
+        };
+        flag("Loop", "loop", "Start again from the beginning when the clip ends");
+        flag("Play on start", "play_on_start",
+             "Play when Run Game starts, or when this node is spawned during the game");
+        flag("Spatial", "spatial",
+             "Positioned in the world: quieter with distance and panned around the listener. Off "
+             "plays flat, like music or interface sounds.");
+        if (boolean_or(*source, "spatial", true)) {
+            const auto minimum = number_or(*source, "min_distance", 1.0);
+            const auto maximum = number_or(*source, "max_distance", 50.0);
+            scalar("Min distance", "min_distance", minimum, 0.05F, "%.2f m", 0.01, maximum);
+            scalar("Max distance", "max_distance", maximum, 0.25F, "%.1f m", minimum, 1e6);
+            static constexpr std::array<const char*, 3> rolloffs{"inverse", "inverse_square", "linear"};
+            static constexpr std::array<const char*, 3> rolloff_labels{"Inverse (natural)",
+                                                                       "Inverse square (steep)",
+                                                                       "Linear"};
+            const auto rolloff = string_or(*source, "rolloff", "inverse");
+            std::size_t current = 0;
+            for (std::size_t index = 0; index < rolloffs.size(); ++index)
+                if (rolloff == rolloffs[index]) current = index;
+            if (inspector_begin_combo("Rolloff", rolloff_labels[current])) {
+                for (std::size_t index = 0; index < rolloffs.size(); ++index)
+                    if (ImGui::Selectable(rolloff_labels[index], index == current))
+                        set(std::string(",\"rolloff\":\"") + rolloffs[index] + '"', "Rolloff changed");
+                ImGui::EndCombo();
+            }
+            scalar("Doppler", "doppler", number_or(*source, "doppler", 1.0), 0.01F, "%.2f", 0.0, 5.0);
+            flag("Occlusion", "occlusion",
+                 "Quieter and duller when colliders stand between it and the listener");
+            scalar("Reverb send", "reverb_send", number_or(*source, "reverb_send", 1.0), 0.01F,
+                   "%.2f", 0.0, 1.0);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How much reaches the reverb of the zone the listener is in");
+        } else {
+            scalar("Pan", "pan", number_or(*source, "pan", 0.0), 0.01F, "%.2f", -1.0, 1.0);
+        }
+    }
+
+    void draw_music_player_section(const JsonValue::Object& entity) {
+        const auto* player = component(entity, "music_player");
+        if (!player || !component_header("Music player", "music_player")) return;
+        const auto& palette = editor_palette();
+        const auto request_fields = entity_field(selection);
+        const auto set = [&](const std::string& fields, const char* label) {
+            mutate("scene.set_music_player", request_fields + fields, label);
+        };
+        std::vector<std::string> tracks;
+        if (const auto* list = field(*player, "tracks"); list && list->array())
+            for (const auto& item : *list->array())
+                if (item.string()) tracks.push_back(*item.string());
+        const auto set_tracks = [&](const std::vector<std::string>& changed, const char* label) {
+            std::string fields = ",\"tracks\":[";
+            for (std::size_t index = 0; index < changed.size(); ++index)
+                fields += std::string(index ? "," : "") + '"' + json_escape(changed[index]) + '"';
+            set(fields + "]", label);
+        };
+        // What plays now, with controls, while the game runs.
+        int playing = -1;
+        if (const auto* status = audio_status.object())
+            if (const auto* music = field(*status, "music"); music && music->array())
+                for (const auto& item : *music->array())
+                    if (const auto* entry = item.object(); entry && string_or(*entry, "entity") == selection)
+                        playing = static_cast<int>(number_or(*entry, "track", -1.0));
+        const bool game = runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game";
+        ImGui::TextColored(editor_color(palette.text_dim), "Playlist");
+        std::optional<std::vector<std::string>> changed;
+        for (std::size_t index = 0; index < tracks.size(); ++index) {
+            ImGui::PushID(static_cast<int>(index));
+            const bool current = static_cast<int>(index) == playing;
+            if (current) ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.success));
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%s%zu  %s", current ? "> " : "  ", index + 1U, tracks[index].c_str());
+            if (current) ImGui::PopStyleColor();
+            ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetContentRegionMax().x - 88.0F * ui_scale));
+            if (game && ImGui::SmallButton("Play"))
+                (void)call("audio.music", request_fields + ",\"action\":\"play\",\"track\":" + std::to_string(index));
+            if (game) ImGui::SameLine();
+            ImGui::BeginDisabled(index == 0U);
+            if (ImGui::ArrowButton("##up", ImGuiDir_Up)) {
+                changed = tracks;
+                std::swap((*changed)[index], (*changed)[index - 1U]);
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) {
+                changed = tracks;
+                changed->erase(changed->begin() + static_cast<std::ptrdiff_t>(index));
+            }
+            note_item("inspector:music:remove:" + std::to_string(index));
+            ImGui::PopID();
+        }
+        if (changed) set_tracks(*changed, "Playlist changed");
+        if (tracks.size() < maximum_music_tracks) {
+            if (inspector_begin_combo("Add track", "+ Choose a sound file")) {
+                for (const auto& file : audio_files) {
+                    if (ImGui::Selectable(file.c_str())) {
+                        auto added = tracks;
+                        added.push_back(file);
+                        set_tracks(added, "Track added");
+                    }
+                    note_item("inspector:music:add:" + file);
+                }
+                ImGui::EndCombo();
+            }
+            note_item("inspector:music:add");
+            if (ImGui::BeginDragDropTarget()) {
+                if (const auto dropped = accept_sound_drop()) {
+                    auto added = tracks;
+                    added.push_back(*dropped);
+                    set_tracks(added, "Track added");
+                }
+                ImGui::EndDragDropTarget();
+            }
+        }
+        if (game) {
+            if (ImGui::Button("Next")) (void)call("audio.music", request_fields + ",\"action\":\"next\"");
+            note_item("inspector:music:next");
+            ImGui::SameLine();
+            if (ImGui::Button("Stop")) (void)call("audio.music", request_fields + ",\"action\":\"stop\"");
+        } else {
+            ImGui::TextColored(editor_color(palette.text_faint), "Plays during Run Game");
+        }
+        const auto bus = string_or(*player, "bus", "Music");
+        if (inspector_begin_combo("Bus", bus.c_str())) {
+            for (const auto& name : audio_bus_names())
+                if (ImGui::Selectable(name.c_str(), name == bus))
+                    set(",\"bus\":\"" + json_escape(name) + '"', "Bus changed");
+            ImGui::EndCombo();
+        }
+        const auto scalar = [&](const char* label, const char* wire, double value, float speed,
+                                const char* format, double minimum, double maximum) {
+            if (drag_scalar(label, value, speed, format))
+                set(",\"" + std::string(wire) + "\":" + number_text(std::clamp(value, minimum, maximum)),
+                    "Music player updated");
+        };
+        scalar("Volume", "volume_db", number_or(*player, "volume_db", 0.0), 0.1F, "%.1f dB",
+               minimum_audio_volume_db, maximum_audio_volume_db);
+        scalar("Crossfade", "crossfade_seconds", number_or(*player, "crossfade_seconds", 2.0), 0.02F,
+               "%.2f s", 0.0, 30.0);
+        const auto flag = [&](const char* label, const char* wire, const bool fallback, const char* tip) {
+            bool value = boolean_or(*player, wire, fallback);
+            inspector_field_label(label);
+            if (ImGui::Checkbox((std::string("##") + wire).c_str(), &value))
+                set(",\"" + std::string(wire) + "\":" + (value ? "true" : "false"), "Music player updated");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+        };
+        flag("Play on start", "play_on_start", true, "Start the first track when Run Game starts");
+        flag("Shuffle", "shuffle", false, "Play the tracks in a random order, a new one each time round");
+        flag("Loop playlist", "loop_playlist", true, "Start again after the last track");
+        ImGui::SeparatorText("Timing");
+        scalar("BPM", "bpm", number_or(*player, "bpm", 120.0), 0.1F, "%.1f", 20.0, 400.0);
+        auto beats = number_or(*player, "beats_per_bar", 4.0);
+        if (drag_scalar("Beats per bar", beats, 0.05F, "%.0f"))
+            set(",\"beats_per_bar\":" + std::to_string(static_cast<int>(std::clamp(std::round(beats), 1.0, 16.0))),
+                "Music player updated");
+        scalar("First beat", "first_beat_seconds", number_or(*player, "first_beat_seconds", 0.0), 0.005F,
+               "%.3f s", 0.0, 60.0);
+        static constexpr std::array<std::pair<const char*, const char*>, 4> syncs{{
+            {"immediate", "Immediately"}, {"beat", "Next beat"}, {"bar", "Next bar"},
+            {"track_end", "End of track"}}};
+        const auto sync = string_or(*player, "sync", "bar");
+        const char* sync_label = "Next bar";
+        for (const auto& [id, label] : syncs)
+            if (sync == id) sync_label = label;
+        if (inspector_begin_combo("Changes land", sync_label)) {
+            for (const auto& [id, label] : syncs)
+                if (ImGui::Selectable(label, sync == id))
+                    set(std::string(",\"sync\":\"") + id + '"', "Music sync changed");
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("When a change asked for by a script or Next waits to happen");
+    }
+
+    void draw_reverb_zone_section(const JsonValue::Object& entity) {
+        const auto* zone = component(entity, "reverb_zone");
+        if (!zone || !component_header("Reverb zone", "reverb_zone")) return;
+        const auto& palette = editor_palette();
+        const auto request_fields = entity_field(selection);
+        const auto set = [&](const std::string& fields, const char* label) {
+            mutate("scene.set_reverb_zone", request_fields + fields, label);
+        };
+        const auto shape = string_or(*zone, "shape", "box");
+        if (inspector_begin_combo("Shape", shape == "sphere" ? "Sphere" : "Box")) {
+            if (ImGui::Selectable("Box", shape == "box")) set(",\"shape\":\"box\"", "Zone shape changed");
+            if (ImGui::Selectable("Sphere", shape == "sphere"))
+                set(",\"shape\":\"sphere\"", "Zone shape changed");
+            ImGui::EndCombo();
+        }
+        note_item("inspector:reverb:shape");
+        const auto scalar = [&](const char* label, const char* wire, double value, float speed,
+                                const char* format, double minimum, double maximum) {
+            if (drag_scalar(label, value, speed, format))
+                set(",\"" + std::string(wire) + "\":" + number_text(std::clamp(value, minimum, maximum)),
+                    "Reverb zone updated");
+        };
+        if (shape == "sphere") {
+            scalar("Radius", "radius", number_or(*zone, "radius", 5.0), 0.05F, "%.2f m", 0.01, 1e5);
+        } else {
+            auto half = editor_vector(*zone, "half_extents", {5, 3, 5});
+            if (const auto mask = drag_vector3("Half size", half, 0.05F, 108.0F * ui_scale)) {
+                for (auto& value : half) value = std::clamp(value, 0.01, 1e5);
+                set(vector_fields(half, {"half_x", "half_y", "half_z"}, mask), "Reverb zone resized");
+            }
+        }
+        scalar("Fade", "fade", number_or(*zone, "fade", 2.0), 0.05F, "%.2f m", 0.0, 1e4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How far outside the shape the reverb fades away");
+        static constexpr std::array<std::pair<const char*, const char*>, 9> presets{{
+            {"room", "Room"}, {"small_room", "Small room"}, {"bathroom", "Bathroom"},
+            {"hall", "Hall"}, {"cathedral", "Cathedral"}, {"cave", "Cave"}, {"arena", "Arena"},
+            {"forest", "Forest"}, {"custom", "Custom"}}};
+        const auto preset = string_or(*zone, "preset", "room");
+        const char* preset_label = "Custom";
+        for (const auto& [id, label] : presets)
+            if (preset == id) preset_label = label;
+        if (inspector_begin_combo("Preset", preset_label)) {
+            for (const auto& [id, label] : presets) {
+                if (ImGui::Selectable(label, preset == id))
+                    set(std::string(",\"preset\":\"") + id + '"', "Reverb preset chosen");
+                note_item(std::string("inspector:reverb:preset:") + id);
+            }
+            ImGui::EndCombo();
+        }
+        note_item("inspector:reverb:preset");
+        scalar("Room size", "room_size", number_or(*zone, "room_size", 0.5), 0.005F, "%.2f", 0.0, 1.0);
+        scalar("Damping", "damping", number_or(*zone, "damping", 0.5), 0.005F, "%.2f", 0.0, 1.0);
+        scalar("Level", "wet_db", number_or(*zone, "wet_db", -8.0), 0.1F, "%.1f dB",
+               minimum_audio_volume_db, 6.0);
+        scalar("Pre-delay", "pre_delay_ms", number_or(*zone, "pre_delay_ms", 8.0), 0.5F, "%.0f ms", 0.0, 250.0);
+        // While the game runs, how much of this zone the listener hears.
+        if (const auto* status = audio_status.object())
+            if (const auto* environment = field(*status, "environment"); environment && environment->object())
+                if (const auto* zones = field(*environment->object(), "zones"); zones && zones->array()) {
+                    double weight = 0.0;
+                    for (const auto& item : *zones->array())
+                        if (const auto* entry = item.object(); entry && string_or(*entry, "entity") == selection)
+                            weight = number_or(*entry, "weight", 0.0);
+                    if (boolean_or(*status, "game", false))
+                        ImGui::TextColored(editor_color(weight > 0.0 ? palette.success : palette.text_faint),
+                                           weight > 0.0 ? "The listener hears %.0f%% of this zone"
+                                                        : "The listener is outside this zone",
+                                           weight * 100.0);
+                }
+        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+        ImGui::TextWrapped("Spatial sounds take on this reverb while the listener is inside the "
+                           "shape, fading out over the fade distance around it.");
+        ImGui::PopStyleColor();
+    }
+
+    // Min/max peak pairs from audio.clip, with a playhead while the source plays.
+    void draw_waveform(const JsonValue::Object& info, const double position_seconds) {
+        const auto* peaks = field(info, "peaks");
+        if (!peaks || !peaks->array() || peaks->array()->size() < 2U) return;
+        const auto& values = *peaks->array();
+        const auto& palette = editor_palette();
+        const float width = ImGui::GetContentRegionAvail().x;
+        const float height = 36.0F * ui_scale;
+        const auto origin = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(width, height));
+        auto* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), palette.input,
+                            3.0F * ui_scale);
+        const auto buckets = values.size() / 2U;
+        const float middle = origin.y + height * 0.5F;
+        for (std::size_t bucket = 0; bucket < buckets; ++bucket) {
+            const auto low = values[bucket * 2U].number() ? *values[bucket * 2U].number() : 0.0;
+            const auto high = values[bucket * 2U + 1U].number() ? *values[bucket * 2U + 1U].number() : 0.0;
+            const float x = origin.x + (static_cast<float>(bucket) + 0.5F) * width / static_cast<float>(buckets);
+            draw->AddLine(ImVec2(x, middle - static_cast<float>(high) * height * 0.48F),
+                          ImVec2(x, middle - static_cast<float>(low) * height * 0.48F + 1.0F),
+                          palette.accent, std::max(1.0F, width / static_cast<float>(buckets) - 1.0F));
+        }
+        const auto duration = number_or(info, "duration_seconds", 0.0);
+        if (position_seconds >= 0.0 && duration > 0.0) {
+            const float x = origin.x + static_cast<float>(std::fmod(position_seconds, duration) / duration) * width;
+            draw->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + height), palette.text, 1.5F * ui_scale);
+        }
+    }
+
+    void draw_audio_listener_section() {
+        if (!component_header("Audio listener", "audio_listener")) return;
+        const auto& palette = editor_palette();
+        std::size_t listeners = 0;
+        for (const auto* other : entities)
+            if (component(*other, "audio_listener")) ++listeners;
+        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+        ImGui::TextWrapped("During Run Game, spatial sounds are heard from this node's position and "
+                           "facing. Put it on the player's camera.");
+        ImGui::PopStyleColor();
+        if (listeners > 1U)
+            ImGui::TextColored(editor_color(palette.warning),
+                               "%zu nodes have listeners; the first in the hierarchy is used.",
+                               listeners);
+    }
+
     void draw_joint_section(const JsonValue::Object& entity) {
         const auto* joint = component(entity, "joint");
         if (!joint || !component_header("Joint", "joint")) return;
@@ -3760,7 +4435,7 @@ struct EditorUi::Impl {
         ImGui::InvisibleButton("##time_ruler", ImVec2(width, ruler_height));
         note_item("timeline:ruler");
         if (ImGui::IsItemActivated()) {
-            ++timeline_gesture;
+            timeline_gesture = ++gesture_serial;
             timeline_scrub_targets = targets;
         }
         if (ImGui::IsItemActive()) {
@@ -3898,6 +4573,14 @@ struct EditorUi::Impl {
             draw_physics_body_section(*entity);
         if (component(*entity, "joint"))
             draw_joint_section(*entity);
+        if (component(*entity, "audio_source"))
+            draw_audio_source_section(*entity);
+        if (component(*entity, "audio_listener"))
+            draw_audio_listener_section();
+        if (component(*entity, "reverb_zone"))
+            draw_reverb_zone_section(*entity);
+        if (component(*entity, "music_player"))
+            draw_music_player_section(*entity);
         if (const auto* scripts = field(*entity, "scripts"); scripts && scripts->array() &&
             !scripts->array()->empty())
             draw_script_sections(*entity);
@@ -4294,6 +4977,11 @@ struct EditorUi::Impl {
             future_action("Shader editor...");
             if (ImGui::MenuItem("Animation timeline")) panel_open[6] = true;
             if (ImGui::MenuItem("Profiler")) panel_open[9] = true;
+            if (ImGui::MenuItem("Audio mixer")) {
+                panel_open[10] = true;
+                refresh_audio_files();
+            }
+            note_item("menu:audio_mixer");
             if (ImGui::MenuItem("Agent workspace...", "Ctrl+Shift+A")) { panel_open[8] = true; agent_expand_pending = true; }
             ImGui::EndMenu();
         }
@@ -5360,6 +6048,249 @@ struct EditorUi::Impl {
         ImGui::Unindent();
     }
 
+    // Mixer buses: a tree under Master with volume, mute, solo and live meters.
+    void draw_audio_page() {
+        const auto& palette = editor_palette();
+        const auto* project = project_status.object();
+        const bool has_project = project && !string_or(*project, "filename").empty();
+        const auto* status = audio_status.object();
+        const auto* output_value = status ? field(*status, "output") : nullptr;
+        const auto* output = output_value ? output_value->object() : nullptr;
+        ImGui::SeparatorText("Output");
+        if (output && boolean_or(*output, "open", false))
+            ImGui::TextColored(editor_color(palette.success), "%s (%s, %d Hz)",
+                               string_or(*output, "device").c_str(),
+                               string_or(*output, "backend").c_str(),
+                               static_cast<int>(number_or(*output, "sample_rate", 0.0)));
+        else if (output && !string_or(*output, "error").empty())
+            ImGui::TextColored(editor_color(palette.warning), "No sound: %s",
+                               string_or(*output, "error").c_str());
+        else
+            ImGui::TextColored(editor_color(palette.text_faint),
+                               "Sound output is off (RELAY_AUDIO=0 or a headless session)");
+
+        const auto* shown_settings = audio_settings.object();
+        const auto* saved_settings = shown_settings ? field(*shown_settings, "settings") : nullptr;
+        const bool binaural = saved_settings && saved_settings->object() &&
+                              string_or(*saved_settings->object(), "spatialization", "stereo") == "binaural";
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Listening on");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Speakers", !binaural) && binaural &&
+            call("audio.set_spatialization", "\"mode\":\"stereo\"")) {
+            set_status("Positioned sounds pan for speakers", false);
+            refresh_audio_files();
+        }
+        note_item("config:audio:speakers");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Headphones", binaural) && !binaural &&
+            call("audio.set_spatialization", "\"mode\":\"binaural\"")) {
+            set_status("Positioned sounds use the head model for headphones", false);
+            refresh_audio_files();
+        }
+        note_item("config:audio:headphones");
+        ImGui::Indent();
+        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+        ImGui::TextWrapped("Headphones gives each ear its own delay and head shadow, so sounds sit "
+                           "left, right and behind you more clearly. It is a head model, not a "
+                           "measured HRTF, so height is only faintly placed.");
+        ImGui::PopStyleColor();
+        ImGui::Unindent();
+
+        ImGui::SeparatorText("Mixer buses");
+        if (ImGui::Button("Open the Mixer")) {
+            panel_open[10] = true;
+            ImGui::SetWindowFocus("Mixer");
+        }
+        note_item("config:audio:open_mixer");
+        ImGui::SameLine();
+        ImGui::TextColored(editor_color(palette.text_dim), "for faders, meters and effects");
+        if (!has_project)
+            ImGui::TextColored(editor_color(palette.warning), "Open a project to save its mixer.");
+        // Buttons below save and re-read audio_settings mid-loop, so the page draws from a copy.
+        const JsonValue shown = audio_settings;
+        const auto* object = shown.object();
+        ImGui::TextColored(editor_color(palette.text_faint), "%s",
+                           object && boolean_or(*object, "saved", false)
+                               ? "Saved in the project file"
+                               : "Defaults until you change something");
+        const auto* settings = object ? field(*object, "settings") : nullptr;
+        const auto* buses = settings && settings->object() ? field(*settings->object(), "buses") : nullptr;
+        const auto* levels = status ? field(*status, "buses") : nullptr;
+        const auto level_of = [&](const std::string& name, const char* key) {
+            if (levels && levels->array())
+                for (const auto& bus : *levels->array())
+                    if (const auto* entry = bus.object(); entry && string_or(*entry, "name") == name)
+                        return number_or(*entry, key, minimum_audio_volume_db);
+            return minimum_audio_volume_db;
+        };
+        const auto save = [&](const std::string& fields, const std::string& message,
+                              const char* method = "audio.set_bus") {
+            if (call(method, fields)) {
+                set_status(message, false);
+                refresh_audio_files();
+            }
+        };
+        const auto names = audio_bus_names();
+        if (!buses || !buses->array()) return;
+        // Depth for indenting the tree; parents are listed before children.
+        std::map<std::string, int, std::less<>> depth;
+        constexpr ImGuiTableFlags table_flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                                                ImGuiTableFlags_SizingStretchProp;
+        if (ImGui::BeginTable("##buses", 6, table_flags)) {
+            ImGui::TableSetupColumn("Bus", ImGuiTableColumnFlags_WidthStretch, 1.4F);
+            ImGui::TableSetupColumn("Parent", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+            ImGui::TableSetupColumn("Volume", ImGuiTableColumnFlags_WidthStretch, 1.2F);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 64.0F * ui_scale);
+            ImGui::TableSetupColumn("Level", ImGuiTableColumnFlags_WidthStretch, 1.4F);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 24.0F * ui_scale);
+            ImGui::TableHeadersRow();
+            for (const auto& value : *buses->array()) {
+                const auto* bus = value.object();
+                if (!bus) continue;
+                const auto name = string_or(*bus, "name");
+                const auto parent = string_or(*bus, "parent");
+                const bool master = parent.empty();
+                const int level = master ? 0 : depth[parent] + 1;
+                depth[name] = level;
+                const auto quoted = "\"name\":\"" + json_escape(name) + '"';
+                ImGui::PushID(name.c_str());
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::Indent(static_cast<float>(level) * 14.0F * ui_scale + 0.001F);
+                if (bus_rename_target == name) {
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::IsWindowAppearing() || !ImGui::IsAnyItemActive()) ImGui::SetKeyboardFocusHere();
+                    const bool entered = ImGui::InputText("##rename", bus_rename.data(), bus_rename.size(),
+                                                          ImGuiInputTextFlags_EnterReturnsTrue);
+                    if (entered || ImGui::IsItemDeactivated()) {
+                        const std::string renamed{bus_rename.data()};
+                        if (entered && !renamed.empty() && renamed != name)
+                            save(quoted + ",\"new_name\":\"" + json_escape(renamed) + '"',
+                                 "Bus renamed to " + renamed);
+                        bus_rename_target.clear();
+                    }
+                } else {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(name.c_str());
+                    if (!master && ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        bus_rename_target = name;
+                        bus_rename.fill('\0');
+                        std::copy_n(name.begin(), std::min(name.size(), bus_rename.size() - 1U), bus_rename.begin());
+                    }
+                    if (!master && ImGui::IsItemHovered()) ImGui::SetTooltip("Double-click to rename");
+                }
+                ImGui::Unindent(static_cast<float>(level) * 14.0F * ui_scale + 0.001F);
+
+                ImGui::TableNextColumn();
+                if (master) {
+                    ImGui::TextDisabled("-");
+                } else {
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::BeginCombo("##parent", parent.c_str())) {
+                        for (const auto& option : names)
+                            if (option != name && ImGui::Selectable(option.c_str(), option == parent))
+                                save(quoted + ",\"parent\":\"" + json_escape(option) + '"',
+                                     name + " now feeds " + option);
+                        ImGui::EndCombo();
+                    }
+                }
+
+                ImGui::TableNextColumn();
+                const auto volume = number_or(*bus, "volume_db", 0.0);
+                if (bus_volume_target != name) bus_volume_edit = volume;
+                double edit = bus_volume_target == name ? bus_volume_edit : volume;
+                const double low = minimum_audio_volume_db, high = maximum_audio_volume_db;
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                ImGui::SliderScalar("##volume", ImGuiDataType_Double, &edit, &low, &high,
+                                    edit <= low ? "-inf dB" : "%.1f dB");
+                if (ImGui::IsItemActivated()) bus_volume_target = name;
+                if (bus_volume_target == name) bus_volume_edit = edit;
+                // Saved once when the drag ends, since each save rewrites the project file.
+                if (ImGui::IsItemDeactivated() && bus_volume_target == name) {
+                    if (bus_volume_edit != volume)
+                        save(quoted + ",\"volume_db\":" + number_text(bus_volume_edit),
+                             name + " volume set");
+                    bus_volume_target.clear();
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ctrl+click to type a value");
+
+                ImGui::TableNextColumn();
+                const auto toggle = [&](const char* label, const char* key, const ImU32 on_color) {
+                    const bool on = boolean_or(*bus, key, false);
+                    if (on) ImGui::PushStyleColor(ImGuiCol_Button, on_color);
+                    if (ImGui::SmallButton(label))
+                        save(quoted + ",\"" + key + "\":" + (on ? "false" : "true"),
+                             name + (std::string_view(key) == "mute" ? (on ? " unmuted" : " muted")
+                                                                     : (on ? " unsoloed" : " soloed")));
+                    if (on) ImGui::PopStyleColor();
+                };
+                toggle("M", "mute", palette.danger);
+                note_item("config:audio:bus:" + name + ":mute");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Mute");
+                ImGui::SameLine(0.0F, 4.0F * ui_scale);
+                toggle("S", "solo", palette.warning);
+                note_item("config:audio:bus:" + name + ":solo");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Solo: hear only soloed buses");
+
+                ImGui::TableNextColumn();
+                draw_level_meter(level_of(name, "peak_left_db"), level_of(name, "peak_right_db"));
+
+                ImGui::TableNextColumn();
+                if (!master) {
+                    if (ImGui::SmallButton("x"))
+                        save(quoted, "Removed bus " + name, "audio.remove_bus");
+                    note_item("config:audio:bus:" + name + ":remove");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Remove; its children move up to %s", parent.c_str());
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::SetNextItemWidth(200.0F * ui_scale);
+        const bool entered = ImGui::InputTextWithHint("##new_bus", "New bus name", new_bus_name.data(),
+                                                      new_bus_name.size(),
+                                                      ImGuiInputTextFlags_EnterReturnsTrue);
+        note_item("config:audio:new_bus");
+        ImGui::SameLine();
+        const std::string requested{new_bus_name.data()};
+        ImGui::BeginDisabled(requested.empty());
+        const bool add = ImGui::Button("Add bus");
+        note_item("config:audio:add_bus");
+        if ((add || entered) && !requested.empty()) {
+            save("\"name\":\"" + json_escape(requested) + '"', "Added bus " + requested);
+            new_bus_name.fill('\0');
+        }
+        ImGui::EndDisabled();
+        ImGui::Indent();
+        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+        ImGui::TextWrapped("Sources choose a bus in the Inspector. Each bus feeds its parent, so "
+                           "turning down SFX turns down everything beneath it. Meters show levels "
+                           "while sounds play.");
+        ImGui::PopStyleColor();
+        ImGui::Unindent();
+    }
+
+    // Two thin bars, left over right, from -60 dB to 0 dB.
+    void draw_level_meter(const double left_db, const double right_db) {
+        const auto& palette = editor_palette();
+        const float width = ImGui::GetContentRegionAvail().x;
+        const float bar = 5.0F * ui_scale;
+        const auto origin = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(width, bar * 2.0F + 2.0F * ui_scale));
+        auto* draw = ImGui::GetWindowDrawList();
+        const auto draw_bar = [&](const float y, const double db) {
+            const float fill = static_cast<float>(std::clamp((db + 60.0) / 60.0, 0.0, 1.0));
+            draw->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x + width, y + bar), palette.input);
+            const ImU32 color = db > -1.0 ? palette.danger : db > -12.0 ? palette.warning : palette.success;
+            if (fill > 0.0F)
+                draw->AddRectFilled(ImVec2(origin.x, y), ImVec2(origin.x + width * fill, y + bar), color);
+        };
+        draw_bar(origin.y, left_db);
+        draw_bar(origin.y + bar + 2.0F * ui_scale, right_db);
+    }
+
     // Project-wide game settings, one page per area. Input is the first; others follow.
     void draw_game_config() {
         if (!game_config_open) {
@@ -5381,7 +6312,13 @@ struct EditorUi::Impl {
                 if (auto settings = call("graphics.settings")) graphics_status = std::move(*settings);
             }
             note_item("config:page:graphics");
-            for (const char* page : {"Physics", "Audio"}) {
+            if (ImGui::Selectable("Audio", game_config_page == 2)) {
+                game_config_page = 2;
+                refresh_audio_files();
+                refresh_audio_status();
+            }
+            note_item("config:page:audio");
+            for (const char* page : {"Physics"}) {
                 ImGui::BeginDisabled();
                 ImGui::Selectable(page);
                 ImGui::EndDisabled();
@@ -5394,6 +6331,8 @@ struct EditorUi::Impl {
         if (ImGui::BeginChild("##config_page", ImVec2(0.0F, 0.0F))) {
             if (game_config_page == 1)
                 draw_graphics_page();
+            else if (game_config_page == 2)
+                draw_audio_page();
             else
                 draw_input_page();
         }
@@ -5908,6 +6847,8 @@ struct EditorUi::Impl {
         else if (entry.kind == "template" && entry.path.starts_with("templates/"))
             instantiate_template("project:" + entry.name.substr(0, entry.name.size() -
                                                                      std::string_view{".relay-template.json"}.size()));
+        else if (entry.kind == "audio")
+            preview_sound(entry.path);
         else if (entry.kind == "script")
             set_status("Edit " + entry.name + " in your code editor; Relay rebuilds scripts when "
                        "they change", false);
@@ -5950,6 +6891,11 @@ struct EditorUi::Impl {
         asset_selection = entry.path;
         if (asset_search_active()) {
             if (ImGui::MenuItem("Show in folder")) reveal_asset(entry.path);
+            ImGui::Separator();
+        }
+        if (entry.kind == "audio") {
+            if (ImGui::MenuItem("Preview")) preview_sound(entry.path);
+            if (ImGui::MenuItem("Stop previews")) (void)call("audio.stop");
             ImGui::Separator();
         }
         if (entry.importable) {
@@ -6088,10 +7034,10 @@ struct EditorUi::Impl {
         ImGui::EndPopup();
     }
 
-    static constexpr std::array<std::pair<const char*, const char*>, 10> asset_kind_labels{{
+    static constexpr std::array<std::pair<const char*, const char*>, 11> asset_kind_labels{{
         {"model", "Models"}, {"scene", "Scenes"}, {"template", "Templates"},
         {"image", "Images"}, {"shader", "Shaders"},
-        {"script", "Scripts"}, {"text", "Text"}, {"media", "Audio and video"},
+        {"script", "Scripts"}, {"text", "Text"}, {"audio", "Audio"}, {"media", "Video"},
         {"folder", "Folders"}, {"other", "Other"}}};
 
     void draw_asset_search_bar() {
@@ -6262,6 +7208,8 @@ struct EditorUi::Impl {
             import_model(*model, "scene", {}, viewport_drop_point(ImGui::GetMousePos()));
         if (const auto dropped = accept_template_drop())
             instantiate_template(*dropped, {}, viewport_drop_point(ImGui::GetMousePos()));
+        if (const auto sound = accept_sound_drop())
+            create_sound_node(*sound, viewport_drop_point(ImGui::GetMousePos()));
         ImGui::EndDragDropTarget();
     }
 
@@ -6473,6 +7421,260 @@ struct EditorUi::Impl {
         char text[32];
         std::snprintf(text, sizeof(text), milliseconds >= 10.0 ? "%.1f ms" : "%.2f ms", milliseconds);
         return text;
+    }
+
+    // The Mixer panel: one strip per bus in tree order, each with a fader heard live while it is
+    // dragged and saved when released, a stereo meter, mute and solo, and its effect chain.
+    // Selecting an effect edits it below the strips.
+    void draw_mixer() {
+        const auto& palette = editor_palette();
+        // Changes re-read audio_settings while the strips are drawn, and the selected effect is
+        // edited after them, so everything here reads a copy that lives for the whole frame.
+        const JsonValue shown = audio_settings;
+        const auto* object = shown.object();
+        const auto* settings = object ? field(*object, "settings") : nullptr;
+        const auto* buses = settings && settings->object() ? field(*settings->object(), "buses") : nullptr;
+        const auto* project = project_status.object();
+        if (!project || string_or(*project, "filename").empty())
+            ImGui::TextColored(editor_color(palette.warning), "Open a project to save its mixer.");
+        if (!buses || !buses->array()) {
+            ImGui::TextDisabled("No mixer settings yet.");
+            return;
+        }
+        const auto* status = audio_status.object();
+        const auto* levels = status ? field(*status, "buses") : nullptr;
+        const auto level_of = [&](const std::string& name, const char* key) {
+            if (levels && levels->array())
+                for (const auto& bus : *levels->array())
+                    if (const auto* entry = bus.object(); entry && string_or(*entry, "name") == name)
+                        return number_or(*entry, key, minimum_audio_volume_db);
+            return minimum_audio_volume_db;
+        };
+        // Sends a mixer change, previewing while a control is held and saving when it is let go.
+        const auto send = [&](const char* method, const std::string& fields, const bool preview,
+                              const std::string& message) {
+            if (call(method, fields + (preview ? ",\"preview\":true" : ""))) {
+                if (!preview) set_status(message, false);
+                if (auto refreshed = call("audio.settings", {}, false)) audio_settings = std::move(*refreshed);
+            }
+        };
+        // Strips fill the panel's height, the fader taking what the labels and buttons leave, and
+        // the selected effect's settings sit beside them, so a short docked panel still works.
+        const float strip_width = 118.0F * ui_scale;
+        const auto available = ImGui::GetContentRegionAvail();
+        const float fader_height = std::clamp(available.y - 120.0F * ui_scale, 48.0F * ui_scale,
+                                              220.0F * ui_scale);
+        const bool editing = mixer_effect >= 0;
+        const float editor_width = editing ? std::min(360.0F * ui_scale, available.x * 0.45F) : 0.0F;
+        ImGui::BeginChild("##strips", ImVec2(available.x - editor_width, 0.0F), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        const JsonValue::Object* selected_effect = nullptr;
+        std::size_t selected_chain = 0;
+        bool added = false;
+        bool first = true;
+        for (const auto& value : *buses->array()) {
+            const auto* bus = value.object();
+            if (!bus) continue;
+            const auto name = string_or(*bus, "name");
+            const auto quoted = "\"name\":\"" + json_escape(name) + '"';
+            if (!first) ImGui::SameLine();
+            first = false;
+            ImGui::PushID(name.c_str());
+            ImGui::BeginChild("##strip", ImVec2(strip_width, 0.0F), ImGuiChildFlags_Borders);
+            ImGui::AlignTextToFramePadding();
+            ImGui::PushFont(fonts.heading, fonts.body_size);
+            ImGui::TextUnformatted(name.c_str());
+            ImGui::PopFont();
+            const auto parent = string_or(*bus, "parent");
+            const auto toggle = [&](const char* label, const char* key, const ImU32 on_color, const char* tip) {
+                const bool on = boolean_or(*bus, key, false);
+                if (on) ImGui::PushStyleColor(ImGuiCol_Button, on_color);
+                if (ImGui::SmallButton(label))
+                    send("audio.set_bus", quoted + ",\"" + key + "\":" + (on ? "false" : "true"), false,
+                         name + (on ? " un" : " ") + key + (std::string_view(key) == "mute" ? "d" : "ed"));
+                if (on) ImGui::PopStyleColor();
+                note_item("mixer:bus:" + name + ':' + key);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+            };
+            // Mute and solo at the right of the name row.
+            const float buttons = ImGui::CalcTextSize("MS").x + ImGui::GetStyle().FramePadding.x * 4.0F +
+                                  ImGui::GetStyle().ItemSpacing.x;
+            ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetContentRegionMax().x - buttons));
+            toggle("M", "mute", palette.danger, "Mute");
+            ImGui::SameLine();
+            toggle("S", "solo", palette.warning, "Solo: hear only soloed buses");
+            ImGui::TextColored(editor_color(palette.text_faint), "%s",
+                               parent.empty() ? "output" : ("to " + parent).c_str());
+            // Fader and meter side by side.
+            const auto volume = number_or(*bus, "volume_db", 0.0);
+            auto& draft = drafts[ImGui::GetID("##fader")];
+            const double low = minimum_audio_volume_db, high = maximum_audio_volume_db;
+            auto& edit = draft.begin(volume);
+            const bool moved = ImGui::VSliderScalar("##fader", ImVec2(36.0F * ui_scale, fader_height),
+                                                    ImGuiDataType_Double, &edit, &low, &high,
+                                                    edit <= low ? "-inf" : "%.1f");
+            note_item("mixer:bus:" + name + ":fader");
+            if (moved) send("audio.set_bus", quoted + ",\"volume_db\":" + number_text(edit), true, {});
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                send("audio.set_bus", quoted + ",\"volume_db\":" + number_text(edit), false,
+                     name + " volume set");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drag to hear the change; Ctrl+click to type");
+            draft.finish(ImGui::IsItemActive());
+            ImGui::SameLine();
+            {
+                const auto origin = ImGui::GetCursorScreenPos();
+                const float bar = 8.0F * ui_scale;
+                ImGui::Dummy(ImVec2(bar * 2.0F + 3.0F * ui_scale, fader_height));
+                auto* draw = ImGui::GetWindowDrawList();
+                const auto meter = [&](const float x, const double db) {
+                    const float fill = static_cast<float>(std::clamp((db + 60.0) / 60.0, 0.0, 1.0));
+                    draw->AddRectFilled(ImVec2(x, origin.y), ImVec2(x + bar, origin.y + fader_height), palette.input);
+                    const ImU32 color = db > -1.0 ? palette.danger : db > -12.0 ? palette.warning : palette.success;
+                    if (fill > 0.0F)
+                        draw->AddRectFilled(ImVec2(x, origin.y + fader_height * (1.0F - fill)),
+                                            ImVec2(x + bar, origin.y + fader_height), color);
+                };
+                meter(origin.x, level_of(name, "peak_left_db"));
+                meter(origin.x + bar + 3.0F * ui_scale, level_of(name, "peak_right_db"));
+            }
+            // The effect chain, then a picker to add to it.
+            const auto* effects = field(*bus, "effects");
+            std::size_t count = 0;
+            if (effects && effects->array()) {
+                count = effects->array()->size();
+                for (std::size_t index = 0; index < count; ++index) {
+                    const auto* effect = (*effects->array())[index].object();
+                    if (!effect) continue;
+                    ImGui::PushID(static_cast<int>(index));
+                    const bool enabled = boolean_or(*effect, "enabled", true);
+                    const bool chosen = mixer_bus == name && mixer_effect == static_cast<int>(index);
+                    if (!enabled) ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_faint));
+                    if (ImGui::Selectable(effect_label(string_or(*effect, "type")), chosen)) {
+                        mixer_bus = name;
+                        mixer_effect = static_cast<int>(index);
+                    }
+                    if (!enabled) ImGui::PopStyleColor();
+                    note_item("mixer:bus:" + name + ":effect:" + std::to_string(index));
+                    if (chosen) {
+                        selected_effect = effect;
+                        selected_chain = count;
+                    }
+                    ImGui::PopID();
+                }
+            }
+            if (count < maximum_bus_effects) {
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##add", "+ Effect", ImGuiComboFlags_NoArrowButton)) {
+                    for (const char* type : {"reverb", "delay", "eq", "compressor", "limiter", "lowpass", "highpass"}) {
+                        if (ImGui::Selectable(effect_label(type))) {
+                            send("audio.set_effect", "\"bus\":\"" + json_escape(name) + "\",\"type\":\"" + type + '"',
+                                 false, std::string(effect_label(type)) + " added to " + name);
+                            mixer_bus = name;
+                            mixer_effect = static_cast<int>(count);
+                            added = true;
+                        }
+                        note_item("mixer:bus:" + name + ":add:" + type);
+                    }
+                    ImGui::EndCombo();
+                }
+                note_item("mixer:bus:" + name + ":add");
+            }
+            ImGui::EndChild();
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        if (!selected_effect) {
+            // A new effect is not in this frame's listing yet; keep it selected for the next.
+            if (!added) mixer_effect = -1;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Select an effect in a strip to edit it. Effects run top to bottom, "
+                                  "before the bus volume.");
+            return;
+        }
+        if (!editing) return; // Chosen this frame; its settings appear next frame.
+        ImGui::SameLine();
+        ImGui::BeginChild("##effect", ImVec2(0.0F, 0.0F), ImGuiChildFlags_Borders);
+        draw_mixer_effect(*selected_effect, selected_chain, send);
+        ImGui::EndChild();
+    }
+
+    static const char* effect_label(const std::string_view type) {
+        if (type == "reverb") return "Reverb";
+        if (type == "delay") return "Delay";
+        if (type == "eq") return "EQ";
+        if (type == "compressor") return "Compressor";
+        if (type == "limiter") return "Limiter";
+        if (type == "lowpass") return "Low-pass";
+        if (type == "highpass") return "High-pass";
+        return "Effect";
+    }
+
+    template <typename Send>
+    void draw_mixer_effect(const JsonValue::Object& effect, const std::size_t chain, const Send& send) {
+        const auto type = string_or(effect, "type");
+        const auto target = "\"bus\":\"" + json_escape(mixer_bus) + "\",\"index\":" + std::to_string(mixer_effect);
+        ImGui::SeparatorText((std::string(effect_label(type)) + " on " + mixer_bus).c_str());
+        bool enabled = boolean_or(effect, "enabled", true);
+        if (ImGui::Checkbox("Enabled", &enabled))
+            send("audio.set_effect", target + ",\"enabled\":" + (enabled ? "true" : "false"), false,
+                 std::string(effect_label(type)) + (enabled ? " on" : " off"));
+        note_item("mixer:effect:enabled");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Move up") && mixer_effect > 0) {
+            send("audio.move_effect", target + ",\"to\":" + std::to_string(mixer_effect - 1), false, "Effect moved");
+            --mixer_effect;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Move down") && static_cast<std::size_t>(mixer_effect) + 1U < chain) {
+            send("audio.move_effect", target + ",\"to\":" + std::to_string(mixer_effect + 1), false, "Effect moved");
+            ++mixer_effect;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove")) {
+            send("audio.remove_effect", target, false, std::string(effect_label(type)) + " removed");
+            mixer_effect = -1;
+            return;
+        }
+        note_item("mixer:effect:remove");
+        struct Parameter {
+            const char* key;
+            const char* label;
+            double minimum, maximum;
+            const char* format;
+        };
+        static constexpr std::array<Parameter, 19> parameters{{
+            {"room_size", "Room size", 0, 1, "%.2f"}, {"damping", "Damping", 0, 1, "%.2f"},
+            {"width", "Width", 0, 1, "%.2f"}, {"pre_delay_ms", "Pre-delay", 0, 250, "%.0f ms"},
+            {"time_ms", "Time", 1, 2000, "%.0f ms"}, {"feedback", "Feedback", 0, 0.95, "%.2f"},
+            {"mix", "Mix", 0, 1, "%.2f"}, {"low_db", "Low", -24, 24, "%.1f dB"},
+            {"mid_db", "Mid", -24, 24, "%.1f dB"}, {"mid_frequency", "Mid frequency", 100, 10000, "%.0f Hz"},
+            {"high_db", "High", -24, 24, "%.1f dB"}, {"threshold_db", "Threshold", -60, 0, "%.1f dB"},
+            {"ratio", "Ratio", 1, 20, "%.1f:1"}, {"attack_ms", "Attack", 0.1, 500, "%.1f ms"},
+            {"release_ms", "Release", 1, 5000, "%.0f ms"}, {"makeup_db", "Makeup", 0, 24, "%.1f dB"},
+            {"ceiling_db", "Ceiling", -24, 0, "%.1f dB"}, {"cutoff_hz", "Cutoff", 20, 20000, "%.0f Hz"},
+            {"resonance", "Resonance", 0.1, 10, "%.2f"}}};
+        ImGui::PushItemWidth(-110.0F * ui_scale);
+        for (const auto& parameter : parameters) {
+            const auto* value = field(effect, parameter.key);
+            if (!value || !value->number()) continue;
+            ImGui::PushID(parameter.key);
+            auto& draft = drafts[ImGui::GetID("##parameter")];
+            auto& edit = draft.begin(*value->number());
+            const bool logarithmic = std::string_view(parameter.key).ends_with("_hz") ||
+                                     std::string_view(parameter.key) == "mid_frequency";
+            const bool moved = ImGui::SliderScalar(parameter.label, ImGuiDataType_Double, &edit,
+                                                   &parameter.minimum, &parameter.maximum,
+                                                   parameter.format,
+                                                   logarithmic ? ImGuiSliderFlags_Logarithmic : 0);
+            note_item(std::string("mixer:effect:param:") + parameter.key);
+            const auto fields = target + ",\"" + parameter.key + "\":" + number_text(edit);
+            if (moved) send("audio.set_effect", fields, true, {});
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                send("audio.set_effect", fields, false, std::string(parameter.label) + " set");
+            draft.finish(ImGui::IsItemActive());
+            ImGui::PopID();
+        }
+        ImGui::PopItemWidth();
     }
 
     void draw_profiler() {
@@ -7217,6 +8419,8 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         ImGui::GetStyle().FontScaleDpi = scale;
     }
     impl_->composer_rect.reset();
+    // A drag change the inspector chose not to send must not tag a later, unrelated edit.
+    impl_->pending_gesture = 0;
     ImGui::NewFrame();
     ImGuizmo::BeginFrame();
     impl_->frame_open = true;
@@ -7319,6 +8523,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         if (!impl_->chat_media.viewer_open()) impl_->update_shortcuts();
         impl_->update_view();
         impl_->draw_collider_wireframes();
+        impl_->draw_audio_shapes();
         impl_->draw_scene_nodes();
         impl_->draw_game_input_hint();
         impl_->draw_gizmo();
@@ -7361,6 +8566,15 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
                 diagnostics && diagnostics->DockId)
                 ImGui::SetNextWindowDockID(diagnostics->DockId, ImGuiCond_FirstUseEver);
         if (panel("Profiler", 9)) impl_->draw_profiler();
+        ImGui::End();
+    }
+    if (impl_->panel_open[10]) {
+        // Like the profiler, the mixer joins Diagnostics the first time it opens.
+        if (!ImGui::FindWindowSettingsByID(ImHashStr("Mixer")))
+            if (const auto* diagnostics = ImGui::FindWindowByName("Diagnostics");
+                diagnostics && diagnostics->DockId)
+                ImGui::SetNextWindowDockID(diagnostics->DockId, ImGuiCond_FirstUseEver);
+        if (panel("Mixer", 10)) impl_->draw_mixer();
         ImGui::End();
     }
     impl_->draw_dialogs();

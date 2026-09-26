@@ -69,6 +69,13 @@ in control of the same project.
   friction, bounce, and angular motion during Run Game, and runtime impulses can be applied at a
   world-space point through the protocol. Fixed, point, hinge, slider and distance joints link
   bodies to each other or to the world, with limits, motors and springs.
+- **Audio** — sound sources placed in the world or played flat, heard from a listener with
+  distance falloff, panning and doppler, muffled behind walls, and coloured by reverb zones
+  (room, hall, cave and more) where the listener stands. A Mixer panel shows a per-project tree
+  of buses with faders, meters, mute, solo and effect chains (reverb, delay, EQ, compressor,
+  limiter, filters). Music players crossfade through playlists on the beat or bar, long files
+  stream, scripts play one-shots and duck buses, and a headphone mode places sounds around your
+  head. WAV, FLAC, MP3 and Ogg Vorbis files play from the project folder.
 - **First person controller example** — the demo project's template and editable C++ script walk,
   sprint, jump and look around with the input map.
 
@@ -217,6 +224,25 @@ the viewport to give the game keyboard and mouse input and press **Escape** to h
 editor; the Input page can also lock the mouse cursor while the game has input, for first-person
 controls.
 
+Sound files (.wav, .flac, .mp3, .ogg) anywhere in the project show up in the Assets panel.
+Create an **Audio Source** node (or add an **Audio source** component) and pick a clip, or drag a
+sound file onto the clip picker; **Play** previews it in the editor. During Run Game a spatial
+source gets quieter with distance between its minimum and maximum distance and pans around the
+listener; turn **Spatial** off for music and interface sounds. Add an **Audio listener** to the
+player's camera (without one, the active camera listens). Each source plays into a mixer bus;
+**Edit → Game Configuration... → Audio** edits the project's buses (Master with Music, SFX,
+Ambience and Voice to start) with volume, mute, solo and live level meters, and shows which sound
+device is in use. **Tools → Audio mixer** opens the Mixer: a strip per bus with a fader you hear
+as you drag it, meters, mute and solo, and an effect chain; select an effect to edit it beside
+the strips. A **Reverb Zone** node (box or sphere, with a fade distance around it) gives the space
+inside it a room's reverb, from presets such as hall or cave; the viewport outlines zones, and a
+selected source's minimum and maximum distance. Spatial sources behind colliders are muffled
+automatically (turn **Occlusion** off per source). Drag a sound file into the viewport to place it
+as an Audio Source, or double-click it in Assets to hear it. A **Music Player** node plays a
+playlist during Run Game, crossfading between tracks on the next beat or bar; long files stream,
+so tracks can be any length. The Audio page switches between **Speakers** and **Headphones**. Set
+`RELAY_AUDIO=0` to run the editor silently.
+
 ## Built-in agent workspace
 
 <p align="center">
@@ -243,6 +269,9 @@ import sandboxing, and sustained live-provider validation remain in progress.
 Native C++ gameplay scripting (including spawning, destroying and overlap queries), physics joints,
 input mapping, components, node types, and templates are in place and verified on Linux, with a
 scripted first person controller in the demo project. Scripts do not load on Windows yet.
+Audio sources, listeners, mixer buses and effects, reverb zones, occlusion, streaming, music and
+headphone output are in place with headless, protocol and script tests; playback through a real sound device has not been checked by ear
+yet.
 Global illumination and ray traced reflections run on Linux with RADV and have been checked on a
 desktop and in offscreen captures.
 
@@ -265,7 +294,13 @@ project in [`examples/demo`](examples/demo) when started from the repository roo
 scene has PBR materials, cascaded sun, point, and spot shadows, keyframed animation, and physics and
 joints playgrounds. **Run Game** puts you in them as a first person player: an upright capsule body,
 a camera at eye height, and the project's `scripts/FirstPersonController.cpp` for mouse, keyboard
-and gamepad look, walking, sprinting, jumping and shooting balls where you look. The first Run Game
+and gamepad look, walking, sprinting, jumping and shooting balls where you look. For sound, bodies
+thump as they land or are hit, louder the harder the hit; the spinning torus hums, so walking
+around it pans and fades the sound; and the glowing button just ahead and to the right plays the
+next note of a scale when you look at it and press **E** (or shoot it). The joints playground
+sits in a hall reverb zone, and crates between you and a sound muffle it. A generated soundtrack
+plays throughout; the blue pad to the left of the start moves it to the next track on the next bar,
+the tone button ducks it under each note, and every shot has its own sound. The first Run Game
 asks you to trust the project so its scripts can build. The player is also a **First Person
 Controller** template for other scenes, and its script is editable like any other (see the
 [scripting guide](docs/scripting.md)). The player's camera is the scene's camera. Set

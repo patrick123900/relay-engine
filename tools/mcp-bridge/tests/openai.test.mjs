@@ -150,7 +150,7 @@ test('installed Codex runtime accepts isolated metadata and all Relay dynamic to
     const result = await service.request('thread/start', {cwd: path.join(directory, '.relay/openai/workspace'), ephemeral: false, approvalPolicy: 'never', sandbox: 'read-only', dynamicTools, baseInstructions: 'Use only Relay tools.'});
     assert.ok(result.thread.id); assert.equal(result.thread.ephemeral, false);
     assert.equal(statSync(path.join(directory, '.relay/openai')).mode & 0o777, 0o700);
-    assert.equal(dynamicTools.length, 115);
+    assert.equal(dynamicTools.length, 132);
   } finally { service.close(); rmSync(directory, {recursive: true, force: true}); }
 });
 

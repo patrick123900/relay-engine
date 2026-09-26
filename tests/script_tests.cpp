@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -441,6 +442,75 @@ void demo_first_person(relay::Engine& engine, relay::ControlProtocol& protocol) 
     expect(engine.stop_game() && engine.scene().active_camera() == scene_camera &&
                engine.scene().get(scene_player)->transform.position.z == 8.0,
            "Stop Game returns the player to its start");
+
+    // Sound tests in the showcase: bodies thump as they land, the torus hums, and the tone button
+    // plays a note when the player looks at it and presses interact.
+    relay::Entity button{}, torus{}, hall{};
+    for (const auto entity : engine.scene().entities()) {
+        if (engine.scene().get(entity)->name == "Tone button") button = entity;
+        if (engine.scene().get(entity)->name == "Spinning torus") torus = entity;
+        if (engine.scene().get(entity)->name == "Hall reverb") hall = entity;
+    }
+    expect(button.valid() && torus.valid() && engine.scene().get(scene_camera)->audio_listener &&
+               hall.valid() && engine.scene().get(hall)->reverb_zone,
+           "the showcase has a tone button, a humming torus, a hall reverb zone and a listener "
+           "on the player's camera");
+    expect(engine.run_game(), "the showcase runs again for its sounds");
+    std::set<relay::Entity> thumped;
+    bool hummed = false;
+    for (int frame = 0; frame < 120; ++frame) {
+        engine.step(1);
+        const auto text = engine.audio().status_json(engine.scene());
+        relay::JsonParser parser(text);
+        const auto audio = parser.parse();
+        for (const auto& voice : *relay::field(*audio->object(), "voices")->array()) {
+            const auto& object = *voice.object();
+            const auto entity = relay::Entity::parse(*relay::field(object, "entity")->string());
+            if (*relay::field(object, "clip")->string() == "sounds/thump.wav") thumped.insert(*entity);
+            if (*entity == torus) hummed = true;
+        }
+    }
+    expect(thumped.size() >= 5U, "falling bodies thump as they land (" +
+                                     std::to_string(thumped.size()) + " did)");
+    expect(hummed && engine.audio().listener() == scene_camera,
+           "the torus hums, heard from the player's camera");
+    // The player stands at (0, 1.6, 8) looking down -Z; the button's cap is at (1.5, 1.05, 6.5):
+    // 45 degrees right and about 14.5 degrees down, at 0.12 degrees per pixel of mouse motion.
+    engine.apply_input_event("mouse_motion:0:0:375:121");
+    engine.step(2);
+    expect(!engine.audio().playing(button), "the button is silent until pressed");
+    (void)request(protocol, "input.simulate", "\"name\":\"interact\"");
+    engine.step(2);
+    expect(engine.audio().playing(button), "looking at the button and pressing interact plays a note");
+    engine.step(8); // The duck takes 0.1 s.
+    expect(engine.audio().bus_volume("Music").value_or(0.0) < -9.0,
+           "the button ducks the music under its note");
+    engine.step(120);
+    expect(std::abs(engine.audio().bus_volume("Music").value_or(-99.0) -
+                    engine.audio_settings().buses[1].volume_db) < 0.1,
+           "and brings it back afterwards");
+    relay::Entity soundtrack{};
+    for (const auto entity : engine.scene().entities())
+        if (engine.scene().get(entity)->name == "Soundtrack") soundtrack = entity;
+    expect(soundtrack.valid() && engine.audio().music_track(soundtrack) == 0,
+           "the soundtrack plays its first track");
+    // The music switch sits 3 m to the left of the button: turn back 90 degrees (750 px) left.
+    engine.apply_input_event("mouse_motion:0:0:-750:0");
+    engine.step(2);
+    (void)request(protocol, "input.simulate", "\"name\":\"interact\"");
+    engine.step(2);
+    int switched = -1;
+    for (int frame = 0; frame < 150 && switched != 1; ++frame) {
+        engine.step(1);
+        switched = engine.audio().music_track(soundtrack);
+    }
+    expect(switched == 1, "the music switch moves the soundtrack on, on the next bar");
+    (void)request(protocol, "input.simulate", "\"name\":\"fire\"");
+    engine.step(1);
+    const bool fired = engine.audio().status_json(engine.scene()).find(
+                           "\"clip\":\"sounds/shot.wav\"") != std::string::npos;
+    expect(fired, "firing plays the shot sound as a one-shot");
+    expect(engine.stop_game(), "stop the sound tests");
 
     expect(ok(request(protocol, "scene.clear")), "start from an empty scene");
 

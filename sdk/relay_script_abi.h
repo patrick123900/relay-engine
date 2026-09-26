@@ -132,6 +132,40 @@ typedef struct RelayHostApi {
     /* Runs a hinge or slider joint's motor at `speed` degrees or metres per second (up to its
      * authored motor force), or stops it when `on` is 0. */
     int (*set_joint_motor)(void* context, RelayEntity entity, int on, double speed);
+    /* Starts, or restarts from the beginning, the entity's audio source. `volume_db` is added to
+     * its authored volume and `pitch` multiplies its authored pitch, for this playing only.
+     * Returns 0 without an audio source and clip, or when the clip cannot be played. */
+    int (*audio_play)(void* context, RelayEntity entity, double volume_db, double pitch);
+    /* Stops the entity's sound; returns whether one was playing. */
+    int (*audio_stop)(void* context, RelayEntity entity);
+    int (*audio_playing)(void* context, RelayEntity entity);
+    /* Seconds into the entity's playing sound, or -1 when it is not playing. */
+    double (*audio_position)(void* context, RelayEntity entity);
+    /* Plays a project sound file once. With `position` it is placed in the world; null plays it
+     * flat. Returns a sound handle, or 0 (logging why). */
+    uint64_t (*audio_play_clip)(void* context, const char* clip, size_t clip_length,
+                                const RelayVec3* position, double volume_db, double pitch,
+                                const char* bus, size_t bus_length, double min_distance,
+                                double max_distance);
+    int (*audio_sound_stop)(void* context, uint64_t sound);
+    int (*audio_sound_playing)(void* context, uint64_t sound);
+    /* Seconds into the sound, or -1 when it is not playing. */
+    double (*audio_sound_position)(void* context, uint64_t sound);
+    /* Game-time mixer changes, undone when the game stops. The volume fades over
+     * `fade_seconds`. */
+    int (*audio_bus_volume)(void* context, const char* bus, size_t length, double volume_db,
+                            double fade_seconds);
+    /* The bus's current volume in dB, or -1000 without such a bus. */
+    double (*audio_get_bus_volume)(void* context, const char* bus, size_t length);
+    int (*audio_bus_mute)(void* context, const char* bus, size_t length, int mute);
+    int (*audio_bus_effect)(void* context, const char* bus, size_t length, uint32_t index,
+                            const char* parameter, size_t parameter_length, double value);
+    /* Music players. `track` -1 is the next in the playlist; `sync` -1 uses the player's own
+     * setting, else 0 immediately, 1 on the next beat, 2 on the next bar, 3 at the track's end. */
+    int (*music_play)(void* context, RelayEntity entity, int track, int sync);
+    int (*music_stop)(void* context, RelayEntity entity, double fade_seconds);
+    /* The playlist index playing, or -1. */
+    int (*music_track)(void* context, RelayEntity entity);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

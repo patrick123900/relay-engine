@@ -132,6 +132,12 @@ struct Vec3 {
 
 // A generation-checked scene entity. Handles to destroyed entities stay invalid rather than
 // aliasing newer ones. Relay's world is Y-up; rotations are Euler degrees applied X, then Y, then Z.
+namespace audio {
+// When a music change happens: at once, or on the current track's next beat, bar or ending.
+// `player` uses the music player's own setting.
+enum class Sync { player = -1, immediate = 0, beat = 1, bar = 2, track_end = 3 };
+} // namespace audio
+
 class Entity {
 public:
     constexpr Entity() = default;
@@ -183,6 +189,34 @@ public:
         return api().set_joint_motor(api().context, handle_, 1, speed) != 0;
     }
     bool stop_joint_motor() const { return api().set_joint_motor(api().context, handle_, 0, 0.0) != 0; }
+
+    // Plays this entity's audio source from the start, as set up in the Inspector, restarting it
+    // if it is already playing. `volume_db` is added to the authored volume and `pitch` multiplies
+    // the authored pitch, for this playing only: vary them so repeated sounds do not all match.
+    // False without an audio source and clip.
+    bool play_sound(double volume_db = 0.0, double pitch = 1.0) const {
+        return api().audio_play(api().context, handle_, volume_db, pitch) != 0;
+    }
+    // Stops this entity's sound. False if nothing was playing.
+    bool stop_sound() const { return api().audio_stop(api().context, handle_) != 0; }
+    [[nodiscard]] bool sound_playing() const { return api().audio_playing(api().context, handle_) != 0; }
+    // Seconds into this entity's playing sound; nothing when it is not playing.
+    [[nodiscard]] std::optional<double> sound_position() const {
+        const double seconds = api().audio_position(api().context, handle_);
+        if (seconds < 0.0) return std::nullopt;
+        return seconds;
+    }
+
+    // This entity's music player: play a playlist track (-1 for the next one), crossfading from
+    // the current track at the sync point; stop with a fade; and which track is playing (-1 for
+    // none). Music plays during the game.
+    bool play_music(int track = -1, audio::Sync sync = audio::Sync::player) const {
+        return api().music_play(api().context, handle_, track, static_cast<int>(sync)) != 0;
+    }
+    bool stop_music(double fade_seconds = 1.0) const {
+        return api().music_stop(api().context, handle_, fade_seconds) != 0;
+    }
+    [[nodiscard]] int music_track() const { return api().music_track(api().context, handle_); }
 
     // Enabled colliders touching this entity's enabled collider, sorted. Each side's layer must
     // be in the other's mask.
@@ -309,6 +343,83 @@ inline void error(std::string_view text) {
     api().log(api().context, RELAY_LOG_ERROR, text.data(), text.size());
 }
 } // namespace world
+
+namespace audio {
+
+// A one-shot sound playing: stop it, or ask whether and where it plays. Empty when it failed.
+class Sound {
+public:
+    constexpr Sound() = default;
+    constexpr explicit Sound(std::uint64_t handle) : handle_(handle) {}
+    [[nodiscard]] constexpr explicit operator bool() const { return handle_ != 0; }
+    [[nodiscard]] constexpr std::uint64_t handle() const { return handle_; }
+    bool stop() const { return api().audio_sound_stop(api().context, handle_) != 0; }
+    [[nodiscard]] bool playing() const { return api().audio_sound_playing(api().context, handle_) != 0; }
+    // Seconds into the sound; nothing once it has finished.
+    [[nodiscard]] std::optional<double> position() const {
+        const double seconds = api().audio_sound_position(api().context, handle_);
+        if (seconds < 0.0) return std::nullopt;
+        return seconds;
+    }
+
+private:
+    static const RelayHostApi& api() { return *detail::host(); }
+    std::uint64_t handle_{0};
+};
+
+struct OneShot {
+    double volume_db = 0.0;
+    double pitch = 1.0;
+    std::string bus = "SFX";
+    double min_distance = 1.0; // Placed sounds: full volume inside, silent beyond max_distance.
+    double max_distance = 50.0;
+};
+
+namespace detail_audio {
+inline Sound play(std::string_view clip, const RelayVec3* position, const OneShot& options) {
+    const auto& host = *detail::host();
+    return Sound{host.audio_play_clip(host.context, clip.data(), clip.size(), position,
+                                      options.volume_db, options.pitch, options.bus.data(),
+                                      options.bus.size(), options.min_distance, options.max_distance)};
+}
+} // namespace detail_audio
+
+// Plays a project sound file once at a place in the world, like an explosion or a footstep.
+inline Sound play(std::string_view clip, Vec3 position, const OneShot& options = {}) {
+    const RelayVec3 at{position.x, position.y, position.z};
+    return detail_audio::play(clip, &at, options);
+}
+// Plays a project sound file once, flat: interface sounds and stingers.
+inline Sound play_flat(std::string_view clip, const OneShot& options = {}) {
+    return detail_audio::play(clip, nullptr, options);
+}
+
+// Game-time mixer changes, such as ducking music in a menu. Stop Game undoes them; the Mixer
+// panel changes the saved mixer.
+inline bool set_bus_volume(std::string_view bus, double volume_db, double fade_seconds = 0.0) {
+    const auto& host = *detail::host();
+    return host.audio_bus_volume(host.context, bus.data(), bus.size(), volume_db, fade_seconds) != 0;
+}
+inline std::optional<double> bus_volume(std::string_view bus) {
+    const auto& host = *detail::host();
+    const double value = host.audio_get_bus_volume(host.context, bus.data(), bus.size());
+    if (value < -999.0) return std::nullopt;
+    return value;
+}
+inline bool set_bus_mute(std::string_view bus, bool mute) {
+    const auto& host = *detail::host();
+    return host.audio_bus_mute(host.context, bus.data(), bus.size(), mute ? 1 : 0) != 0;
+}
+// Sets one parameter of the effect at `index` in the bus's chain, by its name in the Mixer
+// (for example "mix", "cutoff_hz" or "room_size").
+inline bool set_bus_effect(std::string_view bus, std::uint32_t index, std::string_view parameter,
+                           double value) {
+    const auto& host = *detail::host();
+    return host.audio_bus_effect(host.context, bus.data(), bus.size(), index, parameter.data(),
+                                 parameter.size(), value) != 0;
+}
+
+} // namespace audio
 
 // Collects a behaviour's editable fields. Names must be C++ identifiers and unique per behaviour.
 class Properties {

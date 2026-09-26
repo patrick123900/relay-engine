@@ -751,6 +751,159 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                 slot.record.joint = joint;
             }
         }
+        if (result.source_version >= 18U) {
+            const auto* source_value = field(*entity_object, "audio_source");
+            const auto* listener_value = field(*entity_object, "audio_listener");
+            if (!source_value || !listener_value ||
+                (!listener_value->is_null() && !listener_value->object())) {
+                result.error = "version 18 entity requires audio_source and audio_listener";
+                return result;
+            }
+            if (!source_value->is_null()) {
+                const auto* object = source_value->object();
+                AudioSource source;
+                const auto number = [&](const char* key, double& target) {
+                    const auto* item = object ? field(*object, key) : nullptr;
+                    if (!item || !item->number()) return false;
+                    target = *item->number();
+                    return true;
+                };
+                const auto flag = [&](const char* key, bool& target) {
+                    const auto* item = object ? field(*object, key) : nullptr;
+                    if (!item || !item->boolean()) return false;
+                    target = *item->boolean();
+                    return true;
+                };
+                const auto string_value = [&](const char* key, std::string& target) {
+                    const auto* item = object ? field(*object, key) : nullptr;
+                    if (!item || !item->string()) return false;
+                    target = *item->string();
+                    return true;
+                };
+                std::string rolloff;
+                if (!string_value("clip", source.clip) || !string_value("bus", source.bus) ||
+                    !number("volume_db", source.volume_db) || !number("pitch", source.pitch) ||
+                    !number("pan", source.pan) || !flag("loop", source.loop) ||
+                    !flag("play_on_start", source.play_on_start) ||
+                    !flag("spatial", source.spatial) ||
+                    !number("min_distance", source.min_distance) ||
+                    !number("max_distance", source.max_distance) || !string_value("rolloff", rolloff) ||
+                    !number("doppler", source.doppler)) {
+                    result.error = "invalid audio source";
+                    return result;
+                }
+                const auto parsed_rolloff = audio_rolloff_from_name(rolloff);
+                if (!parsed_rolloff) {
+                    result.error = "invalid audio source rolloff";
+                    return result;
+                }
+                source.rolloff = *parsed_rolloff;
+                if (result.source_version >= 19U &&
+                    (!flag("occlusion", source.occlusion) ||
+                     !number("reverb_send", source.reverb_send))) {
+                    result.error = "invalid audio source occlusion or reverb send";
+                    return result;
+                }
+                if (!valid_audio_source(source)) {
+                    result.error = "audio source values outside valid ranges";
+                    return result;
+                }
+                slot.record.audio_source = std::move(source);
+            }
+            if (!listener_value->is_null()) slot.record.audio_listener = AudioListener{};
+        }
+        if (result.source_version >= 19U) {
+            const auto* value = field(*entity_object, "reverb_zone");
+            if (!value || (!value->is_null() && !value->object())) {
+                result.error = "version 19 entity requires reverb_zone";
+                return result;
+            }
+            if (!value->is_null()) {
+                const auto& object = *value->object();
+                ReverbZone zone;
+                const auto number = [&](const char* key, double& target) {
+                    const auto* item = field(object, key);
+                    if (!item || !item->number()) return false;
+                    target = *item->number();
+                    return true;
+                };
+                const auto* shape = field(object, "shape");
+                const auto* preset = field(object, "preset");
+                const auto parsed_shape = shape && shape->string()
+                                              ? reverb_shape_from_name(*shape->string())
+                                              : std::nullopt;
+                if (!parsed_shape || !preset || !preset->string() ||
+                    !number("radius", zone.radius) ||
+                    !read_vec3(field(object, "half_extents"), zone.half_extents) ||
+                    !number("fade", zone.fade) || !number("room_size", zone.room_size) ||
+                    !number("damping", zone.damping) || !number("wet_db", zone.wet_db) ||
+                    !number("pre_delay_ms", zone.pre_delay_ms)) {
+                    result.error = "invalid reverb zone";
+                    return result;
+                }
+                zone.shape = *parsed_shape;
+                zone.preset = *preset->string();
+                if (!valid_reverb_zone(zone)) {
+                    result.error = "reverb zone values outside valid ranges";
+                    return result;
+                }
+                slot.record.reverb_zone = std::move(zone);
+            }
+        }
+        if (result.source_version >= 20U) {
+            const auto* value = field(*entity_object, "music_player");
+            if (!value || (!value->is_null() && !value->object())) {
+                result.error = "version 20 entity requires music_player";
+                return result;
+            }
+            if (!value->is_null()) {
+                const auto& object = *value->object();
+                MusicPlayer player;
+                const auto number = [&](const char* key, double& target) {
+                    const auto* item = field(object, key);
+                    if (!item || !item->number()) return false;
+                    target = *item->number();
+                    return true;
+                };
+                const auto flag = [&](const char* key, bool& target) {
+                    const auto* item = field(object, key);
+                    if (!item || !item->boolean()) return false;
+                    target = *item->boolean();
+                    return true;
+                };
+                const auto* tracks = field(object, "tracks");
+                const auto* bus = field(object, "bus");
+                const auto* sync = field(object, "sync");
+                const auto parsed_sync = sync && sync->string() ? music_sync_from_name(*sync->string())
+                                                                : std::nullopt;
+                double beats = 0.0;
+                bool ok = tracks && tracks->array() && bus && bus->string() && parsed_sync &&
+                          number("volume_db", player.volume_db) &&
+                          number("crossfade_seconds", player.crossfade_seconds) &&
+                          flag("shuffle", player.shuffle) && flag("loop_playlist", player.loop_playlist) &&
+                          flag("play_on_start", player.play_on_start) && number("bpm", player.bpm) &&
+                          number("beats_per_bar", beats) &&
+                          number("first_beat_seconds", player.first_beat_seconds) && beats >= 1.0 &&
+                          beats <= 16.0 && std::floor(beats) == beats;
+                if (ok)
+                    for (const auto& track : *tracks->array()) {
+                        if (!track.string()) ok = false;
+                        else player.tracks.push_back(*track.string());
+                    }
+                if (!ok) {
+                    result.error = "invalid music player";
+                    return result;
+                }
+                player.bus = *bus->string();
+                player.sync = *parsed_sync;
+                player.beats_per_bar = static_cast<std::uint32_t>(beats);
+                if (!valid_music_player(player)) {
+                    result.error = "music player values outside valid ranges";
+                    return result;
+                }
+                slot.record.music_player = std::move(player);
+            }
+        }
         ++result.entity_count;
     }
 

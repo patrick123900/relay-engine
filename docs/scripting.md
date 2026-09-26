@@ -107,7 +107,8 @@ name (`self().child("Camera")`) or list them all (`children()`), make a camera t
 renders through (`camera.make_active_camera()`, restored by Stop Game), read and set local
 transforms, read world positions, set velocities, apply impulses, raycast and test overlaps
 against the live physics world, find entities by name, spawn and destroy entities, and log to the
-editor, and read and drive joints. The header documents each call.
+editor, read and drive joints, play sounds and music and adjust the mixer. The header documents
+each call.
 
 Each frame runs every `on_update`, then animation and physics, then the contact callbacks for that
 step. Stop Game calls `on_stop` and restores the authored scene, so scripts can change the scene
@@ -180,6 +181,73 @@ void on_update(double) override {
   second) up to the motor force set in the Inspector; `stop_joint_motor()` lets it move freely.
 - Entities spawned with joints, from templates or clones, join their partners at once. Destroying
   a node releases the bodies joined to it.
+
+## Sound
+
+Sounds are authored in the editor as an **Audio source** component (clip, bus, volume, pitch,
+spatial range) and scripts decide when they play:
+
+```cpp
+void on_update(double) override { before = self().velocity(); }
+
+void on_contact_begin(relay::Entity) override {
+    // Louder for harder hits: -30 dB for a tap, the authored volume at 8 m/s or more.
+    const double hit = (self().velocity() - before).length();
+    if (hit > 0.6) self().play_sound(-30.0 * (1.0 - std::min(hit / 8.0, 1.0)));
+}
+
+relay::Vec3 before;
+```
+
+- `entity.play_sound(volume_db, pitch)` plays the entity's audio source from the start, restarting
+  it if it is already playing. `volume_db` is added to the authored volume and `pitch` multiplies
+  the authored pitch, for that playing only; both default to no change.
+- `entity.stop_sound()` stops it, `entity.sound_playing()` says whether it is playing and
+  `entity.sound_position()` how many seconds in it is.
+- Sources with **Play on start** start by themselves when the game starts or when they are spawned.
+
+Sounds that do not belong to a node, such as gunshots, explosions and footsteps, are one-shots:
+
+```cpp
+relay::audio::OneShot shot;
+shot.volume_db = -6.0;
+shot.pitch = 0.95;
+const auto sound = relay::audio::play("sounds/shot.wav", muzzle_position, shot); // Placed in the world.
+relay::audio::play_flat("sounds/click.wav");                                      // Interface sounds.
+if (sound && sound.playing()) sound.stop();
+```
+
+`OneShot` also sets the bus (SFX by default) and the minimum and maximum distance. The returned
+`relay::audio::Sound` can be stopped and asked `playing()` and `position()`. One-shots end by
+themselves and with the game.
+
+Scripts can change the mixer while the game runs, for example ducking music under dialogue or in
+a menu; Stop Game undoes it, and the Mixer panel is where the saved mix is made:
+
+```cpp
+const double music = relay::audio::bus_volume("Music").value_or(0.0);
+relay::audio::set_bus_volume("Music", music - 12.0, 0.2); // Fade down over 0.2 s.
+relay::audio::set_bus_mute("Ambience", true);
+relay::audio::set_bus_effect("SFX", 0, "cutoff_hz", 800.0); // A low-pass first in SFX's chain.
+```
+
+A node with a **Music player** plays its playlist during the game. Scripts move it on:
+
+```cpp
+music.play_music();                              // The next track, at the player's sync point.
+music.play_music(2, relay::audio::Sync::bar);    // Track 3, crossfading on the next bar.
+music.stop_music(2.0);                           // Fade out over two seconds.
+int playing = music.music_track();               // -1 when nothing plays.
+```
+
+`Sync` is `immediate`, `beat`, `bar`, `track_end` (crossfading into the end of the current track)
+or `player`, the player's own setting. Beats and bars are counted from the player's first beat at
+its BPM, and changes land on them to the sample.
+
+The demo's `scripts/ImpactSound.cpp` (thumps when bodies hit things), `scripts/ToneButton.cpp` (a
+button that plays the next note of a scale and ducks the music under it),
+`scripts/MusicSwitch.cpp` (a pad that moves the soundtrack on at the next bar) and the shot sound in
+`scripts/FirstPersonController.cpp` are complete examples.
 
 ## Trust
 

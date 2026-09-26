@@ -1,5 +1,6 @@
 #pragma once
 
+#include "relay/audio/audio_settings.hpp"
 #include "relay/core/input.hpp"
 #include "relay/render/graphics_settings.hpp"
 
@@ -25,6 +26,8 @@ struct Project {
     bool legacy_input_file{};
     // settings.graphics; none until someone saves settings, and the defaults apply meanwhile.
     std::optional<GraphicsSettings> graphics;
+    // settings.audio, the mixer's buses; none until someone changes them.
+    std::optional<AudioSettings> audio;
     [[nodiscard]] std::filesystem::path root() const;
     // The file contents; protocol replies leave the settings out.
     [[nodiscard]] std::string json(bool with_settings = true) const;

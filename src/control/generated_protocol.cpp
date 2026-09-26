@@ -57,7 +57,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_assets_browse{{
 
 constexpr std::array<ProtocolFieldSpec, 2> fields_assets_search{{
     {"query", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 64U, "", ""},
-    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 11U, "^(folder|model|scene|template|image|shader|script|text|media|other)$", ""},
+    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 12U, "^(folder|model|scene|template|image|shader|script|text|media|audio|other)$", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_assets_create_folder{{
@@ -125,7 +125,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scene_inspect{{
 constexpr std::array<ProtocolFieldSpec, 3> fields_scene_create{{
     {"name", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 128U, "", ""},
     {"parent", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "Node|Camera|DirectionalLight|PointLight|SpotLight|RigidBody|StaticBody|StaticMesh"},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "Node|Camera|DirectionalLight|PointLight|SpotLight|RigidBody|StaticBody|StaticMesh|AudioSource|ReverbZone|MusicPlayer"},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_scene_destroy{{
@@ -150,7 +150,7 @@ constexpr std::array<ProtocolFieldSpec, 11> fields_scene_set_transform{{
     {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 1000000000, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 8> fields_scene_set_camera{{
+constexpr std::array<ProtocolFieldSpec, 9> fields_scene_set_camera{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"active", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
@@ -159,6 +159,7 @@ constexpr std::array<ProtocolFieldSpec, 8> fields_scene_set_camera{{
     {"far_plane", ProtocolValueType::number, false, false, true, true, 0.001, 1000000, 0U, 0U, "", ""},
     {"orthographic_height", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
     {"exposure_ev", ProtocolValueType::number, false, false, true, true, -16, 16, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_renderer{{
@@ -183,14 +184,15 @@ constexpr std::array<ProtocolFieldSpec, 7> fields_scene_set_animation{{
     {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_morph{{
+constexpr std::array<ProtocolFieldSpec, 5> fields_scene_set_morph{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"target", ProtocolValueType::integer, false, false, true, true, 0, 63, 0U, 0U, "", ""},
     {"weight", ProtocolValueType::number, false, false, true, true, -100, 100, 0U, 0U, "", ""},
     {"reset", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 15> fields_scene_set_collider{{
+constexpr std::array<ProtocolFieldSpec, 16> fields_scene_set_collider{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
@@ -206,6 +208,7 @@ constexpr std::array<ProtocolFieldSpec, 15> fields_scene_set_collider{{
     {"mesh", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9._:-]*$", ""},
     {"layer", ProtocolValueType::integer, false, false, true, true, 1, 4294967295, 0U, 0U, "", ""},
     {"mask", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 8> fields_physics_raycast{{
@@ -241,7 +244,7 @@ constexpr std::array<ProtocolFieldSpec, 7> fields_physics_apply_impulse{{
     {"point_z", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 10> fields_scene_set_physics_body{{
+constexpr std::array<ProtocolFieldSpec, 11> fields_scene_set_physics_body{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "static|dynamic"},
@@ -252,6 +255,7 @@ constexpr std::array<ProtocolFieldSpec, 10> fields_scene_set_physics_body{{
     {"linear_damping", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
     {"angular_damping", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
     {"lock_rotation", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_scripts_trust{{
@@ -271,7 +275,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scripts_create{{
     {"behaviour", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 23> fields_scene_set_joint{{
+constexpr std::array<ProtocolFieldSpec, 24> fields_scene_set_joint{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
@@ -295,17 +299,72 @@ constexpr std::array<ProtocolFieldSpec, 23> fields_scene_set_joint{{
     {"spring_frequency", ProtocolValueType::number, false, false, true, true, 0, 1000, 0U, 0U, "", ""},
     {"spring_damping", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
     {"collide_connected", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 17> fields_scene_set_audio_source{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"clip", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^([A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(wav|WAV|flac|FLAC|mp3|MP3|ogg|OGG))?$", ""},
+    {"bus", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"volume_db", ProtocolValueType::number, false, false, true, true, -80, 24, 0U, 0U, "", ""},
+    {"pitch", ProtocolValueType::number, false, false, true, true, 0.1, 4, 0U, 0U, "", ""},
+    {"pan", ProtocolValueType::number, false, false, true, true, -1, 1, 0U, 0U, "", ""},
+    {"loop", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"play_on_start", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"spatial", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"min_distance", ProtocolValueType::number, false, false, true, true, 0.01, 1000000, 0U, 0U, "", ""},
+    {"max_distance", ProtocolValueType::number, false, false, true, true, 0.01, 1000000, 0U, 0U, "", ""},
+    {"rolloff", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "inverse|inverse_square|linear"},
+    {"doppler", ProtocolValueType::number, false, false, true, true, 0, 5, 0U, 0U, "", ""},
+    {"occlusion", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"reverb_send", ProtocolValueType::number, false, false, true, true, 0, 1, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 14> fields_scene_set_reverb_zone{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"shape", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "sphere|box"},
+    {"radius", ProtocolValueType::number, false, false, true, true, 0.01, 100000, 0U, 0U, "", ""},
+    {"half_x", ProtocolValueType::number, false, false, true, true, 0.01, 100000, 0U, 0U, "", ""},
+    {"half_y", ProtocolValueType::number, false, false, true, true, 0.01, 100000, 0U, 0U, "", ""},
+    {"half_z", ProtocolValueType::number, false, false, true, true, 0.01, 100000, 0U, 0U, "", ""},
+    {"fade", ProtocolValueType::number, false, false, true, true, 0, 10000, 0U, 0U, "", ""},
+    {"preset", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "room|small_room|bathroom|hall|cathedral|cave|arena|forest|custom"},
+    {"room_size", ProtocolValueType::number, false, false, true, true, 0, 1, 0U, 0U, "", ""},
+    {"damping", ProtocolValueType::number, false, false, true, true, 0, 1, 0U, 0U, "", ""},
+    {"wet_db", ProtocolValueType::number, false, false, true, true, -80, 6, 0U, 0U, "", ""},
+    {"pre_delay_ms", ProtocolValueType::number, false, false, true, true, 0, 250, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 14> fields_scene_set_music_player{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"tracks", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 64U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(wav|WAV|flac|FLAC|mp3|MP3|ogg|OGG)$", ""},
+    {"bus", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"volume_db", ProtocolValueType::number, false, false, true, true, -80, 24, 0U, 0U, "", ""},
+    {"crossfade_seconds", ProtocolValueType::number, false, false, true, true, 0, 30, 0U, 0U, "", ""},
+    {"shuffle", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"loop_playlist", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"play_on_start", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"bpm", ProtocolValueType::number, false, false, true, true, 20, 400, 0U, 0U, "", ""},
+    {"beats_per_bar", ProtocolValueType::integer, false, false, true, true, 1, 16, 0U, 0U, "", ""},
+    {"first_beat_seconds", ProtocolValueType::number, false, false, true, true, 0, 60, 0U, 0U, "", ""},
+    {"sync", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "immediate|beat|bar|track_end"},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 3> fields_component_add{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|joint|keyframes|script"},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script"},
     {"behaviour", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 3> fields_component_remove{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|joint|keyframes|script"},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script"},
     {"index", ProtocolValueType::integer, false, false, true, true, 0, 31, 0U, 0U, "", ""},
 }};
 
@@ -316,7 +375,7 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_script{{
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 8> fields_scene_set_script_property{{
+constexpr std::array<ProtocolFieldSpec, 9> fields_scene_set_script_property{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"index", ProtocolValueType::integer, true, false, true, true, 0, 31, 0U, 0U, "", ""},
     {"property", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
@@ -325,6 +384,7 @@ constexpr std::array<ProtocolFieldSpec, 8> fields_scene_set_script_property{{
     {"text", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 1024U, "", ""},
     {"vector", ProtocolValueType::number_array, false, false, false, false, 0, 0, 3U, 3U, "", ""},
     {"reset", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 3> fields_templates_instantiate{{
@@ -339,7 +399,7 @@ constexpr std::array<ProtocolFieldSpec, 3> fields_templates_save{{
     {"replace", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 13> fields_scene_set_light{{
+constexpr std::array<ProtocolFieldSpec, 14> fields_scene_set_light{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "directional|point|spot"},
@@ -353,6 +413,7 @@ constexpr std::array<ProtocolFieldSpec, 13> fields_scene_set_light{{
     {"inner_cone", ProtocolValueType::number, false, false, true, true, 0, 1.5707963267948966, 0U, 0U, "", ""},
     {"outer_cone", ProtocolValueType::number, false, false, true, true, 0.0001, 1.5707963267948966, 0U, 0U, "", ""},
     {"range", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 2> fields_scene_rename{{
@@ -542,7 +603,97 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_chat_control{{
     {"provider", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "openai|compatible"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 131> methods{{
+constexpr std::array<ProtocolFieldSpec, 7> fields_audio_set_bus{{
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"new_name", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"parent", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"volume_db", ProtocolValueType::number, false, false, true, true, -80, 24, 0U, 0U, "", ""},
+    {"mute", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"solo", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"preview", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_audio_remove_bus{{
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_audio_play{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_audio_stop{{
+    {"entity", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"sound", ProtocolValueType::integer, false, false, true, true, 1, 1000000000000, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_audio_clip{{
+    {"clip", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(wav|WAV|flac|FLAC|mp3|MP3|ogg|OGG)$", ""},
+    {"peaks", ProtocolValueType::integer, false, false, true, true, 0, 2048, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 24> fields_audio_set_effect{{
+    {"bus", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"index", ProtocolValueType::integer, false, false, true, true, 0, 7, 0U, 0U, "", ""},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "reverb|delay|eq|compressor|limiter|lowpass|highpass"},
+    {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"mix", ProtocolValueType::number, false, false, true, true, 0, 1, 0U, 0U, "", ""},
+    {"room_size", ProtocolValueType::number, false, false, true, true, 0, 1, 0U, 0U, "", ""},
+    {"damping", ProtocolValueType::number, false, false, true, true, 0, 1, 0U, 0U, "", ""},
+    {"width", ProtocolValueType::number, false, false, true, true, 0, 1, 0U, 0U, "", ""},
+    {"pre_delay_ms", ProtocolValueType::number, false, false, true, true, 0, 250, 0U, 0U, "", ""},
+    {"time_ms", ProtocolValueType::number, false, false, true, true, 1, 2000, 0U, 0U, "", ""},
+    {"feedback", ProtocolValueType::number, false, false, true, true, 0, 0.95, 0U, 0U, "", ""},
+    {"low_db", ProtocolValueType::number, false, false, true, true, -24, 24, 0U, 0U, "", ""},
+    {"mid_db", ProtocolValueType::number, false, false, true, true, -24, 24, 0U, 0U, "", ""},
+    {"mid_frequency", ProtocolValueType::number, false, false, true, true, 100, 10000, 0U, 0U, "", ""},
+    {"high_db", ProtocolValueType::number, false, false, true, true, -24, 24, 0U, 0U, "", ""},
+    {"threshold_db", ProtocolValueType::number, false, false, true, true, -60, 0, 0U, 0U, "", ""},
+    {"ratio", ProtocolValueType::number, false, false, true, true, 1, 20, 0U, 0U, "", ""},
+    {"attack_ms", ProtocolValueType::number, false, false, true, true, 0.1, 500, 0U, 0U, "", ""},
+    {"release_ms", ProtocolValueType::number, false, false, true, true, 1, 5000, 0U, 0U, "", ""},
+    {"makeup_db", ProtocolValueType::number, false, false, true, true, 0, 24, 0U, 0U, "", ""},
+    {"ceiling_db", ProtocolValueType::number, false, false, true, true, -24, 0, 0U, 0U, "", ""},
+    {"cutoff_hz", ProtocolValueType::number, false, false, true, true, 20, 20000, 0U, 0U, "", ""},
+    {"resonance", ProtocolValueType::number, false, false, true, true, 0.1, 10, 0U, 0U, "", ""},
+    {"preview", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_audio_remove_effect{{
+    {"bus", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"index", ProtocolValueType::integer, true, false, true, true, 0, 7, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 3> fields_audio_move_effect{{
+    {"bus", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"index", ProtocolValueType::integer, true, false, true, true, 0, 7, 0U, 0U, "", ""},
+    {"to", ProtocolValueType::integer, true, false, true, true, 0, 7, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 5> fields_audio_music{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"action", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "play|next|stop"},
+    {"track", ProtocolValueType::integer, false, false, true, true, 0, 63, 0U, 0U, "", ""},
+    {"sync", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "immediate|beat|bar|track_end"},
+    {"fade_seconds", ProtocolValueType::number, false, false, true, true, 0, 30, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 9> fields_audio_play_clip{{
+    {"clip", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(wav|WAV|flac|FLAC|mp3|MP3|ogg|OGG)$", ""},
+    {"x", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"y", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"z", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"volume_db", ProtocolValueType::number, false, false, true, true, -80, 24, 0U, 0U, "", ""},
+    {"pitch", ProtocolValueType::number, false, false, true, true, 0.1, 4, 0U, 0U, "", ""},
+    {"bus", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+    {"min_distance", ProtocolValueType::number, false, false, true, true, 0.01, 1000000, 0U, 0U, "", ""},
+    {"max_distance", ProtocolValueType::number, false, false, true, true, 0.01, 1000000, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_audio_set_spatialization{{
+    {"mode", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "stereo|binaural"},
+}};
+
+constexpr std::array<ProtocolMethodSpec, 148> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -616,6 +767,9 @@ constexpr std::array<ProtocolMethodSpec, 131> methods{{
     {"scripts.create", "scripts_create", "Create behaviour script", "Create scripts/<behaviour>.cpp from a starter template defining and registering that behaviour class. Refuses to overwrite.", false, false, false, false, false, fields_scripts_create},
     {"component.types", "component_types", "List component types", "List every component a node can carry: engine components with their category and whether they can be added, removed or repeated, plus each built script behaviour with its declared properties and code defaults.", true, false, false, false, false, no_fields},
     {"scene.set_joint", "scene_set_joint", "Configure joint", "Add, edit or remove an undoable joint linking this node's physics body to another node's body, or to the world when connected is empty, during Run Game. Types: fixed (weld), point (ball and socket), hinge (turns about axis, optional angle limits in degrees with min in [-180, 0] and max in [0, 180], optional motor), slider (moves along axis, optional travel limits in metres with min <= 0 <= max, optional motor) and distance (rope or spring between anchor and connected_anchor; limits are lengths, otherwise the starting length is kept). Anchor and axis are in this node's local space; connected_anchor is in the connected node's space, or world space for the world. At least one body must be dynamic. Joined bodies do not collide unless collide_connected is set. Changing type resets the limits to that type's defaults unless limits are given too.", false, false, false, false, false, fields_scene_set_joint},
+    {"scene.set_audio_source", "scene_set_audio_source", "Configure audio source", "Add, edit or remove a node's audio source: a project sound file (.wav, .flac, .mp3 or .ogg) played through a mixer bus during Run Game. Spatial sources fade with distance from the listener (inverse, inverse square or linear rolloff between the minimum and maximum distance), pan around it and shift pitch with relative motion (doppler); flat sources play as stereo with a balance. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_audio_source},
+    {"scene.set_reverb_zone", "scene_set_reverb_zone", "Configure reverb zone", "Add, edit or remove a reverb zone: a sphere or box (following the node's position, rotation and scale) where spatial sounds take on a room's reverb while the listener is inside, fading out over fade metres outside it. Choosing a preset (room, small_room, bathroom, hall, cathedral, cave, arena, forest) sets its parameters; changing a parameter makes the zone custom. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_reverb_zone},
+    {"scene.set_music_player", "scene_set_music_player", "Configure music player", "Add, edit or remove a music player: a playlist of project sound files played flat on a bus during Run Game, one after another with a crossfade, optionally shuffled and looping. Long files stream. Changes asked for with audio.music wait for the player's sync point (immediate, beat, bar or track_end) counted at bpm from first_beat_seconds. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_music_player},
     {"component.add", "component_add", "Add component", "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.", false, false, false, false, false, fields_component_add},
     {"component.remove", "component_remove", "Remove component", "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.", false, true, false, false, false, fields_component_remove},
     {"scene.set_script", "scene_set_script", "Configure script component", "Change the behaviour or enabled state of one of a node's script components, as an undoable transaction.", false, false, false, false, false, fields_scene_set_script},
@@ -674,6 +828,20 @@ constexpr std::array<ProtocolMethodSpec, 131> methods{{
     {"session.auto_approval", "session_auto_approval", "Auto approval", "Set full session access to every public engine action without approval prompts. Trusted host only.", false, false, false, true, false, fields_session_auto_approval},
     {"chat.configure", "chat_configure", "Configure chat provider", "Pass transient provider settings to the external bridge for private storage. Never traced or exposed to agent tools.", false, false, false, true, false, fields_chat_configure},
     {"chat.control", "chat_control", "Control agent harness", "Host-only OpenAI sign-in, account, model, reasoning and conversation controls, processed by the external bridge.", false, false, false, true, false, fields_chat_control},
+    {"audio.status", "audio_status", "Inspect audio", "Read the audio output device, the listener, every playing voice (clip, bus, position, gains) and each mixer bus with its post-fader peak and RMS levels in dB.", true, false, false, false, false, no_fields},
+    {"audio.settings", "audio_settings", "Read mixer buses", "Read the project's mixer buses (settings.audio in the .relayproject): name, parent, volume in dB, mute and solo, with the defaults.", true, false, false, false, false, no_fields},
+    {"audio.set_bus", "audio_set_bus", "Create or change a mixer bus", "Create a bus, or change one's name, parent, volume, mute or solo, and save the mixer in the open project. A new bus defaults to Master as its parent. While any bus is soloed only soloed buses, their parents and their children are heard. Renaming keeps children attached; sources naming the old bus fall back to Master until they are changed.", false, false, false, false, false, fields_audio_set_bus},
+    {"audio.remove_bus", "audio_remove_bus", "Remove a mixer bus", "Remove a bus other than Master and save the mixer; its children move to its parent and sources routed to it play into Master.", false, true, false, false, false, fields_audio_remove_bus},
+    {"audio.play", "audio_play", "Play an audio source", "Start or restart a node's audio source. During Run Game it plays as authored; in the editor it plays as a flat preview.", false, false, false, false, false, fields_audio_play},
+    {"audio.stop", "audio_stop", "Stop audio", "Stop a node's audio source, a one-shot by the handle audio.play_clip returned, or every playing sound when neither is given.", false, false, false, false, false, fields_audio_stop},
+    {"audio.clip", "audio_clip", "Inspect a sound file", "Decode a project sound file and report its duration, sample rate, channels and frames, with optional min/max peak pairs across it for drawing a waveform.", true, false, false, false, false, fields_audio_clip},
+    {"audio.set_effect", "audio_set_effect", "Add or change a bus effect", "Add an effect to a mixer bus's chain (omit index), or change the effect at index, and save the mixer in the open project. Types and their parameters: reverb (room_size, damping, width, pre_delay_ms, mix), delay (time_ms, feedback, damping, mix), eq (low_db shelf at 200 Hz, mid_db at mid_frequency, high_db shelf at 5 kHz), compressor (threshold_db, ratio, attack_ms, release_ms, makeup_db), limiter (ceiling_db, release_ms), lowpass and highpass (cutoff_hz, resonance). Effects run in order before the bus volume; at most 8 per bus.", false, false, false, false, false, fields_audio_set_effect},
+    {"audio.remove_effect", "audio_remove_effect", "Remove a bus effect", "Remove the effect at index from a bus's chain and save the mixer.", false, true, false, false, false, fields_audio_remove_effect},
+    {"audio.move_effect", "audio_move_effect", "Reorder a bus effect", "Move the effect at index to position to in the same bus's chain and save the mixer.", false, false, false, false, false, fields_audio_move_effect},
+    {"audio.debug_shapes", "audio_debug_shapes", "Inspect audio shapes", "Read reverb zones (centre, box edge vectors or sphere radius in world space, fade) and spatial sources (centre, minimum and maximum distance) for drawing them in a viewport.", true, false, false, false, false, no_fields},
+    {"audio.music", "audio_music", "Control a music player", "During Run Game: play a track (by playlist index), go to the next one, or stop with a fade. A change crossfades from the current track and lands on the next beat, bar or track end, or at once, as sync says (the player's own setting when omitted).", false, false, false, false, false, fields_audio_music},
+    {"audio.play_clip", "audio_play_clip", "Play a sound file", "Play a project sound file once without a node: placed at x, y, z in the world during Run Game (flat in the editor, where it previews), or flat when no position is given. Returns a handle for audio.stop.", false, false, false, false, false, fields_audio_play_clip},
+    {"audio.set_spatialization", "audio_set_spatialization", "Choose speakers or headphones", "Set how positioned sounds reach the ears and save it in the open project: stereo panning for speakers, or binaural for headphones, where a head model gives each ear its own delay and shadow and sounds behind are slightly duller.", false, false, false, false, false, fields_audio_set_spatialization},
 }};
 
 } // namespace

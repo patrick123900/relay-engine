@@ -23,6 +23,9 @@ bool matches(const std::string_view id, const EntityRecord& record) {
     if (id == "RigidBody") return dynamic;
     if (id == "StaticBody") return !dynamic;
     if (id == "StaticMesh") return record.mesh_renderer.has_value();
+    if (id == "AudioSource") return record.audio_source.has_value();
+    if (id == "ReverbZone") return record.reverb_zone.has_value();
+    if (id == "MusicPlayer") return record.music_player.has_value();
     return false;
 }
 
@@ -51,6 +54,12 @@ void contribute(const std::string_view id, EntityRecord& record, const bool came
         record.physics_body = PhysicsBody{PhysicsBody::Type::static_body};
     } else if (id == "StaticMesh") {
         record.mesh_renderer = MeshRenderer{"builtin.quad", "builtin.azure", {}};
+    } else if (id == "AudioSource") {
+        record.audio_source = AudioSource{};
+    } else if (id == "ReverbZone") {
+        record.reverb_zone = ReverbZone{};
+    } else if (id == "MusicPlayer") {
+        record.music_player = MusicPlayer{};
     }
 }
 
@@ -84,6 +93,14 @@ const std::vector<NodeTypeInfo>& node_types() {
          true},
         {"StaticMesh", "Static Mesh", "Node", "Draws a mesh with a material.", {"mesh_renderer"},
          true},
+        {"AudioSource", "Audio Source", "Node",
+         "Plays a sound during Run Game, from its position in the world or flat.",
+         {"audio_source"}, true},
+        {"ReverbZone", "Reverb Zone", "Node",
+         "A room, hall or cave with its own reverb, heard while the listener is inside it.",
+         {"reverb_zone"}, true},
+        {"MusicPlayer", "Music Player", "Node",
+         "Plays a playlist of music, crossfading between tracks on the beat.", {"music_player"}, true},
     };
     return types;
 }
@@ -137,7 +154,10 @@ bool apply_node_type(Scene& scene, const Entity entity, const std::string_view i
     if (!scene.set_camera(entity, record.camera) || !scene.set_light(entity, record.light) ||
         !scene.set_collider(entity, record.collider) ||
         !scene.set_physics_body(entity, record.physics_body) ||
-        !scene.set_mesh_renderer(entity, record.mesh_renderer)) {
+        !scene.set_mesh_renderer(entity, record.mesh_renderer) ||
+        !scene.set_audio_source(entity, record.audio_source) ||
+        !scene.set_reverb_zone(entity, record.reverb_zone) ||
+        !scene.set_music_player(entity, record.music_player)) {
         error = "could not give the node its components";
         return false;
     }

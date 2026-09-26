@@ -158,6 +158,91 @@ struct Joint {
     auto operator<=>(const Joint&) const = default;
 };
 
+// Plays a sound file from the project. Positioned (spatial) sources get quieter with distance and
+// pan around the listener; the rest play as flat stereo, like music or interface sounds.
+struct AudioSource {
+    enum class Rolloff : std::uint8_t { inverse, linear, inverse_square } rolloff{Rolloff::inverse};
+    std::string clip;                // Project-relative .wav, .flac, .mp3 or .ogg; empty is silent.
+    std::string bus{"Master"};       // Mixer bus by name; an unknown bus plays into Master.
+    double volume_db{0.0};           // -80 (silent) to +24.
+    double pitch{1.0};               // Playback speed, 0.1 to 4.
+    double pan{0.0};                 // Flat sources only: -1 left to +1 right.
+    bool loop{false};
+    bool play_on_start{true};        // Starts when Run Game starts or the node is spawned.
+    bool spatial{true};
+    // Full volume inside min_distance; silent beyond max_distance. Metres.
+    double min_distance{1.0};
+    double max_distance{50.0};
+    double doppler{1.0};             // Pitch shift from relative motion, 0 (none) to 5.
+    // Spatial sources behind colliders, seen from the listener, sound quieter and duller.
+    bool occlusion{true};
+    // How much of a spatial source reaches the reverb of the zone the listener is in, 0 to 1.
+    double reverb_send{1.0};
+    auto operator<=>(const AudioSource&) const = default;
+};
+
+// A space with its own reverb, like a hall or a cave. While the listener is inside the shape the
+// zone's reverb is at full strength; it fades out over `fade` metres outside it. Overlapping zones
+// blend by how far inside each one the listener is. The shape follows the node's position,
+// rotation and scale.
+struct ReverbZone {
+    enum class Shape : std::uint8_t { sphere, box } shape{Shape::box};
+    double radius{5.0};
+    Vec3 half_extents{5.0, 3.0, 5.0};
+    double fade{2.0};
+    // A named preset, or "custom" once a parameter is changed by hand.
+    std::string preset{"room"};
+    double room_size{0.5};   // 0 to 1: how long the tail rings.
+    double damping{0.5};     // 0 to 1: how quickly high frequencies die away.
+    double wet_db{-8.0};     // Reverb level, -80 to +6 dB.
+    double pre_delay_ms{8.0}; // Gap before the reverb starts, 0 to 250 ms.
+    auto operator<=>(const ReverbZone&) const = default;
+};
+
+// Plays a playlist of music files flat on a bus, crossfading from one track to the next. Changes
+// asked for by scripts or the protocol can wait for the next beat or bar, counted from
+// `first_beat_seconds` into each track at `bpm`.
+struct MusicPlayer {
+    enum class Sync : std::uint8_t { immediate, beat, bar, track_end } sync{Sync::bar};
+    std::vector<std::string> tracks; // Project-relative sound files, played in order.
+    std::string bus{"Music"};
+    double volume_db{0.0};
+    double crossfade_seconds{2.0}; // 0 to 30.
+    bool shuffle{};
+    bool loop_playlist{true};      // After the last track, start again.
+    bool play_on_start{true};
+    double bpm{120.0};             // 20 to 400.
+    std::uint32_t beats_per_bar{4}; // 1 to 16.
+    double first_beat_seconds{};   // Where the first beat falls in each track.
+    auto operator<=>(const MusicPlayer&) const = default;
+};
+
+inline constexpr std::size_t maximum_music_tracks = 64U;
+[[nodiscard]] std::string_view music_sync_name(MusicPlayer::Sync sync);
+[[nodiscard]] std::optional<MusicPlayer::Sync> music_sync_from_name(std::string_view name);
+[[nodiscard]] bool valid_audio_clip_path(std::string_view path);
+[[nodiscard]] bool valid_music_player(const MusicPlayer& player);
+
+struct ReverbPreset {
+    std::string_view name;
+    double room_size, damping, wet_db, pre_delay_ms;
+};
+[[nodiscard]] const std::vector<ReverbPreset>& reverb_presets();
+// Copies the preset's parameters into the zone; false for an unknown name.
+bool apply_reverb_preset(ReverbZone& zone, std::string_view name);
+[[nodiscard]] bool valid_reverb_zone(const ReverbZone& zone);
+[[nodiscard]] std::string_view reverb_shape_name(ReverbZone::Shape shape);
+[[nodiscard]] std::optional<ReverbZone::Shape> reverb_shape_from_name(std::string_view name);
+
+[[nodiscard]] std::string_view audio_rolloff_name(AudioSource::Rolloff rolloff);
+[[nodiscard]] std::optional<AudioSource::Rolloff> audio_rolloff_from_name(std::string_view name);
+[[nodiscard]] bool valid_audio_source(const AudioSource& source);
+
+// Where the game hears from. The first node with a listener wins; without one, the active camera.
+struct AudioListener {
+    auto operator<=>(const AudioListener&) const = default;
+};
+
 // Default limits for a joint type: +-45 degrees for hinges, +-1 m for sliders, 0 to 2 m for
 // distance joints.
 void set_default_joint_limits(Joint& joint);
@@ -222,6 +307,10 @@ struct EntityRecord {
     std::optional<PhysicsBody> physics_body{};
     std::vector<Script> scripts{};
     std::optional<Joint> joint{};
+    std::optional<AudioSource> audio_source{};
+    std::optional<AudioListener> audio_listener{};
+    std::optional<ReverbZone> reverb_zone{};
+    std::optional<MusicPlayer> music_player{};
 };
 
 // The node type shown to people and agents, derived from the components an entity has now by
@@ -272,6 +361,10 @@ public:
     [[nodiscard]] bool set_scripts(Entity entity, std::vector<Script> scripts);
     // The connected node must exist and differ from `entity`.
     [[nodiscard]] bool set_joint(Entity entity, std::optional<Joint> joint);
+    [[nodiscard]] bool set_audio_source(Entity entity, std::optional<AudioSource> source);
+    [[nodiscard]] bool set_audio_listener(Entity entity, std::optional<AudioListener> listener);
+    [[nodiscard]] bool set_reverb_zone(Entity entity, std::optional<ReverbZone> zone);
+    [[nodiscard]] bool set_music_player(Entity entity, std::optional<MusicPlayer> player);
     [[nodiscard]] std::optional<Entity> active_camera() const;
 
     [[nodiscard]] SceneState capture_state() const;

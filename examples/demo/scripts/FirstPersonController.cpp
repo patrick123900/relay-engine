@@ -30,6 +30,7 @@ public:
         p.add("camera_name", camera_name);
         p.add("ball_template", ball_template);
         p.add("ball_speed", ball_speed);
+        p.add("shot_sound", shot_sound);
     }
 
     void on_start() override {
@@ -96,6 +97,13 @@ private:
         if (!ball) return; // The log says why, for example a missing template.
         // The ball keeps the player's own motion, so shots fired while running fly true.
         ball.set_velocity(self().velocity() + direction * ball_speed);
+        // A one-shot from where the ball leaves, a little lower each shot so repeats differ.
+        if (!shot_sound.empty()) {
+            relay::audio::OneShot sound;
+            sound.volume_db = -6.0;
+            sound.pitch = 1.0 - 0.03 * static_cast<double>(shots++ % 4U);
+            relay::audio::play(shot_sound, camera.world_position() + direction * 0.5, sound);
+        }
     }
 
     bool on_ground() const {
@@ -114,6 +122,8 @@ private:
     std::string camera_name = "Camera";
     std::string ball_template = "Ball"; // Project template to shoot; empty turns shooting off.
     double ball_speed = 20.0;           // Metres per second along the view.
+    std::string shot_sound = "sounds/shot.wav"; // Played on each shot; empty is silent.
+    unsigned shots = 0;
 
     relay::Entity camera;
     double yaw = 0.0;

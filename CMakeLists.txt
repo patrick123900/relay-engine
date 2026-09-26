@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(RelayEngine VERSION 0.1.0 LANGUAGES CXX)
+project(RelayEngine VERSION 0.1.0 LANGUAGES C CXX)
 
 option(RELAY_BUILD_TESTS "Build Relay's tests" ON)
 option(RELAY_ENABLE_SDL "Build the SDL-powered human window" ON)
@@ -35,6 +35,22 @@ FetchContent_Declare(JoltPhysics
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     SOURCE_SUBDIR Build)
 FetchContent_MakeAvailable(JoltPhysics)
+# miniaudio (public domain or MIT No Attribution): playback devices and WAV, FLAC, MP3 and, through
+# its bundled stb_vorbis, Ogg Vorbis decoding. SOURCE_SUBDIR points nowhere so only the sources are
+# fetched; Relay compiles the single implementation file itself.
+FetchContent_Declare(miniaudio
+    URL https://github.com/mackron/miniaudio/archive/refs/tags/0.11.25.tar.gz
+    URL_HASH SHA256=b900edcffe979816e2560a0580b9b1216d674b4f17fbadeca8f777a7f8ab0274
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SOURCE_SUBDIR relay-sources-only)
+FetchContent_MakeAvailable(miniaudio)
+add_library(relay_miniaudio STATIC src/audio/miniaudio_impl.c)
+target_include_directories(relay_miniaudio SYSTEM PUBLIC "${miniaudio_SOURCE_DIR}")
+find_package(Threads REQUIRED)
+target_link_libraries(relay_miniaudio PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(relay_miniaudio PUBLIC m)
+endif()
 add_custom_target(relay_protocol_codegen_check ALL
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_protocol.py" --check
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -43,6 +59,11 @@ add_custom_target(relay_protocol_codegen_check ALL
 )
 
 add_library(relay_engine
+    src/audio/audio_clip.cpp
+    src/audio/audio_effects.cpp
+    src/audio/audio_mixer.cpp
+    src/audio/audio_settings.cpp
+    src/audio/audio_system.cpp
     src/control/control_protocol.cpp
     src/control/agent_session.cpp
     src/control/generated_protocol.cpp
@@ -84,7 +105,7 @@ add_library(relay_engine
     src/script/script_system.cpp
 )
 add_library(Relay::Engine ALIAS relay_engine)
-target_link_libraries(relay_engine PRIVATE Jolt ${CMAKE_DL_LIBS})
+target_link_libraries(relay_engine PRIVATE Jolt relay_miniaudio ${CMAKE_DL_LIBS})
 # Project scripts compile with the same compiler as Relay unless RELAY_SCRIPT_COMPILER overrides it.
 target_compile_definitions(relay_engine PRIVATE
     RELAY_SCRIPT_DEFAULT_COMPILER="${CMAKE_CXX_COMPILER}"

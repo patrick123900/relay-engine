@@ -100,6 +100,7 @@ add_library(relay_engine
     src/observe/trace.cpp
     src/render/software_renderer.cpp
     src/render/asset_manifest.cpp
+    src/render/asset_thumbnail.cpp
     src/render/assets.cpp
     src/render/blender_adapter.cpp
     src/render/image_decode.cpp
@@ -464,7 +465,8 @@ if(RELAY_ENABLE_SDL)
 
                 target_sources(relay_demo PRIVATE src/editor/editor_ui.cpp src/editor/editor_theme.cpp
                     src/editor/editor_layout.cpp src/editor/chat_media.cpp
-                    src/editor/file_browser.cpp src/editor/shader_graph_canvas.cpp)
+                    src/editor/file_browser.cpp src/editor/shader_graph_canvas.cpp
+                    src/editor/editor_widgets.cpp src/editor/asset_thumbnails.cpp)
                 find_package(PkgConfig QUIET)
                 if(PkgConfig_FOUND)
                     pkg_check_modules(CHAT_VIDEO QUIET IMPORTED_TARGET libavformat libavcodec libswscale libavutil)
@@ -540,7 +542,8 @@ if(RELAY_BUILD_TESTS)
     if(TARGET relay_imgui)
         add_executable(relay_editor_headless_tests tests/editor_headless_tests.cpp
             src/editor/editor_ui.cpp src/editor/editor_theme.cpp src/editor/editor_layout.cpp src/editor/chat_media.cpp
-            src/editor/file_browser.cpp src/editor/shader_graph_canvas.cpp src/platform/sdl_input.cpp)
+            src/editor/file_browser.cpp src/editor/shader_graph_canvas.cpp src/editor/editor_widgets.cpp
+            src/editor/asset_thumbnails.cpp src/platform/sdl_input.cpp)
         target_link_libraries(relay_editor_headless_tests PRIVATE Relay::Engine relay_imgui)
         target_compile_definitions(relay_editor_headless_tests PRIVATE RELAY_CHAT_MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat-media")
         relay_enable_warnings(relay_editor_headless_tests)

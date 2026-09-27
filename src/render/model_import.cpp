@@ -1287,6 +1287,7 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
     }
     std::vector<MaterialAsset> new_materials;
     new_materials.reserve(imported->mNumMaterials);
+    std::vector<std::string> material_labels;
     std::vector<TextureAsset> new_textures;
     std::unordered_map<std::string, std::size_t> texture_lookup;
     const auto assign_texture = [&](const aiMaterial& material,
@@ -1352,6 +1353,7 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
         if (source->Get(AI_MATKEY_BASE_COLOR, color) != aiReturn_SUCCESS) {
             (void)source->Get(AI_MATKEY_COLOR_DIFFUSE, color);
         }
+        material_labels.emplace_back(source->GetName().C_Str());
         MaterialAsset material;
         material.color = {color.r, color.g, color.b, color.a};
         (void)source->Get(AI_MATKEY_METALLIC_FACTOR, material.metallic_factor);
@@ -1522,6 +1524,10 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
     for (std::size_t index = 0; index < new_materials.size(); ++index) {
         auto& material = new_materials[index];
         material.name = "asset." + result.content_id + ".material." + std::to_string(index);
+        material.label = index < material_labels.size() && !material_labels[index].empty()
+                             ? material_labels[index]
+                             : "Material " + std::to_string(index + 1U);
+        material.source = std::string(filename);
         resolve_texture_token(material.texture, new_textures);
         resolve_texture_token(material.metallic_roughness_texture, new_textures);
         resolve_texture_token(material.normal_texture, new_textures);
@@ -1580,6 +1586,9 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
                               vertex_offset});
         auto &mesh = new_meshes.back();
         mesh.vertex_count = source->mNumVertices;
+        mesh.label = source->mName.length > 0U ? std::string(source->mName.C_Str())
+                                               : "Mesh " + std::to_string(mesh_index + 1U);
+        mesh.source = std::string(filename);
         if (settings.preset == "scene" && source->HasBones()) {
             mesh.skin.resize(source->mNumVertices);
             for (unsigned b = 0; b < source->mNumBones; ++b) {

@@ -9,6 +9,7 @@
 #include "relay/observe/profiler.hpp"
 #include "relay/render/scene_render.hpp"
 #include "relay/render/sky.hpp"
+#include "relay/render/materials.hpp"
 #include "relay/render/shader_language.hpp"
 #include "relay/scene/project.hpp"
 #include "relay/script/script_system.hpp"
@@ -23,6 +24,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <fstream>
 #include <stdexcept>
 #include <thread>
@@ -325,6 +327,52 @@ void click_center(relay::EditorUi& ui, const std::array<float, 4>& rect) {
     frame(ui);
     io.AddMouseButtonEvent(0, false);
     frame(ui, 2);
+}
+
+// Drags from the middle of one item to the middle of another and lets go there.
+void drag_onto(relay::EditorUi& ui, const std::array<float, 4>& from, const std::array<float, 4>& to) {
+    auto& io = ImGui::GetIO();
+    const float x0 = (from[0] + from[2]) / 2, y0 = (from[1] + from[3]) / 2;
+    const float x1 = (to[0] + to[2]) / 2, y1 = (to[1] + to[3]) / 2;
+    io.AddMousePosEvent(x0, y0);
+    frame(ui);
+    io.AddMouseButtonEvent(0, true);
+    frame(ui);
+    for (int step = 1; step <= 8; ++step) {
+        io.AddMousePosEvent(x0 + (x1 - x0) * static_cast<float>(step) / 8.0F, y0 + (y1 - y0) * static_cast<float>(step) / 8.0F);
+        frame(ui);
+    }
+    frame(ui, 2);
+    io.AddMouseButtonEvent(0, false);
+    frame(ui, 3);
+}
+
+// Opens the Asset Browser by clicking a reference field, optionally goes to a folder through its tree,
+// and chooses `item`: a tile ("asset_browser:item:<path>" or "asset_browser:choice:<value>"),
+// selected and then chosen with Choose, or a footer button ("asset_browser:button:<value>" or
+// "asset_browser:action:<label>").
+void browse_and_choose(relay::EditorUi& ui, const std::string& field, const std::string& item,
+                       const std::string& folder = {}) {
+    const auto browse = ui.headless_item_rect(field);
+    check(browse.has_value(), ("the reference field is shown: " + field).c_str());
+    click_center(ui, *browse);
+    frame(ui, 3);
+    if (!folder.empty()) {
+        const auto row = ui.headless_item_rect("asset_browser:tree:" + folder);
+        check(row.has_value(), ("the browser's tree shows " + folder).c_str());
+        click_center(ui, *row);
+        frame(ui, 3);
+    }
+    const auto target = ui.headless_item_rect(item);
+    check(target.has_value(), ("the browser offers " + item).c_str());
+    click_center(ui, *target);
+    if (!item.starts_with("asset_browser:button:") && !item.starts_with("asset_browser:action:")) {
+        const auto choose = ui.headless_item_rect("asset_browser:choose");
+        check(choose.has_value(), "the browser has a Choose button");
+        click_center(ui, *choose);
+    }
+    frame(ui, 3);
+    check(!ui.headless_item_rect("asset_browser:search"), "choosing closes the browser");
 }
 
 void double_click(relay::EditorUi& ui, const std::array<float, 4>& rect) {
@@ -1044,11 +1092,19 @@ void joints_ui() {
               ui.headless_item_rect("joint:connected"),
           "the Inspector shows the Joint section");
     click_center(ui, *ui.headless_item_rect("joint:connected"));
-    frame(ui, 2);
-    check(!ui.headless_item_rect("joint:connected:" + swing.to_string()).has_value(),
-          "a node cannot be joined to itself");
-    click_center(ui, *ui.headless_item_rect("joint:connected:" + anchor.to_string()));
     frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:choice:" + anchor.to_string()) &&
+              !ui.headless_item_rect("asset_browser:choice:" + swing.to_string()).has_value(),
+          "the browser lists bodies to join to, but not the node itself");
+    click_center(ui, *ui.headless_item_rect("asset_browser:cancel"));
+    frame(ui, 2);
+    browse_and_choose(ui, "joint:connected", "asset_browser:choice:" + anchor.to_string());
+    // Hierarchy rows drop onto the field when they are bodies to join to; the node itself is not.
+    browse_and_choose(ui, "joint:connected", "asset_browser:button:");
+    check(!scene.get(swing)->joint->connected.valid(), "World joins the joint to the world");
+    drag_onto(ui, *ui.headless_item_rect("entity:" + swing.to_string()), *ui.headless_item_rect("joint:connected"));
+    check(!scene.get(swing)->joint->connected.valid(), "a node dropped onto its own joint is refused");
+    drag_onto(ui, *ui.headless_item_rect("entity:" + anchor.to_string()), *ui.headless_item_rect("joint:connected"));
     check(scene.get(swing)->joint->connected == anchor, "choosing a body connects the joint to it");
     click_center(ui, *ui.headless_item_rect("joint:type"));
     frame(ui, 2);
@@ -1106,10 +1162,21 @@ void audio_ui() {
               ui.headless_item_rect("inspector:audio:clip"),
           "the Inspector shows the Audio source section");
     click_center(ui, *ui.headless_item_rect("inspector:audio:clip"));
-    const auto option = ui.headless_item_rect("inspector:audio:clip:sounds/tone.wav");
-    check(option.has_value(), "the clip picker lists the project's sound files");
-    click_center(ui, *option);
     frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("asset_browser:tree:sounds"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:item:sounds/tone.wav") &&
+              ui.headless_item_rect("asset_browser:item:sounds/tone.wav:play"),
+          "the browser shows the project's sound files, each with a play button");
+    click_center(ui, *ui.headless_item_rect("asset_browser:item:sounds/tone.wav:play"));
+    check(engine.audio().status_json(scene).find("sounds/tone.wav") != std::string::npos,
+          "a sound's play button previews it");
+    click_center(ui, *ui.headless_item_rect("asset_browser:item:sounds/tone.wav:play"));
+    check(engine.audio().status_json(scene).find("sounds/tone.wav") == std::string::npos,
+          "pressing it again stops the preview");
+    click_center(ui, *ui.headless_item_rect("asset_browser:cancel"));
+    frame(ui, 2);
+    browse_and_choose(ui, "inspector:audio:clip", "asset_browser:item:sounds/tone.wav", "sounds");
     check(scene.get(speaker)->audio_source->clip == "sounds/tone.wav",
           "choosing a clip sets it on the source");
     click_center(ui, *ui.headless_item_rect("inspector:audio:bus"));
@@ -1249,7 +1316,11 @@ void music_ui() {
           "the Inspector shows the Music player section");
     for (const char* file : {"music/a.wav", "music/b.wav"}) {
         click_center(ui, *ui.headless_item_rect("inspector:music:add"));
-        click_center(ui, *ui.headless_item_rect(std::string("inspector:music:add:") + file));
+        frame(ui, 3);
+        click_center(ui, *ui.headless_item_rect("asset_browser:tree:music"));
+        frame(ui, 3);
+        click_center(ui, *ui.headless_item_rect(std::string("asset_browser:item:") + file));
+        click_center(ui, *ui.headless_item_rect("asset_browser:choose"));
         frame(ui, 3);
     }
     check(scene.get(jukebox)->music_player->tracks == std::vector<std::string>{"music/a.wav", "music/b.wav"},
@@ -1756,31 +1827,27 @@ void sky_ui() {
 
     click_center(ui, *ui.headless_item_rect("inspector:component:sky"));
     frame(ui, 3);
+    if (const char* directory = std::getenv("RELAY_UI_SNAPSHOT_DIR"))
+        (void)relay_test::write_ui_snapshot(std::filesystem::path(directory) / "sky-inspector.png");
     click_center(ui, *ui.headless_item_rect("inspector:sky:fog"));
     frame(ui, 3);
     check(!scene.get(sky)->sky->fog && !ui.headless_item_rect("inspector:sky:fog_start_color"),
           "the Fog checkbox turns fog off and hides its settings");
 
-    click_center(ui, *ui.headless_item_rect("inspector:sky:material"));
-    click_center(ui, *ui.headless_item_rect("inspector:sky:material:new"));
-    frame(ui, 3);
+    browse_and_choose(ui, "inspector:sky:material", "asset_browser:action:New sky material");
     check(scene.get(sky)->sky->material == "New sky material.relay-material" &&
               std::filesystem::exists("projects/skies/New sky material.relay-material") &&
               ui.headless_item_rect("inspector:sky:panorama") &&
               !ui.headless_item_rect("inspector:sky:horizon"),
           "New sky material creates the file and shows its settings in place of the gradient");
-    click_center(ui, *ui.headless_item_rect("inspector:sky:panorama"));
-    click_center(ui, *ui.headless_item_rect("inspector:sky:panorama:sunset.png"));
-    frame(ui, 3);
+    browse_and_choose(ui, "inspector:sky:panorama", "asset_browser:item:sunset.png");
     {
         std::string read_error;
         const auto material =
             relay::read_sky_material("projects/skies", "New sky material.relay-material", read_error);
         check(material && material->panorama == "sunset.png", "choosing a panorama saves it in the material");
     }
-    click_center(ui, *ui.headless_item_rect("inspector:sky:material"));
-    click_center(ui, *ui.headless_item_rect("inspector:sky:material:gradient"));
-    frame(ui, 3);
+    browse_and_choose(ui, "inspector:sky:material", "asset_browser:button:");
     check(scene.get(sky)->sky->material.empty() && ui.headless_item_rect("inspector:sky:horizon"),
           "choosing Gradient goes back to the colors");
     std::cout << "Headless sky UI tests passed\n";
@@ -2016,7 +2083,17 @@ void shader_ui() {
     click(ui, *ui.headless_item_rect("entity:" + post.to_string()));
     frame(ui, 3);
     click_center(ui, *ui.headless_item_rect("inspector:post:add"));
-    click_center(ui, *ui.headless_item_rect("inspector:post:add:Grade.relay-material"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:item:Grade.relay-material") &&
+              !ui.headless_item_rect("asset_browser:item:Glow.relay-material"),
+          "Add effect browses post-processing materials only, not surface ones");
+    click_center(ui, *ui.headless_item_rect("asset_browser:tree:@ready"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:choice:@ready:bloom").has_value(), "ready-made effects are offered");
+    click_center(ui, *ui.headless_item_rect("asset_browser:tree:"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("asset_browser:item:Grade.relay-material"));
+    click_center(ui, *ui.headless_item_rect("asset_browser:choose"));
     frame(ui, 3);
     check(engine.scene().get(post)->post_process->effects.size() == 1U &&
               ui.headless_item_rect("inspector:post:enabled:0").has_value(),
@@ -2025,6 +2102,287 @@ void shader_ui() {
     frame(ui, 3);
     check(!engine.scene().get(post)->post_process->effects[0].enabled, "its checkbox turns the effect off");
     std::cout << "Headless shader UI tests passed\n";
+}
+
+// The Asset Browser: reference fields open it, its tree and folders, searching with several words,
+// type filters, folder names and scope, thumbnails for images, models and materials, imported
+// meshes inside their model, list view, and the Inspector's slider typing a value.
+void asset_browser_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    const auto handle = [&](const std::string& request) {
+        const auto reply = protocol.handle(request);
+        check(reply.find("\"ok\":true") != std::string::npos, reply.c_str());
+        return reply;
+    };
+    handle(R"({"id":1,"method":"project.create","filename":"projects/library/project.relayproject","name":"Library"})");
+    const auto image = [](const std::filesystem::path& path, const int width, const int height, const int hue) {
+        std::filesystem::create_directories(path.parent_path());
+        std::vector<std::uint8_t> rgb(static_cast<std::size_t>(width) * height * 3U);
+        for (int y = 0; y < height; ++y)
+            for (int x = 0; x < width; ++x) {
+                auto* pixel = &rgb[(static_cast<std::size_t>(y) * width + x) * 3U];
+                pixel[0] = static_cast<std::uint8_t>((x * 255 / width + hue) % 256);
+                pixel[1] = static_cast<std::uint8_t>(y * 255 / height);
+                pixel[2] = static_cast<std::uint8_t>(((x / 8 + y / 8) % 2) * 120 + hue / 2);
+            }
+        relay_test::write_png_rgb(path, width, height, rgb);
+    };
+    image("projects/library/textures/wood/Oak_bark.png", 96, 64, 40);
+    image("projects/library/textures/Brick.png", 64, 64, 200);
+    image("projects/library/skies/Dusk.png", 128, 64, 120);
+    write_tone("projects/library/sounds/tone.wav");
+    const auto sources = std::filesystem::path(RELAY_CHAT_MEDIA_FIXTURES).parent_path().parent_path().parent_path();
+    std::filesystem::create_directories("projects/library/models");
+    std::filesystem::copy_file(sources / "examples/demo/models/primitives.glb", "projects/library/models/primitives.glb");
+    handle(R"({"id":2,"method":"assets.create_folder","path":"materials"})");
+    handle(R"({"id":3,"method":"shaders.write","path":"materials/Rock.relay-shader","create":true})");
+    handle(R"({"id":4,"method":"assets.set_material","path":"materials/Rock.relay-material","create":true,"type":"surface","shader":"materials/Rock.relay-shader"})");
+    handle(R"({"id":5,"method":"shaders.write","path":"materials/Fade.relay-shader","create":true,"type":"post_process"})");
+    handle(R"({"id":6,"method":"assets.set_material","path":"materials/Fade.relay-material","create":true,"type":"post_process","shader":"materials/Fade.relay-shader"})");
+    handle(R"({"id":7,"method":"assets.set_sky_material","path":"skies/Dusk.relay-material","create":true,"panorama":"skies/Dusk.png"})");
+    const auto imported = handle(R"({"id":8,"method":"assets.import_model","filename":"models/primitives.glb","instantiate":false})");
+    const auto mesh_start = imported.find("\"meshes\":[\"") + 11U;
+    const auto first_mesh = imported.substr(mesh_start, imported.find('"', mesh_start) - mesh_start);
+    const auto created = handle(R"({"id":9,"method":"scene.create","type":"StaticMesh"})");
+    const auto start = created.find("\"entity\":\"") + 10U;
+    const auto node = *relay::Entity::parse(created.substr(start, created.find('"', start) - start));
+    handle(R"({"id":10,"method":"scene.set_renderer","entity":")" + node.to_string() +
+           R"(","mesh":"builtin.quad","material":"materials/Rock.relay-material"})");
+
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize the asset browser test without windows");
+    const auto snapshot = [](const char* name) {
+        if (const char* directory = std::getenv("RELAY_UI_SNAPSHOT_DIR"))
+            (void)relay_test::write_ui_snapshot(std::filesystem::path(directory) / name);
+    };
+    // Textures other than the font atlas in the last frame: thumbnails being shown.
+    const auto pictures = [] {
+        std::set<const ImTextureData*> seen;
+        if (const auto* data = ImGui::GetDrawData())
+            for (int list = 0; list < data->CmdListsCount; ++list)
+                for (const auto& command : data->CmdLists[list]->CmdBuffer)
+                    if (command.TexRef._TexData && command.TexRef._TexData != ImGui::GetIO().Fonts->TexData)
+                        seen.insert(command.TexRef._TexData);
+        return seen.size();
+    };
+    const auto wait_for_pictures = [&](const std::size_t count) {
+        for (int attempt = 0; attempt < 400 && pictures() < count; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            frame(ui);
+        }
+        return pictures() >= count;
+    };
+    const auto type = [&](const std::string& key, const char* text) {
+        click_center(ui, *ui.headless_item_rect(key));
+        auto& io = ImGui::GetIO();
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddKeyEvent(ImGuiKey_A, true);
+        frame(ui);
+        io.AddKeyEvent(ImGuiKey_A, false);
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        io.AddKeyEvent(ImGuiKey_Backspace, true);
+        frame(ui);
+        io.AddKeyEvent(ImGuiKey_Backspace, false);
+        io.AddInputCharactersUTF8(text);
+        frame(ui, 3);
+    };
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + node.to_string()));
+    frame(ui, 3);
+    check(ui.headless_item_rect("inspector:renderer:mesh") && ui.headless_item_rect("inspector:renderer:material"),
+          "the Mesh renderer's mesh and material are reference fields");
+    snapshot("inspector-asset-fields.png");
+
+    // Choosing a material: the browser opens in its folder, lists only surface materials, and
+    // renders their thumbnails through the window's material preview.
+    click_center(ui, *ui.headless_item_rect("inspector:renderer:material"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:item:materials/Rock.relay-material") &&
+              !ui.headless_item_rect("asset_browser:item:materials/Fade.relay-material") &&
+              !ui.headless_item_rect("asset_browser:item:materials/Rock.relay-shader") &&
+              ui.headless_item_rect("asset_browser:tree:@builtin"),
+          "the material browser starts in the current material's folder and shows only surface materials");
+    frame(ui, 3);
+    check(ui.material_preview_request() == "materials/Rock.relay-material",
+          "a material tile asks the renderer for its thumbnail when the Inspector's preview is not needed");
+    {
+        std::vector<std::uint8_t> sphere(192U * 192U * 4U, 200U);
+        ui.material_preview_ready("materials/Rock.relay-material", 192U, 192U, sphere);
+        frame(ui, 2);
+    }
+    check(pictures() >= 1U, "a rendered material preview becomes the tile's thumbnail");
+    click_center(ui, *ui.headless_item_rect("asset_browser:tree:@builtin"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:choice:builtin.orange").has_value(), "built-in materials are offered");
+    click_center(ui, *ui.headless_item_rect("asset_browser:choice:builtin.orange"));
+    click_center(ui, *ui.headless_item_rect("asset_browser:choose"));
+    frame(ui, 3);
+    check(engine.scene().get(node)->mesh_renderer->material == "builtin.orange", "choosing a built-in material sets it");
+
+    // Choosing a mesh: imported meshes live inside the model they came from.
+    click_center(ui, *ui.headless_item_rect("inspector:renderer:mesh"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("asset_browser:tree:models"));
+    frame(ui, 3);
+    const auto model = ui.headless_item_rect("asset_browser:item:models/primitives.glb");
+    check(model.has_value(), "a model holding imported meshes is shown as something to open");
+    check(wait_for_pictures(1U), "the model's tile gets a rendered thumbnail");
+    snapshot("asset-browser-models.png");
+    double_click(ui, *model);
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:choice:" + first_mesh).has_value(), "opening the model lists its meshes");
+    check(wait_for_pictures(3U), "each imported mesh gets a thumbnail of its own");
+    snapshot("asset-browser-meshes.png");
+    click_center(ui, *ui.headless_item_rect("asset_browser:choice:" + first_mesh));
+    click_center(ui, *ui.headless_item_rect("asset_browser:choose"));
+    frame(ui, 3);
+    check(engine.scene().get(node)->mesh_renderer->mesh == first_mesh, "choosing an imported mesh sets it");
+
+    // Dropping files: only what a field takes is accepted.
+    click_center(ui, *ui.headless_item_rect("menu:tools"));
+    click_center(ui, *ui.headless_item_rect("menu:asset_browser"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("asset_browser:tree:sounds"));
+    frame(ui, 3);
+    drag_onto(ui, *ui.headless_item_rect("asset_browser:item:sounds/tone.wav"), *ui.headless_item_rect("inspector:renderer:mesh"));
+    drag_onto(ui, *ui.headless_item_rect("asset_browser:item:sounds/tone.wav"), *ui.headless_item_rect("inspector:renderer:material"));
+    check(engine.scene().get(node)->mesh_renderer->mesh == first_mesh &&
+              engine.scene().get(node)->mesh_renderer->material == "builtin.orange",
+          "a sound dropped onto a mesh or material field is refused");
+    click_center(ui, *ui.headless_item_rect("asset_browser:tree:materials"));
+    frame(ui, 3);
+    drag_onto(ui, *ui.headless_item_rect("asset_browser:item:materials/Fade.relay-material"),
+              *ui.headless_item_rect("inspector:renderer:material"));
+    check(engine.scene().get(node)->mesh_renderer->material == "builtin.orange",
+          "a post-processing material is refused by a mesh's material field");
+    drag_onto(ui, *ui.headless_item_rect("asset_browser:item:materials/Rock.relay-material"),
+              *ui.headless_item_rect("inspector:renderer:material"));
+    check(engine.scene().get(node)->mesh_renderer->material == "materials/Rock.relay-material",
+          "a surface material dropped onto the material field is used");
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("asset_browser:tree:models"));
+    frame(ui, 3);
+    drag_onto(ui, *ui.headless_item_rect("asset_browser:item:models/primitives.glb"),
+              *ui.headless_item_rect("inspector:renderer:mesh"));
+    check(engine.scene().get(node)->mesh_renderer->mesh == first_mesh &&
+              ui.headless_item_rect("asset_browser:choice:" + first_mesh).has_value(),
+          "a model with several meshes dropped onto a mesh field opens the browser inside it");
+    click_center(ui, *ui.headless_item_rect("asset_browser:cancel"));
+    frame(ui, 2);
+
+    // Browsing everything from the Tools menu.
+    click_center(ui, *ui.headless_item_rect("menu:tools"));
+    click_center(ui, *ui.headless_item_rect("menu:asset_browser"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:item:textures").has_value() &&
+              ui.headless_item_rect("asset_browser:item:sounds").has_value(),
+          "Tools > Asset browser opens on the project's folders");
+    double_click(ui, *ui.headless_item_rect("asset_browser:item:textures"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:item:textures/Brick.png") && ui.headless_item_rect("asset_browser:tree:textures/wood"),
+          "double-clicking a folder opens it, and the tree follows");
+    check(wait_for_pictures(1U), "images get thumbnails");
+    snapshot("asset-browser-images.png");
+    // Words in any order; with folder names matched too, a folder's name narrows the search.
+    type("asset_browser:search", "bark oak");
+    check(ui.headless_item_rect("asset_browser:item:textures/wood/Oak_bark.png").has_value(),
+          "every word of the search must appear in the name, in any order");
+    type("asset_browser:search", "wood oak");
+    check(!ui.headless_item_rect("asset_browser:item:textures/wood/Oak_bark.png").has_value(),
+          "folder names are not matched unless asked for");
+    click_center(ui, *ui.headless_item_rect("asset_browser:options"));
+    click_center(ui, *ui.headless_item_rect("asset_browser:match_paths"));
+    ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, true);
+    frame(ui);
+    ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, false);
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:item:textures/wood/Oak_bark.png").has_value(),
+          "matching folder names finds a file by its folder");
+    type("asset_browser:search", "");
+    click_center(ui, *ui.headless_item_rect("asset_browser:tree:"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("asset_browser:filter"));
+    click_center(ui, *ui.headless_item_rect("asset_browser:filter:audio"));
+    ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, true);
+    frame(ui);
+    ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, false);
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:item:sounds/tone.wav") &&
+              !ui.headless_item_rect("asset_browser:item:textures/Brick.png"),
+          "a type filter lists every file of that type in the project");
+    click_center(ui, *ui.headless_item_rect("asset_browser:view"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:item:sounds/tone.wav:play").has_value(),
+          "the list view keeps sounds' play buttons");
+    snapshot("asset-browser-list.png");
+    click_center(ui, *ui.headless_item_rect("asset_browser:view"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("asset_browser:filter"));
+    click_center(ui, *ui.headless_item_rect("asset_browser:filter:audio"));
+    click_center(ui, *ui.headless_item_rect("asset_browser:filter:material"));
+    ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, true);
+    frame(ui);
+    ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, false);
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:item:skies/Dusk.relay-material") &&
+              ui.headless_item_rect("asset_browser:item:materials/Fade.relay-material"),
+          "every kind of material is listed under Materials");
+    check(wait_for_pictures(2U), "a sky material shows its panorama");
+    snapshot("asset-browser-materials.png");
+    click_center(ui, *ui.headless_item_rect("asset_browser:item:skies/Dusk.relay-material"));
+    ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, true);
+    frame(ui);
+    ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, false);
+    frame(ui, 3);
+    check(!ui.headless_item_rect("asset_browser:search"), "Escape closes the browser");
+
+    // The Inspector's slider: the value box takes a typed value.
+    handle(R"({"id":11,"method":"scene.set_renderer","entity":")" + node.to_string() +
+           R"(","mesh":"builtin.quad","material":"materials/Rock.relay-material"})");
+    frame(ui, 40);
+    const auto roughness = ui.headless_item_rect("inspector:material:roughness");
+    check(roughness.has_value(), "the material's roughness has a slider");
+    auto& io = ImGui::GetIO();
+    io.AddMousePosEvent((*roughness)[2] - 6.0F, ((*roughness)[1] + (*roughness)[3]) * 0.5F);
+    frame(ui);
+    io.AddMouseButtonEvent(0, true);
+    frame(ui);
+    io.AddMouseButtonEvent(0, false);
+    frame(ui, 2);
+    io.AddKeyEvent(ImGuiMod_Ctrl, true);
+    io.AddKeyEvent(ImGuiKey_A, true);
+    frame(ui);
+    io.AddKeyEvent(ImGuiKey_A, false);
+    io.AddKeyEvent(ImGuiMod_Ctrl, false);
+    io.AddInputCharactersUTF8("0.25");
+    frame(ui, 2);
+    key(ui, ImGuiKey_Enter, false);
+    frame(ui, 3);
+    const auto saved_roughness = [] {
+        std::string read_error;
+        const auto material = relay::read_shader_material("projects/library", "materials/Rock.relay-material", read_error);
+        if (!material) return -1.0;
+        const auto value = material->parameters.find("roughness");
+        return value == material->parameters.end() || value->second.numbers.empty() ? -1.0 : value->second.numbers[0];
+    };
+    check(std::abs(saved_roughness() - 0.25) < 1e-6, "clicking a slider's value box types a value");
+    // Dragging along the track sets the value from where the pointer is.
+    const auto track_y = ((*roughness)[1] + (*roughness)[3]) * 0.5F;
+    io.AddMousePosEvent((*roughness)[0] + 4.0F, track_y);
+    frame(ui);
+    io.AddMouseButtonEvent(0, true);
+    frame(ui);
+    io.AddMousePosEvent((*roughness)[0] + 2.0F, track_y);
+    frame(ui);
+    io.AddMouseButtonEvent(0, false);
+    frame(ui, 3);
+    check(saved_roughness() >= 0.0 && saved_roughness() < 0.01, "dragging to the start of the track sets the minimum");
+    snapshot("inspector-slider.png");
+    std::cout << "Headless asset browser tests passed\n";
 }
 
 int main() {
@@ -2053,6 +2411,7 @@ int main() {
         fresh(music_ui);
         fresh(sky_ui);
         fresh(shader_ui);
+        fresh(asset_browser_ui);
         fresh(hierarchy_search_ui);
         fresh(profiler_ui);
         fresh(game_configuration_ui);

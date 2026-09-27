@@ -374,9 +374,11 @@ export function registerGeneratedTools(
     "asset_search",
     {
       title: "Search project files",
-      description: "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.",
+      description: "Find project files and folders below the project root (or one folder) whose names contain every word of the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.",
       inputSchema: z.object({
-        "query": z.string().max(64).default("").describe("Case-insensitive name fragment; empty matches every name"),
+        "query": z.string().max(64).default("").describe("Case-insensitive words separated by spaces, all of which must appear in the name, in any order; empty matches every name"),
+        "folder": z.string().max(128).regex(new RegExp("^([A-Za-z0-9][A-Za-z0-9._ /-]*)?$")).default("").describe("Project-relative folder to search below; empty searches the whole project"),
+        "paths": z.boolean().default(false).describe("Match the words anywhere in the project-relative path instead of only the name"),
         "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|material|shader|script|text|media|audio|other)$"))).max(12).optional().describe("Asset kinds to include; omitted or empty includes all")
       }),
       annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
@@ -384,7 +386,7 @@ export function registerGeneratedTools(
     async (input) => {
         const override = overrides["asset_search"];
         if (override) return override(input as JsonObject);
-        return invoke("assets.search", {"query": input["query"], "kinds": input["kinds"]});
+        return invoke("assets.search", {"query": input["query"], "folder": input["folder"], "paths": input["paths"], "kinds": input["kinds"]});
       },
   );
 

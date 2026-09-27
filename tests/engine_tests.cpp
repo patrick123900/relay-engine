@@ -10,6 +10,7 @@
 #include "relay/render/scene_render.hpp"
 #include "relay/render/asset_manifest.hpp"
 #include "relay/render/assets.hpp"
+#include "relay/render/asset_thumbnail.hpp"
 #include "relay/render/render_graph.hpp"
 #include "relay/render/upload_budget.hpp"
 #include "relay/render/shader_reflection.hpp"
@@ -574,6 +575,42 @@ int main() {
     expect(imported_again.imported && imported_again.content_id == imported.content_id &&
                registry.revision() == asset_revision + 1U,
            "reimporting identical model content reuses stable asset identities");
+    const auto* triangle_mesh = registry.find_mesh(imported.meshes.front());
+    const auto* triangle_material = registry.find_material(imported.materials.front());
+    expect(triangle_mesh && triangle_mesh->label == "RelayTriangle" &&
+               triangle_mesh->source == "relay-test-triangle.gltf" && triangle_material &&
+               triangle_material->label == "Relay White" &&
+               registry.to_json().find(R"("label":"RelayTriangle","source":"relay-test-triangle.gltf")") !=
+                   std::string::npos,
+           "imported meshes and materials keep their file's names and source for people");
+    {
+        relay::ThumbnailImage thumbnail;
+        std::string thumbnail_error;
+        expect(relay::model_thumbnail(assets_root, "relay-test-triangle.gltf", 64U, thumbnail, thumbnail_error) &&
+                   thumbnail.width == 64U && thumbnail.height == 64U,
+               "a model thumbnail renders at the requested size: " + thumbnail_error);
+        std::size_t covered = 0, clear = 0;
+        for (std::size_t pixel = 0; pixel < thumbnail.rgba.size() / 4U; ++pixel) {
+            covered += thumbnail.rgba[pixel * 4U + 3U] == 255U && thumbnail.rgba[pixel * 4U] > 40U;
+            clear += thumbnail.rgba[pixel * 4U + 3U] == 0U;
+        }
+        expect(covered > 200U && clear > 200U,
+               "the model fills part of its thumbnail, lit, on a transparent background");
+        expect(relay::model_thumbnail(assets_root, "relay-test-triangle.gltf", 32U, thumbnail, thumbnail_error,
+                                      imported.meshes.front()) &&
+                   !relay::model_thumbnail(assets_root, "relay-test-triangle.gltf", 32U, thumbnail, thumbnail_error,
+                                           "asset.missing.mesh.7"),
+               "a thumbnail can show one mesh of a model, and refuses a mesh the model lacks");
+        expect(!relay::model_thumbnail(assets_root, "../engine_tests.cpp", 64U, thumbnail, thumbnail_error) &&
+                   !relay::model_thumbnail(assets_root, "missing.glb", 64U, thumbnail, thumbnail_error),
+               "model thumbnails refuse files outside the root and missing files");
+        const auto media = std::filesystem::path{RELAY_TEST_SOURCE_DIR} / "tests/fixtures/chat-media";
+        relay::ThumbnailImage picture;
+        expect(relay::image_thumbnail(media, "image.png", 16U, picture, thumbnail_error) &&
+                   std::max(picture.width, picture.height) <= 16U &&
+                   picture.rgba.size() == static_cast<std::size_t>(picture.width) * picture.height * 4U,
+               "an image thumbnail shrinks to fit the requested size: " + thumbnail_error);
+    }
 
     relay::Scene camera_scene;
     const auto existing_camera = camera_scene.create("Existing camera");
@@ -2098,7 +2135,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 48U && relay::protocol_methods().size() == 160U,
+    expect(relay::protocol_schema_version == 49U && relay::protocol_methods().size() == 160U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");

@@ -14,6 +14,8 @@
 #include "relay/editor/editor_selection.hpp"
 #include "relay/editor/editor_timeline.hpp"
 #include "relay/editor/editor_theme.hpp"
+#include "relay/editor/editor_widgets.hpp"
+#include "relay/editor/asset_thumbnails.hpp"
 #include "relay/editor/shader_graph_canvas.hpp"
 #include "relay/platform/sdl_input.hpp"
 #include "relay/render/graphics_settings.hpp"
@@ -255,7 +257,18 @@ struct EditorUi::Impl {
     std::map<ImGuiID, EditorScalarDraft> drafts;
     bool drawing_inspector{};
 
-    void inspector_field_label(const char* label) const {
+    // How a field's name reads in the label column: any "##id" dropped, underscores as spaces and a
+    // capital first letter, so script and shader names like wave_height read "Wave height".
+    static std::string field_display_name(const std::string_view label) {
+        std::string text(label.substr(0, label.find("##")));
+        std::replace(text.begin(), text.end(), '_', ' ');
+        if (!text.empty()) text[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(text[0])));
+        return text;
+    }
+
+    void inspector_field_label(const char* raw_label) const {
+        const auto shown = field_display_name(raw_label);
+        const char* label = shown.c_str();
         const float label_width = 108.0F * ui_scale;
         if (ImGui::CalcTextSize(label).x > label_width - 12.0F * ui_scale ||
             ImGui::GetContentRegionAvail().x < 230.0F * ui_scale) {
@@ -264,6 +277,15 @@ struct EditorUi::Impl {
             row_label(label, ImGui::GetWindowContentRegionMin().x + label_width);
         }
         ImGui::SetNextItemWidth(inspector_field_reserve > 0.0F ? -inspector_field_reserve : -FLT_MIN);
+    }
+
+    // A checkbox with its name in the label column on the left, like every other Inspector field.
+    bool inspector_checkbox(const char* label, bool* value) {
+        inspector_field_label(label);
+        ImGui::PushID(label);
+        const bool changed = editor_checkbox("##value", value);
+        ImGui::PopID();
+        return changed;
     }
 
     bool inspector_begin_combo(const char* label, const char* preview) const {
@@ -358,9 +380,8 @@ struct EditorUi::Impl {
             ImGui::PushID(label);
             inspector_field_label(label);
         }
-        const bool changed = ImGui::SliderScalar(
-            inspector_field ? "##value" : label, ImGuiDataType_Double, &draft.begin(current),
-            &minimum, &maximum, format);
+        const bool changed = editor_slider(inspector_field ? "##value" : label, &draft.begin(current), minimum,
+                                           maximum, format);
         if (ImGui::IsItemActivated()) animation_gesture = ++gesture_serial;
         current = std::clamp(draft.value, minimum, maximum);
         draft.finish(ImGui::IsItemActive());
@@ -376,12 +397,13 @@ struct EditorUi::Impl {
                                              IM_COL32(109, 156, 226, 255)};
         ImGui::PushID(label);
         const auto& style = ImGui::GetStyle();
+        const auto shown = field_display_name(label);
         const bool stacked = ImGui::GetContentRegionAvail().x < label_width + 220.0F * ui_scale ||
-                             ImGui::CalcTextSize(label).x + 12.0F * ui_scale > label_width;
+                             ImGui::CalcTextSize(shown.c_str()).x + 12.0F * ui_scale > label_width;
         if (stacked) {
-            ImGui::TextColored(editor_color(editor_palette().text_dim), "%s", label);
+            ImGui::TextColored(editor_color(editor_palette().text_dim), "%s", shown.c_str());
         } else {
-            row_label(label, label_width);
+            row_label(shown.c_str(), label_width);
         }
         const float tag = ImGui::CalcTextSize("X").x + style.ItemInnerSpacing.x;
         const float width =
@@ -424,6 +446,12 @@ struct EditorUi::Impl {
     std::string preview_wanted, preview_request;
     std::string preview_path;
     std::unique_ptr<ImTextureData> preview_texture;
+    struct DeliveredPreview {
+        std::string path;
+        std::uint32_t width{}, height{};
+        std::vector<std::uint8_t> rgba;
+    } last_preview;
+    AssetThumbnails thumbnails;
     std::map<std::string, std::array<float, 4>, std::less<>> headless_items;
     void note_item(const std::string& key) {
         note_rect(key, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
@@ -462,6 +490,9 @@ struct EditorUi::Impl {
     std::uint64_t last_log_sequence{0};
 
     EditorSelection selections;
+    // The Hierarchy row the left button went down on, selected if it comes up there undragged.
+    std::string hierarchy_pressed;
+    bool hierarchy_press_double{};
     std::string& selection = selections.primary_handle;
     std::vector<std::string> visible_rows, drawing_rows;
     bool clipboard_ready{false};
@@ -966,31 +997,30 @@ struct EditorUi::Impl {
         const auto label = name.c_str();
         if (type == "sampler2D") {
             const auto texture = string_or(parameter, "texture");
-            const char* fallback = hint == "hint_normal" ? "<flat normal>" : hint == "hint_black" ? "<black>" : "<white>";
-            if (inspector_begin_combo(label, texture.empty() ? fallback : texture.c_str())) {
-                if (ImGui::Selectable(fallback, texture.empty()))
-                    apply(",\"name\":\"" + json_escape(name) + "\",\"texture\":\"\"");
-                for (const auto& file : panorama_files) {
-                    if (ImGui::Selectable(file.c_str(), file == texture))
-                        apply(",\"name\":\"" + json_escape(name) + "\",\"texture\":\"" + json_escape(file) + '"');
-                    note_item(key + name + ":" + file);
-                }
-                if (panorama_files.empty()) ImGui::TextDisabled("No PNG or JPEG images in the project");
-                ImGui::EndCombo();
-            }
-            note_item(key + name);
-            if (ImGui::BeginDragDropTarget()) {
-                if (const auto* payload = ImGui::GetDragDropPayload(); payload && payload->IsDataType("relay.asset")) {
-                    const std::string dropped(static_cast<const char*>(payload->Data));
-                    if (panorama_file(dropped) && ImGui::AcceptDragDropPayload("relay.asset"))
-                        apply(",\"name\":\"" + json_escape(name) + "\",\"texture\":\"" + json_escape(dropped) + '"');
-                }
-                ImGui::EndDragDropTarget();
-            }
+            const char* fallback = hint == "hint_normal" ? "Flat normal" : hint == "hint_black" ? "Black" : "White";
+            // Copied into the pick, which may be chosen frames later.
+            const auto set_texture = [apply = apply, name](const std::string& file) {
+                apply(",\"name\":\"" + json_escape(name) + "\",\"texture\":\"" + json_escape(file) + '"');
+            };
+            asset_field(
+                label, texture, key + name,
+                [=, this] {
+                    AssetPick pick;
+                    pick.key = key + name;
+                    pick.title = "Choose an image for " + name;
+                    pick.current = texture;
+                    pick.kinds = {"image"};
+                    pick.accepts = [](const std::string& path) { return panorama_file(path); };
+                    pick.what = "a PNG or JPEG image";
+                    pick.choices.push_back({"", std::string("Default: ") + fallback, AssetIcon::image, "", "", std::nullopt});
+                    pick.choose = set_texture;
+                    return pick;
+                },
+                fallback, AssetIcon::image);
         } else if (type == "bool") {
             bool value = values[0] != 0.0;
             inspector_field_label(label);
-            if (ImGui::Checkbox("##value", &value)) {
+            if (editor_checkbox("##value", &value)) {
                 values[0] = value ? 1.0 : 0.0;
                 send(1U);
             }
@@ -1013,8 +1043,10 @@ struct EditorUi::Impl {
             if (hint == "hint_range") {
                 const double minimum = number_or(parameter, "minimum", 0.0);
                 const double maximum = number_or(parameter, "maximum", 1.0);
-                if (slider_scalar(label, values[0], minimum, maximum, integer ? "%.0f" : "%.3f")) {
-                    if (const double step = number_or(parameter, "step", 0.0); step > 0.0)
+                const double step = number_or(parameter, "step", 0.0);
+                const auto format = integer ? std::string{"%.0f"} : slider_format(minimum, maximum, step);
+                if (slider_scalar(label, values[0], minimum, maximum, format.c_str())) {
+                    if (step > 0.0)
                         values[0] = minimum + std::round((values[0] - minimum) / step) * step;
                     if (integer) values[0] = std::round(values[0]);
                     send(1U);
@@ -1046,7 +1078,7 @@ struct EditorUi::Impl {
     void draw_material_parameter(const std::string& path, const JsonValue::Object& parameter) {
         const auto name = string_or(parameter, "name");
         draw_material_parameter(
-            parameter, [&](const std::string& fields) { set_material_parameter(path, fields); },
+            parameter, [this, path](const std::string& fields) { set_material_parameter(path, fields); },
             boolean_or(parameter, "set", false)
                 ? std::function<void()>([&] {
                       set_material_parameter(path, ",\"name\":\"" + json_escape(name) + "\",\"reset\":true");
@@ -1085,8 +1117,14 @@ struct EditorUi::Impl {
     }
 
     void material_preview_ready(const std::string& path, const std::uint32_t width, const std::uint32_t height,
-                                const std::vector<std::uint8_t>& rgba) {
+                                std::vector<std::uint8_t> rgba) {
         if (width == 0U || height == 0U || rgba.size() != static_cast<std::size_t>(width) * height * 4U) return;
+        // Kept as delivered for thumbnails: the renderer draws a material again only when it
+        // changes, so a thumbnail of what it drew last is taken from here.
+        last_preview = {path, width, height, rgba};
+        thumbnails.store_material(path, width, height, rgba);
+        // ImGui textures are sampled as linear values on the sRGB swapchain.
+        srgb_rows_to_linear(rgba);
         preview_path = path;
         const bool reuse = preview_texture && preview_texture->Width == static_cast<int>(width) &&
                            preview_texture->Height == static_cast<int>(height) &&
@@ -1123,32 +1161,28 @@ struct EditorUi::Impl {
         ImGui::PushID(path.c_str());
         if (!post) draw_material_preview(path);
         const auto shader = string_or(*material, "shader");
-        const auto set_shader = [&](const std::string& chosen) {
+        const auto set_shader = [this, path](const std::string& chosen) {
             if (call("assets.set_material", "\"path\":\"" + json_escape(path) + "\",\"shader\":\"" +
                                                 json_escape(chosen) + '"'))
                 shader_material_info.erase(path);
         };
-        if (inspector_begin_combo("Shader", shader.empty() ? "<none>" : shader.c_str())) {
-            for (const auto& file : shader_files) {
-                if (ImGui::Selectable(file.c_str(), file == shader)) set_shader(file);
-                note_item("inspector:material:shader:" + file);
-            }
-            ImGui::Separator();
-            if (ImGui::Selectable(post ? "New post-processing shader" : "New surface shader")) {
-                (void)call("assets.create_folder", "\"path\":\"shaders\"", false);
-                if (const auto created = create_shader("shaders", post)) set_shader(*created);
-            }
-            note_item("inspector:material:shader:new");
-            ImGui::EndCombo();
-        }
-        note_item("inspector:material:shader");
-        if (ImGui::BeginDragDropTarget()) {
-            if (const auto* payload = ImGui::GetDragDropPayload(); payload && payload->IsDataType("relay.asset")) {
-                const std::string dropped(static_cast<const char*>(payload->Data));
-                if (dropped.ends_with(".relay-shader") && ImGui::AcceptDragDropPayload("relay.asset")) set_shader(dropped);
-            }
-            ImGui::EndDragDropTarget();
-        }
+        asset_field(
+            "Shader", shader, "inspector:material:shader",
+            [=, this] {
+                AssetPick pick;
+                pick.key = "inspector:material:shader";
+                pick.title = "Choose a shader for " + asset_display_name(path);
+                pick.current = shader;
+                pick.kinds = {"shader"};
+                pick.accepts = [](const std::string& file) { return file.ends_with(".relay-shader"); };
+                pick.actions.emplace_back(post ? "New post-processing shader" : "New surface shader", [this, post, set_shader] {
+                    (void)call("assets.create_folder", "\"path\":\"shaders\"", false);
+                    if (const auto created = create_shader("shaders", post)) set_shader(*created);
+                });
+                pick.choose = set_shader;
+                return pick;
+            },
+            "None", AssetIcon::shader);
         if (!shader.empty()) {
             inspector_field_label("");
             if (ImGui::SmallButton("Edit shader")) open_shader(shader);
@@ -1182,7 +1216,7 @@ struct EditorUi::Impl {
                     enabled.push_back(boolean_or(*effect, "enabled", true));
                     in_editor.push_back(boolean_or(*effect, "editor", true));
                 }
-        const auto set_list = [&](const std::vector<std::string>& list, const char* label) {
+        const auto set_list = [this, request_fields](const std::vector<std::string>& list, const char* label) {
             std::string fields = request_fields + ",\"effects\":[";
             for (std::size_t index = 0; index < list.size(); ++index)
                 fields += (index ? ",\"" : "\"") + json_escape(list[index]) + '"';
@@ -1208,13 +1242,15 @@ struct EditorUi::Impl {
         for (std::size_t index = 0; index < materials.size(); ++index) {
             ImGui::PushID(static_cast<int>(index));
             bool on = enabled[index];
-            if (ImGui::Checkbox("##on", &on))
+            if (editor_checkbox("##on", &on))
                 mutate("scene.set_post_effect",
                        request_fields + ",\"index\":" + std::to_string(index) + ",\"enabled\":" + (on ? "true" : "false"),
                        on ? "Effect on" : "Effect off");
             note_item("inspector:post:enabled:" + std::to_string(index));
             ImGui::SameLine();
-            const bool open = ImGui::TreeNodeEx(base_name(materials[index]).c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
+            const bool open = ImGui::TreeNodeEx("##effect", ImGuiTreeNodeFlags_SpanAvailWidth, "%s",
+                                                asset_display_name(materials[index]).c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", materials[index].c_str());
             note_item("inspector:post:effect:" + std::to_string(index));
             ImGui::SameLine(ImGui::GetContentRegionMax().x - 3.0F * ImGui::GetFrameHeight());
             ImGui::BeginDisabled(index == 0U);
@@ -1242,7 +1278,7 @@ struct EditorUi::Impl {
             if (open) {
                 bool shown = in_editor[index];
                 inspector_field_label("Editor view");
-                if (ImGui::Checkbox("##editor_view", &shown))
+                if (editor_checkbox("##editor_view", &shown))
                     mutate("scene.set_post_effect",
                            request_fields + ",\"index\":" + std::to_string(index) + ",\"editor\":" +
                                (shown ? "true" : "false"),
@@ -1256,45 +1292,39 @@ struct EditorUi::Impl {
             }
             ImGui::PopID();
         }
-        const auto add = [&](const std::string& path) {
+        const auto add = [materials, set_list](const std::string& path) {
             auto list = materials;
             list.push_back(path);
             set_list(list, "Effect added");
         };
-        if (inspector_begin_combo("Add effect", "Choose a material...")) {
-            for (const auto& path : shader_materials_of_type("post_process")) {
-                if (ImGui::Selectable(path.c_str())) add(path);
-                note_item("inspector:post:add:" + path);
-            }
-            ImGui::Separator();
-            if (ImGui::Selectable("New post-processing material")) {
-                (void)call("assets.create_folder", "\"path\":\"materials\"", false);
-                if (const auto created = create_material("materials", true)) add(*created);
-            }
-            note_item("inspector:post:add:new");
-            ImGui::SeparatorText("Ready-made");
-            for (const auto& effect : shader_effects()) {
-                if (ImGui::Selectable(std::string{effect.name}.c_str()))
-                    if (const auto material = add_ready_made_effect(effect)) add(*material);
-                note_item("inspector:post:add:" + std::string{effect.id});
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s. Copied into the project's shaders and materials folders, where you can "
-                                      "change it like any other shader.",
-                                      std::string{effect.description}.c_str());
-            }
-            ImGui::EndCombo();
-        }
-        note_item("inspector:post:add");
-        if (ImGui::BeginDragDropTarget()) {
-            if (const auto* payload = ImGui::GetDragDropPayload(); payload && payload->IsDataType("relay.asset")) {
-                const std::string dropped(static_cast<const char*>(payload->Data));
-                const auto* material = dropped.ends_with(".relay-material") ? shader_material_summary(dropped) : nullptr;
-                if (material && string_or(*material, "type") == "post_process" &&
-                    ImGui::AcceptDragDropPayload("relay.asset"))
-                    add(dropped);
-            }
-            ImGui::EndDragDropTarget();
-        }
+        asset_add_button(
+            "+ Add effect...", "inspector:post:add",
+            [=, this] {
+                AssetPick pick;
+                pick.key = "inspector:post:add";
+                pick.title = "Add a post-processing effect";
+                pick.kinds = {"material"};
+                pick.accepts = [this](const std::string& path) { return material_facts_of(path).type == "post_process"; };
+                pick.what = "a post-processing material";
+                for (const auto& effect : shader_effects())
+                    pick.choices.push_back({"@ready:" + std::string{effect.id}, std::string{effect.name}, AssetIcon::post_material,
+                                            "@ready",
+                                            std::string{effect.description} +
+                                                ". Copied into the project's shaders and materials folders, where you can "
+                                                "change it like any other shader.",
+                                            std::nullopt});
+                pick.actions.emplace_back("New post-processing material", [this, add] {
+                    (void)call("assets.create_folder", "\"path\":\"materials\"", false);
+                    if (const auto created = create_material("materials", true)) add(*created);
+                });
+                pick.choose = [this, add](const std::string& value) {
+                    if (!value.starts_with("@ready:")) return add(value);
+                    for (const auto& effect : shader_effects())
+                        if ("@ready:" + std::string{effect.id} == value)
+                            if (const auto material = add_ready_made_effect(effect)) add(*material);
+                };
+                return pick;
+            });
     }
 
     // A ready-made effect's shader and material in the project (shaders/Bloom.relay-shader and
@@ -1767,7 +1797,7 @@ struct EditorUi::Impl {
                 restore_shader_text(tab, tab.history_index + 1U);
         }
         ImGui::SameLine();
-        if (ImGui::Checkbox("Live preview", &shader_live_preview) && !shader_live_preview) discard_shader_preview(tab);
+        if (editor_checkbox("Live preview", &shader_live_preview) && !shader_live_preview) discard_shader_preview(tab);
         note_item("shader_editor:live_preview");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show changes in the viewport as you make them, before saving");
         ImGui::SameLine();
@@ -1982,10 +2012,10 @@ struct EditorUi::Impl {
         }
         if (graph.type == ShaderType::surface) {
             ImGui::SeparatorText("Surface");
-            if (ImGui::Checkbox("Transparent", &graph.transparent)) graph_changed(tab, true);
+            if (editor_checkbox("Transparent", &graph.transparent)) graph_changed(tab, true);
             note_item("shader_editor:transparent");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Blend with what is behind, using the output's Alpha");
-            if (ImGui::Checkbox("Unshaded", &graph.unshaded)) graph_changed(tab, true);
+            if (editor_checkbox("Unshaded", &graph.unshaded)) graph_changed(tab, true);
             note_item("shader_editor:unshaded");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show Albedo and Emission as they are, without lighting");
         }
@@ -2557,7 +2587,7 @@ struct EditorUi::Impl {
                 ImGui::InputText("Credential", provider_credential.data(), provider_credential.size(), ImGuiInputTextFlags_Password);
                 note_item("agent:credential");
                 ImGui::TextWrapped(settings && boolean_or(*settings, "authenticated", false) ? "Authentication configured. Leave blank to keep it." : "Enter an API key or authentication token.");
-                ImGui::Checkbox("Remove saved credential", &provider_clear);
+                editor_checkbox("Remove saved credential", &provider_clear);
             }
             ImGui::BeginDisabled(!connected || busy);
             if (ImGui::Button("Save provider")) {
@@ -2578,7 +2608,7 @@ struct EditorUi::Impl {
         note_item("agent:access-tab");
         if (access_tab) {
             bool automatic = session_object && boolean_or(*session_object, "auto_approval", false);
-            if (ImGui::Checkbox("Allow all actions", &automatic))
+            if (editor_checkbox("Allow all actions", &automatic))
                 (void)mutate("session.auto_approval", std::string("\"enabled\":") + (automatic ? "true" : "false"), automatic ? "All actions allowed" : "Action approvals required");
             note_item("agent:auto-approval");
             ImGui::TextDisabled("Project: %s", session_object ? string_or(*session_object, "project", "").c_str() : "");
@@ -2888,6 +2918,20 @@ struct EditorUi::Impl {
         };
         collect("meshes", mesh_names);
         collect("materials", material_names);
+        registry_items.clear();
+        for (const auto* key : {"meshes", "materials"})
+            if (const auto* list = field(*object, key); list && list->array())
+                for (const auto& item : *list->array())
+                    if (const auto* record = item.object()) {
+                        RegistryItem entry{string_or(*record, "label"), string_or(*record, "source"), std::nullopt};
+                        if (const auto* color = field(*record, "color"); color && color->array() && color->array()->size() >= 3U) {
+                            std::array<float, 4> rgba{1.0F, 1.0F, 1.0F, 1.0F};
+                            for (std::size_t index = 0; index < std::min<std::size_t>(4U, color->array()->size()); ++index)
+                                if (const auto value = (*color->array())[index].number()) rgba[index] = static_cast<float>(*value);
+                            entry.color = rgba;
+                        }
+                        registry_items[string_or(*record, "name")] = std::move(entry);
+                    }
         if (const auto* meshes = field(*object, "meshes"); meshes && meshes->array())
             for (const auto& mesh : *meshes->array())
                 if (const auto* record = mesh.object())
@@ -4054,11 +4098,22 @@ struct EditorUi::Impl {
                        row_min.y + (row_max.y - row_min.y - size.y) * 0.5F),
                 ImGui::GetColorU32(editor_color(editor_palette().text_faint)), type.c_str());
         }
+        // Rows select when the button is released without a drag, so a node can be dragged onto a
+        // field of the node the Inspector shows without selecting it first.
         if (!editing && ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            hierarchy_pressed = handle;
+            hierarchy_press_double = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+        }
+        if (!editing && hierarchy_pressed == handle && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
             const auto& io = ImGui::GetIO();
-            const bool sole = selection == handle && selections.handles.size() == 1U;
-            click_selection(handle, true);
-            note_slow_click(RenameKind::entity, handle, sole && !io.KeyCtrl && !io.KeyShift);
+            hierarchy_pressed.clear();
+            const bool dragged = io.MouseDragMaxDistanceSqr[0] > io.MouseDragThreshold * io.MouseDragThreshold;
+            if (!dragged && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
+                const bool sole = selection == handle && selections.handles.size() == 1U;
+                click_selection(handle, true);
+                note_slow_click(RenameKind::entity, handle,
+                                sole && !io.KeyCtrl && !io.KeyShift && !hierarchy_press_double);
+            }
         }
 
         // Dragging one row onto another reparents it. The drop target rejects its own subtree
@@ -4163,6 +4218,14 @@ struct EditorUi::Impl {
     }
 
     // Ancestor names from the top, such as "Environment / Props"; empty for top-level nodes.
+    // Where a node sits in the hierarchy, as "Parent / Child / Node", for tooltips.
+    [[nodiscard]] std::string node_path(const std::string& handle) const {
+        const auto* node = find_entity(handle);
+        if (!node) return {};
+        const auto parents = entity_parent_path(*node);
+        return parents.empty() ? string_or(*node, "name") : parents + " / " + string_or(*node, "name");
+    }
+
     [[nodiscard]] std::string entity_parent_path(const JsonValue::Object& entity) const {
         std::vector<std::string> names;
         for (auto parent = string_or(entity, "parent"); !parent.empty() && names.size() < 64;) {
@@ -4487,60 +4550,51 @@ struct EditorUi::Impl {
         const auto material =
             renderer != nullptr ? string_or(*renderer, "material") : std::string{};
 
-        const auto combo = [&](const char* const label, const std::vector<std::string>& options,
-                               const std::string& current) -> std::optional<std::string> {
-            std::optional<std::string> chosen;
-            if (inspector_begin_combo(label, current.empty() ? "<none>" : current.c_str())) {
-                for (const auto& option : options) {
-                    if (ImGui::Selectable(option.c_str(), option == current)) chosen = option;
-                }
-                ImGui::EndCombo();
-            }
-            return chosen;
-        };
-
-        if (const auto chosen = combo("Mesh", mesh_names, mesh)) {
+        const auto handle = selection;
+        const auto set_mesh = [this, handle, material](const std::string& chosen) {
             mutate("scene.set_renderer",
-                   entity_field(selection) + ",\"enabled\":true,\"mesh\":\"" + *chosen +
-                       "\",\"material\":\"" + (material.empty() ? "builtin.orange" : material) +
-                       '"',
+                   entity_field(handle) + ",\"enabled\":true,\"mesh\":\"" + json_escape(chosen) +
+                       "\",\"material\":\"" + json_escape(material.empty() ? "builtin.orange" : material) + '"',
                    "Renderer updated");
-        }
-        const auto set_material = [&](const std::string& chosen) {
+        };
+        asset_field(
+            "Mesh", mesh, "inspector:renderer:mesh",
+            [=, this] {
+                AssetPick pick;
+                pick.key = "inspector:renderer:mesh";
+                pick.title = "Choose a mesh";
+                pick.current = mesh;
+                add_registry_choices(pick, mesh_names, true);
+                pick.choose = set_mesh;
+                return pick;
+            }, "None", AssetIcon::mesh);
+        const auto set_material = [this, handle, mesh](const std::string& chosen) {
             mutate("scene.set_renderer",
-                   entity_field(selection) + ",\"enabled\":true,\"mesh\":\"" +
-                       (mesh.empty() ? "builtin.triangle" : mesh) + "\",\"material\":\"" +
+                   entity_field(handle) + ",\"enabled\":true,\"mesh\":\"" +
+                       json_escape(mesh.empty() ? "builtin.triangle" : mesh) + "\",\"material\":\"" +
                        json_escape(chosen) + '"',
                    "Renderer updated");
         };
-        // Built-in and imported materials, then the project's surface materials.
-        if (inspector_begin_combo("Material", material.empty() ? "<none>" : material.c_str())) {
-            for (const auto& option : material_names)
-                if (ImGui::Selectable(option.c_str(), option == material)) set_material(option);
-            const auto files = shader_materials_of_type("surface");
-            if (!files.empty()) ImGui::Separator();
-            for (const auto& option : files) {
-                if (ImGui::Selectable(option.c_str(), option == material)) set_material(option);
-                note_item("inspector:renderer:material:" + option);
-            }
-            ImGui::Separator();
-            if (ImGui::Selectable("New material")) {
-                (void)call("assets.create_folder", "\"path\":\"materials\"", false);
-                if (const auto created = create_material("materials", false)) set_material(*created);
-            }
-            note_item("inspector:renderer:material:new");
-            ImGui::EndCombo();
-        }
-        note_item("inspector:renderer:material");
-        if (ImGui::BeginDragDropTarget()) {
-            if (const auto* payload = ImGui::GetDragDropPayload(); payload && payload->IsDataType("relay.asset")) {
-                const std::string dropped(static_cast<const char*>(payload->Data));
-                const auto* summary = dropped.ends_with(".relay-material") ? shader_material_summary(dropped) : nullptr;
-                if (summary && string_or(*summary, "type") == "surface" && ImGui::AcceptDragDropPayload("relay.asset"))
-                    set_material(dropped);
-            }
-            ImGui::EndDragDropTarget();
-        }
+        // Built-in and imported materials, and the project's surface materials.
+        asset_field(
+            "Material", material, "inspector:renderer:material",
+            [=, this] {
+                AssetPick pick;
+                pick.key = "inspector:renderer:material";
+                pick.title = "Choose a material";
+                pick.current = material;
+                pick.kinds = {"material"};
+                pick.accepts = [this](const std::string& path) { return material_facts_of(path).type == "surface"; };
+                pick.what = "a surface material";
+                add_registry_choices(pick, material_names, false);
+                pick.actions.emplace_back("New material", [this, set_material] {
+                    (void)call("assets.create_folder", "\"path\":\"materials\"", false);
+                    if (const auto created = create_material("materials", false)) set_material(*created);
+                });
+                pick.choose = set_material;
+                return pick;
+            },
+            "None", AssetIcon::material);
         if (material.ends_with(".relay-material")) {
             draw_shader_material_fields(material, false);
             draw_object_parameters(*renderer, material);
@@ -4671,7 +4725,7 @@ struct EditorUi::Impl {
         // A slider bounded by the clip is what makes scrubbing usable; an unknown or zero-length
         // clip keeps the open-ended drag so the field never becomes unusable.
         const bool seeked = duration > 0.0
-                                ? slider_scalar("Time", time_seconds, 0.0, duration, "%.3f s")
+                                ? slider_scalar("Time", time_seconds, 0.0, duration, "%.2f s")
                                 : drag_scalar("Time", time_seconds, 0.01F);
         if (seeked && time_seconds >= 0.0) {
             mutate("scene.set_animation",
@@ -4704,7 +4758,7 @@ struct EditorUi::Impl {
                    ",\"loop\":" + (loop ? "false" : "true"), "Key loop updated");
         auto duration = number_or(*animation, "duration_seconds", 1.0);
         auto time = number_or(*animation, "time_seconds", 0.0);
-        if (slider_scalar("Key time", time, 0.0, duration, "%.3f s"))
+        if (slider_scalar("Key time", time, 0.0, duration, "%.2f s"))
             mutate("scene.keyframes.playback", entity_request +
                    ",\"playing\":false,\"time_seconds\":" + number_text(time),
                    "Key time updated");
@@ -4867,7 +4921,7 @@ struct EditorUi::Impl {
             ImGui::EndCombo();
         }
         auto enabled = boolean_or(*collider, "enabled", true);
-        if (ImGui::Checkbox("Enabled##collider", &enabled))
+        if (inspector_checkbox("Enabled##collider", &enabled))
             mutate("scene.set_collider", entity_request +
                    ",\"enabled\":" + (enabled ? "true" : "false"), "Collider updated");
         auto center = editor_vector(*collider, "center", {0, 0, 0});
@@ -4887,17 +4941,22 @@ struct EditorUi::Impl {
             const auto mesh = string_or(*collider, "mesh");
             const auto* renderer = component(entity, "mesh_renderer");
             const auto renderer_mesh = renderer ? string_or(*renderer, "mesh") : std::string{};
-            const auto preview = mesh.empty() ? "Renderer mesh" : mesh;
-            if (inspector_begin_combo("Collision mesh", preview.c_str())) {
-                if (ImGui::Selectable("Renderer mesh", mesh.empty()))
-                    mutate("scene.set_collider", entity_request + ",\"mesh\":\"\"",
-                           "Collider mesh updated");
-                for (const auto& option : mesh_names)
-                    if (ImGui::Selectable(option.c_str(), option == mesh))
-                        mutate("scene.set_collider", entity_request + ",\"mesh\":\"" +
-                               json_escape(option) + '"', "Collider mesh updated");
-                ImGui::EndCombo();
-            }
+            const auto set_mesh = [this, entity_request](const std::string& chosen) {
+                mutate("scene.set_collider", entity_request + ",\"mesh\":\"" + json_escape(chosen) + '"',
+                       "Collider mesh updated");
+            };
+            asset_field(
+                "Collision mesh", mesh, "inspector:collider:mesh",
+                [=, this] {
+                    AssetPick pick;
+                    pick.key = "inspector:collider:mesh";
+                    pick.title = "Choose a collision mesh";
+                    pick.current = mesh;
+                    pick.choices.push_back({"", "Use the renderer's mesh", AssetIcon::mesh, "", "", std::nullopt});
+                    add_registry_choices(pick, mesh_names, true);
+                    pick.choose = set_mesh;
+                    return pick;
+                }, "Renderer mesh", AssetIcon::mesh);
             const auto& source = mesh.empty() ? renderer_mesh : mesh;
             if (source.empty())
                 ImGui::TextDisabled("Add a mesh renderer or choose a collision mesh.");
@@ -4951,7 +5010,7 @@ struct EditorUi::Impl {
                 mutate("scene.set_physics_body", body_request + ",\"gravity_scale\":" +
                        number_text(gravity), "Physics body gravity updated");
             bool locked = boolean_or(*body, "lock_rotation", false);
-            if (ImGui::Checkbox("Lock rotation", &locked))
+            if (inspector_checkbox("Lock rotation", &locked))
                 mutate("scene.set_physics_body",
                        body_request + ",\"lock_rotation\":" + (locked ? "true" : "false"),
                        locked ? "Rotation locked" : "Rotation unlocked");
@@ -4991,25 +5050,24 @@ struct EditorUi::Impl {
             mutate("scene.set_audio_source", request_fields + fields, label);
         };
         const auto clip = string_or(*source, "clip");
-        const auto pick_clip = [&](const std::string& chosen) {
-            set(",\"clip\":\"" + json_escape(chosen) + '"', chosen.empty() ? "Clip cleared" : "Clip set");
+        const auto pick_clip = [this, request_fields](const std::string& chosen) {
+            mutate("scene.set_audio_source", request_fields + ",\"clip\":\"" + json_escape(chosen) + '"',
+                   chosen.empty() ? "Clip cleared" : "Clip set");
         };
-        if (inspector_begin_combo("Clip", clip.empty() ? "<none>" : clip.c_str())) {
-            if (ImGui::Selectable("<none>", clip.empty())) pick_clip({});
-            for (const auto& file : audio_files) {
-                if (ImGui::Selectable(file.c_str(), file == clip)) pick_clip(file);
-                note_item("inspector:audio:clip:" + file);
-            }
-            if (audio_files.empty())
-                ImGui::TextDisabled("No .wav, .flac, .mp3 or .ogg files in the project");
-            ImGui::EndCombo();
-        }
-        note_item("inspector:audio:clip");
-        // Sound files dragged from the Assets panel drop onto the picker.
-        if (ImGui::BeginDragDropTarget()) {
-            if (const auto dropped = accept_sound_drop()) pick_clip(*dropped);
-            ImGui::EndDragDropTarget();
-        }
+        // Sound files dragged from the Assets panel drop onto the field too.
+        asset_field(
+            "Clip", clip, "inspector:audio:clip",
+            [=, this] {
+                AssetPick pick;
+                pick.key = "inspector:audio:clip";
+                pick.title = "Choose a sound";
+                pick.current = clip;
+                pick.kinds = {"audio"};
+                pick.choices.push_back({"", "None", AssetIcon::audio, "", "", std::nullopt});
+                pick.choose = pick_clip;
+                return pick;
+            },
+            "None", AssetIcon::audio);
 
         const auto* voice = audio_voice(selection);
         if (!clip.empty()) {
@@ -5068,7 +5126,7 @@ struct EditorUi::Impl {
         const auto flag = [&](const char* label, const char* wire, const char* tooltip) {
             bool value = boolean_or(*source, wire, false);
             inspector_field_label(label);
-            if (ImGui::Checkbox((std::string("##") + wire).c_str(), &value))
+            if (editor_checkbox((std::string("##") + wire).c_str(), &value))
                 set(",\"" + std::string(wire) + "\":" + (value ? "true" : "false"),
                     "Audio source updated");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
@@ -5122,11 +5180,11 @@ struct EditorUi::Impl {
         if (const auto* list = field(*player, "tracks"); list && list->array())
             for (const auto& item : *list->array())
                 if (item.string()) tracks.push_back(*item.string());
-        const auto set_tracks = [&](const std::vector<std::string>& changed, const char* label) {
+        const auto set_tracks = [this, request_fields](const std::vector<std::string>& changed, const char* label) {
             std::string fields = ",\"tracks\":[";
             for (std::size_t index = 0; index < changed.size(); ++index)
                 fields += std::string(index ? "," : "") + '"' + json_escape(changed[index]) + '"';
-            set(fields + "]", label);
+            mutate("scene.set_music_player", request_fields + fields + "]", label);
         };
         // What plays now, with controls, while the game runs.
         int playing = -1;
@@ -5143,7 +5201,18 @@ struct EditorUi::Impl {
             const bool current = static_cast<int>(index) == playing;
             if (current) ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.success));
             ImGui::AlignTextToFramePadding();
-            ImGui::Text("%s%zu  %s", current ? "> " : "  ", index + 1U, tracks[index].c_str());
+            ImGui::Text("%s%zu", current ? "> " : "  ", index + 1U);
+            ImGui::SameLine();
+            {
+                const float icon = ImGui::GetTextLineHeight();
+                const auto at = ImGui::GetCursorScreenPos();
+                draw_asset_type_icon(ImGui::GetWindowDrawList(),
+                                     ImVec2(at.x, at.y + ImGui::GetStyle().FramePadding.y), icon, AssetIcon::audio, 0.8F);
+                ImGui::Dummy(ImVec2(icon, ImGui::GetFrameHeight()));
+                ImGui::SameLine(0.0F, ImGui::GetStyle().ItemInnerSpacing.x);
+            }
+            ImGui::TextUnformatted(asset_display_name(tracks[index]).c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tracks[index].c_str());
             if (current) ImGui::PopStyleColor();
             ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetContentRegionMax().x - 88.0F * ui_scale));
             if (game && ImGui::SmallButton("Play"))
@@ -5165,26 +5234,21 @@ struct EditorUi::Impl {
         }
         if (changed) set_tracks(*changed, "Playlist changed");
         if (tracks.size() < maximum_music_tracks) {
-            if (inspector_begin_combo("Add track", "+ Choose a sound file")) {
-                for (const auto& file : audio_files) {
-                    if (ImGui::Selectable(file.c_str())) {
-                        auto added = tracks;
-                        added.push_back(file);
-                        set_tracks(added, "Track added");
-                    }
-                    note_item("inspector:music:add:" + file);
-                }
-                ImGui::EndCombo();
-            }
-            note_item("inspector:music:add");
-            if (ImGui::BeginDragDropTarget()) {
-                if (const auto dropped = accept_sound_drop()) {
-                    auto added = tracks;
-                    added.push_back(*dropped);
-                    set_tracks(added, "Track added");
-                }
-                ImGui::EndDragDropTarget();
-            }
+            const auto add_track = [tracks, set_tracks](const std::string& file) {
+                auto added = tracks;
+                added.push_back(file);
+                set_tracks(added, "Track added");
+            };
+            asset_add_button(
+                "+ Add track...", "inspector:music:add",
+                [=, this] {
+                    AssetPick pick;
+                    pick.key = "inspector:music:add";
+                    pick.title = "Add a track";
+                    pick.kinds = {"audio"};
+                    pick.choose = add_track;
+                    return pick;
+                });
         }
         if (game) {
             if (ImGui::Button("Next")) (void)call("audio.music", request_fields + ",\"action\":\"next\"");
@@ -5214,7 +5278,7 @@ struct EditorUi::Impl {
         const auto flag = [&](const char* label, const char* wire, const bool fallback, const char* tip) {
             bool value = boolean_or(*player, wire, fallback);
             inspector_field_label(label);
-            if (ImGui::Checkbox((std::string("##") + wire).c_str(), &value))
+            if (editor_checkbox((std::string("##") + wire).c_str(), &value))
                 set(",\"" + std::string(wire) + "\":" + (value ? "true" : "false"), "Music player updated");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
         };
@@ -5283,35 +5347,29 @@ struct EditorUi::Impl {
 
         ImGui::SeparatorText("Skybox");
         const auto material = string_or(*sky, "material");
-        const auto pick_material = [&](const std::string& chosen) {
-            set(",\"material\":\"" + json_escape(chosen) + '"',
-                chosen.empty() ? "Sky gradient chosen" : "Sky material chosen");
+        const auto pick_material = [this, request_fields](const std::string& chosen) {
+            mutate("scene.set_sky", request_fields + ",\"material\":\"" + json_escape(chosen) + '"',
+                   chosen.empty() ? "Sky gradient chosen" : "Sky material chosen");
         };
-        if (inspector_begin_combo("Skybox", material.empty() ? "Gradient" : material.c_str())) {
-            if (ImGui::Selectable("Gradient", material.empty())) pick_material({});
-            note_item("inspector:sky:material:gradient");
-            for (const auto& file : sky_material_files) {
-                if (ImGui::Selectable(file.c_str(), file == material)) pick_material(file);
-                note_item("inspector:sky:material:" + file);
-            }
-            ImGui::Separator();
-            if (ImGui::Selectable("New sky material")) create_sky_material({}, selection);
-            note_item("inspector:sky:material:new");
-            ImGui::EndCombo();
-        }
-        note_item("inspector:sky:material");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("A color gradient, or a sky material showing a panorama image");
-        // Sky materials dragged from the Assets panel drop onto the picker.
-        if (ImGui::BeginDragDropTarget()) {
-            if (const auto* payload = ImGui::GetDragDropPayload();
-                payload && payload->IsDataType("relay.asset")) {
-                const std::string path(static_cast<const char*>(payload->Data));
-                if (path.ends_with(".relay-material") && ImGui::AcceptDragDropPayload("relay.asset"))
-                    pick_material(path);
-            }
-            ImGui::EndDragDropTarget();
-        }
+        // A color gradient, or a sky material showing a panorama image. Sky materials dragged
+        // from the Assets panel drop onto the field.
+        const auto handle = selection;
+        asset_field(
+            "Skybox", material, "inspector:sky:material",
+            [=, this] {
+                AssetPick pick;
+                pick.key = "inspector:sky:material";
+                pick.title = "Choose a sky material";
+                pick.current = material;
+                pick.kinds = {"material"};
+                pick.accepts = [this](const std::string& path) { return material_facts_of(path).type == "sky"; };
+                pick.what = "a sky material";
+                pick.choices.push_back({"", "Gradient", AssetIcon::sky_material, "", "", std::nullopt});
+                pick.actions.emplace_back("New sky material", [this, handle] { create_sky_material({}, handle); });
+                pick.choose = pick_material;
+                return pick;
+            },
+            "Gradient", AssetIcon::sky_material);
         if (material.empty()) {
             const Sky defaults;
             auto horizon = editor_vector(*sky, "horizon_color", {defaults.horizon_color.x,
@@ -5369,7 +5427,7 @@ struct EditorUi::Impl {
         ImGui::SeparatorText("Fog");
         bool fog = boolean_or(*sky, "fog", true);
         inspector_field_label("Fog");
-        if (ImGui::Checkbox("##fog", &fog))
+        if (editor_checkbox("##fog", &fog))
             set(std::string(",\"fog\":") + (fog ? "true" : "false"), fog ? "Fog on" : "Fog off");
         note_item("inspector:sky:fog");
         if (fog) {
@@ -5402,34 +5460,29 @@ struct EditorUi::Impl {
                                "%s cannot be read; the gradient shows instead", path.c_str());
             return;
         }
-        const auto save = [&](const std::string& fields) {
+        const auto save = [this, path](const std::string& fields) {
             // File edits are not undoable scene changes, so drags leave no gesture behind.
             pending_gesture = 0U;
             if (call("assets.set_sky_material", "\"path\":\"" + json_escape(path) + '"' + fields))
                 sky_material_info.erase(path);
         };
         const auto panorama = string_or(*material, "panorama");
-        if (inspector_begin_combo("Panorama", panorama.empty() ? "<none>" : panorama.c_str())) {
-            for (const auto& file : panorama_files) {
-                if (ImGui::Selectable(file.c_str(), file == panorama))
-                    save(",\"panorama\":\"" + json_escape(file) + '"');
-                note_item("inspector:sky:panorama:" + file);
-            }
-            if (panorama_files.empty()) ImGui::TextDisabled("No PNG or JPEG images in the project");
-            ImGui::EndCombo();
-        }
-        note_item("inspector:sky:panorama");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("An equirectangular (2:1) panorama, such as an exported photo sphere");
-        if (ImGui::BeginDragDropTarget()) {
-            if (const auto* payload = ImGui::GetDragDropPayload();
-                payload && payload->IsDataType("relay.asset")) {
-                const std::string dropped(static_cast<const char*>(payload->Data));
-                if (panorama_file(dropped) && ImGui::AcceptDragDropPayload("relay.asset"))
-                    save(",\"panorama\":\"" + json_escape(dropped) + '"');
-            }
-            ImGui::EndDragDropTarget();
-        }
+        const auto set_panorama = [save](const std::string& file) { save(",\"panorama\":\"" + json_escape(file) + '"'); };
+        // An equirectangular (2:1) panorama, such as an exported photo sphere.
+        asset_field(
+            "Panorama", panorama, "inspector:sky:panorama",
+            [=, this] {
+                AssetPick pick;
+                pick.key = "inspector:sky:panorama";
+                pick.title = "Choose a panorama image (2:1)";
+                pick.current = panorama;
+                pick.kinds = {"image"};
+                pick.accepts = [](const std::string& file) { return panorama_file(file); };
+                pick.what = "a PNG or JPEG image";
+                pick.choose = set_panorama;
+                return pick;
+            },
+            "None", AssetIcon::image);
         if (const auto* image = field(*material, "image"); image && image->object()) {
             const auto width = number_or(*image->object(), "width", 0.0);
             const auto height = number_or(*image->object(), "height", 0.0);
@@ -5611,32 +5664,39 @@ struct EditorUi::Impl {
             ImGui::EndCombo();
         }
         bool enabled = boolean_or(*joint, "enabled", true);
-        if (ImGui::Checkbox("Enabled##joint", &enabled))
+        if (inspector_checkbox("Enabled##joint", &enabled))
             set(std::string{",\"enabled\":"} + (enabled ? "true" : "false"), "Joint updated");
 
         // The partner: any other node with a physics body or collider, or the world.
         const auto connected = string_or(*joint, "connected");
         const auto* partner = connected.empty() ? nullptr : find_entity(connected);
-        const auto preview = partner ? string_or(*partner, "name") : std::string{"World"};
-        const bool choosing = inspector_begin_combo("Connected to", preview.c_str());
-        note_item("joint:connected");
-        if (choosing) {
-            if (ImGui::Selectable("World", connected.empty()))
-                set(",\"connected\":\"\"", "Joint connected to the world");
-            for (const auto* candidate : entities) {
-                const auto handle = string_or(*candidate, "entity");
-                if (handle == selection || (!component(*candidate, "physics_body") &&
-                                            !component(*candidate, "collider")))
-                    continue;
-                const auto label = string_or(*candidate, "name") + "##" + handle;
-                if (ImGui::Selectable(label.c_str(), handle == connected))
-                    set(",\"connected\":\"" + handle + '"', "Joint connected");
-                note_item("joint:connected:" + handle);
-            }
-            ImGui::EndCombo();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The body this node is joined to, or a fixed point in the world");
+        // The body this node is joined to, or a fixed point in the world.
+        const auto connect = [this, joint_request](const std::string& handle) {
+            mutate("scene.set_joint", joint_request + ",\"connected\":\"" + handle + '"',
+                   handle.empty() ? "Joint connected to the world" : "Joint connected");
+        };
+        const auto self = selection;
+        asset_field(
+            "Connected to", connected, "joint:connected",
+            [=, this] {
+                AssetPick pick;
+                pick.key = "joint:connected";
+                pick.title = "Choose the body to join to";
+                pick.what = "a node with a collider or physics body";
+                pick.current = connected;
+                pick.choices.push_back({"", "World", AssetIcon::node, "", "", std::nullopt});
+                for (const auto* candidate : entities) {
+                    const auto handle = string_or(*candidate, "entity");
+                    if (handle == self || (!component(*candidate, "physics_body") && !component(*candidate, "collider")))
+                        continue;
+                    pick.choices.push_back({handle, string_or(*candidate, "name"), AssetIcon::node, "@scene",
+                                            node_path(handle), std::nullopt});
+                }
+                pick.choose = connect;
+                return pick;
+            }, "World", AssetIcon::node,
+            partner ? std::optional<Reference>(Reference{string_or(*partner, "name"), AssetIcon::node, node_path(connected)})
+                    : std::nullopt);
 
         auto anchor = editor_vector(*joint, "anchor", {0, 0, 0});
         if (const auto mask = drag_vector3("Anchor", anchor, 0.05F, 84.0F * ui_scale))
@@ -5658,7 +5718,7 @@ struct EditorUi::Impl {
         if (hinge || slider || distance) {
             bool limits = boolean_or(*joint, "limits", false);
             const char* limits_label = hinge ? "Limit angle" : slider ? "Limit travel" : "Limit length";
-            if (ImGui::Checkbox(limits_label, &limits))
+            if (inspector_checkbox(limits_label, &limits))
                 set(std::string{",\"limits\":"} + (limits ? "true" : "false"), "Joint limits updated");
             if (distance && !limits)
                 ImGui::TextDisabled("Keeps the length it has when the game starts.");
@@ -5683,7 +5743,7 @@ struct EditorUi::Impl {
         }
         if (hinge || slider) {
             bool motor = boolean_or(*joint, "motor", false);
-            if (ImGui::Checkbox("Motor", &motor))
+            if (inspector_checkbox("Motor", &motor))
                 set(std::string{",\"motor\":"} + (motor ? "true" : "false"), "Joint motor updated");
             if (motor) {
                 auto speed = number_or(*joint, "motor_speed", 90.0);
@@ -5708,7 +5768,7 @@ struct EditorUi::Impl {
         }
         if (partner) {
             bool collide = boolean_or(*joint, "collide_connected", false);
-            if (ImGui::Checkbox("Collide with connected", &collide))
+            if (inspector_checkbox("Collide with connected", &collide))
                 set(std::string{",\"collide_connected\":"} + (collide ? "true" : "false"),
                     "Joint updated");
         }
@@ -5765,6 +5825,29 @@ struct EditorUi::Impl {
         return false;
     }
 
+    // The asset kind a file name's extension implies, or empty for plain text.
+    static std::string asset_kind_of_file(const std::string_view name) {
+        switch (asset_icon_for_file(name)) {
+        case AssetIcon::audio: return "audio";
+        case AssetIcon::image: return "image";
+        case AssetIcon::model: return "model";
+        case AssetIcon::material: return "material";
+        case AssetIcon::shader: return "shader";
+        case AssetIcon::node_template: return "template";
+        case AssetIcon::scene: return "scene";
+        case AssetIcon::video: return "media";
+        default: return {};
+        }
+    }
+
+    // A text script property holds an asset path when its default or value names one.
+    static std::string script_asset_kind(const JsonValue::Object& declared, const JsonValue& value) {
+        for (const auto* text : {value.string(), field(declared, "value") ? field(declared, "value")->string() : nullptr})
+            if (text && !text->empty())
+                if (auto kind = asset_kind_of_file(*text); !kind.empty()) return kind;
+        return {};
+    }
+
     void draw_script_property(const std::string& script_request, const JsonValue::Object& declared,
                               const JsonValue::Object* stored) {
         const auto name = string_or(declared, "name");
@@ -5778,7 +5861,7 @@ struct EditorUi::Impl {
         ImGui::PushID(name.c_str());
         if (type == "boolean") {
             bool current = value->boolean() && *value->boolean();
-            if (ImGui::Checkbox(name.c_str(), &current))
+            if (inspector_checkbox(name.c_str(), &current))
                 set(std::string{"\"boolean\":"} + (current ? "true" : "false"));
         } else if (type == "number") {
             double current = value->number() ? *value->number() : 0.0;
@@ -5794,15 +5877,40 @@ struct EditorUi::Impl {
             if (drag_vector3(name.c_str(), current, 0.01F, 72.0F * ui_scale))
                 set("\"vector\":[" + number_text(current[0]) + "," + number_text(current[1]) +
                     "," + number_text(current[2]) + "]");
+        } else if (const auto asset_kind = type == "text" ? script_asset_kind(declared, *value) : std::string{};
+                   !asset_kind.empty()) {
+            // Text naming a project file (its default or value has an asset's extension) is edited
+            // as an asset reference.
+            const auto current = value->string() ? *value->string() : std::string{};
+            const auto choose = [this, script_request, name](const std::string& file) {
+                mutate("scene.set_script_property",
+                       script_request + ",\"property\":\"" + name + "\",\"text\":\"" + json_escape(file) + '"',
+                       "Property updated");
+            };
+            const auto key = "inspector:script:" + script_request + ":" + name;
+            asset_field(
+                name.c_str(), current, key,
+                [=, this] {
+                    AssetPick pick;
+                    pick.key = key;
+                    pick.title = "Choose " + name;
+                    pick.current = current;
+                    pick.kinds = {asset_kind};
+                    pick.choices.push_back({"", "None", AssetIcon::other, "", "", std::nullopt});
+                    pick.choose = choose;
+                    return pick;
+                },
+                "None", asset_icon_for_kind(asset_kind));
         } else if (type == "text") {
             auto& buffer = script_text_buffers[script_request + name];
             // Show the stored value unless the person is typing in this field.
-            if (ImGui::GetActiveID() != ImGui::GetID(name.c_str())) {
+            if (ImGui::GetActiveID() != ImGui::GetID(("##" + name).c_str())) {
                 buffer.fill('\0');
                 const auto text = value->string() ? *value->string() : std::string{};
                 std::copy_n(text.begin(), std::min(text.size(), buffer.size() - 1U), buffer.begin());
             }
-            ImGui::InputText(name.c_str(), buffer.data(), buffer.size());
+            inspector_field_label(name.c_str());
+            ImGui::InputText(("##" + name).c_str(), buffer.data(), buffer.size());
             if (ImGui::IsItemDeactivatedAfterEdit())
                 set("\"text\":\"" + json_escape(std::string{buffer.data()}) + '"');
         }
@@ -5832,7 +5940,7 @@ struct EditorUi::Impl {
             }
             const auto script_request = entity_field(selection) + ",\"index\":" + std::to_string(index);
             bool enabled = boolean_or(*script, "enabled", true);
-            if (ImGui::Checkbox("Enabled", &enabled))
+            if (inspector_checkbox("Enabled", &enabled))
                 mutate("scene.set_script", script_request + ",\"enabled\":" + (enabled ? "true" : "false"),
                        enabled ? "Script enabled" : "Script disabled");
             const auto* info = behaviour_info(behaviour);
@@ -6537,7 +6645,9 @@ struct EditorUi::Impl {
             future_action("Build project...");
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Tools")) {
+        const bool tools_menu = ImGui::BeginMenu("Tools");
+        note_item("menu:tools");
+        if (tools_menu) {
             const auto video = call("video.status");
             const bool recording =
                 video && video->object() && boolean_or(*video->object(), "recording", false);
@@ -6556,6 +6666,8 @@ struct EditorUi::Impl {
                 assets_pending = true;
                 refresh_pending = true;
             }
+            if (ImGui::MenuItem("Asset browser")) open_asset_browser(std::nullopt);
+            note_item("menu:asset_browser");
             if (ImGui::MenuItem("Shader editor")) panel_open[11] = true;
             note_item("menu:shader_editor");
             if (ImGui::MenuItem("Animation timeline")) panel_open[6] = true;
@@ -6959,7 +7071,7 @@ struct EditorUi::Impl {
         const auto* parent = node_parent.empty() ? nullptr : find_entity(node_parent);
         if (parent) {
             const auto label = "Add as a child of " + string_or(*parent, "name", "the selection");
-            ImGui::Checkbox(label.c_str(), &node_as_child);
+            editor_checkbox(label.c_str(), &node_as_child);
         } else {
             ImGui::TextColored(editor_color(palette.text_dim), "Adds a node at the top of the scene");
         }
@@ -7320,7 +7432,7 @@ struct EditorUi::Impl {
         ImGui::TextColored(editor_color(palette.text_faint), "%s",
                            input_file_saved ? "Saved in the project file"
                                             : "Engine defaults until you change something");
-        if (ImGui::Checkbox("Lock the mouse cursor while the game has input", &input_edit.lock_mouse))
+        if (editor_checkbox("Lock the mouse cursor while the game has input", &input_edit.lock_mouse))
             changed = true;
         ImGui::SameLine();
         if (ImGui::Button("Reset to defaults")) {
@@ -7405,7 +7517,7 @@ struct EditorUi::Impl {
                 ImGui::TableNextColumn();
                 ImGui::SetNextItemWidth(-1.0F);
                 auto deadzone = static_cast<float>(axis.deadzone);
-                if (ImGui::SliderFloat("##deadzone", &deadzone, 0.0F, 0.95F, "%.2f"))
+                if (editor_slider("##deadzone", &deadzone, 0.0F, 0.95F, "%.2f"))
                     axis.deadzone = deadzone;
                 changed |= ImGui::IsItemDeactivatedAfterEdit();
                 ImGui::TableNextColumn();
@@ -7515,7 +7627,7 @@ struct EditorUi::Impl {
                                 const char* description, const JsonValue::Object* live) {
             bool enabled = settings && boolean_or(*settings, key, true);
             // Without a project the save fails and the status bar says why.
-            if (ImGui::Checkbox(label, &enabled)) {
+            if (editor_checkbox(label, &enabled)) {
                 if (auto saved = call("graphics.set_settings",
                                       std::string{"\""} + key + "\":" + (enabled ? "true" : "false"))) {
                     set_status(std::string(label) + (enabled ? " on" : " off"), false);
@@ -7560,7 +7672,7 @@ struct EditorUi::Impl {
 
         ImGui::SeparatorText("Frame rate");
         bool vsync = settings && boolean_or(*settings, "vsync", false);
-        if (ImGui::Checkbox("Vsync", &vsync)) {
+        if (editor_checkbox("Vsync", &vsync)) {
             if (call("graphics.set_settings", std::string("\"vsync\":") + (vsync ? "true" : "false"))) {
                 set_status(vsync ? "Vsync on" : "Vsync off", false);
                 if (auto refreshed = call("graphics.settings")) graphics_status = std::move(*refreshed);
@@ -7785,8 +7897,7 @@ struct EditorUi::Impl {
                 double edit = bus_volume_target == name ? bus_volume_edit : volume;
                 const double low = minimum_audio_volume_db, high = maximum_audio_volume_db;
                 ImGui::SetNextItemWidth(-FLT_MIN);
-                ImGui::SliderScalar("##volume", ImGuiDataType_Double, &edit, &low, &high,
-                                    edit <= low ? "-inf dB" : "%.1f dB");
+                (void)editor_slider("##volume", &edit, low, high, edit <= low ? "-inf dB" : "%.1f dB");
                 if (ImGui::IsItemActivated()) bus_volume_target = name;
                 if (bus_volume_target == name) bus_volume_edit = edit;
                 // Saved once when the drag ends, since each save rewrites the project file.
@@ -7796,7 +7907,7 @@ struct EditorUi::Impl {
                              name + " volume set");
                     bus_volume_target.clear();
                 }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ctrl+click to type a value");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drag, or click the value to type one");
 
                 ImGui::TableNextColumn();
                 const auto toggle = [&](const char* label, const char* key, const ImU32 on_color) {
@@ -7938,7 +8049,7 @@ struct EditorUi::Impl {
                                               ImGuiInputTextFlags_EnterReturnsTrue);
         note_item("dialog:template:name");
         ImGui::TextDisabled("Saves the node and its children to templates/, for the Add Node window.");
-        ImGui::Checkbox("Replace an existing template", &template_replace);
+        editor_checkbox("Replace an existing template", &template_replace);
         const std::string name = template_name.data();
         ImGui::BeginDisabled(name.empty());
         const bool save = ImGui::Button("Save") || entered;
@@ -8182,8 +8293,9 @@ struct EditorUi::Impl {
     // Keyboard shortcuts, ignored whenever a text field has focus so typing a name never switches
     // the gizmo or deletes the selection.
     void update_shortcuts() {
-        // The shader editor takes typing, Ctrl+S and Ctrl+Z itself.
-        if (shader_editor_focused) return;
+        // The shader editor takes typing, Ctrl+S and Ctrl+Z itself; the Asset Browser takes arrows,
+        // Enter, Backspace and Ctrl+F, and Delete there must not delete scene nodes.
+        if (shader_editor_focused || browser.focused) return;
         if (ImGui::GetIO().WantTextInput || (ImGui::GetActiveID() != 0 && ImGui::GetInputTextState(ImGui::GetActiveID())) || navigating ||
             ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
             return;
@@ -8319,7 +8431,10 @@ struct EditorUi::Impl {
             asset_folders.erase(directory);
             return false;
         }
-        if (directory.empty()) assets_root = string_or(*object, "root", assets_root);
+        if (directory.empty()) {
+            assets_root = string_or(*object, "root", assets_root);
+            thumbnails.set_root(assets_root);
+        }
         asset_listing_truncated |= boolean_or(*object, "truncated", false);
         auto& entries = asset_folders[directory];
         entries.clear();
@@ -8457,24 +8572,10 @@ struct EditorUi::Impl {
     }
 
     void draw_asset_icon(const ImVec2 at, const float size, const AssetEntry& entry) {
-        auto* list = ImGui::GetWindowDrawList();
-        const auto& palette = editor_palette();
-        const float inset = size * 0.14F;
-        const ImVec2 low{at.x + inset, at.y + inset * 1.6F};
-        const ImVec2 high{at.x + size - inset, at.y + size - inset};
-        if (entry.folder) {
-            const ImU32 color = IM_COL32(222, 172, 76, 255);
-            list->AddRectFilled(low, ImVec2(low.x + (high.x - low.x) * 0.45F, low.y + size * 0.16F),
-                                color, size * 0.08F);
-            list->AddRectFilled(ImVec2(low.x, low.y + size * 0.12F), high, color, size * 0.1F);
-            return;
-        }
-        const ImU32 color = entry.importable ? palette.accent : palette.text_faint;
-        const ImVec2 page_low{at.x + size * 0.22F, low.y - inset * 0.6F};
-        list->AddRect(page_low, high, color, size * 0.08F, 0, std::max(1.0F, size * 0.08F));
-        if (entry.importable)
-            list->AddRectFilled(ImVec2(page_low.x + size * 0.14F, high.y - size * 0.3F),
-                                ImVec2(high.x - size * 0.14F, high.y - size * 0.14F), color);
+        const auto icon = entry.folder               ? AssetIcon::folder
+                          : entry.kind == "material" ? asset_icon_for_kind("material", material_facts_of(entry.path).type)
+                                                     : asset_icon_for_kind(entry.kind);
+        draw_asset_type_icon(ImGui::GetWindowDrawList(), at, size, icon, entry.folder || entry.importable ? 1.0F : 0.85F);
     }
 
     void draw_asset_context_menu(const AssetEntry& entry) {
@@ -8788,6 +8889,1340 @@ struct EditorUi::Impl {
         return false;
     }
 
+    // Asset references. Inspector fields that name an asset show its kind's icon and its name
+    // without folders or extension; clicking the field opens the Asset Browser window to choose another.
+
+    // Something to choose that is not a project file: a built-in or imported mesh or material, a
+    // ready-made effect or a scene node. Choices with an empty group ("None", "Gradient") are
+    // buttons at the bottom of the browser; the others live in a virtual folder: "@builtin",
+    // "@ready", "@scene", or the path of the model file an imported mesh or material came from.
+    struct AssetChoice {
+        std::string value, label;
+        AssetIcon icon{AssetIcon::other};
+        std::string group, detail;
+        std::optional<std::array<float, 4>> swatch;
+    };
+    // What the browser is choosing for. `choose` receives a project path or a choice's value; it
+    // captures what it needs by value, since the Inspector may show another node by then.
+    // `what` names what the field takes, for refusing drops ("a surface material"); when empty it
+    // is worked out from the kinds and choices.
+    struct AssetPick {
+        std::string key, title, current, what;
+        std::vector<std::string> kinds;
+        std::function<bool(const std::string&)> accepts;
+        std::vector<AssetChoice> choices;
+        std::vector<std::pair<std::string, std::function<void()>>> actions;
+        std::function<void(const std::string&)> choose;
+    };
+    // Imported and built-in meshes and materials from render.assets, for their people-facing names.
+    struct RegistryItem {
+        std::string label, source;
+        std::optional<std::array<float, 4>> color;
+    };
+    std::map<std::string, RegistryItem, std::less<>> registry_items;
+
+    struct BrowserEntry {
+        AssetEntry entry;
+        std::uintmax_t size{};
+    };
+    struct MaterialFacts {
+        std::string type, shader, panorama;
+        double checked{-1000.0};
+    };
+    enum class BrowserSort : std::uint8_t { name, type, size, folder };
+    struct AssetBrowser {
+        bool open{}, focus{}, search_focus{};
+        std::optional<AssetPick> pick;
+        std::string folder;
+        std::vector<std::string> back, forward;
+        std::string selected;
+        std::array<char, 65> query{};
+        std::set<std::string> kinds;
+        bool whole_project{true}, match_paths{}, show_all{}, list_view{};
+        BrowserSort sort{BrowserSort::name};
+        float tile{96.0F};
+        std::map<std::string, std::vector<BrowserEntry>> folders;
+        std::set<std::string> expanded;
+        std::vector<BrowserEntry> results;
+        bool truncated{};
+        std::string searched;
+        double listed{-1000.0};
+        std::string playing;
+        std::int64_t sound{};
+        double playing_until{};
+        // Set while drawing and acted on once the frame's tiles are no longer in use, since
+        // navigating or choosing replaces the listings they point into.
+        std::optional<std::string> go_to, activate;
+        // Whether the window had focus last frame; the editor's shortcuts stand aside while it does.
+        bool focused{};
+    } browser;
+    std::map<std::string, MaterialFacts> material_facts;
+
+    static double wall_seconds() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // A material's type (surface, post_process or sky), shader and panorama, read at most every
+    // few seconds per file.
+    const MaterialFacts& material_facts_of(const std::string& path) {
+        auto& facts = material_facts[path];
+        const double now = wall_seconds();
+        if (now - facts.checked < 4.0) return facts;
+        facts.checked = now;
+        facts = MaterialFacts{{}, {}, {}, now};
+        if (auto info = call("assets.material", "\"path\":\"" + json_escape(path) + '"', false); info && info->object())
+            if (const auto* material = field(*info->object(), "material"); material && material->object()) {
+                facts.type = string_or(*material->object(), "type");
+                facts.shader = string_or(*material->object(), "shader");
+                return facts;
+            }
+        if (auto info = call("assets.sky_material", "\"path\":\"" + json_escape(path) + '"', false); info && info->object())
+            if (const auto* material = field(*info->object(), "material"); material && material->object()) {
+                facts.type = "sky";
+                facts.panorama = string_or(*material->object(), "panorama");
+            }
+        return facts;
+    }
+
+    static std::string builtin_label(const std::string_view name) {
+        std::string label(name.substr(std::string_view{"builtin."}.size()));
+        for (auto& c : label)
+            if (c == '_' || c == '.') c = ' ';
+        if (!label.empty()) label[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(label[0])));
+        return label;
+    }
+
+    struct Reference {
+        std::string name;
+        AssetIcon icon{AssetIcon::other};
+        std::string detail;
+    };
+    // How an asset reference reads in a field: a built-in or imported asset's own name, or a
+    // project file's name without folders or extension.
+    Reference describe_reference(const std::string& value, const AssetIcon fallback) {
+        if (value.empty()) return {{}, fallback, {}};
+        const bool mesh = std::find(mesh_names.begin(), mesh_names.end(), value) != mesh_names.end();
+        if (value.starts_with("builtin."))
+            return {builtin_label(value), mesh ? AssetIcon::mesh : AssetIcon::material, "Built into Relay"};
+        if (const auto found = registry_items.find(value); found != registry_items.end() && !found->second.label.empty())
+            return {found->second.label, mesh ? AssetIcon::mesh : AssetIcon::material,
+                    "From " + (found->second.source.empty() ? std::string{"an imported model"} : found->second.source)};
+        auto icon = asset_icon_for_file(value);
+        if (icon == AssetIcon::material) icon = asset_icon_for_kind("material", material_facts_of(value).type);
+        return {asset_display_name(value), icon, value};
+    }
+
+    // What a dragged project file or hierarchy node would set on a field: the value to choose, a
+    // model to open in the browser (a model holding several of the meshes or materials the field
+    // takes), or why it cannot be dropped there. Nothing is being dragged when all are empty.
+    struct DropVerdict {
+        std::optional<std::string> value, open_model;
+        std::string refusal;
+        [[nodiscard]] bool usable() const { return value || open_model; }
+    };
+
+    [[nodiscard]] static bool dragging_reference() {
+        const auto* payload = ImGui::GetDragDropPayload();
+        return payload && (payload->IsDataType("relay.asset") || payload->IsDataType("relay.entity"));
+    }
+
+    static std::string with_article(const std::string& noun) {
+        if (noun.empty()) return noun;
+        auto lower = noun;
+        lower[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(lower[0])));
+        return (std::string_view("aeiou").find(lower[0]) != std::string_view::npos ? "an " : "a ") + lower;
+    }
+
+    DropVerdict drop_verdict(const AssetPick& pick) {
+        DropVerdict verdict;
+        const auto* payload = ImGui::GetDragDropPayload();
+        if (!payload || !payload->Data) return verdict;
+        const bool nodes = std::any_of(pick.choices.begin(), pick.choices.end(),
+                                       [](const AssetChoice& choice) { return choice.group == "@scene"; });
+        auto what = pick.what;
+        if (what.empty()) {
+            if (nodes) what = "a node";
+            else if (!pick.kinds.empty()) what = with_article(asset_icon_label(asset_icon_for_kind(pick.kinds.front())));
+            else if (!pick.choices.empty()) what = with_article(asset_icon_label(pick.choices.back().icon));
+            else what = "something else";
+        }
+        const std::string dragged(static_cast<const char*>(payload->Data));
+        if (payload->IsDataType("relay.entity")) {
+            if (std::any_of(pick.choices.begin(), pick.choices.end(), [&](const AssetChoice& choice) {
+                    return choice.group == "@scene" && choice.value == dragged;
+                }))
+                verdict.value = dragged;
+            else {
+                const auto* node = find_entity(dragged);
+                verdict.refusal = (node ? string_or(*node, "name", "This node") : std::string{"This node"}) +
+                                  (nodes ? " cannot be used here: this takes " : " is a node: this takes ") + what;
+            }
+            return verdict;
+        }
+        if (!payload->IsDataType("relay.asset")) return verdict;
+        const auto* entry = asset_entry(dragged);
+        const bool folder = entry ? entry->folder : false;
+        std::string kind = entry ? entry->kind : asset_kind_of_file(dragged);
+        if (!folder && std::find(pick.kinds.begin(), pick.kinds.end(), kind) != pick.kinds.end() &&
+            (!pick.accepts || pick.accepts(dragged))) {
+            verdict.value = dragged;
+            return verdict;
+        }
+        // A model file stands for the meshes or materials imported from it.
+        std::vector<const AssetChoice*> inside;
+        for (const auto& choice : pick.choices)
+            if (choice.group == dragged) inside.push_back(&choice);
+        if (inside.size() == 1U) verdict.value = inside.front()->value;
+        else if (inside.size() > 1U) verdict.open_model = dragged;
+        if (verdict.usable()) return verdict;
+        auto icon = folder ? AssetIcon::folder : asset_icon_for_file(dragged);
+        if (icon == AssetIcon::material) icon = asset_icon_for_kind("material", material_facts_of(dragged).type);
+        verdict.refusal = asset_display_name(dragged) + " is " + with_article(asset_icon_label(icon)) + ": this takes " + what;
+        if (icon == AssetIcon::model && std::any_of(pick.choices.begin(), pick.choices.end(), [](const AssetChoice& choice) {
+                return !choice.group.empty() && !choice.group.starts_with('@');
+            }))
+            verdict.refusal += " (import the model first to use its meshes)";
+        return verdict;
+    }
+
+    // Takes a drop onto the last item when `verdict` allows it, choosing the value or opening the
+    // model in the browser; refusals show why instead of the drag's own tooltip.
+    void accept_reference_drop(const AssetPick& pick, const DropVerdict& verdict) {
+        if (!verdict.usable()) {
+            if (!verdict.refusal.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem))
+                ImGui::SetTooltip("%s", verdict.refusal.c_str());
+            return;
+        }
+        if (!ImGui::BeginDragDropTarget()) return;
+        const auto* payload = ImGui::GetDragDropPayload();
+        const std::string type = payload && payload->IsDataType("relay.entity") ? "relay.entity" : "relay.asset";
+        if (ImGui::AcceptDragDropPayload(type.c_str())) {
+            if (verdict.value) {
+                if (pick.choose) pick.choose(*verdict.value);
+            } else {
+                open_asset_browser(named_pick(pick));
+                browser_navigate(*verdict.open_model);
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
+
+    // Draws one reference field in the Inspector's label column layout. `empty` is what an unset
+    // value reads as. Clicking the field opens the Asset Browser with `make_pick`'s request. Files
+    // from Assets or the browser, and nodes from the Hierarchy, drop onto it when they are what the
+    // field takes; while something is dragged, fields that would take it are outlined.
+    void asset_field(const char* label, const std::string& value, const std::string& key,
+                     const std::function<AssetPick()>& make_pick,
+                     const char* empty = "None", const AssetIcon empty_icon = AssetIcon::other,
+                     const std::optional<Reference>& shown = std::nullopt) {
+        const auto& palette = editor_palette();
+        const auto& style = ImGui::GetStyle();
+        ImGui::PushID(key.c_str());
+        inspector_field_label(label);
+        const float button = ImGui::GetFrameHeight();
+        const float width = std::max(ImGui::CalcItemWidth(), button * 2.0F);
+        const auto reference = shown ? *shown : describe_reference(value, empty_icon);
+        ImGui::InvisibleButton("##field", ImVec2(width, button));
+        note_item(key);
+        const bool hovered = ImGui::IsItemHovered();
+        const auto low = ImGui::GetItemRectMin(), high = ImGui::GetItemRectMax();
+        const bool picking = browser.open && browser.pick && browser.pick->key == key;
+        bool drop_ok = false;
+        if (dragging_reference()) {
+            const auto pick = make_pick();
+            const auto verdict = drop_verdict(pick);
+            drop_ok = verdict.usable();
+            accept_reference_drop(pick, verdict);
+        }
+        if (hovered && !ImGui::GetDragDropPayload()) {
+            const bool file = !value.empty() && !reference.detail.empty() && reference.detail == value;
+            ImGui::SetTooltip("%s%s%s%s%s", reference.name.empty() ? empty : reference.name.c_str(),
+                              reference.name.empty() ? "" : "  ·  ", reference.name.empty() ? "" : asset_icon_label(reference.icon),
+                              reference.detail.empty() ? "" : ("\n" + reference.detail).c_str(),
+                              file ? "\nClick to choose another; right-click to show it in Assets" : "\nClick to choose another");
+        }
+        if (ImGui::IsItemClicked()) open_asset_browser(named_pick(make_pick()));
+        if (!value.empty() && reference.detail == value && ImGui::BeginPopupContextItem("##reference_menu")) {
+            if (ImGui::MenuItem("Show in Assets")) {
+                panel_open[2] = true;
+                reveal_asset(value);
+            }
+            ImGui::EndPopup();
+        }
+        auto* list = ImGui::GetWindowDrawList();
+        list->AddRectFilled(low, high, hovered ? palette.surface : palette.input, style.FrameRounding);
+        if (picking || drop_ok) list->AddRect(low, high, palette.accent_hovered, style.FrameRounding, 0, std::max(1.0F, ui_scale));
+        const float icon = std::round(ImGui::GetTextLineHeight() * 0.95F);
+        const float icon_x = low.x + std::round(style.FramePadding.x * 0.7F);
+        draw_asset_type_icon(list, ImVec2(icon_x, low.y + (button - icon) * 0.5F), icon, reference.icon,
+                             reference.name.empty() ? 0.35F : 0.8F);
+        const float text_x = icon_x + icon + std::round(style.ItemInnerSpacing.x * 0.8F);
+        const std::string text = reference.name.empty() ? std::string{empty} : reference.name;
+        list->PushClipRect(low, high, true);
+        if (reference.name.empty()) ImGui::PushStyleColor(ImGuiCol_Text, palette.text_faint);
+        ImGui::RenderTextEllipsis(list, ImVec2(text_x, low.y + style.FramePadding.y),
+                                  ImVec2(high.x - style.FramePadding.x * 0.5F, high.y), high.x - style.FramePadding.x * 0.5F,
+                                  text.c_str(), nullptr, nullptr);
+        if (reference.name.empty()) ImGui::PopStyleColor();
+        list->PopClipRect();
+        ImGui::PopID();
+    }
+
+    // Picks keep changing the node they were opened for, even when another is selected meanwhile,
+    // so the browser's title names it.
+    AssetPick named_pick(AssetPick pick) const {
+        if (const auto* node = drawing_inspector ? find_entity(selection) : nullptr)
+            pick.title += "  ·  " + string_or(*node, "name", "Node");
+        return pick;
+    }
+
+    // A button that opens the browser to add something, such as a track or an effect.
+    // Files that fit drop onto it, like a reference field.
+    void asset_add_button(const char* label, const std::string& key, const std::function<AssetPick()>& make_pick) {
+        ImGui::PushID(key.c_str());
+        inspector_field_label("");
+        if (ImGui::Button(label, ImVec2(ImGui::CalcItemWidth(), 0.0F))) open_asset_browser(named_pick(make_pick()));
+        note_item(key);
+        if (dragging_reference()) {
+            const auto pick = make_pick();
+            const auto verdict = drop_verdict(pick);
+            if (verdict.usable())
+                ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                                                    editor_palette().accent_hovered, ImGui::GetStyle().FrameRounding, 0,
+                                                    std::max(1.0F, ui_scale));
+            accept_reference_drop(pick, verdict);
+        }
+        ImGui::PopID();
+    }
+
+    // The project's model files with imported meshes or materials, as choice groups.
+    void add_registry_choices(AssetPick& pick, const std::vector<std::string>& names, const bool meshes) {
+        for (const auto& name : names) {
+            AssetChoice choice;
+            choice.value = name;
+            choice.icon = meshes ? AssetIcon::mesh : AssetIcon::material;
+            const auto found = registry_items.find(name);
+            if (found != registry_items.end()) choice.swatch = found->second.color;
+            if (name.starts_with("builtin.")) {
+                choice.label = builtin_label(name);
+                choice.group = "@builtin";
+                choice.detail = "Built into Relay";
+            } else if (found != registry_items.end() && !found->second.source.empty()) {
+                choice.label = found->second.label.empty() ? name : found->second.label;
+                choice.group = found->second.source;
+                choice.detail = "From " + found->second.source;
+            } else {
+                choice.label = found != registry_items.end() && !found->second.label.empty() ? found->second.label : name;
+                choice.group = "@imported";
+                choice.detail = name;
+            }
+            pick.choices.push_back(std::move(choice));
+        }
+    }
+
+    // Browser folders that are not project folders.
+    static bool virtual_folder(const std::string& folder) { return folder.starts_with('@'); }
+    static const char* virtual_folder_label(const std::string& folder) {
+        if (folder == "@builtin") return "Built-in";
+        if (folder == "@ready") return "Ready-made effects";
+        if (folder == "@scene") return "Scene";
+        if (folder == "@imported") return "Imported";
+        return "Project";
+    }
+    [[nodiscard]] bool choice_group(const std::string& path) const {
+        return browser.pick && std::any_of(browser.pick->choices.begin(), browser.pick->choices.end(),
+                                           [&](const AssetChoice& choice) { return choice.group == path; });
+    }
+
+    void open_asset_browser(std::optional<AssetPick> pick) {
+        stop_browser_sound();
+        const bool was_open = browser.open;
+        browser.open = browser.focus = true;
+        browser.pick = std::move(pick);
+        browser.results.clear();
+        browser.searched = "\x01";
+        browser.selected.clear();
+        browser.folders.clear();
+        browser.listed = -1000.0;
+        if (!browser.pick) {
+            if (!was_open) {
+                browser.back.clear();
+                browser.forward.clear();
+            }
+            // Browsing shows project folders only; a pick may have left it in a virtual one.
+            auto start = virtual_folder(browser.folder) ? std::string{} : browser.folder;
+            if (!start.empty() && !list_browser_folder(start)) start.clear();
+            browser.folder.clear();
+            browser_navigate(start, false);
+            return;
+        }
+        // Start where the current value lives, or in the folder its kind usually lives in.
+        const auto& current = browser.pick->current;
+        std::string start;
+        const auto choice = std::find_if(browser.pick->choices.begin(), browser.pick->choices.end(),
+                                         [&](const AssetChoice& item) { return item.value == current && !item.group.empty(); });
+        if (choice != browser.pick->choices.end()) {
+            start = choice->group;
+            browser.selected = "choice:" + current;
+        } else if (!current.empty() && !current.starts_with("builtin.") && !current.starts_with("asset.")) {
+            start = parent_path_of(current);
+            browser.selected = "file:" + current;
+        } else if (!browser.pick->choices.empty() && browser.pick->kinds.empty()) {
+            for (const auto& item : browser.pick->choices)
+                if (!item.group.empty()) {
+                    start = item.group;
+                    break;
+                }
+        }
+        browser.back.clear();
+        browser.forward.clear();
+        browser.folder.clear();
+        browser_navigate(start, false);
+    }
+
+    void close_asset_browser() {
+        stop_browser_sound();
+        browser.open = false;
+        browser.pick.reset();
+    }
+
+    void stop_browser_sound() {
+        if (browser.sound > 0) (void)call("audio.stop", "\"sound\":" + std::to_string(browser.sound), false);
+        browser.sound = 0;
+        browser.playing.clear();
+    }
+
+    void play_browser_sound(const std::string& path) {
+        stop_browser_sound();
+        const auto played = call("audio.play_clip", "\"clip\":\"" + json_escape(path) + '"');
+        if (!played || !played->object()) return;
+        browser.sound = static_cast<std::int64_t>(number_or(*played->object(), "sound", 0.0));
+        browser.playing = path;
+        const auto* info = audio_clip_summary(path);
+        browser.playing_until = wall_seconds() + (info ? number_or(*info, "duration_seconds", 3.0) : 3.0) + 0.1;
+    }
+
+    // Opens `folder` in the browser: a project folder, a model file's contents or a virtual folder.
+    void browser_navigate(const std::string& folder, const bool remember = true) {
+        if (remember && folder != browser.folder) {
+            browser.back.push_back(browser.folder);
+            browser.forward.clear();
+        }
+        browser.folder = folder;
+        if (!virtual_folder(folder) && !choice_group(folder)) {
+            for (auto parent = folder; !parent.empty(); parent = parent_path_of(parent)) browser.expanded.insert(parent);
+            list_browser_folder(folder);
+        }
+        browser.listed = wall_seconds();
+    }
+
+    bool list_browser_folder(const std::string& directory) {
+        const auto listing = call("assets.browse", "\"directory\":\"" + json_escape(directory) + '"', false);
+        const auto* object = listing ? listing->object() : nullptr;
+        if (!object) {
+            browser.folders.erase(directory);
+            return false;
+        }
+        if (directory.empty()) {
+            assets_root = string_or(*object, "root", assets_root);
+            thumbnails.set_root(assets_root);
+        }
+        auto& entries = browser.folders[directory];
+        entries.clear();
+        if (const auto* values = field(*object, "entries"); values && values->array())
+            for (const auto& value : *values->array())
+                if (const auto* entry = value.object()) entries.push_back(browser_entry(*entry));
+        return true;
+    }
+
+    static BrowserEntry browser_entry(const JsonValue::Object& entry) {
+        return {{string_or(entry, "name"), string_or(entry, "path"), string_or(entry, "kind"),
+                 string_or(entry, "type") == "folder", boolean_or(entry, "importable", false),
+                 boolean_or(entry, "protected", false)},
+                static_cast<std::uintmax_t>(number_or(entry, "size", 0.0))};
+    }
+
+    [[nodiscard]] bool browser_searching() const { return browser.query[0] != '\0' || !browser.kinds.empty(); }
+
+    // The file kinds a search asks for: the filter, else what the pick accepts (and models, which
+    // hold imported meshes and materials).
+    [[nodiscard]] std::vector<std::string> browser_search_kinds() const {
+        if (!browser.kinds.empty()) return {browser.kinds.begin(), browser.kinds.end()};
+        if (!browser.pick || browser.show_all) return {};
+        auto kinds = browser.pick->kinds;
+        if (std::any_of(browser.pick->choices.begin(), browser.pick->choices.end(),
+                        [](const AssetChoice& choice) { return !choice.group.empty() && !choice.group.starts_with('@'); }))
+            kinds.push_back("model");
+        if (kinds.empty()) kinds.push_back("folder");
+        return kinds;
+    }
+
+    void run_browser_search() {
+        std::string kinds = "[";
+        for (const auto& kind : browser_search_kinds()) kinds += (kinds.size() > 1U ? ",\"" : "\"") + kind + '"';
+        kinds += ']';
+        const auto folder = browser.whole_project || virtual_folder(browser.folder) ? std::string{}
+                            : choice_group(browser.folder)                         ? parent_path_of(browser.folder)
+                                                                                   : browser.folder;
+        const auto key = std::string(browser.query.data()) + '\n' + kinds + '\n' + folder + (browser.match_paths ? "\np" : "");
+        if (key == browser.searched) return;
+        browser.searched = key;
+        browser.results.clear();
+        browser.truncated = false;
+        if (!browser_searching()) return;
+        const auto found = call("assets.search", "\"query\":\"" + json_escape(browser.query.data()) + "\",\"kinds\":" + kinds +
+                                                     ",\"folder\":\"" + json_escape(folder) + "\",\"paths\":" +
+                                                     (browser.match_paths ? "true" : "false"),
+                                false);
+        const auto* object = found ? found->object() : nullptr;
+        if (!object) return;
+        browser.truncated = boolean_or(*object, "truncated", false);
+        if (const auto* values = field(*object, "entries"); values && values->array())
+            for (const auto& value : *values->array())
+                if (const auto* entry = value.object()) browser.results.push_back(browser_entry(*entry));
+    }
+
+    // Whether a file can be chosen for the current pick.
+    bool browser_accepts(const AssetEntry& entry) {
+        if (!browser.pick) return true;
+        const auto& kinds = browser.pick->kinds;
+        if (std::find(kinds.begin(), kinds.end(), entry.kind) == kinds.end()) return false;
+        return !browser.pick->accepts || browser.pick->accepts(entry.path);
+    }
+
+    struct BrowserTile {
+        enum class Type : std::uint8_t { folder, file, choice, group } type{};
+        std::string id;
+        const AssetEntry* entry{};
+        std::uintmax_t size{};
+        const AssetChoice* choice{};
+        bool usable{true};
+        std::string label, where;
+        AssetIcon icon{AssetIcon::other};
+    };
+
+    static bool words_match(const std::string& text, const std::string_view query) {
+        auto lower = text;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::size_t start = 0;
+        while (start < query.size()) {
+            const auto end = std::min(query.find(' ', start), query.size());
+            auto word = std::string(query.substr(start, end - start));
+            std::transform(word.begin(), word.end(), word.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (!word.empty() && lower.find(word) == std::string::npos) return false;
+            start = end + 1U;
+        }
+        return true;
+    }
+
+    std::vector<BrowserTile> browser_tiles() {
+        std::vector<BrowserTile> tiles;
+        const bool searching = browser_searching();
+        const auto add_file = [&](const BrowserEntry& item, const bool show_folder) {
+            const auto& entry = item.entry;
+            BrowserTile tile;
+            tile.entry = &entry;
+            tile.size = item.size;
+            tile.label = entry.folder ? entry.name : asset_display_name(entry.name);
+            if (show_folder) tile.where = parent_path_of(entry.path);
+            if (entry.folder) {
+                if (searching && browser.pick && !browser.kinds.contains("folder") && browser.kinds.empty() &&
+                    std::find(browser.pick->kinds.begin(), browser.pick->kinds.end(), "folder") == browser.pick->kinds.end() &&
+                    !browser.show_all)
+                    return;
+                tile.type = BrowserTile::Type::folder;
+                tile.id = "folder:" + entry.path;
+                tile.icon = AssetIcon::folder;
+            } else if (choice_group(entry.path)) {
+                tile.type = BrowserTile::Type::group;
+                tile.id = "folder:" + entry.path;
+                tile.icon = AssetIcon::model;
+            } else {
+                tile.type = BrowserTile::Type::file;
+                tile.id = "file:" + entry.path;
+                tile.icon = asset_icon_for_file(entry.name);
+                if (entry.kind == "material") tile.icon = asset_icon_for_kind("material", material_facts_of(entry.path).type);
+                tile.usable = browser_accepts(entry);
+                if (!tile.usable && browser.pick && !browser.show_all) return;
+            }
+            if (!browser.kinds.empty() && tile.type != BrowserTile::Type::group && !browser.kinds.contains(entry.kind)) return;
+            tiles.push_back(std::move(tile));
+        };
+        const auto add_choice = [&](const AssetChoice& choice, const bool show_folder) {
+            BrowserTile tile;
+            tile.type = BrowserTile::Type::choice;
+            tile.id = "choice:" + choice.value;
+            tile.choice = &choice;
+            tile.label = choice.label;
+            tile.icon = choice.icon;
+            if (show_folder) tile.where = virtual_folder(choice.group) ? virtual_folder_label(choice.group) : choice.group;
+            tiles.push_back(std::move(tile));
+        };
+        if (searching) {
+            if (browser.pick && browser.kinds.empty())
+                for (const auto& choice : browser.pick->choices)
+                    if (!choice.group.empty() && browser.query[0] && words_match(choice.label, browser.query.data()))
+                        add_choice(choice, true);
+            for (const auto& item : browser.results) add_file(item, true);
+        } else if (virtual_folder(browser.folder) || choice_group(browser.folder)) {
+            if (browser.pick)
+                for (const auto& choice : browser.pick->choices)
+                    if (choice.group == browser.folder) add_choice(choice, false);
+        } else if (const auto listing = browser.folders.find(browser.folder); listing != browser.folders.end()) {
+            for (const auto& item : listing->second) add_file(item, false);
+        }
+        const auto rank = [](const BrowserTile& tile) { return tile.type == BrowserTile::Type::folder ? 0 : 1; };
+        const auto lower = [](std::string text) {
+            std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return text;
+        };
+        std::stable_sort(tiles.begin(), tiles.end(), [&](const BrowserTile& a, const BrowserTile& b) {
+            if (rank(a) != rank(b)) return rank(a) < rank(b);
+            switch (browser.sort) {
+            case BrowserSort::type:
+                if (a.icon != b.icon) return std::string_view(asset_icon_label(a.icon)) < asset_icon_label(b.icon);
+                break;
+            case BrowserSort::size:
+                if (a.size != b.size) return a.size > b.size;
+                break;
+            case BrowserSort::folder:
+                if (a.where != b.where) return lower(a.where) < lower(b.where);
+                break;
+            case BrowserSort::name: break;
+            }
+            return lower(a.label) < lower(b.label);
+        });
+        return tiles;
+    }
+
+    static std::string size_text(const std::uintmax_t bytes) {
+        std::array<char, 32> text{};
+        if (bytes >= 1024U * 1024U)
+            std::snprintf(text.data(), text.size(), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+        else if (bytes >= 1024U)
+            std::snprintf(text.data(), text.size(), "%.0f KB", static_cast<double>(bytes) / 1024.0);
+        else
+            std::snprintf(text.data(), text.size(), "%ju B", bytes);
+        return text.data();
+    }
+
+    // An image fitted inside a square, keeping its aspect.
+    static void draw_fitted_image(ImDrawList* list, ImTextureData* texture, const ImVec2 low, const float side) {
+        if (texture->Status == ImTextureStatus_Destroyed) texture->SetStatus(ImTextureStatus_WantCreate);
+        const float width = static_cast<float>(texture->Width), height = static_cast<float>(texture->Height);
+        const float scale = side / std::max(width, height);
+        const ImVec2 size(width * scale, height * scale);
+        const ImVec2 corner(low.x + (side - size.x) * 0.5F, low.y + (side - size.y) * 0.5F);
+        list->AddImageRounded(texture->GetTexRef(), corner, ImVec2(corner.x + size.x, corner.y + size.y), ImVec2(0, 0),
+                              ImVec2(1, 1), IM_COL32_WHITE, std::max(2.0F, side * 0.04F));
+    }
+
+    // The picture in a tile: a thumbnail when the asset has one, otherwise its icon.
+    void draw_tile_picture(ImDrawList* list, const BrowserTile& tile, const ImVec2 low, const float side, const float alpha) {
+        ImTextureData* picture = nullptr;
+        if (tile.type == BrowserTile::Type::file || tile.type == BrowserTile::Type::group) {
+            const auto& path = tile.entry->path;
+            if (tile.entry->kind == "image" && panorama_file(path)) {
+                picture = thumbnails.file(path, AssetThumbnails::Source::image);
+            } else if (tile.entry->kind == "model" && !path.ends_with(".blend")) {
+                picture = thumbnails.file(path, AssetThumbnails::Source::model);
+            } else if (tile.entry->kind == "material") {
+                const auto& facts = material_facts_of(path);
+                if (facts.type == "surface") picture = thumbnails.material(path, facts.shader);
+                else if (facts.type == "sky" && panorama_file(facts.panorama))
+                    picture = thumbnails.file(facts.panorama, AssetThumbnails::Source::image);
+            }
+        }
+        if (picture) {
+            draw_fitted_image(list, picture, low, side);
+            // The kind's icon in a corner, so a picture of a sphere still reads as a material.
+            const float badge = std::clamp(side * 0.24F, 12.0F * ui_scale, 20.0F * ui_scale);
+            const ImVec2 corner(low.x + 2.0F, low.y + side - badge - 2.0F);
+            list->AddRectFilled(corner, ImVec2(corner.x + badge, corner.y + badge), IM_COL32(0, 0, 0, 170), badge * 0.25F);
+            draw_asset_type_icon(list, ImVec2(corner.x + badge * 0.12F, corner.y + badge * 0.12F), badge * 0.76F, tile.icon, alpha);
+            return;
+        }
+        // Imported meshes are drawn alone from the model they came from.
+        if (tile.choice && tile.choice->icon == AssetIcon::mesh && !tile.choice->group.empty() &&
+            !virtual_folder(tile.choice->group) && !tile.choice->group.ends_with(".blend"))
+            picture = thumbnails.mesh(tile.choice->group, tile.choice->value);
+        if (picture) {
+            draw_fitted_image(list, picture, low, side);
+            return;
+        }
+        if (tile.choice && tile.choice->swatch) {
+            // A built-in or imported material's own colour on a ball.
+            const auto& color = *tile.choice->swatch;
+            const auto channel = [&](const std::size_t index) { return static_cast<int>(std::clamp(color[index], 0.0F, 1.0F) * 255.0F); };
+            const ImVec2 centre(low.x + side * 0.5F, low.y + side * 0.5F);
+            list->AddCircleFilled(centre, side * 0.34F, IM_COL32(channel(0) / 2, channel(1) / 2, channel(2) / 2, static_cast<int>(255 * alpha)), 32);
+            list->AddCircleFilled(ImVec2(centre.x - side * 0.04F, centre.y - side * 0.04F), side * 0.29F,
+                                  IM_COL32(channel(0), channel(1), channel(2), static_cast<int>(255 * alpha)), 32);
+            list->AddCircleFilled(ImVec2(centre.x - side * 0.13F, centre.y - side * 0.13F), side * 0.06F,
+                                  IM_COL32(255, 255, 255, static_cast<int>(150 * alpha)), 12);
+            return;
+        }
+        const float icon = side * 0.56F;
+        draw_asset_type_icon(list, ImVec2(low.x + (side - icon) * 0.5F, low.y + (side - icon) * 0.5F), icon, tile.icon, alpha);
+    }
+
+    // Double-click or Enter on a tile: open folders, choose usable items, or open files.
+    void activate_tile(const BrowserTile& tile) {
+        if (tile.type == BrowserTile::Type::folder || tile.type == BrowserTile::Type::group) {
+            if (browser_searching()) {
+                browser.query.fill('\0');
+                browser.kinds.clear();
+            }
+            browser_navigate(std::string(tile.entry->path));
+            return;
+        }
+        if (browser.pick) {
+            if (!tile.usable) return;
+            auto choose = browser.pick->choose;
+            const auto value = tile.type == BrowserTile::Type::choice ? tile.choice->value : tile.entry->path;
+            close_asset_browser();
+            if (choose) choose(value);
+            return;
+        }
+        if (tile.entry) open_asset(*tile.entry);
+    }
+
+    void draw_browser_tree_folder(const std::string& path, const std::string& name) {
+        ImGui::PushID(path.c_str());
+        const bool current = browser.folder == path;
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
+                                   ImGuiTreeNodeFlags_OpenOnDoubleClick;
+        if (current) flags |= ImGuiTreeNodeFlags_Selected;
+        const auto listing = browser.folders.find(path);
+        const bool known = listing != browser.folders.end();
+        const bool has_folders = !known || std::any_of(listing->second.begin(), listing->second.end(),
+                                                       [](const BrowserEntry& item) { return item.entry.folder; });
+        if (!has_folders) flags |= ImGuiTreeNodeFlags_Leaf;
+        ImGui::SetNextItemOpen(browser.expanded.contains(path) || path.empty(), path.empty() ? ImGuiCond_Once : ImGuiCond_Always);
+        const bool open = ImGui::TreeNodeEx("##folder", flags);
+        note_item("asset_browser:tree:" + path);
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) browser.go_to = path;
+        if (ImGui::IsItemToggledOpen()) {
+            if (open) browser.expanded.insert(path);
+            else browser.expanded.erase(path);
+        }
+        const auto low = ImGui::GetItemRectMin();
+        const float icon = ImGui::GetTextLineHeight();
+        const float x = low.x + ImGui::GetTreeNodeToLabelSpacing();
+        draw_asset_type_icon(ImGui::GetWindowDrawList(), ImVec2(x, low.y + (ImGui::GetItemRectSize().y - icon) * 0.5F), icon,
+                             AssetIcon::folder, 0.9F);
+        ImGui::SameLine(0.0F, 0.0F);
+        ImGui::SetCursorScreenPos(ImVec2(x + icon + ImGui::GetStyle().ItemInnerSpacing.x, low.y));
+        ImGui::TextUnformatted(name.c_str());
+        if (open) {
+            if (!known) list_browser_folder(path);
+            if (const auto listed = browser.folders.find(path); listed != browser.folders.end())
+                for (const auto& item : std::vector<BrowserEntry>(listed->second))
+                    if (item.entry.folder) draw_browser_tree_folder(item.entry.path, item.entry.name);
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+
+    void draw_browser_tree() {
+        const auto virtual_row = [&](const std::string& folder, const AssetIcon icon) {
+            ImGui::PushID(folder.c_str());
+            ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                       ImGuiTreeNodeFlags_SpanAvailWidth;
+            if (browser.folder == folder) flags |= ImGuiTreeNodeFlags_Selected;
+            ImGui::TreeNodeEx("##virtual", flags);
+            note_item("asset_browser:tree:" + folder);
+            if (ImGui::IsItemClicked()) browser.go_to = folder;
+            const auto low = ImGui::GetItemRectMin();
+            const float size = ImGui::GetTextLineHeight();
+            const float x = low.x + ImGui::GetTreeNodeToLabelSpacing();
+            draw_asset_type_icon(ImGui::GetWindowDrawList(), ImVec2(x, low.y + (ImGui::GetItemRectSize().y - size) * 0.5F),
+                                 size, icon, 0.9F);
+            ImGui::SameLine(0.0F, 0.0F);
+            ImGui::SetCursorScreenPos(ImVec2(x + size + ImGui::GetStyle().ItemInnerSpacing.x, low.y));
+            ImGui::TextUnformatted(virtual_folder_label(folder));
+            ImGui::PopID();
+        };
+        if (browser.pick) {
+            // Each virtual folder with the icon of what it holds.
+            std::map<std::string, AssetIcon> groups;
+            for (const auto& choice : browser.pick->choices)
+                if (virtual_folder(choice.group)) groups.emplace(choice.group, choice.icon);
+            for (const auto* folder : {"@scene", "@builtin", "@ready", "@imported"})
+                if (const auto found = groups.find(folder); found != groups.end()) virtual_row(folder, found->second);
+            if (browser.pick->kinds.empty() &&
+                std::none_of(browser.pick->choices.begin(), browser.pick->choices.end(), [](const AssetChoice& choice) {
+                    return !choice.group.empty() && !virtual_folder(choice.group);
+                }))
+                return;
+        }
+        draw_browser_tree_folder({}, "Project");
+    }
+
+    void draw_browser_toolbar() {
+        const auto& palette = editor_palette();
+        const auto& style = ImGui::GetStyle();
+        const float button = ImGui::GetFrameHeight();
+        ImGui::BeginDisabled(browser.back.empty());
+        if (ImGui::ArrowButton("##back", ImGuiDir_Left)) {
+            browser.forward.push_back(browser.folder);
+            const auto target = browser.back.back();
+            browser.back.pop_back();
+            browser_navigate(target, false);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Back");
+        ImGui::SameLine(0.0F, 2.0F);
+        ImGui::BeginDisabled(browser.forward.empty());
+        if (ImGui::ArrowButton("##forward", ImGuiDir_Right)) {
+            browser.back.push_back(browser.folder);
+            const auto target = browser.forward.back();
+            browser.forward.pop_back();
+            browser_navigate(target, false);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Forward");
+        ImGui::SameLine(0.0F, 2.0F);
+        ImGui::BeginDisabled(browser.folder.empty() || virtual_folder(browser.folder));
+        if (ImGui::ArrowButton("##up", ImGuiDir_Up)) browser_navigate(parent_path_of(browser.folder));
+        ImGui::EndDisabled();
+        note_item("asset_browser:up");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Up to the parent folder");
+
+        // The path as clickable steps.
+        const float controls = 300.0F * ui_scale + button * 3.0F + style.ItemSpacing.x * 4.0F;
+        ImGui::SameLine();
+        const float crumbs_end = ImGui::GetCursorPosX() + std::max(ImGui::GetContentRegionAvail().x - controls, 40.0F);
+        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(0, 0, 0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(style.FramePadding.x * 0.5F, style.FramePadding.y));
+        std::vector<std::pair<std::string, std::string>> steps;
+        if (virtual_folder(browser.folder)) {
+            steps.emplace_back(browser.folder, virtual_folder_label(browser.folder));
+        } else {
+            steps.emplace_back(std::string{}, "Project");
+            std::string built;
+            for (std::size_t start = 0; start < browser.folder.size();) {
+                const auto end = std::min(browser.folder.find('/', start), browser.folder.size());
+                built = browser.folder.substr(0, end);
+                steps.emplace_back(built, browser.folder.substr(start, end - start));
+                start = end + 1U;
+            }
+        }
+        if (browser_searching()) steps.emplace_back("\x01", browser.whole_project ? "Search everywhere" : "Search here");
+        for (std::size_t index = 0; index < steps.size(); ++index) {
+            const auto& [path, name] = steps[index];
+            if (index) {
+                ImGui::SameLine(0.0F, 0.0F);
+                ImGui::TextColored(editor_color(palette.text_faint), "/");
+                ImGui::SameLine(0.0F, 0.0F);
+            }
+            if (ImGui::GetCursorPosX() + ImGui::CalcTextSize(name.c_str()).x > crumbs_end) {
+                ImGui::TextColored(editor_color(palette.text_faint), "...");
+                break;
+            }
+            ImGui::PushID(static_cast<int>(index));
+            const bool last = index + 1U == steps.size();
+            if (last) ImGui::PushStyleColor(ImGuiCol_Text, palette.text);
+            else ImGui::PushStyleColor(ImGuiCol_Text, palette.text_dim);
+            if (ImGui::Button(name.c_str()) && path != "\x01") {
+                browser.query.fill('\0');
+                browser.kinds.clear();
+                browser_navigate(path);
+            }
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+
+        // Search, filters, options and view on the right.
+        ImGui::SameLine(std::max(crumbs_end, ImGui::GetCursorPosX()) + style.ItemSpacing.x);
+        if (browser.search_focus) {
+            ImGui::SetKeyboardFocusHere();
+            browser.search_focus = false;
+        }
+        ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - button * 3.0F - style.ItemSpacing.x * 3.0F,
+                                         80.0F * ui_scale));
+        ImGui::InputTextWithHint("##browser_search", "Search (words in any order)", browser.query.data(), browser.query.size());
+        note_item("asset_browser:search");
+        if (ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) browser.query.fill('\0');
+        ImGui::SameLine();
+        if (filter_button("##browser_filter", !browser.kinds.empty())) ImGui::OpenPopup("##browser_filters");
+        note_item("asset_browser:filter");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show only some types");
+        if (ImGui::BeginPopup("##browser_filters")) {
+            ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
+            for (const auto& [kind, label] : asset_kind_labels) {
+                bool enabled = browser.kinds.contains(kind);
+                if (ImGui::MenuItem(label, nullptr, &enabled)) {
+                    if (enabled) browser.kinds.insert(kind);
+                    else browser.kinds.erase(kind);
+                }
+                note_item(std::string("asset_browser:filter:") + kind);
+            }
+            ImGui::PopItemFlag();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear filters", nullptr, false, !browser.kinds.empty())) browser.kinds.clear();
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("...##browser_options", ImVec2(button, button))) ImGui::OpenPopup("##browser_settings");
+        note_item("asset_browser:options");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Search and view options");
+        if (ImGui::BeginPopup("##browser_settings")) {
+            ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
+            ImGui::SeparatorText("Search");
+            if (ImGui::MenuItem("Whole project", nullptr, browser.whole_project)) browser.whole_project = true;
+            note_item("asset_browser:scope:project");
+            if (ImGui::MenuItem("This folder and below", nullptr, !browser.whole_project)) browser.whole_project = false;
+            note_item("asset_browser:scope:folder");
+            ImGui::MenuItem("Match folder names too", nullptr, &browser.match_paths);
+            note_item("asset_browser:match_paths");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("\"trees bark\" then finds textures/trees/Oak_bark.png");
+            if (browser.pick) {
+                ImGui::MenuItem("Show files that do not fit", nullptr, &browser.show_all);
+                note_item("asset_browser:show_all");
+            }
+            ImGui::SeparatorText("Sort by");
+            for (const auto& [sort, label] : std::array<std::pair<BrowserSort, const char*>, 4>{
+                     {{BrowserSort::name, "Name"}, {BrowserSort::type, "Type"}, {BrowserSort::size, "Size"},
+                      {BrowserSort::folder, "Folder"}}})
+                if (ImGui::MenuItem(label, nullptr, browser.sort == sort)) browser.sort = sort;
+            ImGui::SeparatorText("View");
+            if (ImGui::MenuItem("Thumbnails", nullptr, !browser.list_view)) browser.list_view = false;
+            if (ImGui::MenuItem("List", nullptr, browser.list_view)) browser.list_view = true;
+            note_item("asset_browser:list_view");
+            if (!browser.list_view) {
+                ImGui::SetNextItemWidth(160.0F * ui_scale);
+                (void)editor_slider("Size##tile", &browser.tile, 56.0F, 192.0F, "%.0f px");
+            }
+            ImGui::PopItemFlag();
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("##browser_view", ImVec2(button, button))) browser.list_view = !browser.list_view;
+        note_item("asset_browser:view");
+        {
+            // Shows the view the button switches to: a grid of squares or lines of a list.
+            auto* list = ImGui::GetWindowDrawList();
+            const auto low = ImGui::GetItemRectMin();
+            const ImU32 color = ImGui::IsItemHovered() ? palette.text : palette.text_dim;
+            const float unit = button / 10.0F;
+            if (browser.list_view) {
+                for (const float y : {3.0F, 5.5F})
+                    for (const float x : {3.0F, 5.5F})
+                        list->AddRectFilled(ImVec2(low.x + x * unit, low.y + y * unit),
+                                            ImVec2(low.x + (x + 1.8F) * unit, low.y + (y + 1.8F) * unit), color, unit * 0.3F);
+            } else {
+                for (const float y : {3.2F, 5.0F, 6.8F})
+                    list->AddRectFilled(ImVec2(low.x + 2.8F * unit, low.y + y * unit), ImVec2(low.x + 7.2F * unit, low.y + (y + 0.9F) * unit),
+                                        color, unit * 0.3F);
+            }
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(browser.list_view ? "Show thumbnails" : "Show a list");
+
+        // Active type filters as removable chips.
+        if (!browser.kinds.empty()) {
+            bool first = true;
+            for (const auto& [kind, label] : asset_kind_labels) {
+                if (!browser.kinds.contains(kind)) continue;
+                const std::string chip = std::string(label) + "  x##browser_chip_" + kind;
+                if (!first) ImGui::SameLine();
+                first = false;
+                if (ImGui::SmallButton(chip.c_str())) {
+                    browser.kinds.erase(kind);
+                    break;
+                }
+            }
+        }
+    }
+
+    // One tile of the thumbnail grid.
+    void draw_browser_tile(const BrowserTile& tile, const ImVec2 low, const float side, const float height) {
+        const auto& palette = editor_palette();
+        auto* list = ImGui::GetWindowDrawList();
+        ImGui::PushID(tile.id.c_str());
+        ImGui::SetCursorScreenPos(low);
+        ImGui::SetNextItemAllowOverlap();
+        const float pad = std::round(6.0F * ui_scale);
+        ImGui::InvisibleButton("##tile", ImVec2(side + pad * 2.0F, height));
+        const auto key = tile.type == BrowserTile::Type::choice ? "asset_browser:choice:" + tile.choice->value
+                                                                : "asset_browser:item:" + tile.entry->path;
+        note_item(key);
+        const bool hovered = ImGui::IsItemHovered();
+        const bool selected = browser.selected == tile.id;
+        if (ImGui::IsItemClicked()) browser.selected = tile.id;
+        const bool activated = hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+        if (tile.entry && ImGui::BeginDragDropSource()) {
+            ImGui::SetDragDropPayload("relay.asset", tile.entry->path.c_str(), tile.entry->path.size() + 1U);
+            ImGui::TextUnformatted(tile.label.c_str());
+            ImGui::EndDragDropSource();
+        }
+        draw_browser_item_menu(tile);
+        const ImVec2 high(low.x + side + pad * 2.0F, low.y + height);
+        if (selected) {
+            list->AddRectFilled(low, high, palette.accent_soft, 6.0F * ui_scale);
+            list->AddRect(low, high, palette.accent, 6.0F * ui_scale, 0, std::max(1.0F, ui_scale));
+        } else if (hovered) {
+            list->AddRectFilled(low, high, palette.surface_hovered, 6.0F * ui_scale);
+        }
+        const ImVec2 picture(low.x + pad, low.y + pad);
+        list->AddRectFilled(picture, ImVec2(picture.x + side, picture.y + side), palette.surface, 5.0F * ui_scale);
+        const float alpha = tile.usable ? 1.0F : 0.35F;
+        draw_tile_picture(list, tile, picture, side, alpha);
+        if (tile.type == BrowserTile::Type::group) {
+            // A model holding meshes or materials to choose: a chevron in the corner says it opens.
+            const float badge = std::clamp(side * 0.2F, 12.0F * ui_scale, 18.0F * ui_scale);
+            const ImVec2 corner(picture.x + side - badge - 3.0F, picture.y + 3.0F);
+            list->AddRectFilled(corner, ImVec2(corner.x + badge, corner.y + badge), IM_COL32(0, 0, 0, 170), badge * 0.3F);
+            const ImVec2 chevron[]{{corner.x + badge * 0.4F, corner.y + badge * 0.26F},
+                                   {corner.x + badge * 0.66F, corner.y + badge * 0.5F},
+                                   {corner.x + badge * 0.4F, corner.y + badge * 0.74F}};
+            list->AddPolyline(chevron, 3, palette.text, ImDrawFlags_None, std::max(1.2F, 1.4F * ui_scale));
+        }
+        // Names wrap onto a second line when a folder is shown under them in search results.
+        const auto& style = ImGui::GetStyle();
+        const float line = ImGui::GetTextLineHeight();
+        const float text_top = picture.y + side + style.ItemInnerSpacing.y;
+        const float text_width = ImGui::CalcTextSize(tile.label.c_str()).x;
+        const float left = low.x + pad * 0.5F, right = high.x - pad * 0.5F;
+        const float x = text_width < right - left ? low.x + (high.x - low.x - text_width) * 0.5F : left;
+        if (!tile.usable) ImGui::PushStyleColor(ImGuiCol_Text, palette.text_faint);
+        ImGui::RenderTextEllipsis(list, ImVec2(x, text_top), ImVec2(right, text_top + line), right, tile.label.c_str(), nullptr,
+                                  nullptr);
+        if (!tile.usable) ImGui::PopStyleColor();
+        if (!tile.where.empty()) {
+            const auto where = tile.where;
+            const float where_width = ImGui::CalcTextSize(where.c_str()).x;
+            const float where_x = where_width < right - left ? low.x + (high.x - low.x - where_width) * 0.5F : left;
+            ImGui::PushStyleColor(ImGuiCol_Text, palette.text_faint);
+            ImGui::RenderTextEllipsis(list, ImVec2(where_x, text_top + line), ImVec2(right, text_top + line * 2.0F), right,
+                                      where.c_str(), nullptr, nullptr);
+            ImGui::PopStyleColor();
+        }
+        // Sounds play from their tile.
+        if (tile.entry && tile.entry->kind == "audio") {
+            const float radius = std::max(9.0F * ui_scale, side * 0.13F);
+            sound_button(tile.entry->path, key, ImVec2(picture.x + side - radius - 4.0F, picture.y + side - radius - 4.0F), radius);
+        }
+        if (hovered) browser_tile_tooltip(tile);
+        ImGui::PopID();
+        if (activated) browser.activate = tile.id;
+    }
+
+    // A round play button that previews a sound, or stops it while it plays.
+    void sound_button(const std::string& path, const std::string& key, const ImVec2 centre, const float radius) {
+        const auto& palette = editor_palette();
+        auto* list = ImGui::GetWindowDrawList();
+        const bool playing = browser.playing == path;
+        ImGui::SetCursorScreenPos(ImVec2(centre.x - radius, centre.y - radius));
+        if (ImGui::InvisibleButton("##play", ImVec2(radius * 2.0F, radius * 2.0F))) {
+            if (playing) stop_browser_sound();
+            else play_browser_sound(path);
+        }
+        note_item(key + ":play");
+        const bool over = ImGui::IsItemHovered();
+        if (over) ImGui::SetTooltip(playing ? "Stop" : "Listen");
+        list->AddCircleFilled(centre, radius, over ? palette.accent_hovered : palette.accent, 24);
+        if (playing) {
+            const float half = radius * 0.34F;
+            list->AddRectFilled(ImVec2(centre.x - half, centre.y - half), ImVec2(centre.x + half, centre.y + half), palette.text, 1.5F);
+        } else {
+            const float half = radius * 0.42F;
+            list->AddTriangleFilled(ImVec2(centre.x - half * 0.7F, centre.y - half), ImVec2(centre.x + half, centre.y),
+                                    ImVec2(centre.x - half * 0.7F, centre.y + half), palette.text);
+        }
+    }
+
+    void browser_tile_tooltip(const BrowserTile& tile) {
+        if (ImGui::GetDragDropPayload()) return;
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(tile.label.c_str());
+        ImGui::TextColored(editor_color(editor_palette().text_dim), "%s", asset_icon_label(tile.icon));
+        if (tile.choice && !tile.choice->detail.empty())
+            ImGui::TextColored(editor_color(editor_palette().text_faint), "%s", tile.choice->detail.c_str());
+        if (tile.entry) {
+            ImGui::TextColored(editor_color(editor_palette().text_faint), "%s", tile.entry->path.c_str());
+            if (!tile.entry->folder && tile.size) ImGui::TextColored(editor_color(editor_palette().text_faint), "%s", size_text(tile.size).c_str());
+        }
+        if (!tile.usable) ImGui::TextColored(editor_color(editor_palette().warning), "Cannot be used here");
+        ImGui::EndTooltip();
+    }
+
+    void draw_browser_item_menu(const BrowserTile& tile) {
+        if (!tile.entry || !ImGui::BeginPopupContextItem("##item_menu")) return;
+        browser.selected = tile.id;
+        if (tile.entry->kind == "audio") {
+            if (ImGui::MenuItem("Listen")) play_browser_sound(tile.entry->path);
+            if (ImGui::MenuItem("Stop", nullptr, false, !browser.playing.empty())) stop_browser_sound();
+            ImGui::Separator();
+        }
+        if (ImGui::MenuItem("Show in Assets")) {
+            panel_open[2] = true;
+            reveal_asset(tile.entry->path);
+        }
+        if (ImGui::MenuItem("Open in file browser")) open_in_file_browser(tile.entry->path, tile.entry->folder);
+        ImGui::EndPopup();
+    }
+
+    // One row of the list view.
+    void draw_browser_row(const BrowserTile& tile) {
+        const auto& palette = editor_palette();
+        ImGui::PushID(tile.id.c_str());
+        const float height = ImGui::GetFrameHeight();
+        const auto low = ImGui::GetCursorScreenPos();
+        const float width = ImGui::GetContentRegionAvail().x;
+        ImGui::SetNextItemAllowOverlap();
+        ImGui::InvisibleButton("##row", ImVec2(width, height));
+        const auto key = tile.type == BrowserTile::Type::choice ? "asset_browser:choice:" + tile.choice->value
+                                                                : "asset_browser:item:" + tile.entry->path;
+        note_item(key);
+        const bool hovered = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked()) browser.selected = tile.id;
+        const bool activated = hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+        if (tile.entry && ImGui::BeginDragDropSource()) {
+            ImGui::SetDragDropPayload("relay.asset", tile.entry->path.c_str(), tile.entry->path.size() + 1U);
+            ImGui::TextUnformatted(tile.label.c_str());
+            ImGui::EndDragDropSource();
+        }
+        draw_browser_item_menu(tile);
+        auto* list = ImGui::GetWindowDrawList();
+        const ImVec2 high(low.x + width, low.y + height);
+        if (browser.selected == tile.id) list->AddRectFilled(low, high, palette.accent_soft, 4.0F * ui_scale);
+        else if (hovered) list->AddRectFilled(low, high, palette.surface_hovered, 4.0F * ui_scale);
+        const float icon = ImGui::GetTextLineHeight();
+        const float alpha = tile.usable ? 1.0F : 0.35F;
+        if (tile.choice && tile.choice->swatch) draw_tile_picture(list, tile, ImVec2(low.x + 6.0F, low.y + (height - icon) * 0.5F), icon, alpha);
+        else draw_asset_type_icon(list, ImVec2(low.x + 6.0F, low.y + (height - icon) * 0.5F), icon, tile.icon, alpha);
+        const float text_y = low.y + (height - icon) * 0.5F;
+        const auto column = [&](const float fraction, const std::string& text, const ImU32 color) {
+            const float x = low.x + width * fraction;
+            ImGui::PushStyleColor(ImGuiCol_Text, color);
+            ImGui::RenderTextEllipsis(list, ImVec2(x, text_y), ImVec2(low.x + width - 4.0F, high.y), low.x + width - 4.0F,
+                                      text.c_str(), nullptr, nullptr);
+            ImGui::PopStyleColor();
+        };
+        ImGui::PushStyleColor(ImGuiCol_Text, tile.usable ? palette.text : palette.text_faint);
+        ImGui::RenderTextEllipsis(list, ImVec2(low.x + 12.0F + icon, text_y), ImVec2(low.x + width * 0.45F, high.y),
+                                  low.x + width * 0.45F - 6.0F, tile.label.c_str(), nullptr, nullptr);
+        ImGui::PopStyleColor();
+        column(0.46F, asset_icon_label(tile.icon), palette.text_dim);
+        column(0.66F, tile.where.empty() && tile.entry ? parent_path_of(tile.entry->path) : tile.where, palette.text_faint);
+        if (tile.entry && !tile.entry->folder && tile.size) column(0.84F, size_text(tile.size), palette.text_faint);
+        if (tile.entry && tile.entry->kind == "audio") {
+            const float radius = height * 0.36F;
+            sound_button(tile.entry->path, key, ImVec2(low.x + width - radius - 6.0F, low.y + height * 0.5F), radius);
+        }
+        if (hovered && !ImGui::IsAnyItemActive()) browser_tile_tooltip(tile);
+        ImGui::SetCursorScreenPos(low);
+        ImGui::Dummy(ImVec2(width, height));
+        ImGui::PopID();
+        if (activated) browser.activate = tile.id;
+    }
+
+    void draw_browser_items(const std::vector<BrowserTile>& tiles) {
+        const auto& palette = editor_palette();
+        if (tiles.empty()) {
+            ImGui::TextColored(editor_color(palette.text_faint), "%s",
+                               browser_searching() ? "Nothing matches. Try fewer words, another type, or search the whole project."
+                                                   : browser.pick ? "Nothing here can be used for this field." : "This folder is empty.");
+            return;
+        }
+        if (browser.list_view) {
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(tiles.size()), ImGui::GetFrameHeightWithSpacing());
+            while (clipper.Step())
+                for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index)
+                    draw_browser_row(tiles[static_cast<std::size_t>(index)]);
+            clipper.End();
+        } else {
+            const float side = std::round(browser.tile * ui_scale);
+            const float pad = std::round(6.0F * ui_scale);
+            const float spacing = std::round(6.0F * ui_scale);
+            const bool two_lines = browser_searching();
+            const float height = pad + side + ImGui::GetStyle().ItemInnerSpacing.y +
+                                 ImGui::GetTextLineHeight() * (two_lines ? 2.0F : 1.0F) + pad;
+            const float cell = side + pad * 2.0F;
+            const int columns = std::max(1, static_cast<int>((ImGui::GetContentRegionAvail().x + spacing) / (cell + spacing)));
+            const int rows = (static_cast<int>(tiles.size()) + columns - 1) / columns;
+            ImGuiListClipper clipper;
+            clipper.Begin(rows, height + spacing);
+            while (clipper.Step())
+                for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                    const auto origin = ImGui::GetCursorScreenPos();
+                    for (int column = 0; column < columns; ++column) {
+                        const auto index = static_cast<std::size_t>(row * columns + column);
+                        if (index >= tiles.size()) break;
+                        draw_browser_tile(tiles[index], ImVec2(origin.x + static_cast<float>(column) * (cell + spacing), origin.y),
+                                          side, height);
+                    }
+                    ImGui::SetCursorScreenPos(origin);
+                    ImGui::Dummy(ImVec2(1.0F, height + spacing - ImGui::GetStyle().ItemSpacing.y));
+                }
+            clipper.End();
+        }
+        if (browser.truncated)
+            ImGui::TextColored(editor_color(palette.text_faint), "Only the first 512 matches are shown; add words to narrow it.");
+    }
+
+    // Arrow keys move through the tiles, Enter uses the selection and Backspace goes up.
+    void update_browser_keys(const std::vector<BrowserTile>& tiles, const int columns) {
+        if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows | ImGuiFocusedFlags_NoPopupHierarchy) ||
+            ImGui::GetIO().WantTextInput)
+            return;
+        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) browser.search_focus = true;
+        if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false) && !browser.folder.empty() && !virtual_folder(browser.folder))
+            browser_navigate(parent_path_of(browser.folder));
+        if (tiles.empty()) return;
+        auto current = std::find_if(tiles.begin(), tiles.end(), [&](const BrowserTile& tile) { return tile.id == browser.selected; });
+        int index = current == tiles.end() ? -1 : static_cast<int>(current - tiles.begin());
+        const int count = static_cast<int>(tiles.size());
+        const auto move = [&](const int step) { index = std::clamp(index < 0 ? 0 : index + step, 0, count - 1); };
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) move(1);
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) move(-1);
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) move(browser.list_view ? 1 : columns);
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) move(browser.list_view ? -1 : -columns);
+        if (index >= 0) browser.selected = tiles[static_cast<std::size_t>(index)].id;
+        if (index >= 0 && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
+            browser.activate = browser.selected;
+    }
+
+    void draw_browser_footer(const std::vector<BrowserTile>& tiles) {
+        const auto& palette = editor_palette();
+        ImGui::Separator();
+        if (browser.pick) {
+            // "None", "Gradient" and similar, then actions such as "New material".
+            for (const auto& choice : std::vector<AssetChoice>(browser.pick->choices)) {
+                if (!choice.group.empty()) continue;
+                if (ImGui::Button(choice.label.c_str())) {
+                    auto choose = browser.pick->choose;
+                    close_asset_browser();
+                    if (choose) choose(choice.value);
+                    return;
+                }
+                note_item("asset_browser:button:" + choice.value);
+                ImGui::SameLine();
+            }
+            for (const auto& [label, action] : std::vector<std::pair<std::string, std::function<void()>>>(browser.pick->actions)) {
+                if (ImGui::Button(label.c_str())) {
+                    close_asset_browser();
+                    if (action) action();
+                    return;
+                }
+                note_item("asset_browser:action:" + label);
+                ImGui::SameLine();
+            }
+        }
+        const auto selected = std::find_if(tiles.begin(), tiles.end(), [&](const BrowserTile& tile) { return tile.id == browser.selected; });
+        const auto& style = ImGui::GetStyle();
+        const float buttons = browser.pick ? ImGui::CalcTextSize("Cancel").x + ImGui::CalcTextSize("Choose").x +
+                                                 style.FramePadding.x * 4.0F + style.ItemSpacing.x * 2.0F
+                                           : ImGui::CalcTextSize("Close").x + style.FramePadding.x * 2.0F + style.ItemSpacing.x;
+        if (selected != tiles.end()) {
+            ImGui::AlignTextToFramePadding();
+            const auto text = selected->entry ? selected->entry->path : selected->choice->label;
+            ImGui::TextColored(editor_color(palette.text_dim), "%s", text.c_str());
+            ImGui::SameLine();
+        }
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowContentRegionMax().x - buttons));
+        if (browser.pick) {
+            if (ImGui::Button("Cancel")) close_asset_browser();
+            note_item("asset_browser:cancel");
+            ImGui::SameLine();
+            const bool usable = selected != tiles.end() && selected->usable;
+            ImGui::BeginDisabled(!usable);
+            if (ImGui::Button(selected != tiles.end() && selected->type != BrowserTile::Type::file &&
+                                      selected->type != BrowserTile::Type::choice
+                                  ? "Open"
+                                  : "Choose"))
+                browser.activate = selected->id;
+            ImGui::EndDisabled();
+            note_item("asset_browser:choose");
+        } else if (ImGui::Button("Close")) {
+            close_asset_browser();
+        }
+    }
+
+    void draw_asset_browser() {
+        browser.focused = false;
+        if (!browser.open) return;
+        if (browser.playing_until > 0.0 && !browser.playing.empty() && wall_seconds() > browser.playing_until) {
+            browser.playing.clear();
+            browser.sound = 0;
+        }
+        const auto* main_viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowSize(ImVec2(940.0F * ui_scale, 600.0F * ui_scale), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(main_viewport->GetCenter(), ImGuiCond_FirstUseEver, ImVec2(0.5F, 0.5F));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(420.0F * ui_scale, 300.0F * ui_scale), ImVec2(FLT_MAX, FLT_MAX));
+        if (browser.focus) {
+            ImGui::SetNextWindowFocus();
+            browser.focus = false;
+        }
+        const auto title = (browser.pick ? browser.pick->title : std::string{"Asset Browser"}) + "###asset_browser";
+        bool open = true;
+        const bool visible = ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse);
+        // Escape in one of the browser's menus closes only the menu.
+        if (!open || (visible &&
+                      ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows | ImGuiFocusedFlags_NoPopupHierarchy) &&
+                      !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Escape, false))) {
+            ImGui::End();
+            close_asset_browser();
+            return;
+        }
+        if (!visible) {
+            ImGui::End();
+            return;
+        }
+        browser.focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        // The open folder is listed again every two seconds, so new and changed files show up.
+        if (wall_seconds() - browser.listed > 2.0 && !virtual_folder(browser.folder) && !choice_group(browser.folder)) {
+            list_browser_folder(browser.folder);
+            browser.listed = wall_seconds();
+            browser.searched = "\x01";
+        }
+        draw_browser_toolbar();
+        run_browser_search();
+        const auto tiles = browser_tiles();
+        // Room for the separator and the row of buttons below the panes.
+        const auto& spacing = ImGui::GetStyle().ItemSpacing;
+        const float footer = ImGui::GetFrameHeight() + spacing.y * 3.0F + 2.0F;
+        const float body = std::max(ImGui::GetContentRegionAvail().y - footer, 60.0F);
+        int columns = 1;
+        if (ImGui::BeginTable("##browser_split", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+                              ImVec2(0.0F, body))) {
+            ImGui::TableSetupColumn("folders", ImGuiTableColumnFlags_WidthFixed, 210.0F * ui_scale);
+            ImGui::TableSetupColumn("items", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            if (begin_region("##browser_tree", ImVec2(0.0F, body))) draw_browser_tree();
+            ImGui::EndChild();
+            ImGui::TableNextColumn();
+            if (begin_region("##browser_items", ImVec2(0.0F, body))) {
+                const float cell = std::round(browser.tile * ui_scale) + std::round(6.0F * ui_scale) * 3.0F;
+                columns = std::max(1, static_cast<int>(ImGui::GetContentRegionAvail().x / cell));
+                draw_browser_items(tiles);
+                if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsAnyItemHovered())
+                    browser.selected.clear();
+            }
+            ImGui::EndChild();
+            ImGui::EndTable();
+        }
+        draw_browser_footer(tiles);
+        if (browser.open) update_browser_keys(tiles, columns);
+        ImGui::End();
+        if (const auto target = std::exchange(browser.activate, std::nullopt); target && browser.open) {
+            const auto found = std::find_if(tiles.begin(), tiles.end(), [&](const BrowserTile& tile) { return tile.id == *target; });
+            if (found != tiles.end()) activate_tile(*found);
+        }
+        if (const auto target = std::exchange(browser.go_to, std::nullopt); target && browser.open) {
+            browser.query.fill('\0');
+            browser.kinds.clear();
+            browser_navigate(*target);
+        }
+    }
+
     // Where a model dropped on the viewport lands: the ground plane under the pointer, or a short
     // distance along the pointer ray when the ground is not in view.
     [[nodiscard]] Vec3 viewport_drop_point(const ImVec2 pointer) const {
@@ -8916,7 +10351,7 @@ struct EditorUi::Impl {
         if (ImGui::Button("Build scripts")) start_script_build(true);
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::Checkbox("Build on change", &auto_build_scripts);
+        editor_checkbox("Build on change", &auto_build_scripts);
         ImGui::SameLine();
         if (ImGui::Button("Revoke trust")) {
             if (call("scripts.trust", "\"trusted\":false")) script_status_reply.clear();
@@ -9224,7 +10659,7 @@ struct EditorUi::Impl {
         const auto target = "\"bus\":\"" + json_escape(mixer_bus) + "\",\"index\":" + std::to_string(mixer_effect);
         ImGui::SeparatorText((std::string(effect_label(type)) + " on " + mixer_bus).c_str());
         bool enabled = boolean_or(effect, "enabled", true);
-        if (ImGui::Checkbox("Enabled", &enabled))
+        if (editor_checkbox("Enabled", &enabled))
             send("audio.set_effect", target + ",\"enabled\":" + (enabled ? "true" : "false"), false,
                  std::string(effect_label(type)) + (enabled ? " on" : " off"));
         note_item("mixer:effect:enabled");
@@ -9271,10 +10706,8 @@ struct EditorUi::Impl {
             auto& edit = draft.begin(*value->number());
             const bool logarithmic = std::string_view(parameter.key).ends_with("_hz") ||
                                      std::string_view(parameter.key) == "mid_frequency";
-            const bool moved = ImGui::SliderScalar(parameter.label, ImGuiDataType_Double, &edit,
-                                                   &parameter.minimum, &parameter.maximum,
-                                                   parameter.format,
-                                                   logarithmic ? ImGuiSliderFlags_Logarithmic : 0);
+            const bool moved = editor_slider(parameter.label, &edit, parameter.minimum, parameter.maximum,
+                                             parameter.format, logarithmic);
             note_item(std::string("mixer:effect:param:") + parameter.key);
             const auto fields = target + ",\"" + parameter.key + "\":" + number_text(edit);
             if (moved) send("audio.set_effect", fields, true, {});
@@ -9347,7 +10780,7 @@ struct EditorUi::Impl {
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many recent frames the averages cover");
         ImGui::SameLine();
-        if (ImGui::Checkbox("Game frames only", &profile_game_only)) {
+        if (editor_checkbox("Game frames only", &profile_game_only)) {
             profile_frame = 0U;
             profile_dirty = true;
         }
@@ -9737,6 +11170,7 @@ EditorUi::~EditorUi() {
     if (impl_->imgui_context_created) {
         impl_->layout.save();
         impl_->chat_media.clear();
+        impl_->thumbnails.clear();
         if (impl_->preview_texture) ImGui::UnregisterUserTexture(impl_->preview_texture.get());
         impl_->preview_texture.reset();
         ImGui::DestroyContext();
@@ -10010,6 +11444,15 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     if (!impl_->vulkan_backend_started && !impl_->headless) return;
 
     impl_->preview_request = std::exchange(impl_->preview_wanted, {});
+    // Thumbnails take the renderer's material preview when the Inspector does not need it.
+    if (impl_->preview_request.empty()) {
+        impl_->preview_request = impl_->thumbnails.material_request();
+        if (!impl_->preview_request.empty() && impl_->preview_request == impl_->last_preview.path) {
+            const auto& last = impl_->last_preview;
+            impl_->thumbnails.store_material(last.path, last.width, last.height, last.rgba);
+            impl_->preview_request = impl_->thumbnails.material_request();
+        }
+    }
     if (impl_->headless) {
         impl_->headless_items.clear();
         ImGui::GetIO().DisplaySize = ImVec2(static_cast<float>(width), static_cast<float>(height));
@@ -10034,6 +11477,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     // A drag change the inspector chose not to send must not tag a later, unrelated edit.
     impl_->pending_gesture = 0;
     ImGui::NewFrame();
+    impl_->thumbnails.begin_frame(impl_->headless);
     ImGuizmo::BeginFrame();
     impl_->frame_open = true;
 
@@ -10207,6 +11651,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     }
     impl_->draw_dialogs();
     impl_->draw_game_config();
+    impl_->draw_asset_browser();
 
     impl_->chat_media.draw_viewer(impl_->headless);
     ImGui::Render();
@@ -10269,7 +11714,7 @@ std::string EditorUi::material_preview_request() const { return impl_->preview_r
 
 void EditorUi::material_preview_ready(const std::string& path, const std::uint32_t width, const std::uint32_t height,
                                       std::vector<std::uint8_t> rgba) {
-    if (impl_->imgui_context_created) impl_->material_preview_ready(path, width, height, rgba);
+    if (impl_->imgui_context_created) impl_->material_preview_ready(path, width, height, std::move(rgba));
 }
 
 bool EditorUi::ground_grid_visible() const {

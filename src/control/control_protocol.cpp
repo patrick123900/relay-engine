@@ -1247,7 +1247,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
                                                          : std::nullopt)
                         kinds.push_back(*kind);
             const auto query = string_field(request, "query");
-            const auto listing = search_assets(root, query, kinds);
+            const auto folder = string_field(request, "folder");
+            const auto listing = search_assets(root, query, kinds, folder, boolean_field(request, "paths", false));
             return response_prefix(id) + "{\"root\":\"" + escape_json(root.generic_string()) +
                    "\",\"query\":\"" + escape_json(query) + "\"," + entries_json(listing) + "}}";
         }

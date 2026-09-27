@@ -71,15 +71,25 @@ AssetKind asset_kind_of(const std::string_view filename, const bool directory) {
 }
 
 AssetDirectoryListing search_assets(const std::filesystem::path& root, const std::string_view query,
-                                    const std::vector<AssetKind>& kinds) {
+                                    const std::vector<AssetKind>& kinds, const std::string_view folder,
+                                    const bool match_paths) {
     AssetDirectoryListing result;
-    const auto needle = lowercase(std::string(query));
+    std::vector<std::string> words;
+    for (std::size_t start = 0; start < query.size();) {
+        const auto end = query.find_first_of(" \t", start);
+        const auto word = query.substr(start, end == std::string_view::npos ? query.size() - start : end - start);
+        if (!word.empty()) words.push_back(lowercase(std::string(word)));
+        if (end == std::string_view::npos) break;
+        start = end + 1U;
+    }
     std::error_code failure;
-    if (!std::filesystem::is_directory(root, failure)) return result;
+    std::string ignored;
+    const auto base = resolve(root, folder, ignored);
+    if (!base || !std::filesystem::is_directory(*base, failure)) return result;
     // Visiting is bounded too, so a huge folder cannot stall the editor.
     constexpr std::size_t maximum_visited = 65536U;
     std::size_t visited = 0;
-    std::filesystem::recursive_directory_iterator item{root, failure}, end;
+    std::filesystem::recursive_directory_iterator item{*base, failure}, end;
     for (; !failure && item != end; item.increment(failure)) {
         if (++visited > maximum_visited) {
             result.truncated = true;
@@ -100,7 +110,11 @@ AssetDirectoryListing search_assets(const std::filesystem::path& root, const std
         }
         const auto kind = asset_kind_of(name, is_directory);
         if (!kinds.empty() && std::find(kinds.begin(), kinds.end(), kind) == kinds.end()) continue;
-        if (!needle.empty() && lowercase(name).find(needle) == std::string::npos) continue;
+        const auto haystack = lowercase(match_paths ? relative : name);
+        if (!std::all_of(words.begin(), words.end(), [&](const std::string& word) {
+                return haystack.find(word) != std::string::npos;
+            }))
+            continue;
         if (result.entries.size() == maximum_asset_search_results) {
             result.truncated = true;
             break;

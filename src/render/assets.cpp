@@ -210,7 +210,9 @@ std::string AssetRegistry::to_json() const {
         const auto next_vertex = index + 1U < meshes_.size()
                                      ? static_cast<std::uint32_t>(meshes_[index + 1U].vertex_offset)
                                      : static_cast<std::uint32_t>(vertices_.size());
-        output << "{\"name\":\"" << meshes_[index].name << "\",\"vertices\":"
+        output << "{\"name\":\"" << meshes_[index].name << "\",\"label\":\""
+               << json_escape(meshes_[index].label) << "\",\"source\":\"" << json_escape(meshes_[index].source)
+               << "\",\"vertices\":"
                << next_vertex - static_cast<std::uint32_t>(meshes_[index].vertex_offset)
                << ",\"indices\":" << meshes_[index].index_count
                << ",\"joints\":" << meshes_[index].joints.size()
@@ -226,7 +228,8 @@ std::string AssetRegistry::to_json() const {
     for (std::size_t index = 0; index < materials_.size(); ++index) {
         if (index != 0U) output << ',';
         const auto& material = materials_[index];
-        output << "{\"name\":\"" << material.name << "\",\"color\":["
+        output << "{\"name\":\"" << material.name << "\",\"label\":\"" << json_escape(material.label)
+               << "\",\"source\":\"" << json_escape(material.source) << "\",\"color\":["
                << material.color[0] << ',' << material.color[1] << ',' << material.color[2]
                << ',' << material.color[3] << "],\"texture\":\"" << material.texture
                << "\",\"metallic_factor\":" << material.metallic_factor

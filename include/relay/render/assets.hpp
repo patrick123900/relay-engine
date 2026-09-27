@@ -60,6 +60,10 @@ struct MeshAsset {
     std::vector<SkinJoint> joints{};
     std::vector<std::vector<SkinWeight>> skin{};
     std::vector<MorphTarget> morph_targets{};
+    // For people: the name the model file gave the mesh (or "Mesh 2") and the project-relative
+    // model it came from. Empty for built-in meshes.
+    std::string label{};
+    std::string source{};
 };
 
 enum class AnimationInterpolation : std::uint8_t { linear, step, cubic };
@@ -123,6 +127,9 @@ struct MaterialAsset {
     enum class AlphaMode : std::uint8_t { opaque, mask, blend } alpha_mode{AlphaMode::opaque};
     float alpha_cutoff{0.5F};
     bool double_sided{false};
+    // For people, like MeshAsset::label and source.
+    std::string label{};
+    std::string source{};
 };
 
 enum class TextureColorSpace : std::uint8_t { linear, srgb };

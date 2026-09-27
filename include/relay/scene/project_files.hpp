@@ -44,12 +44,16 @@ struct AssetDirectoryListing {
 
 [[nodiscard]] std::optional<AssetDirectoryListing> list_asset_directory(
     const std::filesystem::path& root, std::string_view directory, std::string& error);
-// Searches the whole tree below the root for names containing `query` (case-insensitive) whose kind
-// is in `kinds` (any kind when empty). Hidden entries and symlinks are skipped. Results are sorted by
-// path and bounded; truncated reports a partial result.
+// Searches the tree below `folder` (the root when empty) for entries whose kind is in `kinds` (any
+// kind when empty) and whose name contains every whitespace-separated word of `query`
+// (case-insensitive, in any order). With `match_paths` the words may match anywhere in the
+// root-relative path, so "hero rock" finds characters/hero/rock.png. Hidden entries and symlinks are
+// skipped. Results are sorted by path and bounded; truncated reports a partial result.
 [[nodiscard]] AssetDirectoryListing search_assets(const std::filesystem::path& root,
                                                   std::string_view query,
-                                                  const std::vector<AssetKind>& kinds);
+                                                  const std::vector<AssetKind>& kinds,
+                                                  std::string_view folder = {},
+                                                  bool match_paths = false);
 [[nodiscard]] bool create_asset_folder(const std::filesystem::path& root, std::string_view path,
                                        std::string& error);
 // Renames or moves a file or folder. The destination must not exist; folders cannot move into

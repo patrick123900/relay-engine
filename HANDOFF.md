@@ -1,14 +1,15 @@
 # Relay Engine — engineering handoff
 
 This file records only the state needed to continue development. User-facing material belongs in
-[`README.md`](README.md); protocol details belong in [`docs/protocol.md`](docs/protocol.md). Follow
+[`docs/editor.md`](docs/editor.md) (the editor guide); keep [`README.md`](README.md) a short
+overview for visitors. Protocol details belong in [`docs/protocol.md`](docs/protocol.md). Follow
 [`AGENTS.md`](AGENTS.md) for working and verification rules.
 
 ## Current snapshot
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v47: 159 native methods. Scene v23, project v2, import manifest v3.
+- Protocol schema v49: 160 native methods. Scene v23, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
@@ -88,6 +89,65 @@ without blocking simultaneous human editing.
   menu, or drag onto the viewport (ground-plane placement) or a hierarchy row (child). The
   Create menu lists future file types (scripts, text, shaders, materials) as disabled
   placeholders.
+- Asset references and the Asset Browser (`src/editor/editor_ui.cpp`, from `asset_field` to
+  `draw_asset_browser`). Inspector fields that name an asset or a node (renderer mesh and material,
+  material shader and image parameters, collision mesh, audio clip, skybox, panorama, joint
+  partner, and script text properties whose default or value has an asset extension) draw the
+  kind's icon and the name without folders or extension (`asset_display_name`; built-in names are
+  title-cased, imported meshes and materials use their new registry `label`), with the path in the
+  tooltip. Clicking the field opens the browser (right-click → Show in Assets reveals the file).
+  Drops are typed by the same pick: while a `relay.asset` or `relay.entity` payload is dragged,
+  each field builds its `AssetPick` and `drop_verdict` accepts files of its kinds passing
+  `accepts`, nodes among its `@scene` choices, and a model file standing for its one imported
+  mesh or material (several open the browser inside the model); fields that would take the drag
+  are outlined, and refusals replace the drag tooltip with what the field takes (`AssetPick::what`
+  or one derived from kinds). Hierarchy rows now select on an undragged release
+  (`hierarchy_pressed`), so dragging a node leaves the Inspector on the current one. Fields, the Music player's **+ Add track...** and Post Process
+  **+ Add effect...** buttons open the browser with an `AssetPick`: accepted kinds, an extra file test, `AssetChoice`s for non-file items
+  (group `""` = footer button such as None or Gradient; `@builtin`, `@ready`, `@scene`, or the source
+  model's path for imported meshes and materials, which makes that model a folder-like tile),
+  actions (New material...) and a `choose` callback. Picks are chosen frames later, so every
+  callback captures by value. Tile activation and tree navigation are deferred to the end of the
+  window (`browser.activate`, `go_to`) because both replace listings the frame's tiles point into.
+  The window is non-modal and undocked, keeps its size in the layout ini, relists the open folder
+  every 2 s, and searches through `assets.search` with the new multi-word `query`, `folder` scope
+  and `paths` matching (protocol v49); imported and built-in choices are matched locally.
+  Material type, shader and panorama come from `assets.material`/`assets.sky_material`, cached 4 s
+  per file (`material_facts_of`). Its menus close on Escape themselves (the editor does not enable
+  ImGui keyboard navigation, so ImGui never closes popups on Escape), and the editor's shortcuts
+  stand aside while it has focus. Tools → Asset browser opens it without a pick. Headless keys:
+  `asset_browser:item:<path>`, `:choice:<value>`, `:button:<value>`, `:action:<label>`,
+  `:tree:<folder>`, `:choose`, `:cancel`, `:search`, `:filter[:kind]`, `:options`, `:view`.
+- Thumbnails (`AssetThumbnails`, `src/editor/asset_thumbnails.cpp`): images and models are drawn on
+  worker threads by `image_thumbnail` and `model_thumbnail` (engine, `src/render/asset_thumbnail.cpp`:
+  box-filtered image shrink; a private import of the model with the `static_mesh` preset drawn by a
+  small CPU rasterizer at 2x with Lambert, sky and rim light, base colors and color textures, or one
+  mesh chosen by its `.mesh.<index>` suffix, since the content id differs by preset), at most two
+  jobs, visible tiles first, 128 px, rechecked against file time and size every 1.5 s, at most 320
+  textures. Surface materials use the window's material preview: when the Inspector does not need
+  it, `build` asks for the thumbnail cache's next material, and every delivered preview is offered
+  to the cache (the renderer does not redraw an unchanged material, so the last delivery is kept
+  in `last_preview`). Sky materials show their panorama; `.blend` models, post materials, shaders
+  and other kinds show their icon. ImGui textures are UNORM on the sRGB swapchain, so pixels are
+  linearised before upload (`srgb_rows_to_linear`); the Inspector's material preview was shown too
+  bright before this and is converted too.
+- Editor widgets (`src/editor/editor_widgets.cpp`): `editor_checkbox` replaces every
+  `ImGui::Checkbox` (a box about 0.86 of the font size, centred in a normal row); `editor_slider`
+  replaces the horizontal sliders (Inspector `slider_scalar`, mixer effect parameters, bus volume,
+  axis deadzone): a thin track filled to the value, a round knob, and a value box that takes typed
+  values on click (Ctrl+click and double-click anywhere also type), optionally logarithmic, rounding
+  to the displayed precision. `slider_format` picks decimals from a hint's step or the range (two up
+  to 10, one up to 100, none beyond). `AssetIcon` has one drawn icon and colour per kind (folder,
+  model, mesh, scene, template, image, surface/sky/post material, shader, script, text, sound,
+  video, node, other), also used by the Assets panel. The mixer's vertical faders and the agent
+  reasoning slider are unchanged.
+- `render.assets` reports each mesh's and material's `label` (the model file's own name, or "Mesh 2")
+  and `source` (project-relative model), set by the importer (`MeshAsset`/`MaterialAsset::label`,
+  `source`) and not part of content hashing.
+- Inspector labels go through `field_display_name` (in `inspector_field_label` and `drag_vector3`):
+  "##id" suffixes dropped, underscores become spaces, first letter capitalised, so script and shader
+  names read "Wave height". Every Inspector checkbox (`inspector_checkbox`) and script text property
+  puts its name in the left label column like other fields.
 - Development builds (`RELAY_OPEN_DEMO_PROJECT`, on in the dev preset) open
   `examples/demo/demo.relayproject` when the UI editor starts from the repository root, unless
   `RELAY_OPEN_DEMO_PROJECT=0`. Smoke tests set that override. `tools/generate_demo_project.py`
@@ -980,6 +1040,13 @@ Phase 3:
    converted to shader materials. Graphs: no per-node previews, comments inside converted stages
    are dropped, and stages with control flow stay code. The canvas has been looked at only through
    the headless test's rasterized snapshots (`RELAY_UI_SNAPSHOT_DIR`), not on a desktop.
+17. The Asset Browser, reference fields, thumbnails, checkbox and slider have headless coverage and
+   were looked at only in `RELAY_UI_SNAPSHOT_DIR` snapshots, not on a desktop. Thumbnails are 8-bit
+   linear textures, so very dark gradients band slightly. Material thumbnails render one per frame
+   through the preview pass. Models are imported once per thumbnail (and once per mesh tile); very
+   large models take a while on the worker. Only project folders and a pick's choices are listed:
+   meshes of models not yet imported cannot be chosen until the model is imported (import it from
+   Assets). Escape still does not close menus outside the browser.
 
 ## Next priorities
 
@@ -1097,6 +1164,16 @@ stages; Post Process add and toggle; `RELAY_UI_SNAPSHOT_DIR` saves rasterized pi
 checked by pixel; the demo's motion blur keeps a still camera sharp and blurs one turning 3 degrees
 in a frame, by counting sharp edges).
 
+The Asset Browser is covered by the engine suite (`image_thumbnail`, whole-model and one-mesh
+`model_thumbnail`, refusals, import labels in `render.assets`), the workflow suite (multi-word
+search, `paths`, `folder` scope) and the headless editor suite (`asset_browser_ui`: fields, surface
+materials only, material thumbnails from a delivered preview, built-in materials, imported meshes
+inside their model with per-mesh thumbnails, Tools → Asset browser, folders, image and sky
+thumbnails, word order, folder-name matching, type filters, list view, the slider's typed value and
+track drag; the joint, audio, music, sky and post-processing tests choose through the browser).
+`tests/ui_snapshot.hpp` now samples each draw's own texture and encodes sRGB like the swapchain, so
+snapshots show thumbnails and the real brightness.
+
 Run native suites sequentially because some fixtures share temporary import paths:
 
 ```sh
@@ -1136,6 +1213,7 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Audio | `src/audio/`, `include/relay/audio/`, Audio source Inspector section and Audio page in `src/editor/editor_ui.cpp` |
 | Shaders and materials | `src/render/shader_graph.cpp`, `src/editor/shader_graph_canvas.cpp`, `src/render/shader_language.cpp`, `src/render/materials.cpp`, `include/relay/render/shader_language.hpp`, `include/relay/render/materials.hpp`, `shaders/scene_bindings.glsl`, `tools/embed_shader_sources.cmake`, custom pipelines and post processing in `src/platform/vulkan_window.cpp`, Shader Editor in `src/editor/editor_ui.cpp`, `docs/shaders.md` |
 | Sky and fog | `src/render/sky.cpp`, `include/relay/render/sky.hpp`, `RenderSky` in `scene_render.hpp`, `shaders/sky.frag`, Sky section in `src/editor/editor_ui.cpp` |
+| Asset Browser and reference fields | `asset_field`…`draw_asset_browser` in `src/editor/editor_ui.cpp`, `src/editor/asset_thumbnails.cpp`, `src/render/asset_thumbnail.cpp`, `src/editor/editor_widgets.cpp` (icons, checkbox, slider) |
 | Frame profiler | `src/observe/profiler.cpp`, `include/relay/observe/profiler.hpp`, Profiler panel in `src/editor/editor_ui.cpp` |
 | Native tests | `tests/engine_tests.cpp`, `tests/script_tests.cpp`, `tests/editor_*tests.cpp` |
 | Bridge tests | `tools/mcp-bridge/tests/` |

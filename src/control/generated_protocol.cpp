@@ -55,8 +55,10 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_assets_browse{{
     {"directory", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^([A-Za-z0-9][A-Za-z0-9._ /-]*)?$", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 2> fields_assets_search{{
+constexpr std::array<ProtocolFieldSpec, 4> fields_assets_search{{
     {"query", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 64U, "", ""},
+    {"folder", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^([A-Za-z0-9][A-Za-z0-9._ /-]*)?$", ""},
+    {"paths", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 12U, "^(folder|model|scene|template|image|material|shader|script|text|media|audio|other)$", ""},
 }};
 
@@ -803,7 +805,7 @@ constexpr std::array<ProtocolMethodSpec, 160> methods{{
     {"assets.formats", "asset_import_formats", "Inspect model import formats", "Report model formats and feature coverage available in this Relay build, including Godot-compatible interchange paths.", true, false, false, false, false, no_fields},
     {"assets.import_model", "asset_import_model", "Import project model", "Import a model from the project-local assets directory using a content-addressed identity and optionally instantiate its node hierarchy.", false, false, false, false, false, fields_assets_import_model},
     {"assets.browse", "asset_browse", "Browse project files", "List the folders and files in one project folder, folders first, with each entry's asset kind. Hidden entries, symlinks and .relayproject files are omitted; importable models are marked.", true, false, false, false, false, fields_assets_browse},
-    {"assets.search", "asset_search", "Search project files", "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.", true, false, false, false, false, fields_assets_search},
+    {"assets.search", "asset_search", "Search project files", "Find project files and folders below the project root (or one folder) whose names contain every word of the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.", true, false, false, false, false, fields_assets_search},
     {"assets.create_folder", "asset_create_folder", "Create project folder", "Create a new, empty folder inside an existing project folder.", false, false, false, false, false, fields_assets_create_folder},
     {"assets.move", "asset_move", "Rename or move project file", "Rename or move a project file or folder without overwriting. Import records follow moved models; project scene files and the project file cannot move.", false, false, false, false, false, fields_assets_move},
     {"assets.delete", "asset_delete", "Delete project file", "Move a project file or folder into the hidden .relay-trash folder, where it can be recovered by hand. Project scene files and the project file cannot be deleted.", false, true, false, false, false, fields_assets_delete},

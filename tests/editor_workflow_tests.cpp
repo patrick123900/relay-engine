@@ -508,6 +508,16 @@ void asset_files() {
               std::vector<std::string>{"scenes/main.relay.json:scene", "textures/wood:folder"},
           "query and kinds combine, sorted by path");
     check(search("\"query\":\"notes.txt\"").empty(), "search skips the hidden trash");
+    check(search("\"query\":\"notes  robot\"") == std::vector<std::string>{"meshes/robot-notes.md:text"},
+          "every word must appear in the name, in any order");
+    check(search("\"query\":\"wood oak\"").empty() &&
+              search("\"query\":\"wood oak\",\"paths\":true") ==
+                  std::vector<std::string>{"textures/wood/Oak.PNG:image"},
+          "path matching lets words match folder names");
+    check(search("\"query\":\"o\",\"folder\":\"textures\"") ==
+              std::vector<std::string>{"textures/wood:folder", "textures/wood/Oak.PNG:image"},
+          "a folder limits the search to its subtree");
+    (void)request(protocol, "assets.search", "\"folder\":\"../outside\"", false);
     (void)request(protocol, "assets.search", "\"kinds\":[\"bogus\"]", false);
     check(engine.run_game(), "asset test game session starts");
     (void)request(protocol, "assets.create_folder", "\"path\":\"during-game\"", false);

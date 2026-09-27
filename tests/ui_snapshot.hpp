@@ -1,8 +1,9 @@
 #pragma once
 
 // Test-only: rasterizes the headless editor's last Dear ImGui frame into a PNG, so interface work
-// can be looked at without a window or a desktop. Every textured draw samples the font atlas, which
-// is the only texture the headless editor has. Colors are blended in sRGB like the Vulkan backend.
+// can be looked at without a window or a desktop. Textured draws sample the font atlas, or the
+// texture's own pixels when it has them (thumbnails). The editor's colors are linear values for an
+// sRGB swapchain, so they are blended as they are and encoded to sRGB at the end, as it does.
 
 #include <imgui.h>
 
@@ -78,8 +79,8 @@ inline bool write_ui_snapshot(const std::filesystem::path& path) {
     const auto* data = ImGui::GetDrawData();
     if (!data || !data->Valid) return false;
     const int width = static_cast<int>(data->DisplaySize.x), height = static_cast<int>(data->DisplaySize.y);
-    std::vector<float> frame(static_cast<std::size_t>(width) * height * 3U, 0.08F);
-    auto* atlas = ImGui::GetIO().Fonts->TexData;
+    std::vector<float> frame(static_cast<std::size_t>(width) * height * 3U, 0.0F);
+    ImTextureData* atlas = nullptr;
     const auto texel = [&](float u, float v) -> std::array<float, 4> {
         if (!atlas || !atlas->Pixels) return {1, 1, 1, 1};
         const int x = std::clamp(static_cast<int>(u * static_cast<float>(atlas->Width)), 0, atlas->Width - 1);
@@ -92,6 +93,8 @@ inline bool write_ui_snapshot(const std::filesystem::path& path) {
         const auto* commands = data->CmdLists[list];
         for (const auto& command : commands->CmdBuffer) {
             if (command.UserCallback) continue;
+            atlas = command.TexRef._TexData && command.TexRef._TexData->Pixels ? command.TexRef._TexData
+                                                                               : ImGui::GetIO().Fonts->TexData;
             const int clip_x0 = std::max(0, static_cast<int>(command.ClipRect.x - data->DisplayPos.x));
             const int clip_y0 = std::max(0, static_cast<int>(command.ClipRect.y - data->DisplayPos.y));
             const int clip_x1 = std::min(width, static_cast<int>(command.ClipRect.z - data->DisplayPos.x));
@@ -137,8 +140,11 @@ inline bool write_ui_snapshot(const std::filesystem::path& path) {
         }
     }
     std::vector<std::uint8_t> rgb(frame.size());
-    for (std::size_t index = 0; index < frame.size(); ++index)
-        rgb[index] = static_cast<std::uint8_t>(std::clamp(frame[index], 0.0F, 1.0F) * 255.0F + 0.5F);
+    for (std::size_t index = 0; index < frame.size(); ++index) {
+        const float linear = std::clamp(frame[index], 0.0F, 1.0F);
+        const float encoded = linear <= 0.0031308F ? linear * 12.92F : 1.055F * std::pow(linear, 1.0F / 2.4F) - 0.055F;
+        rgb[index] = static_cast<std::uint8_t>(encoded * 255.0F + 0.5F);
+    }
     write_png_rgb(path, width, height, rgb);
     return true;
 }

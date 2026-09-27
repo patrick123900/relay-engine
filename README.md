@@ -14,7 +14,7 @@
   <img alt="status" src="https://img.shields.io/badge/status-experimental-f0b44d">
 </p>
 
-![Relay Editor](docs/images/relay_editor.png)
+![Relay Editor](docs/images/relay_editor.webp)
 
 Relay is an experimental game engine and editor built around a shared control surface. The editor,
 automation, tests and AI agents all work through the same typed protocol, so an agent can inspect

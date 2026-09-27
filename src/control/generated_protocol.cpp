@@ -57,7 +57,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_assets_browse{{
 
 constexpr std::array<ProtocolFieldSpec, 2> fields_assets_search{{
     {"query", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 64U, "", ""},
-    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 12U, "^(folder|model|scene|template|image|shader|script|text|media|audio|other)$", ""},
+    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 12U, "^(folder|model|scene|template|image|material|shader|script|text|media|audio|other)$", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_assets_create_folder{{
@@ -71,6 +71,55 @@ constexpr std::array<ProtocolFieldSpec, 2> fields_assets_move{{
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_assets_delete{{
     {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9][A-Za-z0-9._ /-]*$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_shaders_read{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-shader$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 5> fields_shaders_write{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-shader$", ""},
+    {"text", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 262144U, "", ""},
+    {"create", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "surface|post_process"},
+    {"effect", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "bloom|color_grading|vignette"},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 2> fields_shaders_preview{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-shader$", ""},
+    {"text", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 262144U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_assets_material{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 4> fields_assets_set_material{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$", ""},
+    {"create", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "surface|post_process"},
+    {"shader", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^([A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-shader)?$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 5> fields_assets_set_material_parameter{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$", ""},
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 64U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
+    {"value", ProtocolValueType::number_array, false, false, false, false, 0, 0, 1U, 4U, "", ""},
+    {"texture", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^([A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(png|PNG|jpg|JPG|jpeg|JPEG))?$", ""},
+    {"reset", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_assets_sky_material{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 6> fields_assets_set_sky_material{{
+    {"path", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$", ""},
+    {"create", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"panorama", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^([A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(png|PNG|jpg|JPG|jpeg|JPEG))?$", ""},
+    {"tint", ProtocolValueType::number_array, false, false, false, false, 0, 0, 3U, 3U, "", ""},
+    {"intensity", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
+    {"rotation_degrees", ProtocolValueType::number, false, false, true, true, -360, 360, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_logs_read{{
@@ -125,7 +174,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scene_inspect{{
 constexpr std::array<ProtocolFieldSpec, 3> fields_scene_create{{
     {"name", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 128U, "", ""},
     {"parent", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "Node|Camera|DirectionalLight|PointLight|SpotLight|RigidBody|StaticBody|StaticMesh|AudioSource|ReverbZone|MusicPlayer"},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "Node|Camera|Sky|PostProcess|DirectionalLight|PointLight|SpotLight|RigidBody|StaticBody|StaticMesh|AudioSource|ReverbZone|MusicPlayer"},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_scene_destroy{{
@@ -166,7 +215,15 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_renderer{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"mesh", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9._:-]+$", ""},
-    {"material", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z0-9._:-]+$", ""},
+    {"material", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^([A-Za-z0-9._:-]+|[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material)$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 5> fields_scene_set_renderer_parameter{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 64U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
+    {"value", ProtocolValueType::number_array, false, false, false, false, 0, 0, 1U, 4U, "", ""},
+    {"clear", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 2> fields_scene_set_parent{{
@@ -356,15 +413,45 @@ constexpr std::array<ProtocolFieldSpec, 14> fields_scene_set_music_player{{
     {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 13> fields_scene_set_sky{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"material", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^([A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material)?$", ""},
+    {"horizon_color", ProtocolValueType::number_array, false, false, false, false, 0, 0, 3U, 3U, "", ""},
+    {"zenith_color", ProtocolValueType::number_array, false, false, false, false, 0, 0, 3U, 3U, "", ""},
+    {"intensity", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
+    {"ambient_intensity", ProtocolValueType::number, false, false, true, true, 0, 10, 0U, 0U, "", ""},
+    {"fog", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"fog_start", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+    {"fog_end", ProtocolValueType::number, false, false, true, true, 0, 1000000, 0U, 0U, "", ""},
+    {"fog_start_color", ProtocolValueType::number_array, false, false, false, false, 0, 0, 3U, 3U, "", ""},
+    {"fog_end_color", ProtocolValueType::number_array, false, false, false, false, 0, 0, 3U, 3U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_post_process{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"effects", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 16U, "^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_post_effect{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"index", ProtocolValueType::integer, true, false, true, true, 0, 15, 0U, 0U, "", ""},
+    {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"editor", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 3> fields_component_add{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script"},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|sky|post_process|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script"},
     {"behaviour", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 3> fields_component_remove{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script"},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|sky|post_process|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script"},
     {"index", ProtocolValueType::integer, false, false, true, true, 0, 31, 0U, 0U, "", ""},
 }};
 
@@ -693,7 +780,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_audio_set_spatialization{{
     {"mode", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "stereo|binaural"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 148> methods{{
+constexpr std::array<ProtocolMethodSpec, 160> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -720,6 +807,14 @@ constexpr std::array<ProtocolMethodSpec, 148> methods{{
     {"assets.create_folder", "asset_create_folder", "Create project folder", "Create a new, empty folder inside an existing project folder.", false, false, false, false, false, fields_assets_create_folder},
     {"assets.move", "asset_move", "Rename or move project file", "Rename or move a project file or folder without overwriting. Import records follow moved models; project scene files and the project file cannot move.", false, false, false, false, false, fields_assets_move},
     {"assets.delete", "asset_delete", "Delete project file", "Move a project file or folder into the hidden .relay-trash folder, where it can be recovered by hand. Project scene files and the project file cannot be deleted.", false, true, false, false, false, fields_assets_delete},
+    {"shaders.read", "shaders_read", "Read shader", "Read a Relay shader (.relay-shader): its text, type, render modes, uniforms (with types, hints, ranges and defaults), and compile errors by line. A shader being previewed also returns the preview text. See docs/shaders.md for the language: shader_type surface or post_process, uniform declarations, and void vertex()/fragment() functions writing built-ins such as ALBEDO, ROUGHNESS, VERTEX or COLOR.", true, false, false, false, false, fields_shaders_read},
+    {"shaders.write", "shaders_write", "Write shader", "Create or replace a Relay shader file and compile it, returning its compile errors by line. Materials using it redraw at once. With create and no text, starts from the template for type, or from one of Relay's ready-made post-processing effects (effect: bloom, color_grading or vignette), which then belongs to the project like any other shader. Clears any preview of the file.", false, true, false, false, false, fields_shaders_write},
+    {"shaders.preview", "shaders_preview", "Preview shader", "Compile shader text without saving it and draw every material using the shader with it, so edits show in the viewport before they are saved. Omit text to stop previewing and use the file again. Returns compile errors by line.", false, false, false, false, false, fields_shaders_preview},
+    {"assets.material", "asset_material", "Inspect material", "Read a surface or post-processing material (.relay-material): its shader, each shader uniform with its type, hint, range, default and the material's value, and why it cannot be drawn if so. Sky materials are read with assets.sky_material.", true, false, false, false, false, fields_assets_material},
+    {"assets.set_material", "asset_set_material", "Create or edit material", "Create a surface or post-processing material, or change its shader. A surface material draws meshes whose renderer names it (scene.set_renderer material); a post-processing material is an effect in a Post Process node (scene.set_post_process). Parameters for uniforms the new shader lacks are kept but ignored.", false, false, false, false, false, fields_assets_set_material},
+    {"assets.set_material_parameter", "asset_set_material_parameter", "Set material parameter", "Set one shader uniform on a material, saved to its file: value for numbers (1 to 4 numbers matching float, int, bool as 0 or 1, vec2, vec3 or vec4; colors are linear), or texture for sampler2D (a project PNG or JPEG, empty for the default image). reset returns the uniform to the shader's default.", false, false, false, false, false, fields_assets_set_material_parameter},
+    {"assets.sky_material", "asset_sky_material", "Inspect sky material", "Read a sky material file (.relay-material) with its panorama image's size, or the reason the image cannot be drawn.", true, false, false, false, false, fields_assets_sky_material},
+    {"assets.set_sky_material", "asset_set_sky_material", "Create or edit sky material", "Create a sky material file (.relay-material), or change one. A sky material draws an equirectangular (2:1) panorama image from the project behind the scene, tinted, brightened and turned about the vertical axis; a sky uses it through scene.set_sky's material. Omitted fields keep their current values, or the defaults for a new file.", false, false, false, false, false, fields_assets_set_sky_material},
     {"logs.read", "logs_read", "Read Relay logs", "Read structured engine log entries newer than a sequence number.", true, false, false, false, false, fields_logs_read},
     {"performance.read", "performance_read", "Read Relay performance", "Read bounded per-frame CPU/GPU timing, draw/resource counts, entities and process memory.", true, false, false, false, false, fields_performance_read},
     {"profiler.read", "profiler_read", "Read frame profile", "Find what limits the frame rate of the live editor or running game. Aggregates recent profiled frames into frame-time statistics, a CPU/GPU/display bottleneck verdict, a call tree of timed CPU scopes (simulation, scripts per behaviour, physics, rendering, editor UI and waits), hotspots by self time and per-pass GPU timings. Only a live editor records frames.", true, false, false, false, false, fields_profiler_read},
@@ -744,7 +839,8 @@ constexpr std::array<ProtocolMethodSpec, 148> methods{{
     {"scene.clear", "scene_clear", "Clear the scene", "Destroy every entity as one undoable transaction, leaving an empty scene to start new work in.", false, true, false, false, false, no_fields},
     {"scene.set_transform", "scene_set_transform", "Set entity transform", "Update selected local position, Euler rotation or scale fields in one transaction.", false, false, false, false, false, fields_scene_set_transform},
     {"scene.set_camera", "scene_set_camera", "Configure entity camera", "Add, update or remove a perspective or orthographic camera; activating one deactivates the previous camera.", false, false, false, false, false, fields_scene_set_camera},
-    {"scene.set_renderer", "scene_set_renderer", "Configure entity renderer", "Attach a registered built-in or imported mesh and material to an entity, or remove its renderer component.", false, false, false, false, false, fields_scene_set_renderer},
+    {"scene.set_renderer", "scene_set_renderer", "Configure entity renderer", "Attach a registered built-in or imported mesh and a material to an entity, or remove its renderer component. The material is a registered material name or a project surface material (.relay-material) drawn by its shader. Per-object parameter values (scene.set_renderer_parameter) stay while the material is unchanged.", false, false, false, false, false, fields_scene_set_renderer},
+    {"scene.set_renderer_parameter", "scene_set_renderer_parameter", "Set per-object material parameter", "Give one object its own value for a parameter of its shader material, without changing the material file or other objects that use it: value is 1 to 4 numbers matching the uniform (float, int, bool as 0 or 1, vec2, vec3 or vec4; colors are linear). Images cannot be overridden. clear returns the object to the material's value. Undoable; scripts change the same values during the game with entity.set_material_parameter.", false, false, false, false, false, fields_scene_set_renderer_parameter},
     {"scene.set_parent", "scene_set_parent", "Set entity parent", "Reparent an entity safely; use null to move it to the scene root.", false, false, false, false, false, fields_scene_set_parent},
     {"scene.undo", "scene_undo", "Undo scene change", "Undo the most recent scene transaction and restore exact entity generations.", false, false, false, false, false, no_fields},
     {"scene.redo", "scene_redo", "Redo scene change", "Reapply the most recently undone scene transaction.", false, false, false, false, false, no_fields},
@@ -770,6 +866,9 @@ constexpr std::array<ProtocolMethodSpec, 148> methods{{
     {"scene.set_audio_source", "scene_set_audio_source", "Configure audio source", "Add, edit or remove a node's audio source: a project sound file (.wav, .flac, .mp3 or .ogg) played through a mixer bus during Run Game. Spatial sources fade with distance from the listener (inverse, inverse square or linear rolloff between the minimum and maximum distance), pan around it and shift pitch with relative motion (doppler); flat sources play as stereo with a balance. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_audio_source},
     {"scene.set_reverb_zone", "scene_set_reverb_zone", "Configure reverb zone", "Add, edit or remove a reverb zone: a sphere or box (following the node's position, rotation and scale) where spatial sounds take on a room's reverb while the listener is inside, fading out over fade metres outside it. Choosing a preset (room, small_room, bathroom, hall, cathedral, cave, arena, forest) sets its parameters; changing a parameter makes the zone custom. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_reverb_zone},
     {"scene.set_music_player", "scene_set_music_player", "Configure music player", "Add, edit or remove a music player: a playlist of project sound files played flat on a bus during Run Game, one after another with a crossfade, optionally shuffled and looping. Long files stream. Changes asked for with audio.music wait for the player's sync point (immediate, beat, bar or track_end) counted at bpm from first_beat_seconds. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_music_player},
+    {"scene.set_sky", "scene_set_sky", "Configure sky", "Add, edit or remove a sky: what is drawn behind everything, the ambient light it gives the scene, and linear distance fog. The first node with a sky is the one in use; its directional light, if any, is the sun, aimed by turning the node. The sky is a gradient from horizon_color (at the horizon and below) to zenith_color (straight up), unless material names a sky material (.relay-material, see assets.set_sky_material), which draws its panorama instead. Colors are linear RGB triples from 0 to 1000. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_sky},
+    {"scene.set_post_process", "scene_set_post_process", "Configure post processing", "Add, change or remove post processing: an ordered list of post_process materials (full-screen effects from post_process shaders) applied to the lit scene before tone mapping, in every view. The first node with post processing is used. Effects that stay in a replaced list keep their settings; new ones start on and show in the editor's view too. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_post_process},
+    {"scene.set_post_effect", "scene_set_post_effect", "Configure post effect", "Turn one post-processing effect on or off by its position in the list, without removing it, and choose whether it also shows in the editor's own view (off for effects meant for the game camera, such as motion blur). Undoable.", false, false, false, false, false, fields_scene_set_post_effect},
     {"component.add", "component_add", "Add component", "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.", false, false, false, false, false, fields_component_add},
     {"component.remove", "component_remove", "Remove component", "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.", false, true, false, false, false, fields_component_remove},
     {"scene.set_script", "scene_set_script", "Configure script component", "Change the behaviour or enabled state of one of a node's script components, as an undoable transaction.", false, false, false, false, false, fields_scene_set_script},

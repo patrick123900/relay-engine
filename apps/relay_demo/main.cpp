@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -205,8 +206,11 @@ int run_vulkan_capture(const std::string_view path_text) {
 // Opens a project through the control protocol, renders it for a number of frames so temporal
 // effects settle, and captures the final frame. Run with SDL_VIDEODRIVER=offscreen to render
 // without a visible window.
+// Captures a project's scene after `frames` frames. A nonzero `turn_degrees` turns the active
+// camera about the vertical by that much just before the capture, so the captured frame has one
+// frame of camera motion, for checking effects that depend on it such as motion blur.
 int run_vulkan_scene_capture(const std::string& project, const std::string& output,
-                             const unsigned frames) {
+                             const unsigned frames, const double turn_degrees) {
     relay::Engine engine;
     relay::ControlProtocol protocol(engine);
     std::string request = R"({"id":1,"method":"project.open","filename":)";
@@ -224,9 +228,17 @@ int run_vulkan_scene_capture(const std::string& project, const std::string& outp
     for (unsigned frame = 0; frame < frames; ++frame) {
         (void)window.poll_quit();
         apply_graphics_settings(window, engine);
+        engine.sync_render_assets();
         if (!window.draw(engine.scene(), static_cast<double>(frame) / 60.0)) {
             std::cerr << window.error() << '\n';
             return 1;
+        }
+    }
+    if (turn_degrees != 0.0) {
+        if (const auto camera = engine.scene().active_camera()) {
+            auto transform = engine.scene().get(*camera)->transform;
+            transform.rotation_degrees.y += turn_degrees;
+            (void)engine.scene().set_transform(*camera, transform);
         }
     }
     if (!window.capture_image(output, engine.scene(), static_cast<double>(frames) / 60.0)) {
@@ -237,6 +249,40 @@ int run_vulkan_scene_capture(const std::string& project, const std::string& outp
               << " on " << window.device_name() << '\n'
               << window.lighting_status_json() << '\n'
               << "GPU frame: " << window.gpu_frame_milliseconds() << " ms\n";
+    return 0;
+}
+
+// Renders a project's surface material on the editor's preview sphere and writes the preview.
+int run_vulkan_material_preview(const std::string& project, const std::string& material, const std::string& output) {
+    relay::Engine engine;
+    relay::ControlProtocol protocol(engine);
+    const auto opened = protocol.handle(R"({"id":1,"method":"project.open","filename":")" + project + "\"}");
+    if (opened.find(R"("ok":true)") == std::string::npos) {
+        std::cerr << "Could not open " << project << ": " << opened << '\n';
+        return 1;
+    }
+    relay::VulkanWindow window("Relay Material Preview", 640, 360, engine.assets());
+    if (!window.valid()) {
+        std::cerr << window.error() << '\n';
+        return 1;
+    }
+    engine.set_previewed_material(material);
+    std::optional<relay::OwnedFrame> preview;
+    window.set_material_preview(material, [&](const std::string&, relay::OwnedFrame frame) { preview = std::move(frame); });
+    for (unsigned frame = 0; frame < 10U && !preview; ++frame) {
+        (void)window.poll_quit();
+        engine.sync_render_assets();
+        if (!window.draw(engine.scene(), static_cast<double>(frame) / 60.0)) {
+            std::cerr << window.error() << '\n';
+            return 1;
+        }
+    }
+    std::string error;
+    if (!preview || !relay::write_frame_image(preview->view(), output, error)) {
+        std::cerr << (preview ? error : "no preview arrived: " + window.error()) << '\n';
+        return 1;
+    }
+    std::cout << "Previewed " << material << " to " << output << '\n';
     return 0;
 }
 
@@ -422,6 +468,7 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
     // real elapsed time, so neither the frame rate nor the game speed depends on the monitor.
     auto previous_frame = std::chrono::steady_clock::now();
     double unsimulated_seconds = 0.0;
+    const auto shader_clock_start = std::chrono::steady_clock::now();
     // The game's frame rate limiter: the current period and the next frame's deadline.
     std::chrono::steady_clock::duration limiter_period{};
     std::chrono::steady_clock::time_point limiter_deadline{};
@@ -461,6 +508,10 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
         }
 
         const double step = engine.fixed_delta_seconds();
+#ifdef RELAY_HAS_EDITOR_UI
+        // The Inspector's material preview needs its material loaded even when nothing uses it.
+        if (editor) engine.set_previewed_material(editor->material_preview_request());
+#endif
         {
             RELAY_PROFILE_SCOPE("Simulation");
             for (int steps = 0; unsimulated_seconds >= step; ++steps) {
@@ -474,6 +525,9 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
             }
         }
         apply_graphics_settings(window, engine);
+        // Shaders animate in the editor too, so they follow the wall clock rather than game time.
+        window.set_shader_time(std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                             shader_clock_start).count());
         // Frames between game steps blend the last two steps by the time since the latest one.
         window.set_render_interpolation(engine.render_interpolation(unsimulated_seconds / step));
         {
@@ -612,10 +666,17 @@ int main(const int argument_count, char** arguments) {
         return run_vulkan_capture(argument_count > 2 ? std::string_view(arguments[2])
                                                      : std::string_view{});
     }
+    if (mode == "--vulkan-material-preview") {
+        if (argument_count < 5) {
+            std::cerr << "usage: relay_demo --vulkan-material-preview <project> <material> <output.png>\n";
+            return 2;
+        }
+        return run_vulkan_material_preview(arguments[2], arguments[3], arguments[4]);
+    }
     if (mode == "--vulkan-scene-capture") {
         if (argument_count < 4) {
             std::cerr << "usage: relay_demo --vulkan-scene-capture <project> <output.png> "
-                         "[frames]\n";
+                         "[frames] [turn-degrees]\n";
             return 2;
         }
         unsigned frames = 60;
@@ -627,7 +688,16 @@ int main(const int argument_count, char** arguments) {
                 return 2;
             }
         }
-        return run_vulkan_scene_capture(arguments[2], arguments[3], frames);
+        double turn = 0.0;
+        if (argument_count > 5) {
+            const std::string_view text = arguments[5];
+            if (std::from_chars(text.data(), text.data() + text.size(), turn).ec != std::errc{} ||
+                std::abs(turn) > 180.0) {
+                std::cerr << "turn-degrees must be between -180 and 180\n";
+                return 2;
+            }
+        }
+        return run_vulkan_scene_capture(arguments[2], arguments[3], frames, turn);
     }
     if (mode == "--editor-stdio") return run_live_editor(false, true);
     if (mode == "--editor") return run_editor_bridge(arguments[0]);

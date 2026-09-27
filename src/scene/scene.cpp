@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <iomanip>
@@ -81,7 +82,15 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
                 output << ',';
             output << record.mesh_renderer->morph_weights[i];
         }
-        output << "]}";
+        output << "],\"parameters\":{";
+        bool first_parameter = true;
+        for (const auto& [name, values] : record.mesh_renderer->parameters) {
+            output << (first_parameter ? "" : ",") << '"' << escape_json(name) << "\":[";
+            first_parameter = false;
+            for (std::size_t i = 0; i < values.size(); ++i) output << (i ? "," : "") << values[i];
+            output << ']';
+        }
+        output << "}}";
     } else {
         output << "null";
     }
@@ -242,6 +251,32 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
                << ",\"first_beat_seconds\":" << player.first_beat_seconds
                << ",\"sync\":\"" << music_sync_name(player.sync) << "\"}";
     } else output << "null";
+    output << ",\"sky\":";
+    if (record.sky) {
+        const auto& sky = *record.sky;
+        output << "{\"material\":\"" << escape_json(sky.material) << "\",\"horizon_color\":";
+        append_vec3(output, sky.horizon_color);
+        output << ",\"zenith_color\":";
+        append_vec3(output, sky.zenith_color);
+        output << ",\"intensity\":" << sky.intensity
+               << ",\"ambient_intensity\":" << sky.ambient_intensity
+               << ",\"fog\":" << (sky.fog ? "true" : "false") << ",\"fog_start\":" << sky.fog_start
+               << ",\"fog_end\":" << sky.fog_end << ",\"fog_start_color\":";
+        append_vec3(output, sky.fog_start_color);
+        output << ",\"fog_end_color\":";
+        append_vec3(output, sky.fog_end_color);
+        output << '}';
+    } else output << "null";
+    output << ",\"post_process\":";
+    if (record.post_process) {
+        output << "{\"effects\":[";
+        const auto& effects = record.post_process->effects;
+        for (std::size_t index = 0; index < effects.size(); ++index)
+            output << (index ? "," : "") << "{\"material\":\"" << escape_json(effects[index].material)
+                   << "\",\"enabled\":" << (effects[index].enabled ? "true" : "false")
+                   << ",\"editor\":" << (effects[index].editor ? "true" : "false") << '}';
+        output << "]}";
+    } else output << "null";
     output << '}';
 }
 
@@ -256,6 +291,7 @@ std::string_view field_type_name(const ReflectedFieldType type) {
         return "number_array";
     case ReflectedFieldType::object_array:
         return "object_array";
+    case ReflectedFieldType::object: return "object";
     }
     return "unknown";
 }
@@ -402,6 +438,16 @@ bool Scene::set_camera(const Entity entity, std::optional<Camera> camera) {
     return true;
 }
 
+bool valid_renderer_parameter(const std::string_view name, const std::vector<double>& values) {
+    if (name.empty() || name.size() > 64U || values.empty() || values.size() > 16U ||
+        !(std::isalpha(static_cast<unsigned char>(name.front())) || name.front() == '_'))
+        return false;
+    for (const char character : name)
+        if (!std::isalnum(static_cast<unsigned char>(character)) && character != '_') return false;
+    return std::all_of(values.begin(), values.end(),
+                       [](const double value) { return std::isfinite(value) && std::abs(value) <= 1.0e9; });
+}
+
 bool Scene::set_mesh_renderer(const Entity entity, std::optional<MeshRenderer> renderer) {
     auto* record = get(entity);
     if (record == nullptr) return false;
@@ -415,6 +461,10 @@ bool Scene::set_mesh_renderer(const Entity entity, std::optional<MeshRenderer> r
             if (!std::isfinite(w) || std::abs(w) > 100.0)
                 return false;
         }
+    if (renderer && renderer->parameters.size() > maximum_renderer_parameters) return false;
+    if (renderer)
+        for (const auto& [name, values] : renderer->parameters)
+            if (!valid_renderer_parameter(name, values)) return false;
     record->mesh_renderer = std::move(renderer);
     return true;
 }
@@ -678,6 +728,60 @@ bool valid_music_player(const MusicPlayer& player) {
            within(player.first_beat_seconds, 0.0, 60.0);
 }
 
+bool valid_sky_material_path(const std::string_view path) {
+    constexpr std::string_view extension = ".relay-material";
+    if (path.size() <= extension.size() || path.size() > 128U ||
+        path.substr(path.size() - extension.size()) != extension)
+        return false;
+    const std::filesystem::path relative{std::string(path)};
+    if (relative.is_absolute()) return false;
+    for (const auto& part : relative) {
+        const auto name = part.string();
+        if (name.empty() || name.front() == '.') return false;
+        for (const char c : name)
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '-' || c == '_' || c == '.' || c == ' '))
+                return false;
+    }
+    return true;
+}
+
+bool valid_sky(const Sky& sky) {
+    const auto within = [](const double value, const double minimum, const double maximum) {
+        return std::isfinite(value) && value >= minimum && value <= maximum;
+    };
+    const auto color = [&](const Vec3& value) {
+        return within(value.x, 0.0, maximum_sky_color) && within(value.y, 0.0, maximum_sky_color) &&
+               within(value.z, 0.0, maximum_sky_color);
+    };
+    return (sky.material.empty() || valid_sky_material_path(sky.material)) &&
+           color(sky.horizon_color) && color(sky.zenith_color) && within(sky.intensity, 0.0, 100.0) &&
+           within(sky.ambient_intensity, 0.0, 10.0) &&
+           within(sky.fog_start, 0.0, maximum_fog_distance) &&
+           within(sky.fog_end, sky.fog_start + 0.001, maximum_fog_distance) &&
+           color(sky.fog_start_color) && color(sky.fog_end_color);
+}
+
+bool valid_post_process(const PostProcess& post_process) {
+    return post_process.effects.size() <= maximum_post_effects &&
+           std::all_of(post_process.effects.begin(), post_process.effects.end(),
+                       [](const PostEffect& effect) { return valid_sky_material_path(effect.material); });
+}
+
+bool Scene::set_post_process(const Entity entity, std::optional<PostProcess> post_process) {
+    auto* record = get(entity);
+    if (!record || (post_process && !valid_post_process(*post_process))) return false;
+    record->post_process = std::move(post_process);
+    return true;
+}
+
+bool Scene::set_sky(const Entity entity, std::optional<Sky> sky) {
+    auto* record = get(entity);
+    if (!record || (sky && !valid_sky(*sky))) return false;
+    record->sky = std::move(sky);
+    return true;
+}
+
 bool Scene::set_music_player(const Entity entity, std::optional<MusicPlayer> player) {
     auto* record = get(entity);
     if (!record || (player && !valid_music_player(*player))) return false;
@@ -890,6 +994,22 @@ std::optional<Entity> Scene::active_camera() const {
     return std::nullopt;
 }
 
+std::optional<Entity> Scene::active_post_process() const {
+    for (std::uint32_t index = 0; index < slots_.size(); ++index) {
+        const auto& slot = slots_[index];
+        if (slot.alive && slot.record.post_process) return Entity{index, slot.generation};
+    }
+    return std::nullopt;
+}
+
+std::optional<Entity> Scene::active_sky() const {
+    for (std::uint32_t index = 0; index < slots_.size(); ++index) {
+        const auto& slot = slots_[index];
+        if (slot.alive && slot.record.sky) return Entity{index, slot.generation};
+    }
+    return std::nullopt;
+}
+
 std::string Scene::unique_copy_name(const std::string_view name) const {
     // Duplicating a copy should stay "Foo Copy 2" rather than growing "Foo Copy Copy".
     auto base = name;
@@ -1022,7 +1142,8 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
          0x05U,
          {{"mesh", ReflectedFieldType::string},
           {"material", ReflectedFieldType::string},
-          {"morph_weights", ReflectedFieldType::number_array}}},
+          {"morph_weights", ReflectedFieldType::number_array},
+          {"parameters", ReflectedFieldType::object}}},
         {"Animator",
          0x06U,
          {{"model", ReflectedFieldType::string},
@@ -1113,6 +1234,18 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
           {"beats_per_bar", ReflectedFieldType::number},
           {"first_beat_seconds", ReflectedFieldType::number},
           {"sync", ReflectedFieldType::string}}},
+        {"Sky", 0x13U,
+         {{"material", ReflectedFieldType::string},
+          {"horizon_color", ReflectedFieldType::vec3},
+          {"zenith_color", ReflectedFieldType::vec3},
+          {"intensity", ReflectedFieldType::number},
+          {"ambient_intensity", ReflectedFieldType::number},
+          {"fog", ReflectedFieldType::boolean},
+          {"fog_start", ReflectedFieldType::number},
+          {"fog_end", ReflectedFieldType::number},
+          {"fog_start_color", ReflectedFieldType::vec3},
+          {"fog_end_color", ReflectedFieldType::vec3}}},
+        {"PostProcess", 0x14U, {{"effects", ReflectedFieldType::object_array}}},
         {"Scripts", 0x0cU,
          {{"behaviour", ReflectedFieldType::string},
           {"enabled", ReflectedFieldType::boolean},

@@ -14,6 +14,9 @@
 #include "relay/render/assets.hpp"
 #include "relay/render/render_graph.hpp"
 #include "relay/render/scene_render.hpp"
+#include "relay/render/sky.hpp"
+#include "relay/render/materials.hpp"
+#include "relay/render/shader_language.hpp"
 #include "relay/scene/components.hpp"
 #include "relay/scene/node_types.hpp"
 #include "relay/scene/scene_io.hpp"
@@ -296,6 +299,87 @@ std::string script_status_json(const ScriptStatus& status) {
     output << "],\"runtime_error_count\":" << status.runtime_error_count << ",\"output\":\""
            << escape_json(tail) << "\"}";
     return output.str();
+}
+
+std::string shader_messages_json(const std::vector<ShaderMessage>& messages) {
+    std::string text = "[";
+    for (const auto& message : messages) {
+        if (text.size() > 1U) text += ',';
+        text += "{\"line\":" + std::to_string(message.line) + ",\"message\":\"" + escape_json(message.text) + "\"}";
+    }
+    return text + ']';
+}
+
+std::string number_list_json(const double* values, const std::size_t count) {
+    std::ostringstream output;
+    output << std::setprecision(std::numeric_limits<double>::max_digits10) << '[';
+    for (std::size_t index = 0; index < count; ++index) output << (index ? "," : "") << values[index];
+    output << ']';
+    return output.str();
+}
+
+std::string shader_uniform_json(const ShaderUniform& uniform) {
+    std::ostringstream output;
+    output << std::setprecision(std::numeric_limits<double>::max_digits10);
+    output << "{\"name\":\"" << escape_json(uniform.name) << "\",\"type\":\""
+           << shader_uniform_type_name(uniform.type) << "\",\"hint\":\"" << shader_uniform_hint_name(uniform.hint)
+           << "\",\"line\":" << uniform.line;
+    if (uniform.hint == ShaderUniform::Hint::range)
+        output << ",\"minimum\":" << uniform.minimum << ",\"maximum\":" << uniform.maximum
+               << ",\"step\":" << uniform.step;
+    if (uniform.type != ShaderUniform::Type::sampler2d)
+        output << ",\"default\":"
+               << number_list_json(uniform.default_value.data(), shader_uniform_components(uniform.type));
+    output << '}';
+    return output.str();
+}
+
+// A compiled shader as the protocol reports it, with the file's text when given.
+std::string compiled_shader_json(const std::string& path, const CompiledShader& shader,
+                                 const std::string* text, const std::string* preview) {
+    const auto& parsed = shader.parsed;
+    std::string json = "{\"path\":\"" + escape_json(path) + "\",\"type\":\"" +
+                       std::string{shader_type_name(parsed.type)} + "\",\"transparent\":" +
+                       (parsed.transparent ? "true" : "false") + ",\"unshaded\":" +
+                       (parsed.unshaded ? "true" : "false") + ",\"compiled\":" + (shader.ok() ? "true" : "false") +
+                       ",\"errors\":" + shader_messages_json(shader.errors) + ",\"uniforms\":[";
+    for (std::size_t index = 0; index < parsed.uniforms.size(); ++index)
+        json += (index ? "," : "") + shader_uniform_json(parsed.uniforms[index]);
+    json += "],\"previewing\":" + std::string(preview ? "true" : "false");
+    if (text) json += ",\"text\":\"" + escape_json(*text) + '"';
+    if (preview) json += ",\"preview\":\"" + escape_json(*preview) + '"';
+    return json + '}';
+}
+
+std::string shader_material_json(const std::string& path, const ResolvedShaderMaterial& resolved) {
+    std::string json = "{\"path\":\"" + escape_json(path) + "\",\"type\":\"" +
+                       std::string{shader_type_name(resolved.material.type)} + "\",\"shader\":\"" +
+                       escape_json(resolved.material.shader) + "\",\"drawable\":" +
+                       (resolved.drawable() ? "true" : "false") + ",\"error\":" +
+                       (resolved.error.empty() ? std::string{"null"} : '"' + escape_json(resolved.error) + '"') +
+                       ",\"warnings\":[";
+    for (std::size_t index = 0; index < resolved.warnings.size(); ++index)
+        json += (index ? ",\"" : "\"") + escape_json(resolved.warnings[index]) + '"';
+    json += "],\"parameters\":[";
+    bool first = true;
+    if (resolved.shader)
+        for (const auto& uniform : resolved.shader->parsed.uniforms) {
+            auto entry = shader_uniform_json(uniform);
+            entry.pop_back();
+            const auto found = resolved.material.parameters.find(uniform.name);
+            const bool set = found != resolved.material.parameters.end();
+            entry += ",\"set\":" + std::string(set ? "true" : "false");
+            if (uniform.type == ShaderUniform::Type::sampler2d)
+                entry += ",\"texture\":\"" + escape_json(set ? found->second.texture : std::string{}) + '"';
+            else if (set && found->second.numbers.size() == shader_uniform_components(uniform.type))
+                entry += ",\"value\":" + number_list_json(found->second.numbers.data(), found->second.numbers.size());
+            else
+                entry += ",\"value\":" + number_list_json(uniform.default_value.data(),
+                                                          shader_uniform_components(uniform.type));
+            json += (first ? "" : ",") + entry + '}';
+            first = false;
+        }
+    return json + "]}";
 }
 
 } // namespace
@@ -969,6 +1053,149 @@ std::string ControlProtocol::handle(const std::string_view request) {
         }
         output += "],\"state\":" + history_json(history) + '}';
         return response_prefix(id) + output + '}';
+    }
+    if (method == "shaders.read" || method == "shaders.write" || method == "shaders.preview") {
+        const auto path = string_field(request, "path");
+        const auto root = engine_.asset_root();
+        std::string error;
+        if (method == "shaders.write") {
+            auto text = optional_string_field(request, "text");
+            const bool create = boolean_field(request, "create", false);
+            if (!text) {
+                if (!create) return error_response(id, "text is required unless creating from a template");
+                if (const auto effect = optional_string_field(request, "effect")) {
+                    const auto* found = find_shader_effect(*effect);
+                    if (!found || found->text.empty()) return error_response(id, "unknown effect " + *effect);
+                    text = std::string{found->text};
+                } else {
+                    text = shader_template(shader_type_from_name(string_field(request, "type")).value_or(ShaderType::surface));
+                }
+            }
+            if (!write_shader_file(root, path, *text, create, error)) return error_response(id, error);
+            engine_.shaders().set_preview(path, std::nullopt);
+            engine_.logs().write(LogLevel::info, (create ? "Created shader " : "Saved shader ") + path);
+        } else if (method == "shaders.preview") {
+            if (!valid_shader_path(path)) return error_response(id, "shader path must be a .relay-shader file");
+            engine_.shaders().set_preview(path, optional_string_field(request, "text"));
+        }
+        const auto text = read_shader_file(root, path, error);
+        if (!text && method == "shaders.read") return error_response(id, error);
+        const auto compiled = engine_.shader(path);
+        return response_prefix(id) + "{\"shader\":" +
+               compiled_shader_json(path, *compiled, method == "shaders.read" && text ? &*text : nullptr,
+                                    engine_.shaders().preview(path)) +
+               "}}";
+    }
+    if (method == "assets.material" || method == "assets.set_material" ||
+        method == "assets.set_material_parameter") {
+        const auto path = string_field(request, "path");
+        const auto root = engine_.asset_root();
+        std::string error;
+        if (method == "assets.set_material" && boolean_field(request, "create", false)) {
+            const auto type = shader_type_from_name(string_field(request, "type"));
+            if (!type) return error_response(id, "creating a material needs its type: surface or post_process");
+            ShaderMaterial material;
+            material.type = *type;
+            material.shader = string_field(request, "shader");
+            if (!write_shader_material(root, path, material, true, error)) return error_response(id, error);
+            engine_.logs().write(LogLevel::info, "Created material " + path);
+        } else if (method != "assets.material") {
+            const auto kind = read_material_type(root, path, error);
+            if (!kind) return error_response(id, error);
+            if (*kind == "sky") return error_response(id, "sky materials are edited with assets.set_sky_material");
+            auto material = read_shader_material(root, path, error);
+            if (!material) return error_response(id, error);
+            if (method == "assets.set_material") {
+                if (const auto type = optional_string_field(request, "type");
+                    type && shader_type_from_name(*type) != material->type)
+                    return error_response(id, "a material's type cannot change; create a new material");
+                if (const auto shader = optional_string_field(request, "shader")) material->shader = *shader;
+            } else {
+                const auto name = string_field(request, "name");
+                if (boolean_field(request, "reset", false)) {
+                    material->parameters.erase(name);
+                } else {
+                    MaterialValue value;
+                    JsonParser parser(request);
+                    const auto parsed = parser.parse();
+                    const auto* numbers = parsed && parsed->object() ? field(*parsed->object(), "value") : nullptr;
+                    if (numbers && numbers->array())
+                        for (const auto& number : *numbers->array()) value.numbers.push_back(*number.number());
+                    const auto texture = optional_string_field(request, "texture");
+                    if (texture) value.texture = *texture;
+                    if (!texture && value.numbers.empty())
+                        return error_response(id, "send value (numbers), texture or reset");
+                    // Checked against the shader when it compiles; otherwise stored as given.
+                    const auto shader = material->shader.empty() ? nullptr : engine_.shader(material->shader);
+                    if (shader && shader->ok()) {
+                        const auto* uniform = shader->parsed.find_uniform(name);
+                        if (!uniform) return error_response(id, "the shader has no uniform called " + name);
+                        if (!valid_material_value(*uniform, value, error)) return error_response(id, error);
+                    }
+                    if (texture && texture->empty() && value.numbers.empty()) material->parameters.erase(name);
+                    else if (material->parameters.size() >= maximum_material_parameters &&
+                             !material->parameters.contains(name))
+                        return error_response(id, "a material has at most 64 parameters");
+                    else material->parameters[name] = std::move(value);
+                }
+            }
+            if (!write_shader_material(root, path, *material, false, error)) return error_response(id, error);
+        }
+        if (const auto kind = read_material_type(root, path, error); kind && *kind == "sky")
+            return error_response(id, "sky materials are read with assets.sky_material");
+        const auto resolved = engine_.shader_material(path);
+        if (method == "assets.material" && !resolved->error.empty() && !read_shader_material(root, path, error))
+            return error_response(id, error);
+        return response_prefix(id) + "{\"material\":" + shader_material_json(path, *resolved) + "}}";
+    }
+    if (method == "assets.sky_material" || method == "assets.set_sky_material") {
+        const auto path = string_field(request, "path");
+        const auto material_json = [&](const SkyMaterial& material) {
+            std::ostringstream output;
+            output << std::setprecision(std::numeric_limits<double>::max_digits10)
+                   << "{\"path\":\"" << escape_json(path) << "\",\"panorama\":\""
+                   << escape_json(material.panorama) << "\",\"tint\":[" << material.tint.x << ','
+                   << material.tint.y << ',' << material.tint.z
+                   << "],\"intensity\":" << material.intensity
+                   << ",\"rotation_degrees\":" << material.rotation_degrees;
+            const auto resolved = engine_.sky_material(path);
+            if (resolved && resolved->panorama)
+                output << ",\"image\":{\"width\":" << resolved->panorama->image.width
+                       << ",\"height\":" << resolved->panorama->image.height << "},\"error\":null}";
+            else
+                output << ",\"image\":null,\"error\":\""
+                       << escape_json(resolved ? resolved->error : "not loaded") << "\"}";
+            return output.str();
+        };
+        std::string error;
+        if (method == "assets.sky_material") {
+            const auto material = read_sky_material(engine_.asset_root(), path, error);
+            if (!material) return error_response(id, error);
+            return response_prefix(id) + "{\"material\":" + material_json(*material) + "}}";
+        }
+        const bool create = boolean_field(request, "create", false);
+        SkyMaterial material;
+        if (!create) {
+            const auto existing = read_sky_material(engine_.asset_root(), path, error);
+            if (!existing) return error_response(id, error);
+            material = *existing;
+        }
+        if (const auto panorama = optional_string_field(request, "panorama"))
+            material.panorama = *panorama;
+        JsonParser parser(request);
+        const auto parsed = parser.parse();
+        if (const auto* tint = parsed && parsed->object() ? field(*parsed->object(), "tint") : nullptr;
+            tint && tint->array()) {
+            const auto& items = *tint->array();
+            material.tint = {*items[0].number(), *items[1].number(), *items[2].number()};
+        }
+        if (const auto value = number_field(request, "intensity")) material.intensity = *value;
+        if (const auto value = number_field(request, "rotation_degrees"))
+            material.rotation_degrees = *value;
+        if (!write_sky_material(engine_.asset_root(), path, material, create, error))
+            return error_response(id, error);
+        engine_.logs().write(LogLevel::info, (create ? "Created sky material " : "Saved sky material ") + path);
+        return response_prefix(id) + "{\"material\":" + material_json(material) + "}}";
     }
     if (method == "assets.browse" || method == "assets.search" || method == "assets.create_folder" ||
         method == "assets.move" || method == "assets.delete") {
@@ -1930,6 +2157,96 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }
+    if (method == "scene.set_sky") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::optional<Sky> sky;
+        if (boolean_field(request, "attached", true)) {
+            sky = engine_.scene().get(*entity)->sky.value_or(Sky{});
+            JsonParser parser(request);
+            const auto parsed = parser.parse();
+            const auto* object = parsed ? parsed->object() : nullptr;
+            const auto color = [&](const char* key, Vec3& target) {
+                const auto* value = object ? field(*object, key) : nullptr;
+                if (!value || !value->array()) return;
+                const auto& items = *value->array();
+                target = {*items[0].number(), *items[1].number(), *items[2].number()};
+            };
+            if (const auto material = optional_string_field(request, "material"))
+                sky->material = *material;
+            color("horizon_color", sky->horizon_color);
+            color("zenith_color", sky->zenith_color);
+            color("fog_start_color", sky->fog_start_color);
+            color("fog_end_color", sky->fog_end_color);
+            const auto number = [&](const char* key, double& target) {
+                if (const auto value = number_field(request, key)) target = *value;
+            };
+            number("intensity", sky->intensity);
+            number("ambient_intensity", sky->ambient_intensity);
+            number("fog_start", sky->fog_start);
+            number("fog_end", sky->fog_end);
+            sky->fog = boolean_field(request, "fog", sky->fog);
+        }
+        if (!engine_.scene_history().execute(
+                std::string(sky ? "Configure sky " : "Remove sky ") + entity->to_string(),
+                [&](Scene& scene) { return scene.set_sky(*entity, sky); },
+                unsigned_field(request, "gesture", 0U)))
+            return error_response(id, "invalid sky values: colors must be 0 to 1000 and the fog "
+                                      "must end beyond where it starts");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.set_post_process" || method == "scene.set_post_effect") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::optional<PostProcess> post_process = engine_.scene().get(*entity)->post_process;
+        if (method == "scene.set_post_effect") {
+            const auto index = static_cast<std::size_t>(unsigned_field(request, "index", 0U));
+            if (!post_process || index >= post_process->effects.size())
+                return error_response(id, "the node has no post-processing effect at that index");
+            auto& effect = post_process->effects[index];
+            effect.enabled = boolean_field(request, "enabled", effect.enabled);
+            effect.editor = boolean_field(request, "editor", effect.editor);
+        } else if (!boolean_field(request, "attached", true)) {
+            post_process.reset();
+        } else {
+            if (!post_process) post_process = PostProcess{};
+            JsonParser parser(request);
+            const auto parsed = parser.parse();
+            if (const auto* effects = parsed && parsed->object() ? field(*parsed->object(), "effects") : nullptr;
+                effects && effects->array()) {
+                // Effects that stay in the list keep whether they are on, so reordering is safe.
+                auto previous = std::move(post_process->effects);
+                post_process->effects.clear();
+                std::string error;
+                for (const auto& effect : *effects->array()) {
+                    const auto kind = read_material_type(engine_.asset_root(), *effect.string(), error);
+                    if (!kind) return error_response(id, error);
+                    if (*kind != "post_process")
+                        return error_response(id, *effect.string() + " is not a post_process material");
+                    PostEffect entry{*effect.string(), true, true};
+                    const auto kept = std::find_if(previous.begin(), previous.end(), [&](const PostEffect& old) {
+                        return old.material == *effect.string();
+                    });
+                    if (kept != previous.end()) {
+                        entry = *kept;
+                        previous.erase(kept);
+                    }
+                    post_process->effects.push_back(entry);
+                }
+            }
+        }
+        if (!engine_.scene_history().execute(
+                std::string(post_process ? "Configure post processing " : "Remove post processing ") +
+                    entity->to_string(),
+                [&](Scene& scene) { return scene.set_post_process(*entity, post_process); },
+                unsigned_field(request, "gesture", 0U)))
+            return error_response(id, "invalid post processing");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
     if (method == "component.types") {
         std::ostringstream output;
         output << response_prefix(id) << "{\"engine\":[";
@@ -2246,17 +2563,69 @@ std::string ControlProtocol::handle(const std::string_view request) {
             auto material = string_field(request, "material");
             if (mesh.empty()) mesh = "builtin.triangle";
             if (material.empty()) material = "builtin.orange";
-            if (engine_.assets().find_mesh(mesh) == nullptr ||
-                engine_.assets().find_material(material) == nullptr) {
-                return error_response(id, "mesh or material asset is not registered");
+            if (engine_.assets().find_mesh(mesh) == nullptr)
+                return error_response(id, "mesh asset is not registered");
+            if (valid_material_path(material)) {
+                std::string error;
+                const auto kind = read_material_type(engine_.asset_root(), material, error);
+                if (!kind) return error_response(id, error);
+                if (*kind != "surface") return error_response(id, material + " is not a surface material");
+            } else if (engine_.assets().find_material(material) == nullptr) {
+                return error_response(id, "material asset is not registered");
             }
             renderer = MeshRenderer{std::move(mesh), std::move(material)};
+            // Morph weights stay with the same mesh, per-object parameters with the same material.
+            if (const auto& previous = engine_.scene().get(*entity)->mesh_renderer) {
+                if (previous->mesh == renderer->mesh) renderer->morph_weights = previous->morph_weights;
+                if (previous->material == renderer->material) renderer->parameters = previous->parameters;
+            }
         }
         if (!engine_.scene_history().execute(
                 std::string(enabled ? "Configure renderer " : "Remove renderer ") + entity->to_string(),
                 [&](Scene& scene) { return scene.set_mesh_renderer(*entity, renderer); })) {
             return error_response(id, "could not update mesh renderer component");
         }
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
+    if (method == "scene.set_renderer_parameter") {
+        const auto entity = entity_field(request, "entity");
+        const auto* record = entity ? engine_.scene().get(*entity) : nullptr;
+        if (!record) return error_response(id, "entity does not exist or has a stale handle");
+        if (!record->mesh_renderer) return error_response(id, "entity has no mesh renderer");
+        auto renderer = *record->mesh_renderer;
+        const auto name = string_field(request, "name");
+        if (boolean_field(request, "clear", false)) {
+            renderer.parameters.erase(name);
+        } else {
+            JsonParser parser(request);
+            const auto parsed = parser.parse();
+            const auto* numbers = parsed && parsed->object() ? field(*parsed->object(), "value") : nullptr;
+            std::vector<double> values;
+            if (numbers && numbers->array())
+                for (const auto& number : *numbers->array()) values.push_back(*number.number());
+            if (values.empty()) return error_response(id, "send value (numbers) or clear");
+            if (!valid_material_path(renderer.material))
+                return error_response(id, "the renderer's material is not a shader material");
+            const auto material = engine_.shader_material(renderer.material);
+            if (!material || !material->shader || !material->shader->ok())
+                return error_response(id, "the material's shader must compile before its parameters can be set");
+            const auto* uniform = material->shader->parsed.find_uniform(name);
+            if (!uniform) return error_response(id, "the shader has no uniform called " + name);
+            if (uniform->type == ShaderUniform::Type::sampler2d)
+                return error_response(id, "images cannot be set per object; use another material");
+            if (values.size() != shader_uniform_components(uniform->type))
+                return error_response(id, name + " takes " + std::to_string(shader_uniform_components(uniform->type)) +
+                                              " number(s)");
+            if (!renderer.parameters.contains(name) && renderer.parameters.size() >= maximum_renderer_parameters)
+                return error_response(id, "an object can override at most 32 parameters");
+            renderer.parameters[name] = std::move(values);
+        }
+        if (!engine_.scene_history().execute(
+                "Set " + name + " on " + entity->to_string(),
+                [&](Scene& scene) { return scene.set_mesh_renderer(*entity, renderer); },
+                unsigned_field(request, "gesture", 0U)))
+            return error_response(id, "invalid parameter value");
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }

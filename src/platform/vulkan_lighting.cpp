@@ -69,8 +69,8 @@ struct LightingResources {
     VkPhysicalDeviceMemoryProperties memory_properties{};
     std::array<Image, noise_texture_count> noise{};
     Image environment;
-    std::array<float, 3> environment_sky{-1.0F, -1.0F, -1.0F};
-    std::array<float, 3> environment_ground{};
+    std::uint64_t environment_key{};
+    bool environment_valid{};
 
     bool initialize_resources(const LightingDevice& device, std::string& error) {
         gpu = device;
@@ -314,11 +314,10 @@ struct LightingResources {
         return upload_images(uploads, error);
     }
 
-    // The environment seen by rays that leave the distance field: Relay's analytic sky and
-    // ground hemisphere, as a small cube map.
-    bool update_environment(const std::array<float, 3>& sky, const std::array<float, 3>& ground,
-                            std::string& error) {
-        if (sky == environment_sky && ground == environment_ground && environment.image) return true;
+    // The environment seen by rays that leave the distance field, as a small cube map: the
+    // scene's sky in ambient scale, or Relay's analytic hemisphere without one.
+    bool update_environment(const RenderSky* sky, const std::uint64_t key, std::string& error) {
+        if (environment_valid && key == environment_key && environment.image) return true;
         if (!environment.image) {
             environment.info = image_info(VK_IMAGE_TYPE_2D, VK_FORMAT_R32G32B32A32_SFLOAT,
                                           {environment_size, environment_size, 1U},
@@ -329,31 +328,47 @@ struct LightingResources {
         } else {
             vkQueueWaitIdle(gpu.queue);
         }
+        const RenderSky analytic{};
+        const auto& source = sky ? *sky : analytic;
+        // Each texel averages a 3 x 3 grid of directions, so panorama detail smaller than a texel
+        // does not flicker in and out as the sky turns.
+        constexpr std::uint32_t samples = 3U;
         std::vector<float> texels(6U * environment_size * environment_size * 4U);
         for (std::uint32_t face = 0; face < 6U; ++face)
             for (std::uint32_t y = 0; y < environment_size; ++y)
                 for (std::uint32_t x = 0; x < environment_size; ++x) {
-                    const float u = (static_cast<float>(x) + 0.5F) / environment_size * 2.0F - 1.0F;
-                    const float v = (static_cast<float>(y) + 0.5F) / environment_size * 2.0F - 1.0F;
-                    // Direction y per the Vulkan cube face order +X, -X, +Y, -Y, +Z, -Z.
-                    const std::array<std::array<float, 3>, 6> directions{{
-                        {1.0F, -v, -u}, {-1.0F, -v, u}, {u, 1.0F, v},
-                        {u, -1.0F, -v}, {u, -v, 1.0F}, {-u, -v, -1.0F}}};
-                    const auto& direction = directions[face];
-                    const float length = std::sqrt(direction[0] * direction[0] +
-                                                   direction[1] * direction[1] +
-                                                   direction[2] * direction[2]);
-                    const float t = std::clamp(direction[1] / length * 0.5F + 0.5F, 0.0F, 1.0F);
                     auto* texel = &texels[((face * environment_size + y) * environment_size + x) * 4U];
-                    for (std::size_t channel = 0; channel < 3U; ++channel)
-                        texel[channel] = ground[channel] + (sky[channel] - ground[channel]) * t;
+                    for (std::uint32_t sy = 0; sy < samples; ++sy)
+                        for (std::uint32_t sx = 0; sx < samples; ++sx) {
+                            const auto offset = [&](const std::uint32_t texel_index,
+                                                    const std::uint32_t sample) {
+                                return (static_cast<float>(texel_index) +
+                                        (static_cast<float>(sample) + 0.5F) / samples) /
+                                           static_cast<float>(environment_size) * 2.0F - 1.0F;
+                            };
+                            const float u = offset(x, sx);
+                            const float v = offset(y, sy);
+                            // Directions per the Vulkan cube face order +X, -X, +Y, -Y, +Z, -Z.
+                            const std::array<std::array<float, 3>, 6> directions{{
+                                {1.0F, -v, -u}, {-1.0F, -v, u}, {u, 1.0F, v},
+                                {u, -1.0F, -v}, {u, -v, 1.0F}, {-u, -v, -1.0F}}};
+                            const auto& direction = directions[face];
+                            const double length = std::sqrt(direction[0] * direction[0] +
+                                                            direction[1] * direction[1] +
+                                                            direction[2] * direction[2]);
+                            const auto color = sky_environment(
+                                source, {direction[0] / length, direction[1] / length,
+                                         direction[2] / length});
+                            for (std::size_t channel = 0; channel < 3U; ++channel)
+                                texel[channel] += color[channel] / (samples * samples);
+                        }
                     texel[3] = 1.0F;
                 }
         std::vector<std::byte> bytes(texels.size() * sizeof(float));
         std::memcpy(bytes.data(), texels.data(), bytes.size());
         if (!upload_images({{&environment, std::move(bytes)}}, error)) return false;
-        environment_sky = sky;
-        environment_ground = ground;
+        environment_key = key;
+        environment_valid = true;
         return true;
     }
 
@@ -710,7 +725,7 @@ struct GlobalIllumination::Impl : LightingResources {
             error = "global illumination is not initialised";
             return false;
         }
-        if (!update_environment(frame.sky_color, frame.ground_color, error) ||
+        if (!update_environment(frame.sky, frame.sky_key, error) ||
             !ensure_outputs(frame.extent, error) || !update_instances(frame, error))
             return false;
 
@@ -1036,7 +1051,7 @@ struct Reflections::Impl : LightingResources {
     std::size_t current(const std::uint64_t frame_index) const { return (frame_index & 1U) ? 0U : 1U; }
 
     bool record_classification(const ReflectionFrame& frame, std::string& error) {
-        if (!update_environment(frame.sky_color, frame.ground_color, error) ||
+        if (!update_environment(frame.sky, frame.sky_key, error) ||
             !ensure_targets(frame.extent, error))
             return false;
         const auto a = current(frame.frame_index);

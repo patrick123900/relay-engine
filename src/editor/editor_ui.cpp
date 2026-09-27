@@ -14,11 +14,14 @@
 #include "relay/editor/editor_selection.hpp"
 #include "relay/editor/editor_timeline.hpp"
 #include "relay/editor/editor_theme.hpp"
+#include "relay/editor/shader_graph_canvas.hpp"
 #include "relay/platform/sdl_input.hpp"
 #include "relay/render/graphics_settings.hpp"
 #include "relay/render/scene_render.hpp"
+#include "relay/render/shader_graph.hpp"
 
 #include <ImGuizmo.h>
+#include <TextEditor.h>
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
@@ -27,6 +30,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <cstdint>
 #include <chrono>
@@ -95,12 +99,12 @@ const JsonValue::Object* component(const JsonValue::Object& entity, const std::s
 }
 
 // Dockable panels, in the order of EditorUi::Impl::panel_open.
-constexpr std::array<const char*, 11> panel_names{"Hierarchy", "Inspector", "Assets", "History",
+constexpr std::array<const char*, 12> panel_names{"Hierarchy", "Inspector", "Assets", "History",
                                                   "Diagnostics", "Viewport", "Timeline", "Project",
-                                                  "Agent", "Profiler", "Mixer"};
+                                                  "Agent", "Profiler", "Mixer", "Shader Editor"};
 constexpr std::array<bool, panel_names.size()> default_panels{true, true, true, false, true,
                                                               true, false, false, false, false,
-                                                              false};
+                                                              false, false};
 
 // A dim caption in a fixed column, so every inspector row lines up down the panel.
 void row_label(const char* const label, const float width) {
@@ -259,7 +263,7 @@ struct EditorUi::Impl {
         } else {
             row_label(label, ImGui::GetWindowContentRegionMin().x + label_width);
         }
-        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SetNextItemWidth(inspector_field_reserve > 0.0F ? -inspector_field_reserve : -FLT_MIN);
     }
 
     bool inspector_begin_combo(const char* label, const char* preview) const {
@@ -287,6 +291,62 @@ struct EditorUi::Impl {
         draft.finish(ImGui::IsItemActive());
         if (inspector_field) ImGui::PopID();
         return commit;
+    }
+
+    static double linear_to_srgb(const double value) {
+        const double c = std::max(value, 0.0);
+        return c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055;
+    }
+
+    static double srgb_to_linear(const double value) {
+        const double c = std::max(value, 0.0);
+        return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+    }
+
+    // A linear color edited as it looks: the fields and picker show sRGB, values above 1 are
+    // allowed for bright skies, and the scene stores linear. Like drag_scalar, every change applies
+    // at once, and one pick or drag is one undo step.
+    bool color_edit(const char* label, std::array<double, 3>& linear) {
+        ImGui::PushID(label);
+        inspector_field_label(label);
+        std::array<float, 3> shown{};
+        for (std::size_t channel = 0; channel < 3U; ++channel)
+            shown[channel] = static_cast<float>(linear_to_srgb(linear[channel]));
+        const bool changed = ImGui::ColorEdit3("##color", shown.data(),
+                                               ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+        const auto key = ImGui::GetID("##color");
+        ImGui::PushID("##color");
+        const bool editing = ImGui::IsItemActive() || ImGui::IsPopupOpen("picker");
+        ImGui::PopID();
+        if (editing && color_gestures.insert(key).second) inspector_gesture = ++gesture_serial;
+        if (!editing) color_gestures.erase(key);
+        if (changed) {
+            pending_gesture = inspector_gesture;
+            for (std::size_t channel = 0; channel < 3U; ++channel)
+                linear[channel] = std::min(srgb_to_linear(shown[channel]), 1000.0);
+        }
+        ImGui::PopID();
+        return changed;
+    }
+
+    // A bar running between two linear colors, as a preview of a gradient.
+    void draw_color_ramp(const std::array<double, 3>& from, const std::array<double, 3>& to,
+                         const char* tooltip) {
+        const auto packed = [](const std::array<double, 3>& color) {
+            const auto channel = [&](const std::size_t index) {
+                return static_cast<int>(std::clamp(linear_to_srgb(color[index]), 0.0, 1.0) * 255.0 + 0.5);
+            };
+            return IM_COL32(channel(0), channel(1), channel(2), 255);
+        };
+        inspector_field_label("");
+        const float width = ImGui::GetContentRegionAvail().x;
+        const float height = 10.0F * ui_scale;
+        const auto origin = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(width, height));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
+        ImGui::GetWindowDrawList()->AddRectFilledMultiColor(
+            origin, ImVec2(origin.x + width, origin.y + height), packed(from), packed(to),
+            packed(to), packed(from));
     }
 
     // Keep the draft stable across refreshes, but apply each change for live pose scrubbing.
@@ -357,6 +417,13 @@ struct EditorUi::Impl {
 
     bool imgui_context_created{false};
     bool headless{false};
+    // Width Inspector fields leave free on their right, for a button after them.
+    float inspector_field_reserve{0.0F};
+    // The Inspector's material preview: the surface material shown this frame and last frame
+    // (what the renderer is asked for), and the last sphere rendered, as one reused texture.
+    std::string preview_wanted, preview_request;
+    std::string preview_path;
+    std::unique_ptr<ImTextureData> preview_texture;
     std::map<std::string, std::array<float, 4>, std::less<>> headless_items;
     void note_item(const std::string& key) {
         note_rect(key, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
@@ -546,6 +613,53 @@ struct EditorUi::Impl {
     // page, audio.status (voices and meters) while a source is selected or the page is open, and
     // decoded clip summaries for the Inspector's waveform.
     std::vector<std::string> audio_files;
+    // Shader Editor: open .relay-shader files, one tab each, as node graphs. The shading language
+    // is the saved form: the graph is read from the file's text and written back to it, so agents'
+    // code and people's graphs are the same file. A tab previews its text in the scene
+    // (shaders.preview) a moment after an edit, and saves on Ctrl+S.
+    struct ShaderTab {
+        std::string path;
+        std::string saved;     // The file's text.
+        std::string text;      // The text now: the graph written out, or typed code.
+        std::string previewed; // The text last sent for preview; empty when showing the file.
+        ShaderGraph graph;
+        GraphSource source;    // Where each node's code is, to put compile errors on nodes.
+        std::string stage{"fragment"};
+        std::map<std::string, ShaderGraphView> views;
+        std::vector<std::string> history; // Texts for undo.
+        std::size_t history_index{};
+        // Code the graph cannot show: the shader's functions, and a stage that uses control flow.
+        // A file whose declarations do not parse is edited whole as text until they do.
+        std::unique_ptr<TextEditor> functions_editor, code_editor;
+        std::size_t functions_undo{}, code_undo{};
+        bool raw{};
+        bool dirty{};
+        bool preview_pending{};
+        double changed_at{};
+        JsonValue status; // The latest shader report (errors, uniforms).
+        std::string message;
+        // The file is checked for changes made elsewhere (by an agent, say) once a second. A tab
+        // without edits reloads; one with edits keeps them and holds the file's new text here
+        // until the person chooses.
+        double checked_at{};
+        std::optional<std::string> changed_on_disk;
+    };
+    std::vector<ShaderTab> shader_tabs;
+    std::size_t shader_tab_selected{};
+    std::string shader_tab_select_request;
+    std::string shader_tab_closing;
+    bool shader_live_preview{true};
+    bool shader_editor_focused{};
+    bool shader_editor_focus_pending{};
+    std::vector<std::string> shader_files;
+    // Sky materials and the images they can show, for the Sky section's pickers, and each
+    // material's settings and image status from assets.sky_material.
+    std::vector<std::string> sky_material_files, panorama_files;
+    std::map<std::string, JsonValue> sky_material_info;
+    // Surface and post-processing materials as assets.material reports them; null for sky materials.
+    std::map<std::string, JsonValue> shader_material_info;
+    // Color fields with an edit under way, so a whole pick or drag is one undo step.
+    std::set<ImGuiID> color_gestures;
     JsonValue audio_settings;
     JsonValue audio_status;
     std::map<std::string, JsonValue, std::less<>> audio_clip_info;
@@ -752,6 +866,1167 @@ struct EditorUi::Impl {
                 graphics_status = std::move(*settings);
         }
         refresh_audio_status();
+    }
+
+    void refresh_sky_files() {
+        const auto search = [&](const char* kind) {
+            std::vector<std::string> files;
+            if (auto found = call("assets.search", std::string("\"kinds\":[\"") + kind + "\"]", false);
+                found && found->object())
+                if (const auto* entries = field(*found->object(), "entries"); entries && entries->array())
+                    for (const auto& entry : *entries->array())
+                        if (const auto* object = entry.object(); object && string_or(*object, "type") == "file")
+                            files.push_back(string_or(*object, "path"));
+            return files;
+        };
+        sky_material_files = search("material");
+        panorama_files.clear();
+        for (auto& file : search("image"))
+            if (panorama_file(file)) panorama_files.push_back(std::move(file));
+        // Read again, so a changed or newly added image shows up.
+        sky_material_info.clear();
+        shader_material_info.clear();
+    }
+
+    static bool panorama_file(const std::string_view path) {
+        const auto dot = path.rfind('.');
+        std::string extension(dot == std::string_view::npos ? std::string_view{} : path.substr(dot + 1U));
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return extension == "png" || extension == "jpg" || extension == "jpeg";
+    }
+
+    // A sky material's settings and whether its image loads, or null when it cannot be read.
+    const JsonValue::Object* sky_material_summary(const std::string& path) {
+        auto found = sky_material_info.find(path);
+        if (found == sky_material_info.end()) {
+            auto info = call("assets.sky_material", "\"path\":\"" + json_escape(path) + '"', false);
+            found = sky_material_info.emplace(path, info ? std::move(*info) : JsonValue{}).first;
+        }
+        const auto* object = found->second.object();
+        const auto* material = object ? field(*object, "material") : nullptr;
+        return material ? material->object() : nullptr;
+    }
+
+    // A surface or post-processing material's shader, parameters and problems, or null.
+    const JsonValue::Object* shader_material_summary(const std::string& path) {
+        auto found = shader_material_info.find(path);
+        if (found == shader_material_info.end()) {
+            auto info = call("assets.material", "\"path\":\"" + json_escape(path) + '"', false);
+            found = shader_material_info.emplace(path, info ? std::move(*info) : JsonValue{}).first;
+        }
+        const auto* object = found->second.object();
+        const auto* material = object ? field(*object, "material") : nullptr;
+        return material ? material->object() : nullptr;
+    }
+
+    std::vector<std::string> shader_materials_of_type(const std::string_view type) {
+        std::vector<std::string> paths;
+        for (const auto& path : sky_material_files)
+            if (const auto* material = shader_material_summary(path); material && string_or(*material, "type") == type)
+                paths.push_back(path);
+        return paths;
+    }
+
+    // Material edits write the file rather than the scene, so a drag leaves no undo gesture behind.
+    void set_material_parameter(const std::string& path, const std::string& fields) {
+        pending_gesture = 0U;
+        if (call("assets.set_material_parameter", "\"path\":\"" + json_escape(path) + "\"" + fields))
+            shader_material_info.erase(path);
+    }
+
+    // One shader parameter's field. `apply` receives the request fields for a new value
+    // (",\"name\":...,\"value\":[...]" or an image's ",\"texture\":..."); `reset`, when given, shows a
+    // Reset button. `own` replaces the value shown (an object's own value); `key` prefixes the
+    // headless test keys.
+    void draw_material_parameter(const JsonValue::Object& parameter, const std::function<void(const std::string&)>& apply,
+                                 const std::function<void()>& reset, const std::vector<double>* own,
+                                 const std::string& key, const char* reset_tip) {
+        const auto name = string_or(parameter, "name");
+        const auto type = string_or(parameter, "type");
+        const auto hint = string_or(parameter, "hint");
+        ImGui::PushID(name.c_str());
+        std::array<double, 4> values{};
+        std::size_t count = 0;
+        if (const auto* list = field(parameter, "value"); list && list->array())
+            for (const auto& item : *list->array())
+                if (item.number() && count < values.size()) values[count++] = *item.number();
+        if (own)
+            for (std::size_t index = 0; index < std::min(own->size(), values.size()); ++index) values[index] = (*own)[index];
+        // Room for the Reset button beside the field.
+        if (reset)
+            inspector_field_reserve = ImGui::CalcTextSize("Reset").x + ImGui::GetStyle().FramePadding.x * 2.0F +
+                                      ImGui::GetStyle().ItemSpacing.x;
+        const auto send = [&](const std::size_t components) {
+            std::string fields = ",\"name\":\"" + json_escape(name) + "\",\"value\":[";
+            for (std::size_t index = 0; index < components; ++index)
+                fields += (index ? "," : "") + number_text(values[index]);
+            apply(fields + ']');
+        };
+        const auto label = name.c_str();
+        if (type == "sampler2D") {
+            const auto texture = string_or(parameter, "texture");
+            const char* fallback = hint == "hint_normal" ? "<flat normal>" : hint == "hint_black" ? "<black>" : "<white>";
+            if (inspector_begin_combo(label, texture.empty() ? fallback : texture.c_str())) {
+                if (ImGui::Selectable(fallback, texture.empty()))
+                    apply(",\"name\":\"" + json_escape(name) + "\",\"texture\":\"\"");
+                for (const auto& file : panorama_files) {
+                    if (ImGui::Selectable(file.c_str(), file == texture))
+                        apply(",\"name\":\"" + json_escape(name) + "\",\"texture\":\"" + json_escape(file) + '"');
+                    note_item(key + name + ":" + file);
+                }
+                if (panorama_files.empty()) ImGui::TextDisabled("No PNG or JPEG images in the project");
+                ImGui::EndCombo();
+            }
+            note_item(key + name);
+            if (ImGui::BeginDragDropTarget()) {
+                if (const auto* payload = ImGui::GetDragDropPayload(); payload && payload->IsDataType("relay.asset")) {
+                    const std::string dropped(static_cast<const char*>(payload->Data));
+                    if (panorama_file(dropped) && ImGui::AcceptDragDropPayload("relay.asset"))
+                        apply(",\"name\":\"" + json_escape(name) + "\",\"texture\":\"" + json_escape(dropped) + '"');
+                }
+                ImGui::EndDragDropTarget();
+            }
+        } else if (type == "bool") {
+            bool value = values[0] != 0.0;
+            inspector_field_label(label);
+            if (ImGui::Checkbox("##value", &value)) {
+                values[0] = value ? 1.0 : 0.0;
+                send(1U);
+            }
+            note_item(key + name);
+        } else if ((type == "vec3" || type == "vec4") && hint == "source_color") {
+            std::array<double, 3> color{values[0], values[1], values[2]};
+            if (color_edit(label, color)) {
+                values[0] = color[0];
+                values[1] = color[1];
+                values[2] = color[2];
+                send(type == "vec4" ? 4U : 3U);
+            }
+            note_item(key + name);
+            if (type == "vec4" && drag_scalar("Alpha", values[3], 0.005F, "%.3f")) {
+                values[3] = std::clamp(values[3], 0.0, 1.0);
+                send(4U);
+            }
+        } else if (type == "float" || type == "int") {
+            const bool integer = type == "int";
+            if (hint == "hint_range") {
+                const double minimum = number_or(parameter, "minimum", 0.0);
+                const double maximum = number_or(parameter, "maximum", 1.0);
+                if (slider_scalar(label, values[0], minimum, maximum, integer ? "%.0f" : "%.3f")) {
+                    if (const double step = number_or(parameter, "step", 0.0); step > 0.0)
+                        values[0] = minimum + std::round((values[0] - minimum) / step) * step;
+                    if (integer) values[0] = std::round(values[0]);
+                    send(1U);
+                }
+            } else if (drag_scalar(label, values[0], integer ? 0.2F : 0.01F, integer ? "%.0f" : "%.3f")) {
+                if (integer) values[0] = std::round(values[0]);
+                send(1U);
+            }
+            note_item(key + name);
+        } else {
+            const auto components = type == "vec2" ? 2 : type == "vec3" ? 3 : 4;
+            inspector_field_label(label);
+            if (ImGui::DragScalarN("##value", ImGuiDataType_Double, values.data(), components, 0.01F, nullptr,
+                                   nullptr, "%.3f"))
+                send(static_cast<std::size_t>(components));
+            note_item(key + name);
+        }
+        inspector_field_reserve = 0.0F;
+        if (reset) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset")) reset();
+            note_item(key + name + ":reset");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", reset_tip);
+        }
+        ImGui::PopID();
+    }
+
+    // A material file's parameter, saved to the file as it changes.
+    void draw_material_parameter(const std::string& path, const JsonValue::Object& parameter) {
+        const auto name = string_or(parameter, "name");
+        draw_material_parameter(
+            parameter, [&](const std::string& fields) { set_material_parameter(path, fields); },
+            boolean_or(parameter, "set", false)
+                ? std::function<void()>([&] {
+                      set_material_parameter(path, ",\"name\":\"" + json_escape(name) + "\",\"reset\":true");
+                  })
+                : std::function<void()>{},
+            nullptr, "inspector:material:", "Back to the shader's default");
+    }
+
+    // A surface material on a sphere, rendered by the window a frame or two after it changes.
+    void draw_material_preview(const std::string& path) {
+        preview_wanted = path;
+        const float side = std::min(ImGui::GetContentRegionAvail().x, 144.0F * ui_scale);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - side) * 0.5F);
+        if (preview_texture && preview_path == path) {
+            if (headless) {
+                preview_texture->SetTexID(1);
+                preview_texture->SetStatus(ImTextureStatus_OK);
+            } else if (preview_texture->Status == ImTextureStatus_Destroyed) {
+                preview_texture->SetStatus(ImTextureStatus_WantCreate);
+            }
+            ImGui::Image(preview_texture->GetTexRef(), {side, side});
+        } else {
+            const auto corner = ImGui::GetCursorScreenPos();
+            ImGui::Dummy({side, side});
+            auto* draw = ImGui::GetWindowDrawList();
+            draw->AddRectFilled(corner, {corner.x + side, corner.y + side}, ImGui::GetColorU32(editor_color(editor_palette().surface_active)));
+            const char* label = "Rendering preview...";
+            const auto text = ImGui::CalcTextSize(label);
+            draw->AddText({corner.x + (side - text.x) * 0.5F, corner.y + (side - text.y) * 0.5F},
+                          ImGui::GetColorU32(editor_color(editor_palette().text_faint)), label);
+        }
+        note_item("inspector:material:preview");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s on a sphere, under Relay's default sky and sun. Values set for one object "
+                              "alone are not shown here.", base_name(path).c_str());
+    }
+
+    void material_preview_ready(const std::string& path, const std::uint32_t width, const std::uint32_t height,
+                                const std::vector<std::uint8_t>& rgba) {
+        if (width == 0U || height == 0U || rgba.size() != static_cast<std::size_t>(width) * height * 4U) return;
+        preview_path = path;
+        const bool reuse = preview_texture && preview_texture->Width == static_cast<int>(width) &&
+                           preview_texture->Height == static_cast<int>(height) &&
+                           preview_texture->Status != ImTextureStatus_WantDestroy;
+        if (!reuse) {
+            if (preview_texture) ImGui::UnregisterUserTexture(preview_texture.get());
+            preview_texture = std::make_unique<ImTextureData>();
+            preview_texture->Create(ImTextureFormat_RGBA32, static_cast<int>(width), static_cast<int>(height));
+            preview_texture->RefCount = 1;
+            std::memcpy(preview_texture->Pixels, rgba.data(), rgba.size());
+            preview_texture->SetStatus(ImTextureStatus_WantCreate);
+            ImGui::RegisterUserTexture(preview_texture.get());
+            return;
+        }
+        std::memcpy(preview_texture->Pixels, rgba.data(), rgba.size());
+        if (preview_texture->Status == ImTextureStatus_OK) {
+            const ImTextureRect whole{0, 0, static_cast<unsigned short>(width), static_cast<unsigned short>(height)};
+            preview_texture->UpdateRect = whole;
+            preview_texture->Updates.resize(0);
+            preview_texture->Updates.push_back(whole);
+            preview_texture->SetStatus(ImTextureStatus_WantUpdates);
+        }
+    }
+
+    // A surface or post-processing material's shader and parameters, saved to its file as they
+    // change. `post` picks which shaders it may use.
+    void draw_shader_material_fields(const std::string& path, const bool post) {
+        const auto& palette = editor_palette();
+        const auto* material = shader_material_summary(path);
+        if (!material) {
+            ImGui::TextColored(editor_color(palette.warning), "%s cannot be read", path.c_str());
+            return;
+        }
+        ImGui::PushID(path.c_str());
+        if (!post) draw_material_preview(path);
+        const auto shader = string_or(*material, "shader");
+        const auto set_shader = [&](const std::string& chosen) {
+            if (call("assets.set_material", "\"path\":\"" + json_escape(path) + "\",\"shader\":\"" +
+                                                json_escape(chosen) + '"'))
+                shader_material_info.erase(path);
+        };
+        if (inspector_begin_combo("Shader", shader.empty() ? "<none>" : shader.c_str())) {
+            for (const auto& file : shader_files) {
+                if (ImGui::Selectable(file.c_str(), file == shader)) set_shader(file);
+                note_item("inspector:material:shader:" + file);
+            }
+            ImGui::Separator();
+            if (ImGui::Selectable(post ? "New post-processing shader" : "New surface shader")) {
+                (void)call("assets.create_folder", "\"path\":\"shaders\"", false);
+                if (const auto created = create_shader("shaders", post)) set_shader(*created);
+            }
+            note_item("inspector:material:shader:new");
+            ImGui::EndCombo();
+        }
+        note_item("inspector:material:shader");
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto* payload = ImGui::GetDragDropPayload(); payload && payload->IsDataType("relay.asset")) {
+                const std::string dropped(static_cast<const char*>(payload->Data));
+                if (dropped.ends_with(".relay-shader") && ImGui::AcceptDragDropPayload("relay.asset")) set_shader(dropped);
+            }
+            ImGui::EndDragDropTarget();
+        }
+        if (!shader.empty()) {
+            inspector_field_label("");
+            if (ImGui::SmallButton("Edit shader")) open_shader(shader);
+            note_item("inspector:material:edit_shader");
+        }
+        if (const auto* error = field(*material, "error"); error && error->string()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.warning));
+            ImGui::TextWrapped("%s%s", error->string()->c_str(), post ? "" : "; the surface shows a checkerboard");
+            ImGui::PopStyleColor();
+        }
+        if (const auto* warnings = field(*material, "warnings"); warnings && warnings->array())
+            for (const auto& warning : *warnings->array())
+                if (warning.string()) ImGui::TextColored(editor_color(palette.text_faint), "%s", warning.string()->c_str());
+        if (const auto* parameters = field(*material, "parameters"); parameters && parameters->array())
+            for (const auto& item : *parameters->array())
+                if (const auto* parameter = item.object()) draw_material_parameter(path, *parameter);
+        ImGui::PopID();
+    }
+
+    void draw_post_process_section(const JsonValue::Object& entity) {
+        const auto* post = component(entity, "post_process");
+        if (!post || !component_header("Post process", "post_process")) return;
+        const auto& palette = editor_palette();
+        const auto request_fields = entity_field(selection);
+        std::vector<std::string> materials;
+        std::vector<bool> enabled, in_editor;
+        if (const auto* effects = field(*post, "effects"); effects && effects->array())
+            for (const auto& item : *effects->array())
+                if (const auto* effect = item.object()) {
+                    materials.push_back(string_or(*effect, "material"));
+                    enabled.push_back(boolean_or(*effect, "enabled", true));
+                    in_editor.push_back(boolean_or(*effect, "editor", true));
+                }
+        const auto set_list = [&](const std::vector<std::string>& list, const char* label) {
+            std::string fields = request_fields + ",\"effects\":[";
+            for (std::size_t index = 0; index < list.size(); ++index)
+                fields += (index ? ",\"" : "\"") + json_escape(list[index]) + '"';
+            mutate("scene.set_post_process", fields + ']', label);
+        };
+        std::size_t nodes = 0;
+        bool used = false;
+        for (const auto* other : entities)
+            if (component(*other, "post_process")) {
+                if (nodes++ == 0U) used = string_or(*other, "entity") == selection;
+            }
+        if (nodes > 1U)
+            ImGui::TextColored(editor_color(palette.warning),
+                               used ? "%zu nodes have post processing; this one is used."
+                                    : "%zu nodes have post processing; only the first is used, not this one.",
+                               nodes);
+        if (materials.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+            ImGui::TextWrapped("No effects yet. Add a post-processing material below; its shader changes the "
+                               "whole image before tone mapping, in the editor and the game.");
+            ImGui::PopStyleColor();
+        }
+        for (std::size_t index = 0; index < materials.size(); ++index) {
+            ImGui::PushID(static_cast<int>(index));
+            bool on = enabled[index];
+            if (ImGui::Checkbox("##on", &on))
+                mutate("scene.set_post_effect",
+                       request_fields + ",\"index\":" + std::to_string(index) + ",\"enabled\":" + (on ? "true" : "false"),
+                       on ? "Effect on" : "Effect off");
+            note_item("inspector:post:enabled:" + std::to_string(index));
+            ImGui::SameLine();
+            const bool open = ImGui::TreeNodeEx(base_name(materials[index]).c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
+            note_item("inspector:post:effect:" + std::to_string(index));
+            ImGui::SameLine(ImGui::GetContentRegionMax().x - 3.0F * ImGui::GetFrameHeight());
+            ImGui::BeginDisabled(index == 0U);
+            if (ImGui::ArrowButton("##up", ImGuiDir_Up)) {
+                auto list = materials;
+                std::swap(list[index], list[index - 1U]);
+                set_list(list, "Effect moved");
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine(0.0F, 2.0F);
+            ImGui::BeginDisabled(index + 1U == materials.size());
+            if (ImGui::ArrowButton("##down", ImGuiDir_Down)) {
+                auto list = materials;
+                std::swap(list[index], list[index + 1U]);
+                set_list(list, "Effect moved");
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine(0.0F, 2.0F);
+            if (ImGui::SmallButton("x")) {
+                auto list = materials;
+                list.erase(list.begin() + static_cast<std::ptrdiff_t>(index));
+                set_list(list, "Effect removed");
+            }
+            note_item("inspector:post:remove:" + std::to_string(index));
+            if (open) {
+                bool shown = in_editor[index];
+                inspector_field_label("Editor view");
+                if (ImGui::Checkbox("##editor_view", &shown))
+                    mutate("scene.set_post_effect",
+                           request_fields + ",\"index\":" + std::to_string(index) + ",\"editor\":" +
+                               (shown ? "true" : "false"),
+                           shown ? "Effect shown in the editor view" : "Effect kept to the game camera");
+                note_item("inspector:post:editor:" + std::to_string(index));
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Also show this effect while looking around in the editor. The game "
+                                      "camera's view always shows it.");
+                draw_shader_material_fields(materials[index], true);
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        const auto add = [&](const std::string& path) {
+            auto list = materials;
+            list.push_back(path);
+            set_list(list, "Effect added");
+        };
+        if (inspector_begin_combo("Add effect", "Choose a material...")) {
+            for (const auto& path : shader_materials_of_type("post_process")) {
+                if (ImGui::Selectable(path.c_str())) add(path);
+                note_item("inspector:post:add:" + path);
+            }
+            ImGui::Separator();
+            if (ImGui::Selectable("New post-processing material")) {
+                (void)call("assets.create_folder", "\"path\":\"materials\"", false);
+                if (const auto created = create_material("materials", true)) add(*created);
+            }
+            note_item("inspector:post:add:new");
+            ImGui::SeparatorText("Ready-made");
+            for (const auto& effect : shader_effects()) {
+                if (ImGui::Selectable(std::string{effect.name}.c_str()))
+                    if (const auto material = add_ready_made_effect(effect)) add(*material);
+                note_item("inspector:post:add:" + std::string{effect.id});
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s. Copied into the project's shaders and materials folders, where you can "
+                                      "change it like any other shader.",
+                                      std::string{effect.description}.c_str());
+            }
+            ImGui::EndCombo();
+        }
+        note_item("inspector:post:add");
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto* payload = ImGui::GetDragDropPayload(); payload && payload->IsDataType("relay.asset")) {
+                const std::string dropped(static_cast<const char*>(payload->Data));
+                const auto* material = dropped.ends_with(".relay-material") ? shader_material_summary(dropped) : nullptr;
+                if (material && string_or(*material, "type") == "post_process" &&
+                    ImGui::AcceptDragDropPayload("relay.asset"))
+                    add(dropped);
+            }
+            ImGui::EndDragDropTarget();
+        }
+    }
+
+    // A ready-made effect's shader and material in the project (shaders/Bloom.relay-shader and
+    // materials/Bloom.relay-material, say), made from Relay's copy unless they already exist.
+    // Returns the material.
+    std::optional<std::string> add_ready_made_effect(const ShaderEffect& effect) {
+        const std::string name{effect.name};
+        const auto shader = "shaders/" + name + ".relay-shader";
+        const auto material = "materials/" + name + ".relay-material";
+        if (std::find(shader_files.begin(), shader_files.end(), shader) == shader_files.end()) {
+            (void)call("assets.create_folder", "\"path\":\"shaders\"", false);
+            if (!call("shaders.write", "\"path\":\"" + json_escape(shader) + "\",\"create\":true,\"effect\":\"" +
+                                           std::string{effect.id} + '"'))
+                return std::nullopt;
+            refresh_shader_files();
+        }
+        if (std::find(sky_material_files.begin(), sky_material_files.end(), material) == sky_material_files.end()) {
+            (void)call("assets.create_folder", "\"path\":\"materials\"", false);
+            if (!call("assets.set_material", "\"path\":\"" + json_escape(material) +
+                                                 "\",\"create\":true,\"type\":\"post_process\",\"shader\":\"" +
+                                                 json_escape(shader) + '"'))
+                return std::nullopt;
+            refresh_sky_files();
+        }
+        refresh_asset_listing();
+        return material;
+    }
+
+    // Creates "New sky material.relay-material" (numbered when taken) in `folder`. With `sky`
+    // set, that node's sky shows it; otherwise the new file is selected for renaming.
+    void create_sky_material(const std::string& folder, const std::string& sky = {}) {
+        const auto taken = [&](const std::string& path) {
+            return std::find(sky_material_files.begin(), sky_material_files.end(), path) !=
+                   sky_material_files.end();
+        };
+        std::string path = join_path(folder, "New sky material.relay-material");
+        for (int suffix = 2; taken(path); ++suffix)
+            path = join_path(folder, "New sky material " + std::to_string(suffix) + ".relay-material");
+        if (!call("assets.set_sky_material", "\"path\":\"" + json_escape(path) + "\",\"create\":true"))
+            return;
+        refresh_sky_files();
+        refresh_asset_listing();
+        if (!sky.empty()) {
+            mutate("scene.set_sky", entity_field(sky) + ",\"material\":\"" + json_escape(path) + '"',
+                   "Created " + path);
+        } else {
+            if (!folder.empty()) set_asset_folder_open(folder, true);
+            asset_selection = path;
+            begin_rename(RenameKind::asset, path, base_name(path));
+        }
+    }
+
+    // Relay's shading language, for the code boxes: GLSL plus its declarations and built-ins.
+    static const TextEditor::Language* relay_shader_language() {
+        static const TextEditor::Language language = [] {
+            auto relay = *TextEditor::Language::Glsl();
+            relay.name = "Relay shader";
+            for (const char* keyword : {"shader_type", "render_mode", "surface", "post_process",
+                                        "transparent", "unshaded", "source_color", "hint_range",
+                                        "hint_normal", "hint_black", "hint_white"})
+                relay.keywords.insert(keyword);
+            for (const char* builtin :
+                 {"VERTEX", "NORMAL", "TANGENT", "UV", "TIME", "MODEL_MATRIX", "WORLD_POSITION", "VIEW",
+                  "CAMERA_POSITION", "FRAGCOORD", "FRONT_FACING", "ALBEDO", "ALPHA", "METALLIC",
+                  "ROUGHNESS", "EMISSION", "AO", "NORMAL_MAP", "NORMAL_MAP_DEPTH", "ALPHA_SCISSOR_THRESHOLD",
+                  "SCREEN_UV", "SCREEN_PIXEL_SIZE", "COLOR", "DEPTH", "SCREEN_TEXTURE", "MOTION", "DELTA_TIME",
+                  "scene_color", "scene_depth", "scene_normal", "scene_motion", "vertex", "fragment"})
+                relay.identifiers.insert(builtin);
+            return relay;
+        }();
+        return &language;
+    }
+
+    static std::unique_ptr<TextEditor> make_code_editor(const std::string& text) {
+        auto editor = std::make_unique<TextEditor>();
+        editor->SetLanguage(relay_shader_language());
+        editor->SetTabSize(4);
+        editor->SetShowWhitespacesEnabled(false);
+        editor->SetPalette(TextEditor::GetDarkPalette());
+        editor->SetText(text);
+        return editor;
+    }
+
+    // The text without its trailing layout comment: what compiles.
+    static std::string shader_code_part(const std::string& text) {
+        const auto at = text.rfind("\n// relay-graph ");
+        return at == std::string::npos ? text : text.substr(0U, at + 1U);
+    }
+
+    // Reads text into a tab: as a graph, or as text when its declarations do not parse.
+    void load_shader_text(ShaderTab& tab, const std::string& text) {
+        tab.text = text;
+        tab.graph = shader_to_graph(text);
+        tab.raw = !tab.graph.errors.empty();
+        tab.source = tab.raw ? GraphSource{} : graph_to_shader(tab.graph);
+        if (tab.raw) {
+            tab.code_editor = make_code_editor(text);
+            tab.code_undo = tab.code_editor->GetUndoIndex();
+            tab.functions_editor.reset();
+        } else {
+            tab.functions_editor = make_code_editor(tab.graph.functions);
+            tab.functions_undo = tab.functions_editor->GetUndoIndex();
+            refresh_stage_code_editor(tab);
+        }
+        if (tab.graph.type == ShaderType::post_process) tab.stage = "fragment";
+        tab.dirty = tab.text != tab.saved;
+    }
+
+    void refresh_stage_code_editor(ShaderTab& tab) {
+        const auto* stage = tab.graph.stage(tab.stage);
+        if (stage && stage->code_only) {
+            tab.code_editor = make_code_editor(stage->code);
+            tab.code_undo = tab.code_editor->GetUndoIndex();
+        } else {
+            tab.code_editor.reset();
+        }
+    }
+
+    // Writes the graph back to text after an edit. `committed` edits are remembered for undo and
+    // previewed; others (a node being dragged) only update the text.
+    void graph_changed(ShaderTab& tab, const bool committed) {
+        if (auto* stage = tab.graph.stage(tab.stage); stage && !stage->code_only)
+            (void)update_graph_types(tab.graph, *stage);
+        tab.source = graph_to_shader(tab.graph);
+        const bool code_changed = shader_code_part(tab.source.text) != shader_code_part(tab.text);
+        tab.text = tab.source.text;
+        tab.dirty = tab.text != tab.saved;
+        if (!committed) return;
+        remember_shader_text(tab);
+        if (code_changed) {
+            tab.preview_pending = true;
+            tab.changed_at = ImGui::GetTime();
+        }
+    }
+
+    void remember_shader_text(ShaderTab& tab) {
+        if (!tab.history.empty() && tab.history[tab.history_index] == tab.text) return;
+        if (!tab.history.empty()) tab.history.resize(tab.history_index + 1U);
+        tab.history.push_back(tab.text);
+        if (tab.history.size() > 200U) tab.history.erase(tab.history.begin());
+        tab.history_index = tab.history.size() - 1U;
+    }
+
+    void restore_shader_text(ShaderTab& tab, const std::size_t index) {
+        if (index >= tab.history.size()) return;
+        tab.history_index = index;
+        const auto stage = tab.stage;
+        load_shader_text(tab, tab.history[index]);
+        tab.stage = stage;
+        refresh_stage_code_editor(tab);
+        tab.preview_pending = true;
+        tab.changed_at = ImGui::GetTime();
+    }
+
+    // Opens a shader in the Shader Editor, or brings its tab forward.
+    void open_shader(const std::string& path) {
+        panel_open[11] = true;
+        shader_editor_focus_pending = true;
+        shader_tab_select_request = path;
+        if (std::any_of(shader_tabs.begin(), shader_tabs.end(), [&](const ShaderTab& tab) { return tab.path == path; }))
+            return;
+        auto read = call("shaders.read", "\"path\":\"" + json_escape(path) + '"');
+        const auto* object = read && read->object() ? field(*read->object(), "shader") : nullptr;
+        if (!object || !object->object()) return;
+        ShaderTab tab;
+        tab.path = path;
+        tab.saved = string_or(*object->object(), "text");
+        const auto* preview = field(*object->object(), "preview");
+        const auto text = preview && preview->string() ? *preview->string() : tab.saved;
+        tab.previewed = preview && preview->string() ? *preview->string() : std::string{};
+        tab.status = *object;
+        load_shader_text(tab, text);
+        remember_shader_text(tab);
+        shader_tabs.push_back(std::move(tab));
+    }
+
+    void set_shader_status(ShaderTab& tab, const std::optional<JsonValue>& result) {
+        const auto* object = result && result->object() ? field(*result->object(), "shader") : nullptr;
+        if (object && object->object()) tab.status = *object;
+        if (tab.code_editor) {
+            // Code boxes mark their own errors: the whole file in text mode, else a code stage's lines.
+            tab.code_editor->ClearMarkers();
+            if (const auto* errors = field(*tab.status.object(), "errors"); errors && errors->array() && tab.raw)
+                for (const auto& item : *errors->array())
+                    if (const auto* error = item.object()) {
+                        const auto line = static_cast<std::size_t>(number_or(*error, "line", 0.0));
+                        const auto message = string_or(*error, "message");
+                        if (line > 0U && line <= tab.code_editor->GetLineCount())
+                            tab.code_editor->AddMarker(line - 1U, IM_COL32(230, 80, 80, 255), IM_COL32(230, 80, 80, 60),
+                                                       message, message);
+                    }
+        }
+        refresh_pending = true;
+    }
+
+    // Compile errors, by the node whose code they are in; the rest are listed for the whole file.
+    std::map<std::string, std::string> shader_node_errors(const ShaderTab& tab, std::vector<std::string>& others) const {
+        std::map<std::string, std::string> result;
+        const auto* status = tab.status.object();
+        const auto* errors = status ? field(*status, "errors") : nullptr;
+        if (!errors || !errors->array()) return result;
+        for (const auto& item : *errors->array()) {
+            const auto* error = item.object();
+            if (!error) continue;
+            const auto line = static_cast<std::uint32_t>(number_or(*error, "line", 0.0));
+            const auto message = string_or(*error, "message");
+            const auto found = tab.source.node_lines.find(line);
+            if (found != tab.source.node_lines.end() && found->second.first == tab.stage) {
+                auto& text = result[found->second.second];
+                text += (text.empty() ? "" : "\n") + message;
+            } else if (found == tab.source.node_lines.end() || found->second.first == tab.stage) {
+                others.push_back((line ? "Line " + std::to_string(line) + ": " : std::string{}) + message);
+            } else {
+                others.push_back("In the " + found->second.first + " stage: " + message);
+            }
+        }
+        return result;
+    }
+
+    bool save_shader(ShaderTab& tab) {
+        auto result = call("shaders.write", "\"path\":\"" + json_escape(tab.path) + "\",\"text\":\"" +
+                                                json_escape(tab.text) + '"');
+        if (!result) return false;
+        tab.saved = tab.text;
+        tab.previewed.clear();
+        tab.dirty = false;
+        tab.preview_pending = false;
+        set_shader_status(tab, result);
+        set_status("Saved " + tab.path, false);
+        return true;
+    }
+
+    // Stops previewing unsaved text, so the scene shows the file again.
+    void discard_shader_preview(ShaderTab& tab) {
+        if (!tab.previewed.empty() || tab.dirty)
+            (void)call("shaders.preview", "\"path\":\"" + json_escape(tab.path) + '"', false);
+        tab.previewed.clear();
+        refresh_pending = true;
+    }
+
+    // Creates a shader of the given type in `folder` from its template and opens it.
+    std::optional<std::string> create_shader(const std::string& folder, const bool post) {
+        const auto taken = [&](const std::string& path) {
+            return std::find(shader_files.begin(), shader_files.end(), path) != shader_files.end();
+        };
+        const std::string stem = post ? "New post-processing shader" : "New surface shader";
+        std::string path = join_path(folder, stem + ".relay-shader");
+        for (int suffix = 2; taken(path); ++suffix)
+            path = join_path(folder, stem + ' ' + std::to_string(suffix) + ".relay-shader");
+        if (!call("shaders.write", "\"path\":\"" + json_escape(path) + "\",\"create\":true,\"type\":\"" +
+                                       (post ? "post_process" : "surface") + '"'))
+            return std::nullopt;
+        refresh_shader_files();
+        refresh_asset_listing();
+        open_shader(path);
+        return path;
+    }
+
+    // Creates a surface or post-processing material in `folder`. With `node` set it is given to
+    // that node (its mesh renderer, or its post processing); otherwise it is selected for renaming.
+    std::optional<std::string> create_material(const std::string& folder, const bool post,
+                                               const std::string& shader = {}) {
+        const auto taken = [&](const std::string& path) {
+            return std::find(sky_material_files.begin(), sky_material_files.end(), path) !=
+                   sky_material_files.end();
+        };
+        const std::string stem = post ? "New post-processing material" : "New material";
+        std::string path = join_path(folder, stem + ".relay-material");
+        for (int suffix = 2; taken(path); ++suffix)
+            path = join_path(folder, stem + ' ' + std::to_string(suffix) + ".relay-material");
+        if (!call("assets.set_material", "\"path\":\"" + json_escape(path) + "\",\"create\":true,\"type\":\"" +
+                                             (post ? "post_process" : "surface") + "\",\"shader\":\"" +
+                                             json_escape(shader) + '"'))
+            return std::nullopt;
+        refresh_sky_files();
+        refresh_asset_listing();
+        return path;
+    }
+
+    void refresh_shader_files() {
+        shader_files.clear();
+        if (auto found = call("assets.search", "\"kinds\":[\"shader\"]", false); found && found->object())
+            if (const auto* entries = field(*found->object(), "entries"); entries && entries->array())
+                for (const auto& entry : *entries->array())
+                    if (const auto* object = entry.object();
+                        object && string_or(*object, "type") == "file" &&
+                        string_or(*object, "path").ends_with(".relay-shader"))
+                        shader_files.push_back(string_or(*object, "path"));
+    }
+
+    void draw_shader_editor() {
+        const auto& palette = editor_palette();
+        shader_editor_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        if (shader_tabs.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+            ImGui::TextWrapped("Double-click a .relay-shader file in Assets to edit its nodes here, or start a new "
+                               "one. Surface shaders decide how meshes look; post-processing shaders "
+                               "change the whole image.");
+            ImGui::PopStyleColor();
+            if (ImGui::Button("New surface shader")) {
+                (void)call("assets.create_folder", "\"path\":\"shaders\"", false);
+                (void)create_shader("shaders", false);
+            }
+            note_item("shader_editor:new_surface");
+            ImGui::SameLine();
+            if (ImGui::Button("New post-processing shader")) {
+                (void)call("assets.create_folder", "\"path\":\"shaders\"", false);
+                (void)create_shader("shaders", true);
+            }
+            note_item("shader_editor:new_post");
+            return;
+        }
+        const double now = ImGui::GetTime();
+        if (ImGui::BeginTabBar("##shader_tabs", ImGuiTabBarFlags_AutoSelectNewTabs |
+                                                    ImGuiTabBarFlags_FittingPolicyScroll)) {
+            for (std::size_t index = 0; index < shader_tabs.size(); ++index) {
+                auto& tab = shader_tabs[index];
+                bool open = true;
+                const auto label = base_name(tab.path) + (tab.dirty ? " *" : "") + "###" + tab.path;
+                ImGuiTabItemFlags flags = tab.dirty ? ImGuiTabItemFlags_UnsavedDocument : 0;
+                if (shader_tab_select_request == tab.path) {
+                    flags |= ImGuiTabItemFlags_SetSelected;
+                    shader_tab_select_request.clear();
+                }
+                const bool visible = ImGui::BeginTabItem(label.c_str(), &open, flags);
+                note_item("shader_editor:tab:" + tab.path);
+                if (!open) {
+                    if (tab.dirty) shader_tab_closing = tab.path;
+                    else {
+                        discard_shader_preview(tab);
+                        shader_tabs.erase(shader_tabs.begin() + static_cast<std::ptrdiff_t>(index));
+                        if (visible) ImGui::EndTabItem();
+                        break;
+                    }
+                }
+                if (now - tab.checked_at >= 1.0) {
+                    tab.checked_at = now;
+                    check_shader_file(tab);
+                }
+                if (!visible) continue;
+                shader_tab_selected = index;
+                draw_shader_tab(tab, now);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+        // Tabs with changes wait here for a choice before they close.
+        if (!shader_tab_closing.empty()) ImGui::OpenPopup("Close shader");
+        if (ImGui::BeginPopupModal("Close shader", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            const auto found = std::find_if(shader_tabs.begin(), shader_tabs.end(),
+                                            [&](const ShaderTab& tab) { return tab.path == shader_tab_closing; });
+            ImGui::Text("%s has changes that are not saved.", shader_tab_closing.c_str());
+            const auto close = [&](const bool save) {
+                if (found != shader_tabs.end()) {
+                    if (!save || save_shader(*found)) {
+                        if (!save) discard_shader_preview(*found);
+                        shader_tabs.erase(found);
+                    }
+                }
+                shader_tab_closing.clear();
+                ImGui::CloseCurrentPopup();
+            };
+            if (ImGui::Button("Save")) close(true);
+            note_item("shader_editor:close:save");
+            ImGui::SameLine();
+            if (ImGui::Button("Discard")) close(false);
+            note_item("shader_editor:close:discard");
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                shader_tab_closing.clear();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+    }
+
+    // Picks up a shader file changed outside this tab: reloads a tab without edits (the old text
+    // stays in its undo history), or remembers the new text for a tab with edits.
+    void check_shader_file(ShaderTab& tab) {
+        const auto read = call("shaders.read", "\"path\":\"" + json_escape(tab.path) + '"', false);
+        const auto* object = read && read->object() ? field(*read->object(), "shader") : nullptr;
+        if (!object || !object->object()) return;
+        const auto text = string_or(*object->object(), "text");
+        if (text == tab.saved) {
+            tab.changed_on_disk.reset();
+            return;
+        }
+        if (tab.dirty) {
+            tab.changed_on_disk = text;
+            return;
+        }
+        reload_shader_from_disk(tab, text);
+    }
+
+    // `text` is a copy: it may come from tab.changed_on_disk, which this clears.
+    void reload_shader_from_disk(ShaderTab& tab, const std::string text) {
+        tab.saved = text;
+        tab.changed_on_disk.reset();
+        load_shader_text(tab, text);
+        remember_shader_text(tab);
+        tab.preview_pending = false;
+        discard_shader_preview(tab);
+        set_shader_status(tab, call("shaders.read", "\"path\":\"" + json_escape(tab.path) + '"', false));
+        tab.message = "Reloaded: the file was changed outside the editor";
+    }
+
+    // A code box for code the graph cannot show; returns true when it was edited this frame.
+    bool draw_shader_code_box(TextEditor& editor, std::size_t& undo_index, const char* id, const ImVec2 size) {
+        ImGui::PushFont(fonts.monospace, fonts.monospace_size);
+        editor.Render(id, size, ImGuiChildFlags_Borders);
+        ImGui::PopFont();
+        if (editor.GetUndoIndex() == undo_index) return false;
+        undo_index = editor.GetUndoIndex();
+        return true;
+    }
+
+    void draw_shader_tab(ShaderTab& tab, const double now) {
+        const auto& palette = editor_palette();
+        auto& io = ImGui::GetIO();
+        if (tab.changed_on_disk) {
+            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.warning));
+            ImGui::TextWrapped("%s was changed outside the editor (by an agent or another program) while you "
+                               "have unsaved changes here.", base_name(tab.path).c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::Button("Load the new version")) reload_shader_from_disk(tab, *tab.changed_on_disk);
+            note_item("shader_editor:disk:reload");
+            ImGui::SameLine();
+            if (tab.changed_on_disk && ImGui::Button("Keep mine")) {
+                // Saving now replaces the other version, as the person chose.
+                tab.saved = *tab.changed_on_disk;
+                tab.changed_on_disk.reset();
+            }
+            note_item("shader_editor:disk:keep");
+        }
+        const bool code_box_focused = ImGui::GetActiveID() != 0 && io.WantTextInput;
+        // Toolbar: save, revert, undo, preview and the compile status.
+        const bool save_pressed = shader_editor_focused && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false);
+        ImGui::BeginDisabled(!tab.dirty);
+        if (ImGui::Button("Save") || (save_pressed && tab.dirty)) (void)save_shader(tab);
+        ImGui::EndDisabled();
+        note_item("shader_editor:save");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Save (Ctrl+S)");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!tab.dirty);
+        if (ImGui::Button("Revert")) {
+            load_shader_text(tab, tab.saved);
+            remember_shader_text(tab);
+            tab.preview_pending = false;
+            discard_shader_preview(tab);
+            set_shader_status(tab, call("shaders.read", "\"path\":\"" + json_escape(tab.path) + '"', false));
+        }
+        ImGui::EndDisabled();
+        note_item("shader_editor:revert");
+        ImGui::SameLine();
+        const bool can_undo = tab.history_index > 0U, can_redo = tab.history_index + 1U < tab.history.size();
+        ImGui::BeginDisabled(!can_undo);
+        if (ImGui::ArrowButton("##undo", ImGuiDir_Left)) restore_shader_text(tab, tab.history_index - 1U);
+        ImGui::EndDisabled();
+        note_item("shader_editor:undo");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Undo (Ctrl+Z)");
+        ImGui::SameLine(0.0F, 2.0F);
+        ImGui::BeginDisabled(!can_redo);
+        if (ImGui::ArrowButton("##redo", ImGuiDir_Right)) restore_shader_text(tab, tab.history_index + 1U);
+        ImGui::EndDisabled();
+        note_item("shader_editor:redo");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Redo (Ctrl+Y)");
+        if (shader_editor_focused && io.KeyCtrl && !code_box_focused) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Z, false) && !io.KeyShift && can_undo) restore_shader_text(tab, tab.history_index - 1U);
+            else if ((ImGui::IsKeyPressed(ImGuiKey_Y, false) || (ImGui::IsKeyPressed(ImGuiKey_Z, false) && io.KeyShift)) && can_redo)
+                restore_shader_text(tab, tab.history_index + 1U);
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Live preview", &shader_live_preview) && !shader_live_preview) discard_shader_preview(tab);
+        note_item("shader_editor:live_preview");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show changes in the viewport as you make them, before saving");
+        ImGui::SameLine();
+        std::vector<std::string> other_errors;
+        const auto node_errors = shader_node_errors(tab, other_errors);
+        const auto* status = tab.status.object();
+        const auto* errors = status ? field(*status, "errors") : nullptr;
+        const std::size_t error_count = errors && errors->array() ? errors->array()->size() : 0U;
+        if (error_count == 0U)
+            ImGui::TextColored(editor_color(palette.success), "Compiled  ·  %s shader",
+                               tab.graph.type == ShaderType::post_process ? "post-processing" : "surface");
+        else
+            ImGui::TextColored(editor_color(palette.danger), "%zu error%s", error_count, error_count == 1U ? "" : "s");
+        note_item("shader_editor:status");
+        if (!tab.message.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(editor_color(palette.warning), "%s", tab.message.c_str());
+        }
+
+        if (tab.raw) {
+            // Declarations that do not parse (an agent's mistake, say) keep the graph closed.
+            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.warning));
+            ImGui::TextWrapped("This shader's declarations have mistakes, so it cannot be shown as nodes. Fix them "
+                               "here; the nodes come back once it reads correctly.");
+            ImGui::PopStyleColor();
+            for (const auto& message : tab.graph.errors)
+                ImGui::TextColored(editor_color(palette.danger), "Line %u: %s", message.line, message.text.c_str());
+            if (draw_shader_code_box(*tab.code_editor, tab.code_undo, "##shader_raw", {0.0F, -ImGui::GetFrameHeightWithSpacing()})) {
+                tab.text = tab.code_editor->GetText();
+                tab.dirty = tab.text != tab.saved;
+                tab.preview_pending = true;
+                tab.changed_at = now;
+            }
+            note_item("shader_editor:raw");
+            const auto reparsed = shader_to_graph(tab.text);
+            ImGui::BeginDisabled(!reparsed.errors.empty());
+            if (ImGui::Button("Show as nodes")) {
+                load_shader_text(tab, tab.text);
+                remember_shader_text(tab);
+            }
+            ImGui::EndDisabled();
+            note_item("shader_editor:show_nodes");
+        } else {
+            // Stages, then a side panel (parameters, settings, functions) beside the canvas.
+            if (tab.graph.type == ShaderType::surface) {
+                for (const auto* name : {"fragment", "vertex"}) {
+                    if (name != std::string_view{"fragment"}) ImGui::SameLine();
+                    const bool active = tab.stage == name;
+                    if (active) ImGui::PushStyleColor(ImGuiCol_Button, editor_color(palette.accent_soft));
+                    if (ImGui::Button(name == std::string_view{"fragment"} ? "Fragment (surface)" : "Vertex (shape)")) {
+                        tab.stage = name;
+                        refresh_stage_code_editor(tab);
+                    }
+                    if (active) ImGui::PopStyleColor();
+                    note_item(std::string("shader_editor:stage:") + name);
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("Right-click or Space to add nodes; drag from pins to wire them.");
+            }
+            const float side = 250.0F * ui_scale;
+            ImGui::BeginChild("##shader_side", {side, 0.0F}, ImGuiChildFlags_Borders);
+            draw_shader_side_panel(tab);
+            ImGui::EndChild();
+            ImGui::SameLine();
+            ImGui::BeginChild("##shader_main", {0.0F, 0.0F});
+            auto* stage = tab.graph.stage(tab.stage);
+            const float errors_height = other_errors.empty()
+                                            ? 0.0F
+                                            : std::min<float>(static_cast<float>(other_errors.size()), 3.0F) *
+                                                      ImGui::GetTextLineHeightWithSpacing() +
+                                                  ImGui::GetStyle().WindowPadding.y * 2.0F;
+            if (stage && stage->code_only) {
+                ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+                ImGui::TextWrapped("This stage is code, because %s. Nodes cannot show that; edit it here, or remove "
+                                   "it and use nodes.", stage->reason.c_str());
+                ImGui::PopStyleColor();
+                if (!tab.code_editor) refresh_stage_code_editor(tab);
+                if (draw_shader_code_box(*tab.code_editor, tab.code_undo, "##shader_stage_code",
+                                         {0.0F, -errors_height - ImGui::GetFrameHeightWithSpacing()})) {
+                    stage->code = tab.code_editor->GetText();
+                    graph_changed(tab, true);
+                }
+                note_item("shader_editor:stage_code");
+                if (ImGui::Button("Try as nodes")) {
+                    const auto name = tab.stage;
+                    load_shader_text(tab, tab.text);
+                    tab.stage = name;
+                    refresh_stage_code_editor(tab);
+                    if (auto* converted = tab.graph.stage(tab.stage); converted && converted->code_only)
+                        tab.message = "Still code: " + converted->reason;
+                }
+                note_item("shader_editor:try_nodes");
+            } else if (stage) {
+                ImGui::BeginChild("##canvas_area", {0.0F, -errors_height});
+                auto& canvas_view = tab.views[tab.stage];
+                const auto events = draw_shader_graph_canvas(
+                    tab.graph, *stage, canvas_view, node_errors,
+                    [this](const std::string& key, const ImVec2 low, const ImVec2 high) { note_rect(key, low, high); },
+                    ui_scale);
+                ImGui::EndChild();
+                if (!events.status.empty()) tab.message = events.status;
+                else if (events.committed) tab.message.clear();
+                if (events.changed || events.committed) graph_changed(tab, events.committed);
+            }
+            if (!other_errors.empty()) {
+                ImGui::BeginChild("##shader_errors", {0.0F, errors_height}, ImGuiChildFlags_Borders);
+                for (std::size_t index = 0; index < other_errors.size(); ++index) {
+                    ImGui::TextColored(editor_color(palette.danger), "%s", other_errors[index].c_str());
+                    note_item("shader_editor:error:" + std::to_string(index));
+                }
+                ImGui::EndChild();
+            }
+            ImGui::EndChild();
+        }
+        // A pause after an edit sends the text for preview; going back to the saved text stops it.
+        if (tab.preview_pending && shader_live_preview && now - tab.changed_at > 0.35) {
+            tab.preview_pending = false;
+            if (tab.text == tab.saved) {
+                discard_shader_preview(tab);
+                set_shader_status(tab, call("shaders.read", "\"path\":\"" + json_escape(tab.path) + '"', false));
+            } else {
+                tab.previewed = tab.text;
+                set_shader_status(tab, call("shaders.preview", "\"path\":\"" + json_escape(tab.path) +
+                                                                   "\",\"text\":\"" + json_escape(tab.text) + '"'));
+            }
+        }
+    }
+
+    // Parameters (uniforms), render modes and the shader's own functions.
+    void draw_shader_side_panel(ShaderTab& tab) {
+        const auto& palette = editor_palette();
+        auto& graph = tab.graph;
+        ImGui::SeparatorText("Parameters");
+        note_item("shader_editor:parameters");
+        std::optional<std::size_t> remove;
+        for (std::size_t index = 0; index < graph.uniforms.size(); ++index) {
+            auto& uniform = graph.uniforms[index];
+            ImGui::PushID(static_cast<int>(index));
+            char name[64]{};
+            std::snprintf(name, sizeof(name), "%s", uniform.name.c_str());
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 3.0F * ImGui::GetFrameHeight());
+            ImGui::InputText("##name", name, sizeof(name), ImGuiInputTextFlags_CharsNoBlank);
+            if (ImGui::IsItemDeactivatedAfterEdit()) rename_shader_parameter(tab, index, name);
+            note_item("shader_editor:parameter:" + uniform.name);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s parameter; materials set its value", std::string{shader_uniform_type_name(uniform.type)}.c_str());
+            ImGui::SameLine(0.0F, 2.0F);
+            if (ImGui::Button("+", {ImGui::GetFrameHeight(), 0.0F})) {
+                auto* stage = graph.stage(tab.stage);
+                if (stage && !stage->code_only) {
+                    auto& canvas_view = tab.views[tab.stage];
+                    const float zoom = canvas_view.zoom * ui_scale;
+                    const ImVec2 at{(-canvas_view.pan.x + 60.0F) / zoom, (-canvas_view.pan.y + 60.0F) / zoom};
+                    ShaderGraphEntry entry{uniform.name, "Parameters", {}, GraphNode::Kind::parameter, uniform.name, 0U, {}};
+                    canvas_view.selected = {add_shader_graph_node(graph, *stage, entry, at)};
+                    graph_changed(tab, true);
+                }
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Put this parameter on the canvas");
+            note_item("shader_editor:parameter:add:" + uniform.name);
+            ImGui::SameLine(0.0F, 2.0F);
+            if (ImGui::Button("x", {ImGui::GetFrameHeight(), 0.0F})) remove = index;
+            note_item("shader_editor:parameter:remove:" + uniform.name);
+            ImGui::TextColored(editor_color(palette.text_faint), "%s%s", std::string{shader_uniform_type_name(uniform.type)}.c_str(),
+                               uniform.hint == ShaderUniform::Hint::none ? "" : ("  ·  " + std::string{shader_uniform_hint_name(uniform.hint)}).c_str());
+            ImGui::PopID();
+        }
+        if (remove) {
+            const auto name = graph.uniforms[*remove].name;
+            graph.uniforms.erase(graph.uniforms.begin() + static_cast<std::ptrdiff_t>(*remove));
+            for (auto* stage : {&graph.vertex, &graph.fragment}) {
+                std::erase_if(stage->nodes, [&](const GraphNode& node) {
+                    return node.kind == GraphNode::Kind::parameter && node.op == name;
+                });
+                for (auto& node : stage->nodes)
+                    for (auto& input : node.inputs)
+                        if (input.source == "uniform:" + name) input.source.clear();
+            }
+            graph_changed(tab, true);
+        }
+        if (ImGui::Button("Add parameter")) ImGui::OpenPopup("##new_parameter");
+        note_item("shader_editor:parameter:new");
+        if (ImGui::BeginPopup("##new_parameter")) {
+            static constexpr std::array<std::tuple<const char*, ShaderUniform::Type, ShaderUniform::Hint>, 7> kinds{{
+                {"Color", ShaderUniform::Type::vec3, ShaderUniform::Hint::color},
+                {"Number", ShaderUniform::Type::float_value, ShaderUniform::Hint::none},
+                {"Slider (0 to 1)", ShaderUniform::Type::float_value, ShaderUniform::Hint::range},
+                {"Image", ShaderUniform::Type::sampler2d, ShaderUniform::Hint::color},
+                {"Normal map", ShaderUniform::Type::sampler2d, ShaderUniform::Hint::normal},
+                {"Vector (vec3)", ShaderUniform::Type::vec3, ShaderUniform::Hint::none},
+                {"Switch", ShaderUniform::Type::bool_value, ShaderUniform::Hint::none}}};
+            for (const auto& [label, type, hint] : kinds) {
+                if (ImGui::Selectable(label)) {
+                    ShaderUniform uniform;
+                    uniform.type = type;
+                    uniform.hint = hint;
+                    if (hint == ShaderUniform::Hint::color && type == ShaderUniform::Type::vec3) uniform.default_value = {1, 1, 1, 1};
+                    if (hint == ShaderUniform::Hint::range) uniform.default_value = {0.5, 0, 0, 0};
+                    std::string stem = type == ShaderUniform::Type::sampler2d ? "image" : hint == ShaderUniform::Hint::color ? "color" : "value";
+                    std::string name = stem;
+                    for (int suffix = 2; std::any_of(graph.uniforms.begin(), graph.uniforms.end(),
+                                                     [&](const ShaderUniform& other) { return other.name == name; });
+                         ++suffix)
+                        name = stem + "_" + std::to_string(suffix);
+                    uniform.name = name;
+                    graph.uniforms.push_back(uniform);
+                    graph_changed(tab, true);
+                }
+                note_item(std::string("shader_editor:parameter:new:") + label);
+            }
+            ImGui::EndPopup();
+        }
+        if (graph.type == ShaderType::surface) {
+            ImGui::SeparatorText("Surface");
+            if (ImGui::Checkbox("Transparent", &graph.transparent)) graph_changed(tab, true);
+            note_item("shader_editor:transparent");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Blend with what is behind, using the output's Alpha");
+            if (ImGui::Checkbox("Unshaded", &graph.unshaded)) graph_changed(tab, true);
+            note_item("shader_editor:unshaded");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show Albedo and Emission as they are, without lighting");
+        }
+        ImGui::SeparatorText("Functions");
+        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_faint));
+        ImGui::TextWrapped("GLSL functions that nodes can call by name.");
+        ImGui::PopStyleColor();
+        if (tab.functions_editor &&
+            draw_shader_code_box(*tab.functions_editor, tab.functions_undo, "##shader_functions",
+                                 {0.0F, std::max(120.0F * ui_scale, ImGui::GetContentRegionAvail().y)})) {
+            graph.functions = tab.functions_editor->GetText();
+            graph_changed(tab, true);
+        }
+        note_item("shader_editor:functions");
+    }
+
+    // Renames a uniform everywhere it is used, keeping the name unique and valid.
+    void rename_shader_parameter(ShaderTab& tab, const std::size_t index, const std::string& name) {
+        auto& graph = tab.graph;
+        if (index >= graph.uniforms.size() || name == graph.uniforms[index].name) return;
+        const bool valid = !name.empty() && (std::isalpha(static_cast<unsigned char>(name[0])) != 0 || name[0] == '_') &&
+                           std::all_of(name.begin(), name.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; }) &&
+                           std::none_of(graph.uniforms.begin(), graph.uniforms.end(), [&](const ShaderUniform& other) { return other.name == name; });
+        if (!valid) {
+            tab.message = "Parameter names are unique letters, digits and underscores";
+            return;
+        }
+        const auto old = graph.uniforms[index].name;
+        graph.uniforms[index].name = name;
+        for (auto* stage : {&graph.vertex, &graph.fragment})
+            for (auto& node : stage->nodes) {
+                if (node.kind == GraphNode::Kind::parameter && node.op == old) {
+                    node.op = name;
+                    node.id = "uniform:" + name;
+                }
+                for (auto& input : node.inputs)
+                    if (input.source == "uniform:" + old) input.source = "uniform:" + name;
+            }
+        graph_changed(tab, true);
+        const auto check = parse_relay_shader(tab.text);
+        if (!check.errors.empty()) tab.message = check.errors.front().text;
     }
 
     // Sound files for the clip picker, and the buses sources can play into.
@@ -1554,6 +2829,8 @@ struct EditorUi::Impl {
         refresh_asset_listing();
         refresh_templates();
         refresh_audio_files();
+        refresh_sky_files();
+        refresh_shader_files();
         assets_pending = false;
     }
 
@@ -3229,13 +4506,100 @@ struct EditorUi::Impl {
                        '"',
                    "Renderer updated");
         }
-        if (const auto chosen = combo("Material", material_names, material)) {
+        const auto set_material = [&](const std::string& chosen) {
             mutate("scene.set_renderer",
                    entity_field(selection) + ",\"enabled\":true,\"mesh\":\"" +
-                       (mesh.empty() ? "builtin.triangle" : mesh) + "\",\"material\":\"" + *chosen +
-                       '"',
+                       (mesh.empty() ? "builtin.triangle" : mesh) + "\",\"material\":\"" +
+                       json_escape(chosen) + '"',
                    "Renderer updated");
+        };
+        // Built-in and imported materials, then the project's surface materials.
+        if (inspector_begin_combo("Material", material.empty() ? "<none>" : material.c_str())) {
+            for (const auto& option : material_names)
+                if (ImGui::Selectable(option.c_str(), option == material)) set_material(option);
+            const auto files = shader_materials_of_type("surface");
+            if (!files.empty()) ImGui::Separator();
+            for (const auto& option : files) {
+                if (ImGui::Selectable(option.c_str(), option == material)) set_material(option);
+                note_item("inspector:renderer:material:" + option);
+            }
+            ImGui::Separator();
+            if (ImGui::Selectable("New material")) {
+                (void)call("assets.create_folder", "\"path\":\"materials\"", false);
+                if (const auto created = create_material("materials", false)) set_material(*created);
+            }
+            note_item("inspector:renderer:material:new");
+            ImGui::EndCombo();
         }
+        note_item("inspector:renderer:material");
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto* payload = ImGui::GetDragDropPayload(); payload && payload->IsDataType("relay.asset")) {
+                const std::string dropped(static_cast<const char*>(payload->Data));
+                const auto* summary = dropped.ends_with(".relay-material") ? shader_material_summary(dropped) : nullptr;
+                if (summary && string_or(*summary, "type") == "surface" && ImGui::AcceptDragDropPayload("relay.asset"))
+                    set_material(dropped);
+            }
+            ImGui::EndDragDropTarget();
+        }
+        if (material.ends_with(".relay-material")) {
+            draw_shader_material_fields(material, false);
+            draw_object_parameters(*renderer, material);
+        }
+    }
+
+    // Values of the material's parameters for this object alone: shown as the material's until
+    // changed here (or by a script during the game), and undoable like other scene edits.
+    void draw_object_parameters(const JsonValue::Object& renderer, const std::string& material) {
+        const auto* summary = shader_material_summary(material);
+        const auto* parameters = summary ? field(*summary, "parameters") : nullptr;
+        if (!parameters || !parameters->array()) return;
+        std::map<std::string, std::vector<double>> own;
+        if (const auto* values = field(renderer, "parameters"); values && values->object())
+            for (const auto& [name, list] : *values->object())
+                if (list.array()) {
+                    auto& numbers = own[name];
+                    for (const auto& item : *list.array())
+                        if (item.number()) numbers.push_back(*item.number());
+                }
+        std::vector<const JsonValue::Object*> numeric;
+        for (const auto& item : *parameters->array())
+            if (const auto* parameter = item.object(); parameter && string_or(*parameter, "type") != "sampler2D")
+                numeric.push_back(parameter);
+        if (numeric.empty()) return;
+        ImGui::PushID("object_parameters");
+        if (!own.empty()) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+        const std::string title = own.empty() ? "This object only" : "This object only (" + std::to_string(own.size()) + ")";
+        const bool open = ImGui::TreeNodeEx("##object", ImGuiTreeNodeFlags_SpanAvailWidth, "%s", title.c_str());
+        note_item("inspector:object:parameters");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Values for this object alone. Other objects using %s keep the material's values. "
+                              "Scripts change the same values with set_material_parameter.",
+                              base_name(material).c_str());
+        if (open) {
+            const auto entity_fields = entity_field(selection);
+            for (const auto* parameter : numeric) {
+                const auto name = string_or(*parameter, "name");
+                const auto found = own.find(name);
+                const bool overridden = found != own.end();
+                // The material's values are dimmed; this object's own are in full color.
+                if (!overridden) ImGui::PushStyleColor(ImGuiCol_Text, editor_color(editor_palette().text_dim));
+                draw_material_parameter(
+                    *parameter,
+                    [&](const std::string& fields) {
+                        mutate("scene.set_renderer_parameter", entity_fields + fields, "Object value set");
+                    },
+                    overridden ? std::function<void()>([&] {
+                        mutate("scene.set_renderer_parameter",
+                               entity_fields + ",\"name\":\"" + json_escape(name) + "\",\"clear\":true",
+                               "Object value cleared");
+                    })
+                               : std::function<void()>{},
+                    overridden ? &found->second : nullptr, "inspector:object:", "Back to the material's value");
+                if (!overridden) ImGui::PopStyleColor();
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
     }
 
     void draw_animator_section(const JsonValue::Object& entity) {
@@ -3441,6 +4805,7 @@ struct EditorUi::Impl {
                    entity_field(selection) + ",\"intensity\":" + number_text(intensity),
                    "Light intensity updated");
         }
+        note_item("inspector:light:intensity");
 
         auto range = number_or(*light, "range", 0.0);
         if (drag_scalar("Range", range, 0.1F) && range >= 0.0) {
@@ -3879,6 +5244,222 @@ struct EditorUi::Impl {
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("When a change asked for by a script or Next waits to happen");
+    }
+
+    void draw_sky_section(const JsonValue::Object& entity) {
+        const auto* sky = component(entity, "sky");
+        if (!sky || !component_header("Sky", "sky")) return;
+        const auto& palette = editor_palette();
+        const auto request_fields = entity_field(selection);
+        const auto set = [&](const std::string& fields, const char* label) {
+            mutate("scene.set_sky", request_fields + fields, label);
+        };
+        const auto color_field = [](const char* wire, const std::array<double, 3>& color) {
+            return ",\"" + std::string(wire) + "\":[" + number_text(color[0]) + ',' +
+                   number_text(color[1]) + ',' + number_text(color[2]) + ']';
+        };
+        const auto scalar = [&](const char* label, const char* wire, double value, float speed,
+                                const char* format, double minimum, double maximum) {
+            if (drag_scalar(label, value, speed, format))
+                set(",\"" + std::string(wire) + "\":" + number_text(std::clamp(value, minimum, maximum)),
+                    "Sky updated");
+        };
+        const auto dim_text = [&](const char* text) {
+            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+            ImGui::TextWrapped("%s", text);
+            ImGui::PopStyleColor();
+        };
+        std::size_t skies = 0;
+        bool used = false;
+        for (const auto* other : entities)
+            if (component(*other, "sky")) {
+                if (skies++ == 0U) used = string_or(*other, "entity") == selection;
+            }
+        if (skies > 1U)
+            ImGui::TextColored(editor_color(palette.warning),
+                               used ? "%zu nodes have a sky; this one is used."
+                                    : "%zu nodes have a sky; only the first is used, not this one.",
+                               skies);
+
+        ImGui::SeparatorText("Skybox");
+        const auto material = string_or(*sky, "material");
+        const auto pick_material = [&](const std::string& chosen) {
+            set(",\"material\":\"" + json_escape(chosen) + '"',
+                chosen.empty() ? "Sky gradient chosen" : "Sky material chosen");
+        };
+        if (inspector_begin_combo("Skybox", material.empty() ? "Gradient" : material.c_str())) {
+            if (ImGui::Selectable("Gradient", material.empty())) pick_material({});
+            note_item("inspector:sky:material:gradient");
+            for (const auto& file : sky_material_files) {
+                if (ImGui::Selectable(file.c_str(), file == material)) pick_material(file);
+                note_item("inspector:sky:material:" + file);
+            }
+            ImGui::Separator();
+            if (ImGui::Selectable("New sky material")) create_sky_material({}, selection);
+            note_item("inspector:sky:material:new");
+            ImGui::EndCombo();
+        }
+        note_item("inspector:sky:material");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("A color gradient, or a sky material showing a panorama image");
+        // Sky materials dragged from the Assets panel drop onto the picker.
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto* payload = ImGui::GetDragDropPayload();
+                payload && payload->IsDataType("relay.asset")) {
+                const std::string path(static_cast<const char*>(payload->Data));
+                if (path.ends_with(".relay-material") && ImGui::AcceptDragDropPayload("relay.asset"))
+                    pick_material(path);
+            }
+            ImGui::EndDragDropTarget();
+        }
+        if (material.empty()) {
+            const Sky defaults;
+            auto horizon = editor_vector(*sky, "horizon_color", {defaults.horizon_color.x,
+                                                                 defaults.horizon_color.y,
+                                                                 defaults.horizon_color.z});
+            auto zenith = editor_vector(*sky, "zenith_color", {defaults.zenith_color.x,
+                                                               defaults.zenith_color.y,
+                                                               defaults.zenith_color.z});
+            if (color_edit("Horizon", horizon))
+                set(color_field("horizon_color", horizon), "Sky horizon color changed");
+            note_item("inspector:sky:horizon");
+            if (color_edit("Zenith", zenith))
+                set(color_field("zenith_color", zenith), "Sky zenith color changed");
+            note_item("inspector:sky:zenith");
+            draw_color_ramp(horizon, zenith,
+                            "From the horizon (and everything below it) to straight up");
+        } else {
+            draw_sky_material_fields(material);
+        }
+        scalar("Intensity", "intensity", number_or(*sky, "intensity", Sky{}.intensity), 0.01F, "%.2f",
+               0.0, 100.0);
+        note_item("inspector:sky:intensity");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How bright the visible sky is");
+        scalar("Ambient light", "ambient_intensity", number_or(*sky, "ambient_intensity", 0.25),
+               0.005F, "%.2f", 0.0, 10.0);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How strongly the sky lights the scene. At 1 surfaces receive as much "
+                              "light as the visible sky gives; lower leaves the sun in charge.");
+
+        ImGui::SeparatorText("Sun");
+        const auto* light = component(entity, "light");
+        if (light && number_or(*light, "type", 1.0) == 0.0) {
+            dim_text("The directional light below is the sun, drawn in the sky where its light "
+                     "comes from. Rotate this node to move it.");
+        } else if (light) {
+            ImGui::TextColored(editor_color(palette.warning),
+                               "This node's light is not directional, so it is not a sun.");
+            if (ImGui::Button("Make it the sun"))
+                mutate("scene.set_light", request_fields + ",\"type\":\"directional\"",
+                       "Light turned into the sun");
+            note_item("inspector:sky:make_sun");
+        } else {
+            dim_text("No sun. Add one to light the scene from the sky's direction.");
+            if (ImGui::Button("Add sun") && mutate("component.add", request_fields + ",\"component\":\"light\"",
+                                                   "Sun added"))
+                (void)call("scene.set_light",
+                           request_fields + ",\"type\":\"directional\",\"intensity\":" +
+                               number_text(default_sun_intensity) +
+                               ",\"red\":" + number_text(default_sun_color.x) +
+                               ",\"green\":" + number_text(default_sun_color.y) +
+                               ",\"blue\":" + number_text(default_sun_color.z));
+            note_item("inspector:sky:add_sun");
+        }
+
+        ImGui::SeparatorText("Fog");
+        bool fog = boolean_or(*sky, "fog", true);
+        inspector_field_label("Fog");
+        if (ImGui::Checkbox("##fog", &fog))
+            set(std::string(",\"fog\":") + (fog ? "true" : "false"), fog ? "Fog on" : "Fog off");
+        note_item("inspector:sky:fog");
+        if (fog) {
+            const auto start = number_or(*sky, "fog_start", 30.0);
+            const auto end = number_or(*sky, "fog_end", 250.0);
+            scalar("Start", "fog_start", start, 0.1F, "%.1f m", 0.0, end - 0.01);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Distance from the camera where fog begins");
+            scalar("End", "fog_end", end, 0.25F, "%.1f m", start + 0.01, 1e6);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Distance from the camera where everything is fog");
+            auto start_color = editor_vector(*sky, "fog_start_color", {0.62, 0.74, 0.88});
+            auto end_color = editor_vector(*sky, "fog_end_color", {0.62, 0.74, 0.88});
+            if (color_edit("Start color", start_color))
+                set(color_field("fog_start_color", start_color), "Fog color changed");
+            note_item("inspector:sky:fog_start_color");
+            if (color_edit("End color", end_color))
+                set(color_field("fog_end_color", end_color), "Fog color changed");
+            note_item("inspector:sky:fog_end_color");
+            draw_color_ramp(start_color, end_color, "The fog's color from its start to its end");
+        }
+    }
+
+    // The sky material's own settings, saved to its file as they change. Not undoable: they
+    // belong to the file, which other skies and scenes may share.
+    void draw_sky_material_fields(const std::string& path) {
+        const auto& palette = editor_palette();
+        const auto* material = sky_material_summary(path);
+        if (!material) {
+            ImGui::TextColored(editor_color(palette.warning),
+                               "%s cannot be read; the gradient shows instead", path.c_str());
+            return;
+        }
+        const auto save = [&](const std::string& fields) {
+            // File edits are not undoable scene changes, so drags leave no gesture behind.
+            pending_gesture = 0U;
+            if (call("assets.set_sky_material", "\"path\":\"" + json_escape(path) + '"' + fields))
+                sky_material_info.erase(path);
+        };
+        const auto panorama = string_or(*material, "panorama");
+        if (inspector_begin_combo("Panorama", panorama.empty() ? "<none>" : panorama.c_str())) {
+            for (const auto& file : panorama_files) {
+                if (ImGui::Selectable(file.c_str(), file == panorama))
+                    save(",\"panorama\":\"" + json_escape(file) + '"');
+                note_item("inspector:sky:panorama:" + file);
+            }
+            if (panorama_files.empty()) ImGui::TextDisabled("No PNG or JPEG images in the project");
+            ImGui::EndCombo();
+        }
+        note_item("inspector:sky:panorama");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("An equirectangular (2:1) panorama, such as an exported photo sphere");
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto* payload = ImGui::GetDragDropPayload();
+                payload && payload->IsDataType("relay.asset")) {
+                const std::string dropped(static_cast<const char*>(payload->Data));
+                if (panorama_file(dropped) && ImGui::AcceptDragDropPayload("relay.asset"))
+                    save(",\"panorama\":\"" + json_escape(dropped) + '"');
+            }
+            ImGui::EndDragDropTarget();
+        }
+        if (const auto* image = field(*material, "image"); image && image->object()) {
+            const auto width = number_or(*image->object(), "width", 0.0);
+            const auto height = number_or(*image->object(), "height", 0.0);
+            ImGui::TextColored(editor_color(palette.text_faint), "%d x %d", static_cast<int>(width),
+                               static_cast<int>(height));
+            if (height > 0.0 && std::abs(width / height - 2.0) > 0.02) {
+                ImGui::SameLine();
+                ImGui::TextColored(editor_color(palette.warning), "(not 2:1, so it will look stretched)");
+            }
+        } else if (!panorama.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.warning));
+            ImGui::TextWrapped("%s; the gradient shows instead",
+                               string_or(*material, "error", "the image cannot be shown").c_str());
+            ImGui::PopStyleColor();
+        }
+        auto tint = editor_vector(*material, "tint", {1, 1, 1});
+        if (const auto* list = field(*material, "tint"); list && list->array() && list->array()->size() == 3U)
+            for (std::size_t channel = 0; channel < 3U; ++channel)
+                if (const auto* value = (*list->array())[channel].number()) tint[channel] = *value;
+        if (color_edit("Tint", tint))
+            save(",\"tint\":[" + number_text(tint[0]) + ',' + number_text(tint[1]) + ',' +
+                 number_text(tint[2]) + ']');
+        note_item("inspector:sky:tint");
+        auto intensity = number_or(*material, "intensity", 1.0);
+        if (drag_scalar("Brightness", intensity, 0.01F, "%.2f"))
+            save(",\"intensity\":" + number_text(std::clamp(intensity, 0.0, 100.0)));
+        auto rotation = number_or(*material, "rotation_degrees", 0.0);
+        if (drag_scalar("Rotation", rotation, 0.5F, "%.1f deg"))
+            save(",\"rotation_degrees\":" + number_text(std::clamp(rotation, -360.0, 360.0)));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Turns the panorama about the vertical axis");
     }
 
     void draw_reverb_zone_section(const JsonValue::Object& entity) {
@@ -4552,35 +6133,36 @@ struct EditorUi::Impl {
         ImGui::Spacing();
 
         draw_transform_section(*entity);
-        if (component(*entity, "camera"))
-            draw_camera_section(*entity);
-        if (component(*entity, "mesh_renderer"))
-            draw_renderer_section(*entity);
-        if (component(*entity, "animator"))
-            draw_animator_section(*entity);
-        if (component(*entity, "transform_animation"))
-            draw_keyframes_section(*entity);
-        if (const auto* renderer = component(*entity, "mesh_renderer"); renderer) {
-            const auto morph = morph_defaults.find(string_or(*renderer, "mesh"));
-            if (morph != morph_defaults.end() && !morph->second.empty())
+        // Each section gets its own ID scope, so fields with the same label in two sections of
+        // one node, such as a Sky's and its sun's Intensity, stay separate widgets.
+        const auto section = [&](const char* id, const auto& draw) {
+            if (!component(*entity, id)) return;
+            ImGui::PushID(id);
+            draw();
+            ImGui::PopID();
+        };
+        section("camera", [&] { draw_camera_section(*entity); });
+        section("mesh_renderer", [&] { draw_renderer_section(*entity); });
+        section("animator", [&] { draw_animator_section(*entity); });
+        section("transform_animation", [&] { draw_keyframes_section(*entity); });
+        section("mesh_renderer", [&] {
+            const auto morph = morph_defaults.find(string_or(*component(*entity, "mesh_renderer"), "mesh"));
+            if (morph != morph_defaults.end() && !morph->second.empty()) {
+                ImGui::PushID("morph");
                 draw_morph_section(*entity);
-        }
-        if (component(*entity, "light"))
-            draw_light_section(*entity);
-        if (component(*entity, "collider"))
-            draw_collider_section(*entity);
-        if (component(*entity, "physics_body"))
-            draw_physics_body_section(*entity);
-        if (component(*entity, "joint"))
-            draw_joint_section(*entity);
-        if (component(*entity, "audio_source"))
-            draw_audio_source_section(*entity);
-        if (component(*entity, "audio_listener"))
-            draw_audio_listener_section();
-        if (component(*entity, "reverb_zone"))
-            draw_reverb_zone_section(*entity);
-        if (component(*entity, "music_player"))
-            draw_music_player_section(*entity);
+                ImGui::PopID();
+            }
+        });
+        section("sky", [&] { draw_sky_section(*entity); });
+        section("post_process", [&] { draw_post_process_section(*entity); });
+        section("light", [&] { draw_light_section(*entity); });
+        section("collider", [&] { draw_collider_section(*entity); });
+        section("physics_body", [&] { draw_physics_body_section(*entity); });
+        section("joint", [&] { draw_joint_section(*entity); });
+        section("audio_source", [&] { draw_audio_source_section(*entity); });
+        section("audio_listener", [&] { draw_audio_listener_section(); });
+        section("reverb_zone", [&] { draw_reverb_zone_section(*entity); });
+        section("music_player", [&] { draw_music_player_section(*entity); });
         if (const auto* scripts = field(*entity, "scripts"); scripts && scripts->array() &&
             !scripts->array()->empty())
             draw_script_sections(*entity);
@@ -4974,7 +6556,8 @@ struct EditorUi::Impl {
                 assets_pending = true;
                 refresh_pending = true;
             }
-            future_action("Shader editor...");
+            if (ImGui::MenuItem("Shader editor")) panel_open[11] = true;
+            note_item("menu:shader_editor");
             if (ImGui::MenuItem("Animation timeline")) panel_open[6] = true;
             if (ImGui::MenuItem("Profiler")) panel_open[9] = true;
             if (ImGui::MenuItem("Audio mixer")) {
@@ -6599,6 +8182,8 @@ struct EditorUi::Impl {
     // Keyboard shortcuts, ignored whenever a text field has focus so typing a name never switches
     // the gizmo or deletes the selection.
     void update_shortcuts() {
+        // The shader editor takes typing, Ctrl+S and Ctrl+Z itself.
+        if (shader_editor_focused) return;
         if (ImGui::GetIO().WantTextInput || (ImGui::GetActiveID() != 0 && ImGui::GetInputTextState(ImGui::GetActiveID())) || navigating ||
             ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
             return;
@@ -6852,6 +8437,12 @@ struct EditorUi::Impl {
         else if (entry.kind == "script")
             set_status("Edit " + entry.name + " in your code editor; Relay rebuilds scripts when "
                        "they change", false);
+        else if (entry.kind == "shader" && entry.path.ends_with(".relay-shader"))
+            open_shader(entry.path);
+        else if (entry.kind == "material")
+            set_status("Choose " + entry.name + " in a Mesh renderer's Material, a Post Process node "
+                       "or a Sky node's Skybox in the Inspector (or drop it there) to edit it",
+                       false);
         else set_status("No editor for " + entry.name + " yet", false);
     }
 
@@ -6927,9 +8518,27 @@ struct EditorUi::Impl {
             attach_new_script_to.clear();
             open_new_script_dialog = true;
         }
+        if (ImGui::MenuItem("Surface shader")) (void)create_shader(parent, false);
+        note_item("assets:create:surface_shader");
+        if (ImGui::MenuItem("Post-processing shader")) (void)create_shader(parent, true);
+        note_item("assets:create:post_shader");
+        if (ImGui::MenuItem("Material")) {
+            if (const auto created = create_material(parent, false)) {
+                asset_selection = *created;
+                begin_rename(RenameKind::asset, *created, base_name(*created));
+            }
+        }
+        note_item("assets:create:material");
+        if (ImGui::MenuItem("Post-processing material")) {
+            if (const auto created = create_material(parent, true)) {
+                asset_selection = *created;
+                begin_rename(RenameKind::asset, *created, base_name(*created));
+            }
+        }
+        note_item("assets:create:post_material");
+        if (ImGui::MenuItem("Sky material")) create_sky_material(parent);
+        note_item("assets:create:sky_material");
         future_action("Text file");
-        future_action("Shader");
-        future_action("Material");
         ImGui::EndMenu();
     }
 
@@ -7034,9 +8643,9 @@ struct EditorUi::Impl {
         ImGui::EndPopup();
     }
 
-    static constexpr std::array<std::pair<const char*, const char*>, 11> asset_kind_labels{{
+    static constexpr std::array<std::pair<const char*, const char*>, 12> asset_kind_labels{{
         {"model", "Models"}, {"scene", "Scenes"}, {"template", "Templates"},
-        {"image", "Images"}, {"shader", "Shaders"},
+        {"image", "Images"}, {"material", "Materials"}, {"shader", "Shaders"},
         {"script", "Scripts"}, {"text", "Text"}, {"audio", "Audio"}, {"media", "Video"},
         {"folder", "Folders"}, {"other", "Other"}}};
 
@@ -8128,6 +9737,8 @@ EditorUi::~EditorUi() {
     if (impl_->imgui_context_created) {
         impl_->layout.save();
         impl_->chat_media.clear();
+        if (impl_->preview_texture) ImGui::UnregisterUserTexture(impl_->preview_texture.get());
+        impl_->preview_texture.reset();
         ImGui::DestroyContext();
         impl_->imgui_context_created = false;
     }
@@ -8398,6 +10009,7 @@ bool EditorUi::handle_event(const void* const sdl_event) {
 void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     if (!impl_->vulkan_backend_started && !impl_->headless) return;
 
+    impl_->preview_request = std::exchange(impl_->preview_wanted, {});
     if (impl_->headless) {
         impl_->headless_items.clear();
         ImGui::GetIO().DisplaySize = ImVec2(static_cast<float>(width), static_cast<float>(height));
@@ -8568,6 +10180,22 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         if (panel("Profiler", 9)) impl_->draw_profiler();
         ImGui::End();
     }
+    if (impl_->panel_open[11]) {
+        // Node graphs need room: the shader editor opens as a tab beside the viewport the first time.
+        if (!ImGui::FindWindowSettingsByID(ImHashStr("Shader Editor")))
+            if (const auto* viewport_window = ImGui::FindWindowByName("Viewport");
+                viewport_window && viewport_window->DockId)
+                ImGui::SetNextWindowDockID(viewport_window->DockId, ImGuiCond_FirstUseEver);
+        if (impl_->shader_editor_focus_pending) {
+            ImGui::SetNextWindowFocus();
+            impl_->shader_editor_focus_pending = false;
+        }
+        if (panel("Shader Editor", 11)) impl_->draw_shader_editor();
+        else impl_->shader_editor_focused = false;
+        ImGui::End();
+    } else {
+        impl_->shader_editor_focused = false;
+    }
     if (impl_->panel_open[10]) {
         // Like the profiler, the mixer joins Diagnostics the first time it opens.
         if (!ImGui::FindWindowSettingsByID(ImHashStr("Mixer")))
@@ -8635,6 +10263,13 @@ std::vector<Entity> EditorUi::selected_entities() const {
         for (const auto& handle : impl_->selections.handles)
             if (const auto entity = Entity::parse(handle)) result.push_back(*entity);
     return result;
+}
+
+std::string EditorUi::material_preview_request() const { return impl_->preview_request; }
+
+void EditorUi::material_preview_ready(const std::string& path, const std::uint32_t width, const std::uint32_t height,
+                                      std::vector<std::uint8_t> rgba) {
+    if (impl_->imgui_context_created) impl_->material_preview_ready(path, width, height, rgba);
 }
 
 bool EditorUi::ground_grid_visible() const {

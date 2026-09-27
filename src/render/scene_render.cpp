@@ -1,5 +1,6 @@
 #include "relay/render/scene_render.hpp"
 #include "relay/render/assets.hpp"
+#include "relay/render/materials.hpp"
 
 #include <algorithm>
 #include <array>
@@ -7,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <numbers>
 #include <unordered_map>
 
 namespace relay {
@@ -643,6 +645,126 @@ void RenderInterpolation::remember(const Scene& scene) {
     }
 }
 
+namespace {
+
+float srgb_to_linear(const std::uint8_t value) {
+    const float c = static_cast<float>(value) / 255.0F;
+    return c <= 0.04045F ? c / 12.92F : std::pow((c + 0.055F) / 1.055F, 2.4F);
+}
+
+std::array<float, 3> to_color(const Vec3& value, const double scale) {
+    return {static_cast<float>(value.x * scale), static_cast<float>(value.y * scale),
+            static_cast<float>(value.z * scale)};
+}
+
+RenderSky make_render_sky(const Scene& scene, const AssetRegistry& assets) {
+    RenderSky output;
+    const auto entity = scene.active_sky();
+    if (!entity) return output;
+    const auto& sky = *scene.get(*entity)->sky;
+    output.visible = true;
+    output.entity = *entity;
+    output.horizon = to_color(sky.horizon_color, sky.intensity);
+    output.zenith = to_color(sky.zenith_color, sky.intensity);
+    output.ambient_scale = static_cast<float>(std::numbers::pi * sky.ambient_intensity);
+    std::array<float, 3> upper{}, lower = output.horizon;
+    const auto blend = static_cast<float>(sky_gradient_upper_average);
+    for (std::size_t channel = 0; channel < 3U; ++channel)
+        upper[channel] = output.horizon[channel] +
+                         (output.zenith[channel] - output.horizon[channel]) * blend;
+    if (!sky.material.empty()) {
+        const auto material = assets.sky_material(sky.material);
+        if (!material) {
+            output.material_error = "the sky material is not loaded";
+        } else if (!material->panorama) {
+            output.material_error = material->error;
+        } else {
+            output.panorama = material->panorama;
+            output.panorama_tint = to_color(material->material.tint,
+                                            material->material.intensity * sky.intensity);
+            output.panorama_rotation_degrees =
+                static_cast<float>(material->material.rotation_degrees);
+            for (std::size_t channel = 0; channel < 3U; ++channel) {
+                upper[channel] = material->panorama->upper[channel] * output.panorama_tint[channel];
+                lower[channel] = material->panorama->lower[channel] * output.panorama_tint[channel];
+            }
+        }
+    }
+    for (std::size_t channel = 0; channel < 3U; ++channel) {
+        output.ambient_up[channel] = upper[channel] * output.ambient_scale;
+        output.ambient_down[channel] = lower[channel] * output.ambient_scale;
+    }
+    output.fog = sky.fog;
+    output.fog_start = static_cast<float>(sky.fog_start);
+    output.fog_end = static_cast<float>(sky.fog_end);
+    output.fog_start_color = to_color(sky.fog_start_color, 1.0);
+    output.fog_end_color = to_color(sky.fog_end_color, 1.0);
+    return output;
+}
+
+// The visible sky without the sun.
+std::array<float, 3> sky_background(const RenderSky& sky, const Vec3& direction) {
+    if (!sky.visible) return {};
+    if (sky.panorama) {
+        const auto& image = sky.panorama->image;
+        const auto uv = sky_panorama_uv(direction, sky.panorama_rotation_degrees);
+        const auto x = std::min(static_cast<std::uint32_t>(uv[0] * image.width), image.width - 1U);
+        const auto y = std::min(static_cast<std::uint32_t>(uv[1] * image.height), image.height - 1U);
+        const auto* texel = &image.rgba[(static_cast<std::size_t>(y) * image.width + x) * 4U];
+        return {srgb_to_linear(texel[0]) * sky.panorama_tint[0],
+                srgb_to_linear(texel[1]) * sky.panorama_tint[1],
+                srgb_to_linear(texel[2]) * sky.panorama_tint[2]};
+    }
+    const auto t = static_cast<float>(sky_gradient_position(direction.y));
+    return {sky.horizon[0] + (sky.zenith[0] - sky.horizon[0]) * t,
+            sky.horizon[1] + (sky.zenith[1] - sky.horizon[1]) * t,
+            sky.horizon[2] + (sky.zenith[2] - sky.horizon[2]) * t};
+}
+
+} // namespace
+
+std::array<float, 3> sun_glow(const RenderSky& sky, const Vec3& direction) {
+    if (!sky.visible || !sky.sun) return {};
+    const double cosine = std::clamp(direction.x * sky.sun_direction.x + direction.y * sky.sun_direction.y +
+                                         direction.z * sky.sun_direction.z,
+                                     -1.0, 1.0);
+    const double angle = std::acos(cosine);
+    const double radius = sun_disc_radius_degrees * std::numbers::pi / 180.0;
+    const double edge = radius * 0.15;
+    const double disc = 1.0 - std::clamp((angle - radius + edge) / (2.0 * edge), 0.0, 1.0);
+    const double glow = 0.25 * std::exp(-angle / 0.02) + 0.03 * std::exp(-angle / 0.15);
+    const double below = std::clamp((direction.y + 0.03) / 0.04, 0.0, 1.0);
+    const double horizon = below * below * (3.0 - 2.0 * below);
+    const double scale = (disc * sun_disc_brightness + glow) * horizon;
+    return {static_cast<float>(sky.sun_radiance[0] * scale), static_cast<float>(sky.sun_radiance[1] * scale),
+            static_cast<float>(sky.sun_radiance[2] * scale)};
+}
+
+std::array<float, 3> sky_radiance(const RenderSky& sky, const Vec3& direction) {
+    auto radiance = sky_background(sky, direction);
+    const auto sun = sun_glow(sky, direction);
+    for (std::size_t channel = 0; channel < 3U; ++channel) radiance[channel] += sun[channel];
+    return radiance;
+}
+
+std::array<float, 3> sky_environment(const RenderSky& sky, const Vec3& direction) {
+    if (!sky.visible) {
+        const auto t = static_cast<float>(std::clamp(direction.y * 0.5 + 0.5, 0.0, 1.0));
+        return {sky.ambient_down[0] + (sky.ambient_up[0] - sky.ambient_down[0]) * t,
+                sky.ambient_down[1] + (sky.ambient_up[1] - sky.ambient_down[1]) * t,
+                sky.ambient_down[2] + (sky.ambient_up[2] - sky.ambient_down[2]) * t};
+    }
+    auto radiance = sky_background(sky, direction);
+    for (auto& channel : radiance) channel *= sky.ambient_scale;
+    return radiance;
+}
+
+float fog_amount(const RenderSky& sky, const float distance) {
+    if (!sky.visible || !sky.fog) return 0.0F;
+    return std::clamp((distance - sky.fog_start) / std::max(sky.fog_end - sky.fog_start, 1e-3F),
+                      0.0F, 1.0F);
+}
+
 RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
                                const float aspect_ratio, const ViewOverride* const view,
                                const bool collect_bounds, const bool keep_culled,
@@ -676,6 +798,23 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
     output.camera.exposure_ev = static_cast<float>(selected_camera.exposure_ev);
     output.camera_position = transform_point(camera_world, {});
     output.camera_forward = normalized(transform_point(camera_world, {0, 0, -1}, true));
+    output.sky = make_render_sky(scene, assets);
+    if (const auto post = scene.active_post_process())
+        for (const auto& effect : scene.get(*post)->post_process->effects) {
+            // An explicit viewpoint is the editor's own camera.
+            if (!effect.enabled || (view != nullptr && !effect.editor)) continue;
+            auto material = assets.shader_material(effect.material);
+            if (material && material->drawable() && material->shader->parsed.type == ShaderType::post_process)
+                output.post_effects.push_back(std::move(material));
+        }
+    if (output.sky.visible)
+        if (const auto& sun = scene.get(output.sky.entity)->light;
+            sun && sun->type == Light::Type::directional && sun->intensity > 0.0) {
+            const auto shining = normalized(transform_point(resolve_world(output.sky.entity), {0, 0, -1}, true));
+            output.sky.sun = true;
+            output.sky.sun_direction = scaled(shining, -1.0);
+            output.sky.sun_radiance = to_color(sun->color, sun->intensity);
+        }
     for (const auto entity : entities)
         if (const auto& light = scene.get(entity)->light) {
             const auto world = resolve_world(entity);
@@ -1014,7 +1153,9 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
                 (mesh_asset->bounds_min[2] + mesh_asset->bounds_max[2]) * 0.5F};
             view_depth = m[3] * centre[0] + m[7] * centre[1] + m[11] * centre[2] + m[15];
         }
-        const auto* material_asset = assets.find_material(material);
+        // Shader materials stand in as the plain grey material where their shader cannot run.
+        const std::string material_name = valid_material_path(material) ? "builtin.grey" : material;
+        const auto* material_asset = assets.find_material(material_name);
         const auto missing_texture = std::numeric_limits<std::uint32_t>::max();
         const auto texture_slot = [&](const std::string& name) {
             return !name.empty() && assets.find_texture(name) != nullptr
@@ -1036,7 +1177,7 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         instance.material = material;
         instance.texture_index =
             material_asset != nullptr ? texture_slot(material_asset->texture) : missing_texture;
-        instance.material_index = material_asset != nullptr ? assets.material_index(material) : 0U;
+        instance.material_index = material_asset != nullptr ? assets.material_index(material_name) : 0U;
         instance.alpha_blended = material_asset != nullptr &&
                                  material_asset->alpha_mode == MaterialAsset::AlphaMode::blend;
         instance.camera_visible = camera_visible;
@@ -1061,6 +1202,16 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
         } else {
             instance.pbr_textures = {missing_texture, missing_texture, missing_texture,
                                      0x0000FFFFU};
+        }
+        if (valid_material_path(material)) {
+            // Shader materials: drawn by their own shader, and blended when it is transparent.
+            instance.shader_material = assets.shader_material(material);
+            instance.alpha_blended = instance.shader_material && instance.shader_material->drawable() &&
+                                     instance.shader_material->shader->parsed.transparent;
+            if (instance.shader_material && instance.shader_material->drawable() &&
+                !record->mesh_renderer->parameters.empty())
+                instance.shader_parameters =
+                    override_material_parameters(*instance.shader_material, record->mesh_renderer->parameters);
         }
         output.instances.push_back(std::move(instance));
     }

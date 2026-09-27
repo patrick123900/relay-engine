@@ -64,6 +64,9 @@ public:
     [[nodiscard]] Entity selected_entity() const override;
     [[nodiscard]] std::vector<Entity> selected_entities() const override;
     [[nodiscard]] bool ground_grid_visible() const override;
+    [[nodiscard]] std::string material_preview_request() const override;
+    void material_preview_ready(const std::string& path, std::uint32_t width, std::uint32_t height,
+                                std::vector<std::uint8_t> rgba) override;
 
 private:
     struct Impl;

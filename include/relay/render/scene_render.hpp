@@ -1,11 +1,15 @@
 #pragma once
 
 #include "relay/render/assets.hpp"
+#include "relay/render/materials.hpp"
+#include "relay/render/sky.hpp"
 #include "relay/scene/scene.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -51,6 +55,13 @@ struct RenderInstance {
     std::array<std::uint32_t, 4> pbr_textures{};
     // Nonnegative selects an instance-specific slice in RenderScene::deformed_vertices.
     std::int32_t deformed_vertex_offset{-1};
+    // A surface .relay-material: its shader draws the instance. When it cannot be drawn (see
+    // ResolvedShaderMaterial::error) the renderer shows its error surface instead. Null for
+    // imported and built-in materials.
+    std::shared_ptr<const ResolvedShaderMaterial> shader_material;
+    // The instance's own parameter block when its renderer overrides any of the material's
+    // parameters (MeshRenderer::parameters); empty draws with the material's block.
+    std::vector<std::uint8_t> shader_parameters;
 };
 
 struct RenderLight {
@@ -96,6 +107,55 @@ struct PointShadow {
     float far_plane{50.0F};
 };
 
+// Relay's analytic hemisphere light when the scene has no sky: the light reaching surfaces that
+// face straight up and straight down, scaled as irradiance (Lambertian surfaces reflect
+// albedo * value / pi).
+inline constexpr std::array<float, 3> default_ambient_up{0.20F, 0.31F, 0.48F};
+inline constexpr std::array<float, 3> default_ambient_down{0.055F, 0.047F, 0.039F};
+
+// The scene's sky as the renderer draws it, from the first node with a Sky component.
+struct RenderSky {
+    // False without a sky: the renderer keeps its plain background and analytic light, no fog.
+    bool visible{false};
+    Entity entity{};
+    // The gradient, as linear radiance with the sky's intensity applied.
+    std::array<float, 3> horizon{}, zenith{};
+    // A sky material's panorama replaces the gradient. The tint includes both intensities.
+    std::shared_ptr<const SkyPanorama> panorama;
+    std::array<float, 3> panorama_tint{1.0F, 1.0F, 1.0F};
+    float panorama_rotation_degrees{};
+    // Why a named material is not drawn, such as a missing image; empty otherwise.
+    std::string material_error;
+    // The light the sky gives surfaces facing straight up and down (as default_ambient_up/down),
+    // and the scale from visible radiance to that light: pi times the sky's ambient intensity.
+    std::array<float, 3> ambient_up = default_ambient_up, ambient_down = default_ambient_down;
+    float ambient_scale{};
+    // The sun: the sky node's own directional light, drawn as a disc with a glow where its light
+    // comes from. The direction points towards the sun; the radiance is the light's color times
+    // its intensity. The disc is only drawn, not lit from: the light already lights the scene.
+    bool sun{false};
+    Vec3 sun_direction{0.0, 1.0, 0.0};
+    std::array<float, 3> sun_radiance{};
+    bool fog{false};
+    float fog_start{}, fog_end{};
+    std::array<float, 3> fog_start_color{}, fog_end_color{};
+};
+
+// The sun disc's angular radius, and how much brighter than its light's intensity it is drawn.
+inline constexpr double sun_disc_radius_degrees = 0.8;
+inline constexpr double sun_disc_brightness = 40.0;
+// The visible sky's radiance along a normalized world direction, sun included.
+[[nodiscard]] std::array<float, 3> sky_radiance(const RenderSky& sky, const Vec3& direction);
+// What the sun adds along a direction: its disc, a soft edge and a glow around it, fading out
+// as the direction dips below the horizon. shaders/surface_lighting.glsl has the same function.
+[[nodiscard]] std::array<float, 3> sun_glow(const RenderSky& sky, const Vec3& direction);
+// The light arriving from a direction, in ambient (irradiance) scale: the visible sky without the
+// sun times ambient_scale, or the analytic hemisphere without a sky. Global illumination and reflected
+// rays that leave the scene see this, divided by pi.
+[[nodiscard]] std::array<float, 3> sky_environment(const RenderSky& sky, const Vec3& direction);
+// How much fog covers a surface at this distance from the camera, 0 to 1.
+[[nodiscard]] float fog_amount(const RenderSky& sky, float distance);
+
 struct RenderScene {
     std::vector<DrawableBounds> drawable_bounds;
     RenderCamera camera{};
@@ -109,6 +169,9 @@ struct RenderScene {
     PointShadow point_shadow{};
     Vec3 camera_position{0.0, 0.0, 5.0};
     Vec3 camera_forward{0.0, 0.0, -1.0};
+    RenderSky sky{};
+    // The active post processing's enabled effects that can be drawn, in order.
+    std::vector<std::shared_ptr<const ResolvedShaderMaterial>> post_effects;
     // Drawable entities rejected by frustum culling this frame.
     std::size_t culled{};
     std::size_t deformation_overflow{};

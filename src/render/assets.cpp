@@ -1,4 +1,6 @@
 #include "relay/render/assets.hpp"
+#include "relay/render/materials.hpp"
+#include "relay/render/sky.hpp"
 #include "relay/core/json.hpp"
 
 #include <algorithm>
@@ -6,8 +8,10 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <numbers>
 #include <iomanip>
 #include <sstream>
+#include <vector>
 
 namespace relay {
 namespace {
@@ -38,6 +42,11 @@ const std::array initial_materials{
                   MaterialAsset::AlphaMode::opaque, 0.5F, false},
     MaterialAsset{"builtin.violet", {0.62F, 0.32F, 0.98F, 1.0F}, "builtin.checker",
                   0.0F, 1.0F, {}, {}, 1.0F, {}, 1.0F, {}, {},
+                  MaterialAsset::AlphaMode::opaque, 0.5F, false},
+    // Plain and untextured. Surfaces with shader materials use it where their shader cannot run,
+    // such as in ray traced reflections.
+    MaterialAsset{"builtin.grey", {0.7F, 0.7F, 0.7F, 1.0F}, "",
+                  0.0F, 0.6F, {}, {}, 1.0F, {}, 1.0F, {}, {},
                   MaterialAsset::AlphaMode::opaque, 0.5F, false},
 };
 
@@ -84,6 +93,48 @@ AssetRegistry::AssetRegistry()
       meshes_{initial_meshes.begin(), initial_meshes.end()},
       materials_{initial_materials.begin(), initial_materials.end()},
       textures_{make_textures()} {
+    // A UV sphere of radius 0.5: a primitive for scenes, and what material previews are drawn on.
+    constexpr std::uint32_t rings = 24U, segments = 48U;
+    const auto first_vertex = static_cast<std::int32_t>(vertices_.size());
+    const auto first_index = static_cast<std::uint32_t>(indices_.size());
+    for (std::uint32_t ring = 0; ring <= rings; ++ring) {
+        const float v = static_cast<float>(ring) / static_cast<float>(rings);
+        const float polar = v * std::numbers::pi_v<float>;
+        for (std::uint32_t segment = 0; segment <= segments; ++segment) {
+            const float u = static_cast<float>(segment) / static_cast<float>(segments);
+            const float azimuth = u * 2.0F * std::numbers::pi_v<float>;
+            const float nx = std::sin(polar) * std::sin(azimuth), ny = std::cos(polar),
+                        nz = std::sin(polar) * std::cos(azimuth);
+            MeshVertex vertex{0.5F * nx, 0.5F * ny, 0.5F * nz, u, v, nx, ny, nz};
+            vertex.tx = std::cos(azimuth);
+            vertex.ty = 0.0F;
+            vertex.tz = -std::sin(azimuth);
+            vertices_.push_back(vertex);
+        }
+    }
+    // Triangles run from -z to +z, so seen from +z (as previews are) a transparent sphere's far
+    // side is drawn before its near side.
+    std::vector<std::array<std::uint32_t, 3>> triangles;
+    for (std::uint32_t ring = 0; ring < rings; ++ring)
+        for (std::uint32_t segment = 0; segment < segments; ++segment) {
+            const std::uint32_t a = ring * (segments + 1U) + segment, b = a + segments + 1U;
+            triangles.push_back({a, b, a + 1U});
+            triangles.push_back({a + 1U, b, b + 1U});
+        }
+    const auto depth = [&](const std::array<std::uint32_t, 3>& triangle) {
+        float z = 0.0F;
+        for (const auto corner : triangle) z += vertices_[static_cast<std::size_t>(first_vertex) + corner].z;
+        return z;
+    };
+    std::stable_sort(triangles.begin(), triangles.end(),
+                     [&](const auto& left, const auto& right) { return depth(left) < depth(right); });
+    for (const auto& triangle : triangles) indices_.insert(indices_.end(), triangle.begin(), triangle.end());
+    meshes_.push_back(MeshAsset{"builtin.sphere", first_index,
+                                static_cast<std::uint32_t>(indices_.size()) - first_index, first_vertex});
+    meshes_.back().vertex_count = static_cast<std::uint32_t>(vertices_.size()) - static_cast<std::uint32_t>(first_vertex);
+    // Ray traced geometry reads each built-in mesh's vertex count.
+    meshes_[0].vertex_count = 3U;
+    meshes_[1].vertex_count = 4U;
     recompute_bounds(0U);
 }
 
@@ -304,6 +355,23 @@ bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
     recompute_bounds(first_new_mesh);
     ++revision_;
     return true;
+}
+
+void AssetRegistry::set_sky_material(std::shared_ptr<const ResolvedSkyMaterial> material) {
+    sky_material_ = std::move(material);
+}
+
+std::shared_ptr<const ResolvedSkyMaterial> AssetRegistry::sky_material(const std::string_view path) const {
+    return sky_material_ && sky_material_->path == path ? sky_material_ : nullptr;
+}
+
+void AssetRegistry::set_shader_materials(ShaderMaterials materials) {
+    shader_materials_ = std::move(materials);
+}
+
+std::shared_ptr<const ResolvedShaderMaterial> AssetRegistry::shader_material(const std::string_view path) const {
+    const auto found = shader_materials_.find(path);
+    return found == shader_materials_.end() ? nullptr : found->second;
 }
 
 } // namespace relay

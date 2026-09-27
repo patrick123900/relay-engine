@@ -3,6 +3,8 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -55,9 +57,16 @@ struct MeshRenderer {
     std::string mesh{"builtin.triangle"};
     std::string material{"builtin.orange"};
     std::vector<double> morph_weights{};
+    // Per-object values for a shader material's parameters, by uniform name: numbers in the
+    // uniform's order (a color is three, booleans 0 or 1). Parameters left out use the material's.
+    std::map<std::string, std::vector<double>, std::less<>> parameters{};
 
     auto operator<=>(const MeshRenderer&) const = default;
 };
+
+inline constexpr std::size_t maximum_renderer_parameters = 32U;
+// A parameter name the renderer accepts: a shader identifier of at most 64 characters.
+[[nodiscard]] bool valid_renderer_parameter(std::string_view name, const std::vector<double>& values);
 
 struct Animator {
     std::string model;
@@ -238,6 +247,57 @@ bool apply_reverb_preset(ReverbZone& zone, std::string_view name);
 [[nodiscard]] std::optional<AudioSource::Rolloff> audio_rolloff_from_name(std::string_view name);
 [[nodiscard]] bool valid_audio_source(const AudioSource& source);
 
+// The scene's sky: what is drawn behind everything, the ambient light it gives the scene, and
+// distance fog. The first node with a sky is the one in use. Its node usually carries the sun too,
+// as an ordinary directional light. Colors are linear, like light colors.
+struct Sky {
+    // A project-relative .relay-material sky material (a panorama image). Empty draws the gradient.
+    std::string material;
+    // The defaults are the demo project's daylight sky.
+    Vec3 horizon_color{0.2422811503738336, 0.5359934738543398, 1.0}; // At the horizon and below.
+    Vec3 zenith_color{0.0336550465746293, 0.06990458441244064, 0.15152599396319083}; // Straight up.
+    double intensity{2.0};                // Brightness of the visible sky, 0 to 100.
+    // How strongly the sky lights the scene, 0 to 10. At 1 surfaces receive as much light as the
+    // visible sky would give them; lower values leave the sun to dominate.
+    double ambient_intensity{0.25};
+    // Linear distance fog from the camera: none before fog_start, all fog from fog_end, with the
+    // color running from fog_start_color to fog_end_color between them. The sky is not fogged.
+    bool fog{true};
+    double fog_start{30.0};
+    double fog_end{250.0};
+    Vec3 fog_start_color{0.62, 0.74, 0.88};
+    Vec3 fog_end_color{0.62, 0.74, 0.88};
+    auto operator<=>(const Sky&) const = default;
+};
+
+inline constexpr double maximum_sky_color = 1000.0;
+// The sun a new Sky node gets: its directional light's color and intensity.
+inline constexpr Vec3 default_sun_color{1.0, 0.95, 0.86};
+inline constexpr double default_sun_intensity = 2.5;
+inline constexpr double maximum_fog_distance = 1e6;
+// A project-relative path ending in .relay-material, with the same characters as sound paths.
+[[nodiscard]] bool valid_sky_material_path(std::string_view path);
+[[nodiscard]] bool valid_sky(const Sky& sky);
+
+// Full-screen effects on the lit scene, applied in order before tone mapping. Each effect is a
+// post_process .relay-material. As with the sky, the first node with post processing is the one in
+// use. Effects show in the scene camera's view (Run Game, captures) and, unless `editor` is off, in
+// the editor's own view too; motion blur, say, is for the game only.
+struct PostEffect {
+    std::string material;
+    bool enabled{true};
+    bool editor{true};
+    auto operator<=>(const PostEffect&) const = default;
+};
+
+struct PostProcess {
+    std::vector<PostEffect> effects;
+    auto operator<=>(const PostProcess&) const = default;
+};
+
+inline constexpr std::size_t maximum_post_effects = 16U;
+[[nodiscard]] bool valid_post_process(const PostProcess& post_process);
+
 // Where the game hears from. The first node with a listener wins; without one, the active camera.
 struct AudioListener {
     auto operator<=>(const AudioListener&) const = default;
@@ -280,7 +340,7 @@ inline constexpr std::size_t maximum_script_text_bytes = 1024U;
 [[nodiscard]] std::string_view script_property_type_name(ScriptProperty::Type type);
 [[nodiscard]] std::optional<ScriptProperty::Type> script_property_type_from_name(std::string_view name);
 
-enum class ReflectedFieldType { string, entity, vec3, number, boolean, number_array, object_array };
+enum class ReflectedFieldType { string, entity, vec3, number, boolean, number_array, object_array, object };
 
 struct ReflectedField {
     std::string_view name;
@@ -311,6 +371,8 @@ struct EntityRecord {
     std::optional<AudioListener> audio_listener{};
     std::optional<ReverbZone> reverb_zone{};
     std::optional<MusicPlayer> music_player{};
+    std::optional<Sky> sky{};
+    std::optional<PostProcess> post_process{};
 };
 
 // The node type shown to people and agents, derived from the components an entity has now by
@@ -365,7 +427,13 @@ public:
     [[nodiscard]] bool set_audio_listener(Entity entity, std::optional<AudioListener> listener);
     [[nodiscard]] bool set_reverb_zone(Entity entity, std::optional<ReverbZone> zone);
     [[nodiscard]] bool set_music_player(Entity entity, std::optional<MusicPlayer> player);
+    [[nodiscard]] bool set_sky(Entity entity, std::optional<Sky> sky);
+    [[nodiscard]] bool set_post_process(Entity entity, std::optional<PostProcess> post_process);
     [[nodiscard]] std::optional<Entity> active_camera() const;
+    // The sky in use: the first node, in entity order, that has one.
+    [[nodiscard]] std::optional<Entity> active_sky() const;
+    // The post processing in use: the first node, in entity order, that has it.
+    [[nodiscard]] std::optional<Entity> active_post_process() const;
 
     [[nodiscard]] SceneState capture_state() const;
     void restore_state(SceneState state);

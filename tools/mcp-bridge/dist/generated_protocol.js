@@ -275,7 +275,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         description: "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.",
         inputSchema: z.object({
             "query": z.string().max(64).default("").describe("Case-insensitive name fragment; empty matches every name"),
-            "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|shader|script|text|media|audio|other)$"))).max(12).optional().describe("Asset kinds to include; omitted or empty includes all")
+            "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|material|shader|script|text|media|audio|other)$"))).max(12).optional().describe("Asset kinds to include; omitted or empty includes all")
         }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
@@ -323,6 +323,127 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override(input);
         return invoke("assets.delete", { "path": input["path"] });
+    });
+    server.registerTool("shaders_read", {
+        title: "Read shader",
+        description: "Read a Relay shader (.relay-shader): its text, type, render modes, uniforms (with types, hints, ranges and defaults), and compile errors by line. A shader being previewed also returns the preview text. See docs/shaders.md for the language: shader_type surface or post_process, uniform declarations, and void vertex()/fragment() functions writing built-ins such as ALBEDO, ROUGHNESS, VERTEX or COLOR.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-shader$")).describe("Project-relative .relay-shader file")
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["shaders_read"];
+        if (override)
+            return override(input);
+        return invoke("shaders.read", { "path": input["path"] });
+    });
+    server.registerTool("shaders_write", {
+        title: "Write shader",
+        description: "Create or replace a Relay shader file and compile it, returning its compile errors by line. Materials using it redraw at once. With create and no text, starts from the template for type, or from one of Relay's ready-made post-processing effects (effect: bloom, color_grading or vignette), which then belongs to the project like any other shader. Clears any preview of the file.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-shader$")).describe("Project-relative .relay-shader file"),
+            "text": z.string().max(262144).optional().describe("The whole shader source"),
+            "create": z.boolean().default(false).describe("Refuse to replace an existing file"),
+            "type": z.enum(["surface", "post_process"]).default("surface").describe("Template type when creating without text"),
+            "effect": z.enum(["bloom", "color_grading", "vignette"]).optional().describe("A ready-made post-processing effect to start from when creating without text")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["shaders_write"];
+        if (override)
+            return override(input);
+        return invoke("shaders.write", { "path": input["path"], "text": input["text"], "create": input["create"], "type": input["type"], "effect": input["effect"] });
+    });
+    server.registerTool("shaders_preview", {
+        title: "Preview shader",
+        description: "Compile shader text without saving it and draw every material using the shader with it, so edits show in the viewport before they are saved. Omit text to stop previewing and use the file again. Returns compile errors by line.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-shader$")).describe("Project-relative .relay-shader file"),
+            "text": z.string().max(262144).optional().describe("Shader source to preview; omit to stop")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["shaders_preview"];
+        if (override)
+            return override(input);
+        return invoke("shaders.preview", { "path": input["path"], "text": input["text"] });
+    });
+    server.registerTool("asset_material", {
+        title: "Inspect material",
+        description: "Read a surface or post-processing material (.relay-material): its shader, each shader uniform with its type, hint, range, default and the material's value, and why it cannot be drawn if so. Sky materials are read with assets.sky_material.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$")).describe("Project-relative .relay-material file")
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["asset_material"];
+        if (override)
+            return override(input);
+        return invoke("assets.material", { "path": input["path"] });
+    });
+    server.registerTool("asset_set_material", {
+        title: "Create or edit material",
+        description: "Create a surface or post-processing material, or change its shader. A surface material draws meshes whose renderer names it (scene.set_renderer material); a post-processing material is an effect in a Post Process node (scene.set_post_process). Parameters for uniforms the new shader lacks are kept but ignored.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$")).describe("Project-relative .relay-material file"),
+            "create": z.boolean().default(false).describe("Create a new file, refusing to replace one"),
+            "type": z.enum(["surface", "post_process"]).optional().describe("Required when creating"),
+            "shader": z.string().max(128).regex(new RegExp("^([A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-shader)?$")).optional().describe("Project-relative .relay-shader of the same type")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["asset_set_material"];
+        if (override)
+            return override(input);
+        return invoke("assets.set_material", { "path": input["path"], "create": input["create"], "type": input["type"], "shader": input["shader"] });
+    });
+    server.registerTool("asset_set_material_parameter", {
+        title: "Set material parameter",
+        description: "Set one shader uniform on a material, saved to its file: value for numbers (1 to 4 numbers matching float, int, bool as 0 or 1, vec2, vec3 or vec4; colors are linear), or texture for sampler2D (a project PNG or JPEG, empty for the default image). reset returns the uniform to the shader's default.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$")).describe("Project-relative .relay-material file"),
+            "name": z.string().max(64).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")),
+            "value": z.array(z.number().finite()).min(1).max(4).optional(),
+            "texture": z.string().max(128).regex(new RegExp("^([A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(png|PNG|jpg|JPG|jpeg|JPEG))?$")).optional(),
+            "reset": z.boolean().default(false)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["asset_set_material_parameter"];
+        if (override)
+            return override(input);
+        return invoke("assets.set_material_parameter", { "path": input["path"], "name": input["name"], "value": input["value"], "texture": input["texture"], "reset": input["reset"] });
+    });
+    server.registerTool("asset_sky_material", {
+        title: "Inspect sky material",
+        description: "Read a sky material file (.relay-material) with its panorama image's size, or the reason the image cannot be drawn.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$")).describe("Project-relative sky material")
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["asset_sky_material"];
+        if (override)
+            return override(input);
+        return invoke("assets.sky_material", { "path": input["path"] });
+    });
+    server.registerTool("asset_set_sky_material", {
+        title: "Create or edit sky material",
+        description: "Create a sky material file (.relay-material), or change one. A sky material draws an equirectangular (2:1) panorama image from the project behind the scene, tinted, brightened and turned about the vertical axis; a sky uses it through scene.set_sky's material. Omitted fields keep their current values, or the defaults for a new file.",
+        inputSchema: z.object({
+            "path": z.string().max(128).regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$")).describe("Project-relative sky material; its folder must exist"),
+            "create": z.boolean().default(false).describe("Create a new file, refusing to replace one; otherwise the file must exist"),
+            "panorama": z.string().max(128).regex(new RegExp("^([A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.(png|PNG|jpg|JPG|jpeg|JPEG))?$")).optional().describe("Project-relative PNG or JPEG equirectangular panorama; empty for none yet"),
+            "tint": z.array(z.number().finite()).min(3).max(3).optional().describe("Linear RGB multiplier"),
+            "intensity": z.number().finite().min(0).max(100).optional(),
+            "rotationDegrees": z.number().finite().min(-360).max(360).optional().describe("Turns the panorama about the vertical axis")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["asset_set_sky_material"];
+        if (override)
+            return override(input);
+        return invoke("assets.set_sky_material", { "path": input["path"], "create": input["create"], "panorama": input["panorama"], "tint": input["tint"], "intensity": input["intensity"], "rotation_degrees": input["rotationDegrees"] });
     });
     server.registerTool("logs_read", {
         title: "Read Relay logs",
@@ -548,7 +669,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         inputSchema: z.object({
             "name": z.string().min(1).max(128).optional().describe("Node name; defaults to the type's name, or Entity"),
             "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity handle"),
-            "type": z.enum(["Node", "Camera", "DirectionalLight", "PointLight", "SpotLight", "RigidBody", "StaticBody", "StaticMesh", "AudioSource", "ReverbZone", "MusicPlayer"]).optional().describe("Node type to create; omitted creates a plain Node")
+            "type": z.enum(["Node", "Camera", "Sky", "PostProcess", "DirectionalLight", "PointLight", "SpotLight", "RigidBody", "StaticBody", "StaticMesh", "AudioSource", "ReverbZone", "MusicPlayer"]).optional().describe("Node type to create; omitted creates a plain Node")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
@@ -640,12 +761,12 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("scene_set_renderer", {
         title: "Configure entity renderer",
-        description: "Attach a registered built-in or imported mesh and material to an entity, or remove its renderer component.",
+        description: "Attach a registered built-in or imported mesh and a material to an entity, or remove its renderer component. The material is a registered material name or a project surface material (.relay-material) drawn by its shader. Per-object parameter values (scene.set_renderer_parameter) stay while the material is unchanged.",
         inputSchema: z.object({
             "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
             "enabled": z.boolean().default(true),
             "mesh": z.string().max(128).regex(new RegExp("^[A-Za-z0-9._:-]+$")).default("builtin.triangle"),
-            "material": z.string().max(128).regex(new RegExp("^[A-Za-z0-9._:-]+$")).default("builtin.orange")
+            "material": z.string().max(128).regex(new RegExp("^([A-Za-z0-9._:-]+|[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material)$")).default("builtin.orange")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
@@ -653,6 +774,23 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override(input);
         return invoke("scene.set_renderer", { "entity": input["entity"], "enabled": input["enabled"], "mesh": input["mesh"], "material": input["material"] });
+    });
+    server.registerTool("scene_set_renderer_parameter", {
+        title: "Set per-object material parameter",
+        description: "Give one object its own value for a parameter of its shader material, without changing the material file or other objects that use it: value is 1 to 4 numbers matching the uniform (float, int, bool as 0 or 1, vec2, vec3 or vec4; colors are linear). Images cannot be overridden. clear returns the object to the material's value. Undoable; scripts change the same values during the game with entity.set_material_parameter.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "name": z.string().max(64).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")),
+            "value": z.array(z.number().finite()).min(1).max(4).optional(),
+            "clear": z.boolean().default(false),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_renderer_parameter"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_renderer_parameter", { "entity": input["entity"], "name": input["name"], "value": input["value"], "clear": input["clear"], "gesture": input["gesture"] });
     });
     server.registerTool("scene_set_parent", {
         title: "Set entity parent",
@@ -1056,12 +1194,69 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             return override(input);
         return invoke("scene.set_music_player", { "entity": input["entity"], "attached": input["attached"], "tracks": input["tracks"], "bus": input["bus"], "volume_db": input["volumeDb"], "crossfade_seconds": input["crossfadeSeconds"], "shuffle": input["shuffle"], "loop_playlist": input["loopPlaylist"], "play_on_start": input["playOnStart"], "bpm": input["bpm"], "beats_per_bar": input["beatsPerBar"], "first_beat_seconds": input["firstBeatSeconds"], "sync": input["sync"], "gesture": input["gesture"] });
     });
+    server.registerTool("scene_set_sky", {
+        title: "Configure sky",
+        description: "Add, edit or remove a sky: what is drawn behind everything, the ambient light it gives the scene, and linear distance fog. The first node with a sky is the one in use; its directional light, if any, is the sun, aimed by turning the node. The sky is a gradient from horizon_color (at the horizon and below) to zenith_color (straight up), unless material names a sky material (.relay-material, see assets.set_sky_material), which draws its panorama instead. Colors are linear RGB triples from 0 to 1000. Undoable and saved with the scene.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "attached": z.boolean().default(true).describe("False removes the sky"),
+            "material": z.string().max(128).regex(new RegExp("^([A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material)?$")).optional().describe("Project-relative sky material; empty uses the gradient"),
+            "horizonColor": z.array(z.number().finite()).min(3).max(3).optional().describe("Linear RGB seen at the horizon and below"),
+            "zenithColor": z.array(z.number().finite()).min(3).max(3).optional().describe("Linear RGB seen straight up"),
+            "intensity": z.number().finite().min(0).max(100).optional().describe("Brightness of the visible sky, gradient or material"),
+            "ambientIntensity": z.number().finite().min(0).max(10).optional().describe("How strongly the sky lights the scene; 1 matches the visible sky"),
+            "fog": z.boolean().optional().describe("Whether distance fog is on"),
+            "fogStart": z.number().finite().min(0).max(1000000).optional().describe("Distance from the camera where fog begins, in metres"),
+            "fogEnd": z.number().finite().min(0).max(1000000).optional().describe("Distance where everything is fog; must exceed fog_start"),
+            "fogStartColor": z.array(z.number().finite()).min(3).max(3).optional().describe("Linear RGB of the fog at fog_start"),
+            "fogEndColor": z.array(z.number().finite()).min(3).max(3).optional().describe("Linear RGB of the fog at fog_end"),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_sky"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_sky", { "entity": input["entity"], "attached": input["attached"], "material": input["material"], "horizon_color": input["horizonColor"], "zenith_color": input["zenithColor"], "intensity": input["intensity"], "ambient_intensity": input["ambientIntensity"], "fog": input["fog"], "fog_start": input["fogStart"], "fog_end": input["fogEnd"], "fog_start_color": input["fogStartColor"], "fog_end_color": input["fogEndColor"], "gesture": input["gesture"] });
+    });
+    server.registerTool("scene_set_post_process", {
+        title: "Configure post processing",
+        description: "Add, change or remove post processing: an ordered list of post_process materials (full-screen effects from post_process shaders) applied to the lit scene before tone mapping, in every view. The first node with post processing is used. Effects that stay in a replaced list keep their settings; new ones start on and show in the editor's view too. Undoable and saved with the scene.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "attached": z.boolean().default(true).describe("False removes post processing"),
+            "effects": z.array(z.string().regex(new RegExp("^[A-Za-z0-9_-][A-Za-z0-9._ /-]*\\.relay-material$"))).max(16).optional().describe("Post-processing materials, applied in this order"),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_post_process"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_post_process", { "entity": input["entity"], "attached": input["attached"], "effects": input["effects"], "gesture": input["gesture"] });
+    });
+    server.registerTool("scene_set_post_effect", {
+        title: "Configure post effect",
+        description: "Turn one post-processing effect on or off by its position in the list, without removing it, and choose whether it also shows in the editor's own view (off for effects meant for the game camera, such as motion blur). Undoable.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "index": z.number().int().min(0).max(15),
+            "enabled": z.boolean().optional().describe("Whether the effect runs"),
+            "editor": z.boolean().optional().describe("Whether it also shows in the editor's view; the game camera's view always shows it")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_post_effect"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_post_effect", { "entity": input["entity"], "index": input["index"], "enabled": input["enabled"], "editor": input["editor"] });
+    });
     server.registerTool("component_add", {
         title: "Add component",
         description: "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.",
         inputSchema: z.object({
             "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-            "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script"]),
+            "component": z.enum(["mesh_renderer", "camera", "light", "sky", "post_process", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script"]),
             "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).optional().describe("Behaviour class name; required for script")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
@@ -1076,7 +1271,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         description: "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.",
         inputSchema: z.object({
             "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-            "component": z.enum(["mesh_renderer", "camera", "light", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script"]),
+            "component": z.enum(["mesh_renderer", "camera", "light", "sky", "post_process", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script"]),
             "index": z.number().int().min(0).max(31).optional().describe("Which script component, from zero")
         }),
         annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },

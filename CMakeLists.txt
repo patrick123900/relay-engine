@@ -58,6 +58,24 @@ add_custom_target(relay_protocol_codegen_check ALL
     VERBATIM
 )
 
+# Shader include files the engine compiles project shaders against at runtime, and the
+# post-processing effects it copies into projects.
+set(RELAY_EMBEDDED_SHADER_INPUTS
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bindings.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/surface_lighting.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/effects/Bloom.relay-shader"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/effects/ColorGrading.relay-shader"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/effects/Vignette.relay-shader")
+set(RELAY_EMBEDDED_SHADER_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_shader_sources.cpp")
+add_custom_command(
+    OUTPUT "${RELAY_EMBEDDED_SHADER_SOURCES}"
+    COMMAND "${CMAKE_COMMAND}" "-DOUTPUT=${RELAY_EMBEDDED_SHADER_SOURCES}"
+            "-DINPUTS=${RELAY_EMBEDDED_SHADER_INPUTS}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_shader_sources.cmake"
+    DEPENDS ${RELAY_EMBEDDED_SHADER_INPUTS} "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_shader_sources.cmake"
+    COMMENT "Embedding shader include files"
+    VERBATIM)
+
 add_library(relay_engine
     src/audio/audio_clip.cpp
     src/audio/audio_effects.cpp
@@ -87,6 +105,11 @@ add_library(relay_engine
     src/render/image_decode.cpp
     src/render/model_import.cpp
     src/render/scene_render.cpp
+    src/render/sky.cpp
+    src/render/shader_language.cpp
+    src/render/materials.cpp
+    src/render/shader_graph.cpp
+    ${RELAY_EMBEDDED_SHADER_SOURCES}
     src/render/render_graph.cpp
     src/render/upload_budget.cpp
     src/render/graphics_settings.cpp
@@ -130,6 +153,16 @@ if(TARGET assimp::assimp)
     target_compile_definitions(relay_engine PRIVATE RELAY_HAS_ASSIMP=1)
 else()
     message(STATUS "Assimp was not found; project model import will report unavailable")
+endif()
+
+# Runtime compilation of project shaders. Without glslang, shaders report that they cannot build.
+find_package(glslang CONFIG QUIET)
+if(TARGET glslang::glslang AND TARGET glslang::SPIRV AND TARGET glslang::glslang-default-resource-limits)
+    target_link_libraries(relay_engine PRIVATE glslang::glslang glslang::SPIRV
+                                               glslang::glslang-default-resource-limits)
+    target_compile_definitions(relay_engine PRIVATE RELAY_HAS_GLSLANG=1)
+else()
+    message(STATUS "glslang was not found; project shaders will report that they cannot compile")
 endif()
 
 find_package(PNG QUIET)
@@ -240,6 +273,7 @@ if(RELAY_ENABLE_SDL)
                         -o "${RELAY_FRAGMENT_SHADER}"
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/first_light.frag"
                         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/surface_lighting.glsl"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bindings.glsl"
                 VERBATIM
             )
             foreach(stage vert frag)
@@ -298,6 +332,18 @@ if(RELAY_ENABLE_SDL)
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gi_composite.frag"
                 VERBATIM
             )
+            set(RELAY_SKY_FRAGMENT "${RELAY_SHADER_OUTPUT_DIR}/sky.frag.spv")
+            add_custom_command(
+                OUTPUT "${RELAY_SKY_FRAGMENT}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
+                COMMAND "${RELAY_GLSLC}" -fshader-stage=frag
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.frag"
+                        -o "${RELAY_SKY_FRAGMENT}"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.frag"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/surface_lighting.glsl"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bindings.glsl"
+                VERBATIM
+            )
             # Ray traced reflections; ray queries need SPIR-V 1.4, so these target Vulkan 1.3.
             foreach(shader reflection_trace reflection_arguments)
                 set(RELAY_${shader}_SHADER "${RELAY_SHADER_OUTPUT_DIR}/${shader}.comp.spv")
@@ -309,11 +355,13 @@ if(RELAY_ENABLE_SDL)
                             -o "${RELAY_${shader}_SHADER}"
                     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.comp"
                             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/surface_lighting.glsl"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bindings.glsl"
                     VERBATIM
                 )
             endforeach()
             add_custom_target(relay_shaders DEPENDS "${RELAY_VERTEX_SHADER}" "${RELAY_FRAGMENT_SHADER}"
-                              "${RELAY_GI_COMPOSITE_FRAGMENT}" "${RELAY_reflection_trace_SHADER}"
+                              "${RELAY_GI_COMPOSITE_FRAGMENT}" "${RELAY_SKY_FRAGMENT}"
+                              "${RELAY_reflection_trace_SHADER}"
                               "${RELAY_reflection_arguments_SHADER}"
                               "${RELAY_TONE_VERTEX}" "${RELAY_TONE_FRAGMENT}"
                               "${RELAY_SHADOW_VERTEX}" "${RELAY_SHADOW_FRAGMENT}"
@@ -349,6 +397,7 @@ if(RELAY_ENABLE_SDL)
                 RELAY_SELECTION_VERTEX_PATH="${RELAY_SELECTION_vert}"
                 RELAY_SELECTION_FRAGMENT_PATH="${RELAY_SELECTION_frag}"
                 RELAY_GI_COMPOSITE_FRAGMENT_PATH="${RELAY_GI_COMPOSITE_FRAGMENT}"
+                RELAY_SKY_FRAGMENT_PATH="${RELAY_SKY_FRAGMENT}"
                 RELAY_REFLECTION_TRACE_PATH="${RELAY_reflection_trace_SHADER}"
                 RELAY_REFLECTION_ARGUMENTS_PATH="${RELAY_reflection_arguments_SHADER}"
             )
@@ -379,6 +428,17 @@ if(RELAY_ENABLE_SDL)
                 )
                 FetchContent_MakeAvailable(ImGuizmo)
 
+                # The Shader Editor's syntax-coloring text editor (MIT), pinned to the release made
+                # for Dear ImGui 1.92.
+                FetchContent_Declare(
+                    ImGuiColorTextEdit
+                    URL https://github.com/goossens/ImGuiColorTextEdit/archive/refs/tags/v1.92.9.tar.gz
+                    URL_HASH SHA256=1fe29ec5945dc31783bfc380b51891b03a168008b3de2615c93a0e1aacaf343d
+                    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+                    SOURCE_SUBDIR relay-does-not-build-this
+                )
+                FetchContent_MakeAvailable(ImGuiColorTextEdit)
+
                 add_library(relay_imgui STATIC
                     "${dearimgui_SOURCE_DIR}/imgui.cpp"
                     "${dearimgui_SOURCE_DIR}/imgui_draw.cpp"
@@ -387,6 +447,7 @@ if(RELAY_ENABLE_SDL)
                     "${dearimgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
                     "${dearimgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp"
                     "${imguizmo_SOURCE_DIR}/src/ImGuizmo.cpp"
+                    "${imguicolortextedit_SOURCE_DIR}/TextEditor.cpp"
                 )
                 target_compile_features(relay_imgui PUBLIC cxx_std_20)
                 # SYSTEM keeps third-party headers from emitting warnings into Relay's strict builds.
@@ -394,6 +455,7 @@ if(RELAY_ENABLE_SDL)
                     "${dearimgui_SOURCE_DIR}"
                     "${dearimgui_SOURCE_DIR}/backends"
                     "${imguizmo_SOURCE_DIR}/src"
+                    "${imguicolortextedit_SOURCE_DIR}"
                 )
                 target_link_libraries(relay_imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan)
                 if(TARGET Vulkan::Headers)
@@ -402,7 +464,7 @@ if(RELAY_ENABLE_SDL)
 
                 target_sources(relay_demo PRIVATE src/editor/editor_ui.cpp src/editor/editor_theme.cpp
                     src/editor/editor_layout.cpp src/editor/chat_media.cpp
-                    src/editor/file_browser.cpp)
+                    src/editor/file_browser.cpp src/editor/shader_graph_canvas.cpp)
                 find_package(PkgConfig QUIET)
                 if(PkgConfig_FOUND)
                     pkg_check_modules(CHAT_VIDEO QUIET IMPORTED_TARGET libavformat libavcodec libswscale libavutil)
@@ -478,7 +540,7 @@ if(RELAY_BUILD_TESTS)
     if(TARGET relay_imgui)
         add_executable(relay_editor_headless_tests tests/editor_headless_tests.cpp
             src/editor/editor_ui.cpp src/editor/editor_theme.cpp src/editor/editor_layout.cpp src/editor/chat_media.cpp
-            src/editor/file_browser.cpp src/platform/sdl_input.cpp)
+            src/editor/file_browser.cpp src/editor/shader_graph_canvas.cpp src/platform/sdl_input.cpp)
         target_link_libraries(relay_editor_headless_tests PRIVATE Relay::Engine relay_imgui)
         target_compile_definitions(relay_editor_headless_tests PRIVATE RELAY_CHAT_MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat-media")
         relay_enable_warnings(relay_editor_headless_tests)

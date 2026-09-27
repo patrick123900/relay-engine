@@ -22,10 +22,13 @@ layout(push_constant) uniform CompositeData {
     // xy: scene target size in pixels. z: 1 global illumination, 2 reflections, 3 both.
     // w: the GGX alpha below which traced reflections apply.
     vec4 extent;
+    // The analytic hemisphere: the light reaching up- and downward surfaces (RenderSky).
+    vec4 ambient_up;
+    vec4 ambient_down;
 } composite;
 
-const vec3 sky_radiance = vec3(0.20, 0.31, 0.48);
-const vec3 ground_radiance = vec3(0.055, 0.047, 0.039);
+#define sky_radiance (composite.ambient_up.rgb)
+#define ground_radiance (composite.ambient_down.rgb)
 
 // Split-sum environment BRDF, approximated analytically (Karis, "Physically Based Shading on
 // Mobile"): scale and bias applied to F0.

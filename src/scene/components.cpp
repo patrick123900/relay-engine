@@ -16,6 +16,12 @@ const std::vector<ComponentKind>& engine_components() {
          "Game shows."},
         {"light", "Light", "Rendering", true, true, false,
          "A directional, point or spot light, with shadows."},
+        {"sky", "Sky", "Rendering", true, true, false,
+         "The scene's sky: a color gradient or a sky material drawn behind everything, the "
+         "ambient light it gives, and distance fog. The first node with a sky is used."},
+        {"post_process", "Post process", "Rendering", true, true, false,
+         "Full-screen effects from post_process shaders, such as color grading or outlines, "
+         "applied in order to every view. The first node with post processing is used."},
         {"collider", "Collider", "Physics", true, true, false,
          "A box, sphere, capsule, convex hull or triangle mesh shape for collisions, overlaps "
          "and raycasts."},
@@ -66,6 +72,8 @@ bool has_component(const EntityRecord& record, const std::string_view id) {
     if (id == "audio_listener") return record.audio_listener.has_value();
     if (id == "reverb_zone") return record.reverb_zone.has_value();
     if (id == "music_player") return record.music_player.has_value();
+    if (id == "sky") return record.sky.has_value();
+    if (id == "post_process") return record.post_process.has_value();
     if (id == "animator") return record.animator.has_value();
     if (id == "script") return !record.scripts.empty();
     return false;
@@ -110,6 +118,10 @@ bool add_component(Scene& scene, const Entity entity, const std::string_view id,
         added = scene.set_reverb_zone(entity, ReverbZone{});
     } else if (id == "music_player") {
         added = scene.set_music_player(entity, MusicPlayer{});
+    } else if (id == "sky") {
+        added = scene.set_sky(entity, Sky{});
+    } else if (id == "post_process") {
+        added = scene.set_post_process(entity, PostProcess{});
     } else if (id == "keyframes") {
         TransformAnimation animation;
         animation.keys.push_back({0.0, record->transform});
@@ -159,6 +171,8 @@ bool remove_component(Scene& scene, const Entity entity, const std::string_view 
     if (id == "audio_listener") return scene.set_audio_listener(entity, std::nullopt);
     if (id == "reverb_zone") return scene.set_reverb_zone(entity, std::nullopt);
     if (id == "music_player") return scene.set_music_player(entity, std::nullopt);
+    if (id == "sky") return scene.set_sky(entity, std::nullopt);
+    if (id == "post_process") return scene.set_post_process(entity, std::nullopt);
     auto scripts = record->scripts;
     scripts.erase(scripts.begin() + static_cast<std::ptrdiff_t>(index));
     return scene.set_scripts(entity, std::move(scripts));

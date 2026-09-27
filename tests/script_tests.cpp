@@ -838,6 +838,65 @@ void spawning(relay::Engine& engine, relay::ControlProtocol& protocol) {
     scene.restore_state(earlier);
 }
 
+const char* flash_source = R"(#include "relay_script.hpp"
+
+class Flash : public relay::Behaviour {
+public:
+    void on_start() override {
+        const auto before = self().material_parameter("power");
+        relay::world::log("power before " + std::to_string(before.size()) + " " +
+                          std::to_string(static_cast<int>(before.empty() ? 0.0 : before[0])));
+        self().set_material_parameter("power", 3.5);
+        self().set_material_parameter("tint", relay::Vec3{1, 0, 0});
+        relay::world::log(std::string("wrong count ") +
+                          (self().set_material_parameter("tint", 1.0) ? "accepted" : "refused"));
+        relay::world::log(std::string("missing ") +
+                          (self().set_material_parameter("nothing", 1.0) ? "accepted" : "refused"));
+        relay::world::log("power after " + std::to_string(self().material_parameter("power")[0]));
+    }
+    void on_update(double) override {
+        if (++updates == 2)
+            relay::world::log(std::string("cleared ") + (self().clear_material_parameter("tint") ? "yes" : "no"));
+    }
+private:
+    int updates = 0;
+};
+RELAY_BEHAVIOUR(Flash)
+)";
+
+// Scripts give one object its own shader parameter values; Stop Game puts the authored ones back.
+void material_parameters(relay::Engine& engine, relay::ControlProtocol& protocol) {
+    const std::string shader = "shader_type surface;\nuniform vec3 tint : source_color = vec3(1.0);\n"
+                               "uniform float power = 2.0;\nvoid fragment() { ALBEDO = tint * power; }\n";
+    expect(ok(request(protocol, "shaders.write", "\"path\":\"Flash.relay-shader\",\"text\":" + quoted(shader))) &&
+               ok(request(protocol, "assets.set_material",
+                          "\"path\":\"Flash.relay-material\",\"create\":true,\"type\":\"surface\","
+                          "\"shader\":\"Flash.relay-shader\"")),
+           "write the flash shader and material");
+    expect(ok(write_script(protocol, "flash.cpp", flash_source)) && ok(request(protocol, "scripts.build")) &&
+               wait_for_build(engine, protocol).find("\"state\":\"ready\"") != std::string::npos,
+           "the flash script builds");
+    auto& scene = engine.scene();
+    const auto earlier = scene.capture_state();
+    expect(ok(request(protocol, "scene.clear")), "start the flash scene empty");
+    const auto target = scene.create("Target");
+    expect(scene.set_mesh_renderer(target, relay::MeshRenderer{"builtin.quad", "Flash.relay-material"}) &&
+               ok(add_script(protocol, target, "Flash")),
+           "a quad with the flash material and script");
+    expect(engine.run_game(), "the flash scene runs");
+    engine.step(3);
+    const auto& own = scene.get(target)->mesh_renderer->parameters;
+    expect(logged(engine, "power before 1 2") && logged(engine, "power after 3.5") &&
+               logged(engine, "wrong count refused") && logged(engine, "missing refused") &&
+               logged(engine, "tint takes 3 number(s)") && logged(engine, "cleared yes"),
+           "scripts read the material's value, set their own, and are told about wrong names and counts");
+    expect(own == std::map<std::string, std::vector<double>, std::less<>>{{"power", {3.5}}},
+           "a script's values are the object's own, and clearing one returns it to the material's");
+    expect(engine.stop_game() && scene.get(target)->mesh_renderer->parameters.empty(),
+           "Stop Game restores the authored values");
+    scene.restore_state(earlier);
+}
+
 } // namespace
 
 int main() {
@@ -863,6 +922,7 @@ int main() {
         path_rules(protocol);
         lifecycle(engine, protocol);
         spawning(engine, protocol);
+        material_parameters(engine, protocol);
         compile_errors(engine, protocol);
         demo_first_person(engine, protocol);
     } catch (const std::exception& error) {

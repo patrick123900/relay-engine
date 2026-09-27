@@ -166,6 +166,17 @@ typedef struct RelayHostApi {
     int (*music_stop)(void* context, RelayEntity entity, double fade_seconds);
     /* The playlist index playing, or -1. */
     int (*music_track)(void* context, RelayEntity entity);
+    /* Per-object values for the entity's shader material parameters (its mesh renderer's
+     * .relay-material), leaving the material and other objects alone. `count` must match the
+     * uniform: 1 for float, int or bool (0 or 1), 2 to 4 for vectors; colors are linear. */
+    int (*set_material_parameter)(void* context, RelayEntity entity, const char* name, size_t length,
+                                  const double* values, size_t count);
+    /* Fills `values` with the parameter's current value (the object's own, else the material's,
+     * else the shader's default) and returns how many numbers it has, or 0 without one. */
+    size_t (*get_material_parameter)(void* context, RelayEntity entity, const char* name,
+                                     size_t length, double* values, size_t capacity);
+    /* Returns the object to the material's value; 0 when it had none of its own. */
+    int (*clear_material_parameter)(void* context, RelayEntity entity, const char* name, size_t length);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

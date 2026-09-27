@@ -3,37 +3,7 @@
 // The includer defines SURFACE_TEXTURE(index, uv) to sample the bindless texture table: fragment
 // shaders use implicit derivatives, compute shaders an explicit level of detail.
 
-layout(set = 0, binding = 0) uniform sampler2D textures[16];
-
-struct MaterialData {
-    vec4 base_color_factor;
-    vec4 emissive_metallic;
-    vec4 surface_parameters;
-    uvec4 texture_indices;
-};
-layout(std430, set = 0, binding = 1) readonly buffer MaterialBuffer {
-    MaterialData materials[];
-};
-struct LightData { vec4 position_type; vec4 direction_inner; vec4 color_intensity; vec4 attenuation_outer; vec4 range; };
-layout(std430,set=0,binding=2) readonly buffer LightingBuffer {
-    vec4 camera_count;
-    LightData lights[16];
-    mat4 shadow_view_projections[3];
-    mat4 spot_shadow_view_projection;
-    mat4 point_shadow_view_projections[6];
-    vec4 shadow_splits;
-    // w holds indirect light flags: 1, global illumination replaces the analytic sky; 2, ray
-    // traced reflections replace its specular half. See first_light.frag.
-    vec4 camera_forward;
-    vec4 point_shadow_position_far;
-    uvec4 shadow_parameters;
-    uvec4 point_shadow_parameters;
-} lighting;
-layout(set=0,binding=3) uniform sampler2DShadow shadow_maps[4];
-layout(set=0,binding=4) uniform samplerCubeShadow point_shadow_map;
-
-const uint missing_texture = 0xffffffffu;
-const float pi = 3.14159265359;
+#include "scene_bindings.glsl"
 
 float filtered_shadow(uint map_index, vec3 coordinates) {
     vec2 texel = 1.0 / vec2(textureSize(shadow_maps[0], 0));
@@ -241,10 +211,72 @@ void direct_lighting(Surface surface, vec3 world_position, vec3 view_direction, 
     diffuse_total = direct_diffuse;
 }
 
-// Analytic hemispherical environment. The sky and ground are linear radiances; rough surfaces see
-// a broad reflection while polished surfaces retain directional variation.
-const vec3 sky_radiance = vec3(0.20, 0.31, 0.48);
-const vec3 ground_radiance = vec3(0.055, 0.047, 0.039);
+// Analytic hemispherical environment from the light reaching up- and downward surfaces: the
+// scene's sky, or Relay's default without one. Rough surfaces see a broad reflection while
+// polished surfaces retain directional variation.
+#define sky_radiance (lighting.ambient_up.rgb)
+#define ground_radiance (lighting.ambient_down.rgb)
+
+// sky_gradient_position in sky.cpp: 0 at the horizon and below, 1 straight up.
+float sky_gradient_position(float direction_y) {
+    float below = 1.0 - clamp(direction_y, 0.0, 1.0);
+    return 1.0 - below * below;
+}
+
+// The visible sky along a normalized direction without the sun (sky_background in
+// scene_render.cpp).
+vec3 sky_background(vec3 direction) {
+    uint mode = uint(lighting.sky_zenith.w);
+    if (mode == 2u) {
+        // sky_panorama_uv in sky.cpp. Level 0 avoids the seam a derivative-based level would
+        // show where u wraps.
+        float u = 0.5 + atan(direction.x, -direction.z) / (2.0 * pi) - lighting.sky_horizon.w;
+        float v = 0.5 - asin(clamp(direction.y, -1.0, 1.0)) / pi;
+        return textureLod(sky_panorama, vec2(fract(u), v), 0.0).rgb * lighting.sky_tint.rgb;
+    }
+    if (mode == 1u)
+        return mix(lighting.sky_horizon.rgb, lighting.sky_zenith.rgb,
+                   sky_gradient_position(direction.y));
+    return vec3(0.0);
+}
+
+// sun_glow in scene_render.cpp, with the same constants (sun_disc_radius_degrees 0.8 and
+// sun_disc_brightness 40).
+vec3 sun_glow(vec3 direction) {
+    if (lighting.sun_direction.w == 0.0 || uint(lighting.sky_zenith.w) == 0u) return vec3(0.0);
+    float angle = acos(clamp(dot(direction, lighting.sun_direction.xyz), -1.0, 1.0));
+    float radius = radians(0.8);
+    float edge = radius * 0.15;
+    float disc = 1.0 - clamp((angle - radius + edge) / (2.0 * edge), 0.0, 1.0);
+    float glow = 0.25 * exp(-angle / 0.02) + 0.03 * exp(-angle / 0.15);
+    float horizon = smoothstep(0.0, 1.0, clamp((direction.y + 0.03) / 0.04, 0.0, 1.0));
+    return lighting.sun_radiance.rgb * (disc * 40.0 + glow) * horizon;
+}
+
+// What the sky pass draws: the sky with the sun in it.
+vec3 visible_sky(vec3 direction) {
+    return sky_background(direction) + sun_glow(direction);
+}
+
+// The light arriving from a direction in ambient scale (sky_environment in scene_render.cpp).
+// The sun is left out: its directional light already lights the scene.
+vec3 sky_environment(vec3 direction) {
+    if (uint(lighting.sky_zenith.w) == 0u)
+        return mix(ground_radiance, sky_radiance, clamp(direction.y * 0.5 + 0.5, 0.0, 1.0));
+    return sky_background(direction) * lighting.sky_tint.w;
+}
+
+// fog_amount in scene_render.cpp: how much fog covers a surface this far from the camera.
+float fog_amount(float distance_from_camera) {
+    if (lighting.fog_parameters.x == 0.0) return 0.0;
+    float start = lighting.fog_start_color.w;
+    float end = lighting.fog_end_color.w;
+    return clamp((distance_from_camera - start) / max(end - start, 1e-3), 0.0, 1.0);
+}
+
+vec3 fog_color(float amount) {
+    return mix(lighting.fog_start_color.rgb, lighting.fog_end_color.rgb, amount);
+}
 
 // The diffuse half of the analytic environment light, before occlusion.
 vec3 ambient_diffuse(Surface surface) {

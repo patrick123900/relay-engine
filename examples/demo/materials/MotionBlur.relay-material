@@ -1,0 +1,7 @@
+{
+  "format": "relay.material",
+  "version": 1,
+  "type": "post_process",
+  "shader": "shaders/MotionBlur.relay-shader",
+  "parameters": {}
+}

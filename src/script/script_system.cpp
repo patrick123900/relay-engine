@@ -4,6 +4,7 @@
 #include "relay/core/hash.hpp"
 #include "relay/core/process.hpp"
 #include "relay/observe/profiler.hpp"
+#include "relay/render/materials.hpp"
 #include "relay/editor/editor_math.hpp"
 #include "relay/scene/scene_edit.hpp"
 #include "relay/scene/templates.hpp"
@@ -929,6 +930,67 @@ struct ScriptSystem::Impl {
         host.music_track = [](void* context, RelayEntity entity) {
             return self(context).engine.audio().music_track(unpack(entity));
         };
+        host.set_material_parameter = [](void* context, RelayEntity entity, const char* name, size_t length,
+                                         const double* values, size_t count) {
+            auto& impl = self(context);
+            const std::string parameter(name, length);
+            const std::string where = "set_material_parameter(\"" + parameter + "\") on " + unpack(entity).to_string();
+            const auto* record = impl.engine.scene().get(unpack(entity));
+            if (!record || !record->mesh_renderer) {
+                impl.warn(where + ": the entity has no mesh renderer");
+                return 0;
+            }
+            const auto* uniform = impl.material_uniform(*record->mesh_renderer, parameter, where);
+            if (!uniform) return 0;
+            if (!values || count != shader_uniform_components(uniform->type)) {
+                impl.warn(where + ": " + parameter + " takes " +
+                          std::to_string(shader_uniform_components(uniform->type)) + " number(s)");
+                return 0;
+            }
+            auto renderer = *record->mesh_renderer;
+            if (!renderer.parameters.contains(parameter) &&
+                renderer.parameters.size() >= maximum_renderer_parameters) {
+                impl.warn(where + ": an object can override at most 32 parameters");
+                return 0;
+            }
+            renderer.parameters[parameter].assign(values, values + count);
+            if (impl.engine.scene().set_mesh_renderer(unpack(entity), std::move(renderer))) return 1;
+            impl.warn(where + ": values must be finite");
+            return 0;
+        };
+        host.get_material_parameter = [](void* context, RelayEntity entity, const char* name, size_t length,
+                                         double* values, size_t capacity) -> size_t {
+            auto& impl = self(context);
+            const std::string parameter(name, length);
+            const auto* record = impl.engine.scene().get(unpack(entity));
+            if (!record || !record->mesh_renderer) return 0U;
+            const auto copy = [&](const std::vector<double>& numbers) {
+                for (std::size_t index = 0; index < std::min(numbers.size(), capacity); ++index)
+                    values[index] = numbers[index];
+                return numbers.size();
+            };
+            if (const auto own = record->mesh_renderer->parameters.find(parameter);
+                own != record->mesh_renderer->parameters.end())
+                return copy(own->second);
+            if (!valid_material_path(record->mesh_renderer->material)) return 0U;
+            const auto material = impl.engine.shader_material(record->mesh_renderer->material);
+            if (!material || !material->shader) return 0U;
+            const auto* uniform = material->shader->parsed.find_uniform(parameter);
+            if (!uniform || uniform->type == ShaderUniform::Type::sampler2d) return 0U;
+            const auto components = shader_uniform_components(uniform->type);
+            if (const auto set = material->material.parameters.find(parameter);
+                set != material->material.parameters.end() && set->second.numbers.size() == components)
+                return copy(set->second.numbers);
+            return copy({uniform->default_value.begin(), uniform->default_value.begin() + components});
+        };
+        host.clear_material_parameter = [](void* context, RelayEntity entity, const char* name, size_t length) {
+            auto& scene = self(context).engine.scene();
+            const auto* record = scene.get(unpack(entity));
+            if (!record || !record->mesh_renderer) return 0;
+            auto renderer = *record->mesh_renderer;
+            if (renderer.parameters.erase(std::string(name, length)) == 0U) return 0;
+            return scene.set_mesh_renderer(unpack(entity), std::move(renderer)) ? 1 : 0;
+        };
         host.overlap_sphere = [](void* context, RelayVec3 center, double radius,
                                  uint32_t layer_mask, RelayEntity ignore, RelayEntity* out,
                                  size_t capacity) -> size_t {
@@ -951,6 +1013,27 @@ struct ScriptSystem::Impl {
     [[nodiscard]] std::string log_prefix() const {
         return "[" + (active ? active->script.behaviour + " " + active->entity.to_string()
                              : std::string{"script"}) + "] ";
+    }
+
+    // The numeric uniform a renderer's shader material has under `name`, warning (with `where`)
+    // when there is none.
+    const ShaderUniform* material_uniform(const MeshRenderer& renderer, const std::string& name,
+                                          const std::string& where) {
+        if (!valid_material_path(renderer.material)) {
+            warn(where + ": " + renderer.material + " is not a shader material");
+            return nullptr;
+        }
+        const auto material = engine.shader_material(renderer.material);
+        if (!material || !material->shader || !material->shader->ok()) {
+            warn(where + ": the material's shader does not compile");
+            return nullptr;
+        }
+        const auto* uniform = material->shader->parsed.find_uniform(name);
+        if (!uniform || uniform->type == ShaderUniform::Type::sampler2d) {
+            warn(where + ": the shader has no number, vector or bool uniform called " + name);
+            return nullptr;
+        }
+        return uniform;
     }
 
     void warn(const std::string& message) {

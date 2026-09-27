@@ -5,11 +5,13 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <filesystem>
+#include <map>
 
 namespace relay {
 
@@ -143,6 +145,9 @@ struct TextureAsset {
 // Owns every mesh, material and texture a renderer may draw. An instance starts populated with
 // Relay's built-in assets; imported content is appended. Registries are independent, so tests and
 // future multi-project hosts can hold several without sharing mutable state.
+struct ResolvedSkyMaterial;
+struct ResolvedShaderMaterial;
+
 class AssetRegistry {
 public:
     AssetRegistry();
@@ -172,6 +177,18 @@ public:
                            std::vector<MeshAsset> meshes, std::vector<MaterialAsset> materials,
                            std::vector<TextureAsset> textures = {});
 
+    // The sky material the scene's sky uses, loaded by the engine from the project. It lives
+    // apart from the mesh and texture tables and does not change revision(): renderers compare
+    // its panorama's own revision.
+    void set_sky_material(std::shared_ptr<const ResolvedSkyMaterial> material);
+    // The loaded material when its path is `path`, else null.
+    [[nodiscard]] std::shared_ptr<const ResolvedSkyMaterial> sky_material(std::string_view path) const;
+    // Surface and post-processing materials the scene uses, by path, loaded by the engine in the
+    // same way. Also apart from revision(): each material carries its own.
+    using ShaderMaterials = std::map<std::string, std::shared_ptr<const ResolvedShaderMaterial>, std::less<>>;
+    void set_shader_materials(ShaderMaterials materials);
+    [[nodiscard]] std::shared_ptr<const ResolvedShaderMaterial> shader_material(std::string_view path) const;
+
 private:
     void recompute_bounds(std::size_t first_mesh);
 
@@ -181,6 +198,8 @@ private:
     std::vector<MaterialAsset> materials_;
     std::vector<TextureAsset> textures_;
     std::vector<ModelAsset> models_;
+    std::shared_ptr<const ResolvedSkyMaterial> sky_material_;
+    ShaderMaterials shader_materials_;
     std::uint64_t revision_{1U};
 };
 

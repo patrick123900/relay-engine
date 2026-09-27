@@ -338,6 +338,25 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                         mesh_renderer->morph_weights.push_back(*weight.number());
                     }
                 }
+                if (result.source_version >= 24U) {
+                    const auto* parameters = field(*renderer_object, "parameters");
+                    if (!parameters || !parameters->object() ||
+                        parameters->object()->size() > maximum_renderer_parameters) {
+                        result.error = "renderer parameters must be an object of at most 32 values";
+                        return result;
+                    }
+                    for (const auto& [parameter_name, value] : *parameters->object()) {
+                        std::vector<double> numbers;
+                        if (value.array())
+                            for (const auto& number : *value.array())
+                                numbers.push_back(number.number() ? *number.number() : NAN);
+                        if (!value.array() || !valid_renderer_parameter(parameter_name, numbers)) {
+                            result.error = "invalid renderer parameter " + parameter_name;
+                            return result;
+                        }
+                        mesh_renderer->parameters.emplace(parameter_name, std::move(numbers));
+                    }
+                }
             }
         }
         slot.generation = parsed_entity->generation;
@@ -902,6 +921,75 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                     return result;
                 }
                 slot.record.music_player = std::move(player);
+            }
+        }
+        if (result.source_version >= 21U) {
+            const auto* value = field(*entity_object, "sky");
+            if (!value || (!value->is_null() && !value->object())) {
+                result.error = "version 21 entity requires sky";
+                return result;
+            }
+            if (!value->is_null()) {
+                const auto& object = *value->object();
+                Sky sky;
+                const auto number = [&](const char* key, double& target) {
+                    const auto* item = field(object, key);
+                    if (!item || !item->number()) return false;
+                    target = *item->number();
+                    return true;
+                };
+                const auto* material = field(object, "material");
+                const auto* fog = field(object, "fog");
+                if (!material || !material->string() || !fog || !fog->boolean() ||
+                    !read_vec3(field(object, "horizon_color"), sky.horizon_color) ||
+                    !read_vec3(field(object, "zenith_color"), sky.zenith_color) ||
+                    !number("intensity", sky.intensity) ||
+                    !number("ambient_intensity", sky.ambient_intensity) ||
+                    !number("fog_start", sky.fog_start) || !number("fog_end", sky.fog_end) ||
+                    !read_vec3(field(object, "fog_start_color"), sky.fog_start_color) ||
+                    !read_vec3(field(object, "fog_end_color"), sky.fog_end_color)) {
+                    result.error = "invalid sky";
+                    return result;
+                }
+                sky.material = *material->string();
+                sky.fog = *fog->boolean();
+                if (!valid_sky(sky)) {
+                    result.error = "sky values outside valid ranges";
+                    return result;
+                }
+                slot.record.sky = std::move(sky);
+            }
+        }
+        if (result.source_version >= 22U) {
+            const auto* value = field(*entity_object, "post_process");
+            if (!value || (!value->is_null() && !value->object())) {
+                result.error = "version 22 entity requires post_process";
+                return result;
+            }
+            if (!value->is_null()) {
+                const auto* effects = field(*value->object(), "effects");
+                PostProcess post_process;
+                bool ok = effects && effects->array();
+                if (ok)
+                    for (const auto& item : *effects->array()) {
+                        const auto* effect = item.object();
+                        const auto* material = effect ? field(*effect, "material") : nullptr;
+                        const auto* enabled = effect ? field(*effect, "enabled") : nullptr;
+                        // Version 23 added whether an effect shows in the editor's view.
+                        const auto* editor = effect && result.source_version >= 23U ? field(*effect, "editor") : nullptr;
+                        if (!material || !material->string() || !enabled || !enabled->boolean() ||
+                            (result.source_version >= 23U && (!editor || !editor->boolean()))) {
+                            ok = false;
+                            break;
+                        }
+                        post_process.effects.push_back({*material->string(), *enabled->boolean(),
+                                                        editor ? *editor->boolean() : true});
+                    }
+                if (!ok || !valid_post_process(post_process)) {
+                    result.error = "invalid post processing";
+                    return result;
+                }
+                slot.record.post_process = std::move(post_process);
             }
         }
         ++result.entity_count;

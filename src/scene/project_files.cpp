@@ -24,9 +24,9 @@ std::string lowercase(std::string value) {
     return value;
 }
 
-constexpr std::array<std::string_view, 11> kind_names{
-    "folder", "model", "scene", "template", "image", "shader", "script", "text", "media", "audio",
-    "other"};
+constexpr std::array<std::string_view, 12> kind_names{
+    "folder", "model", "scene", "template", "image", "material", "shader", "script", "text",
+    "media", "audio", "other"};
 
 // Hidden entries, and project files, which the Project panel manages rather than the browser.
 bool hidden_from_assets(const std::string& name, const bool directory) {
@@ -50,6 +50,8 @@ AssetKind asset_kind_of(const std::string_view filename, const bool directory) {
     const auto name = lowercase(std::string(filename));
     if (name.ends_with(".relay.json")) return AssetKind::scene;
     if (name.ends_with(".relay-template.json")) return AssetKind::node_template;
+    if (name.ends_with(".relay-material")) return AssetKind::material;
+    if (name.ends_with(".relay-shader")) return AssetKind::shader;
     const auto dot = name.rfind('.');
     const auto extension = dot == std::string::npos ? std::string{} : name.substr(dot + 1U);
     const auto any = [&](std::initializer_list<std::string_view> list) {

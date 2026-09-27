@@ -1,0 +1,19 @@
+shader_type post_process;
+
+// Vignette: the picture darkens (or fades to a color) towards its edges, drawing the eye to the
+// middle, as old lenses do.
+uniform float amount : hint_range(0.0, 1.0) = 0.5;
+uniform float size : hint_range(0.0, 2.0) = 0.8;
+uniform float softness : hint_range(0.01, 2.0) = 0.9;
+uniform vec3 color : source_color = vec3(0.0);
+
+// Distance from the middle of the screen: 1 at the top and bottom edges, more at the sides.
+float distance_from_middle(vec2 uv) {
+    vec2 centred = (uv - 0.5) * 2.0;
+    return length(vec2(centred.x * SCREEN_PIXEL_SIZE.y / SCREEN_PIXEL_SIZE.x, centred.y));
+}
+
+void fragment() {
+    float edge = smoothstep(size, size + softness, distance_from_middle(SCREEN_UV));
+    COLOR = mix(COLOR, color, edge * amount);
+}

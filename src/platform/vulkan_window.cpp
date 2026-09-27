@@ -4,6 +4,8 @@
 #include "relay/observe/capture.hpp"
 #include "relay/observe/profiler.hpp"
 #include "relay/render/assets.hpp"
+#include "relay/render/materials.hpp"
+#include "relay/render/shader_language.hpp"
 #include "relay/render/scene_render.hpp"
 #include "relay/render/render_graph.hpp"
 #include "relay/render/shader_reflection.hpp"
@@ -107,10 +109,27 @@ std::array<float, 16> invert_matrix(const std::array<float, 16>& m) {
     return result;
 }
 
-// The analytic sky and ground light in first_light.frag, which global illumination replaces
-// for opaque surfaces and uses for rays that leave the scene.
-constexpr std::array<float, 3> sky_radiance{0.20F, 0.31F, 0.48F};
-constexpr std::array<float, 3> ground_radiance{0.055F, 0.047F, 0.039F};
+// Changes whenever anything sky_environment() reads changes, so the lighting effects rebuild
+// their environment map only then.
+std::uint64_t sky_environment_key(const RenderSky& sky) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto mix = [&hash](const void* data, const std::size_t size) {
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        for (std::size_t index = 0; index < size; ++index) {
+            hash ^= bytes[index];
+            hash *= 1099511628211ULL;
+        }
+    };
+    const std::uint64_t revision = sky.panorama ? sky.panorama->revision : 0U;
+    mix(&sky.visible, sizeof sky.visible);
+    mix(&revision, sizeof revision);
+    for (const auto* color : {&sky.horizon, &sky.zenith, &sky.ambient_up, &sky.ambient_down,
+                              &sky.panorama_tint})
+        mix(color->data(), sizeof(float) * color->size());
+    mix(&sky.ambient_scale, sizeof sky.ambient_scale);
+    mix(&sky.panorama_rotation_degrees, sizeof sky.panorama_rotation_degrees);
+    return hash;
+}
 
 constexpr std::uint32_t no_draw_slot = std::numeric_limits<std::uint32_t>::max();
 
@@ -242,6 +261,9 @@ struct VulkanWindow::Impl {
         std::array<float, 4> point_shadow_position_far{};
         std::array<std::uint32_t, 4> shadow_parameters{};
         std::array<std::uint32_t, 4> point_shadow_parameters{};
+        // The sky and fog; see LightingBuffer in shaders/surface_lighting.glsl.
+        std::array<float, 4> sky_horizon{}, sky_zenith{}, sky_tint{}, ambient_up{}, ambient_down{},
+            fog_start_color{}, fog_end_color{}, fog_parameters{}, sun_direction{}, sun_radiance{}, frame_time{};
     };
     struct alignas(16) GpuMaterial {
         std::array<float, 4> base_color_factor;
@@ -262,7 +284,7 @@ struct VulkanWindow::Impl {
     };
     static_assert(sizeof(DrawPushConstants) == 128U);
     static_assert(sizeof(GpuMaterial) == 64U);
-    static_assert(sizeof(GpuLight) == 80U && sizeof(GpuLighting) == 2016U);
+    static_assert(sizeof(GpuLight) == 80U && sizeof(GpuLighting) == 2192U);
     VkSwapchainKHR swapchain{};
     VkFormat swapchain_format{VK_FORMAT_UNDEFINED};
     VkExtent2D swapchain_extent{};
@@ -282,13 +304,19 @@ struct VulkanWindow::Impl {
     struct SceneImage {
         VkImage image{};
         VkDeviceMemory memory{};
-        VkImageView view{};
+        VkImageView view{}; // The first mip level, for rendering into.
         VkImageCreateInfo info{};
+        // Every mip level, for sampling, when the image has more than one.
+        VkImageView sampled_view{};
+        [[nodiscard]] VkImageView sampled() const { return sampled_view ? sampled_view : view; }
     };
     struct SceneTargets {
         SceneImage hdr, normal_roughness, albedo_metallic, motion_occlusion, depth_value,
             diffuse_light, depth_stencil;
         VkFramebuffer geometry_framebuffer{}, forward_framebuffer{};
+        // Post processing alternates between the HDR image (0) and this second one (1).
+        SceneImage post;
+        std::array<VkFramebuffer, 2> post_framebuffers{};
     };
     std::array<SceneTargets, frames_in_flight> scene_targets{};
     // Whether each frame's targets hold a finished frame, and so can serve as history.
@@ -344,8 +372,120 @@ struct VulkanWindow::Impl {
         std::array<float, 16> inverse_view_projection{};
         std::array<float, 4> camera_position{};
         std::array<float, 4> extent{};
+        std::array<float, 4> ambient_up{};
+        std::array<float, 4> ambient_down{};
     };
-    static_assert(sizeof(CompositeConstants) == 96U);
+    static_assert(sizeof(CompositeConstants) == 128U);
+    // Draws the sky behind everything and fogs opaque surfaces, in the forward pass. It binds the
+    // scene's set 0 for the sky and fog values and the composite's set for depth.
+    VkPipelineLayout sky_pipeline_layout{};
+    VkPipeline sky_pipeline{};
+    // The sky material's panorama in set 0, binding 6, or a 1x1 placeholder without one.
+    GpuTexture sky_placeholder{}, sky_panorama_texture{};
+    std::uint64_t sky_panorama_revision{};
+    std::string sky_error;
+    // Shader materials. Set 1 of their pipelines holds the parameter block (binding 0) and up to
+    // eight images (bindings 1 to 8).
+    VkDescriptorSetLayout material_layout{};
+    VkPipelineLayout custom_pipeline_layout{};
+    // A compiled shader's pipelines, by shader revision: a surface shader's for the geometry pass
+    // (or the forward pass when transparent) and the shadow maps; a post shader's full-screen one.
+    // They use the swapchain's render passes, so they are rebuilt with it.
+    struct CustomShader {
+        VkPipeline surface{}, shadow{}, post{};
+        bool used{};
+    };
+    std::unordered_map<std::uint64_t, CustomShader> custom_shaders;
+    // A material's parameter buffer, images and set, by material path.
+    // A material's images and sets. Its parameter block is not stored here: each frame writes the
+    // blocks it draws with (the material's own, and per-object overrides) into that frame's
+    // parameter buffer, which the sets bind at a dynamic offset. Changing parameters therefore
+    // never rebuilds GPU resources; `key` covers only what does (the shader, images and size).
+    struct CustomMaterial {
+        std::uint64_t key{};
+        VkDeviceSize block_size{16U};
+        std::vector<GpuTexture> textures;
+        VkDescriptorPool pool{};
+        std::array<VkDescriptorSet, frames_in_flight> sets{};
+        bool used{};
+    };
+    // Per frame: every parameter block the frame draws with, persistently mapped. The first
+    // block is zeros, for the built-in error and copy materials.
+    struct ParameterBuffer {
+        VkBuffer buffer{};
+        VkDeviceMemory memory{};
+        VkDeviceSize capacity{};
+        std::uint8_t* mapped{};
+    };
+    std::array<ParameterBuffer, frames_in_flight> parameter_buffers{};
+    VkDeviceSize parameter_alignment{256U};
+    // This frame's offsets: per render instance (by index) and per post effect.
+    std::vector<std::uint32_t> instance_parameter_offsets, effect_parameter_offsets;
+    // Material previews: a sphere drawn with one surface material under a default sky and sun,
+    // into small targets of their own inside the frame's commands. Each frame's result is read
+    // back once its fence completes and handed to the overlay.
+    static constexpr std::uint32_t material_preview_size = 192U;
+    struct MaterialPreviewFrame {
+        std::array<SceneImage, geometry_color_attachments> color{};
+        SceneImage depth_stencil{};
+        VkFramebuffer geometry_framebuffer{}, forward_framebuffer{};
+        VkBuffer lighting{}, draw{}, readback{};
+        VkDeviceMemory lighting_memory{}, draw_memory{}, readback_memory{};
+        VkDescriptorSet set{};
+        std::string pending; // The material this frame drew, waiting to be read back.
+    };
+    std::array<MaterialPreviewFrame, frames_in_flight> preview_frames{};
+    VkDescriptorPool preview_pool{};
+    bool preview_resources_ready{}, preview_resources_failed{};
+    std::unique_ptr<Scene> preview_scene;
+    Entity preview_sphere{};
+    // What was last drawn, and what this frame draws (null for nothing).
+    std::string preview_path;
+    std::uint64_t preview_revision{};
+    std::shared_ptr<const ResolvedShaderMaterial> preview_material;
+    RenderScene preview_render;
+    // Set through VulkanWindow::set_material_preview; the overlay is asked otherwise.
+    std::string direct_preview;
+    VulkanWindow::MaterialPreviewReceiver direct_preview_receiver;
+    std::uint32_t preview_parameter_offset{};
+    std::unordered_map<std::string, CustomMaterial> custom_materials;
+    // Images for samplers a material leaves empty: white, black and a flat normal.
+    std::array<GpuTexture, 3> default_material_images{};
+    // Built-in shaders: a checkerboard for surfaces whose material cannot be drawn, and a copy for
+    // post-processing chains that end in the wrong image. The error material has no parameters.
+    std::shared_ptr<const CompiledShader> error_shader, copy_shader;
+    CustomMaterial error_material;
+    bool shader_resources_ready{false};
+    // Post processing samples the scene color through this, filtered and across mip levels.
+    VkSampler post_sampler{};
+    // Whether each frame's two post-processing images have every mip level in the layout their
+    // sampled views expect; set once after the images are made.
+    std::array<bool, frames_in_flight> post_mips_ready{};
+    bool post_mips_supported{};
+    bool shader_resources_failed{false};
+    std::string shader_error;
+    // Post processing: inputs are the scene color, depth and normals.
+    VkDescriptorSetLayout post_input_layout{};
+    VkDescriptorPool post_input_pool{};
+    std::array<std::array<VkDescriptorSet, 2>, frames_in_flight> post_input_sets{};
+    // Per frame: the camera's matrices now and one frame ago, so post shaders can tell how the
+    // view moved (the sky's motion; surfaces have motion vectors).
+    struct PostCamera {
+        std::array<float, 16> inverse_view_projection{};
+        std::array<float, 16> previous_view_projection{};
+    };
+    std::array<VkBuffer, frames_in_flight> post_camera_buffers{};
+    std::array<VkDeviceMemory, frames_in_flight> post_camera_memories{};
+    double last_frame_time{-1.0};
+    VkPipelineLayout post_pipeline_layout{};
+    VkRenderPass post_render_pass{};
+    struct PostConstants {
+        std::array<float, 16> inverse_projection{};
+        std::array<float, 4> extent_time{};
+    };
+    static_assert(sizeof(PostConstants) == 80U);
+    // Seconds for animated shaders (TIME); the host sets it, captures use their own time.
+    std::optional<double> shader_time;
     VkRenderPass geometry_render_pass{};
     // Transparent geometry, grid and selection draw here, after the geometry pass.
     VkRenderPass scene_render_pass{};
@@ -482,6 +622,23 @@ struct VulkanWindow::Impl {
                 vkDestroyImage(device, texture.image, nullptr);
                 vkFreeMemory(device, texture.memory, nullptr);
             }
+            for (auto* texture : {&sky_placeholder, &sky_panorama_texture}) destroy_sky_texture(*texture);
+            for (auto& [path, material] : custom_materials) destroy_custom_material(material);
+            for (auto& parameters : parameter_buffers) destroy_parameter_buffer(parameters);
+            destroy_preview_resources();
+            vkDestroySampler(device, post_sampler, nullptr);
+            custom_materials.clear();
+            destroy_custom_material(error_material);
+            for (auto& image : default_material_images) destroy_sky_texture(image);
+            vkDestroyPipelineLayout(device, custom_pipeline_layout, nullptr);
+            vkDestroyPipelineLayout(device, post_pipeline_layout, nullptr);
+            vkDestroyDescriptorPool(device, post_input_pool, nullptr);
+            for (std::size_t frame = 0; frame < frames_in_flight; ++frame) {
+                vkDestroyBuffer(device, post_camera_buffers[frame], nullptr);
+                vkFreeMemory(device, post_camera_memories[frame], nullptr);
+            }
+            vkDestroyDescriptorSetLayout(device, post_input_layout, nullptr);
+            vkDestroyDescriptorSetLayout(device, material_layout, nullptr);
             vkDestroyDescriptorSetLayout(device, texture_layout, nullptr);
             vkDestroySampler(device, shadow_sampler, nullptr);
             vkDestroyCommandPool(device, command_pool, nullptr);
@@ -1574,6 +1731,822 @@ struct VulkanWindow::Impl {
         return gpu_materials;
     }
 
+    // Sky panoramas and shader material images upload outside the asynchronous asset batches: they
+    // change only when someone picks another image or edits one, and the caller has already waited
+    // for the device. The upload is waited for here. Material images repeat both ways and get
+    // mipmaps; panoramas repeat around the horizon only.
+    bool create_sky_texture(const TextureAsset& asset, GpuTexture& texture, const bool srgb = true,
+                            const bool material_image = false) {
+        const auto format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+        VkFormatProperties format_properties{};
+        vkGetPhysicalDeviceFormatProperties(physical_device, format, &format_properties);
+        constexpr VkFormatFeatureFlags blit_features =
+            VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        texture.mip_levels =
+            material_image && (format_properties.optimalTilingFeatures & blit_features) == blit_features
+                ? static_cast<std::uint32_t>(std::floor(std::log2(static_cast<double>(
+                      std::max(asset.width, asset.height))))) + 1U
+                : 1U;
+        VkImageCreateInfo image_info{};
+        image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = format;
+        image_info.extent = {asset.width, asset.height, 1U};
+        image_info.mipLevels = texture.mip_levels;
+        image_info.arrayLayers = 1U;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                           VK_IMAGE_USAGE_SAMPLED_BIT;
+        image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        auto result = vkCreateImage(device, &image_info, nullptr, &texture.image);
+        VkMemoryRequirements requirements{};
+        if (result == VK_SUCCESS) vkGetImageMemoryRequirements(device, texture.image, &requirements);
+        const auto memory_type = result == VK_SUCCESS
+                                     ? find_memory_type(requirements.memoryTypeBits,
+                                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                                     : std::optional<std::uint32_t>{};
+        if (result == VK_SUCCESS && !memory_type) result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        VkMemoryAllocateInfo allocation{};
+        allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = memory_type.value_or(0U);
+        if (result == VK_SUCCESS) result = vkAllocateMemory(device, &allocation, nullptr, &texture.memory);
+        if (result == VK_SUCCESS) result = vkBindImageMemory(device, texture.image, texture.memory, 0U);
+        VkBuffer staging{};
+        VkDeviceMemory staging_memory{};
+        const auto byte_count = static_cast<VkDeviceSize>(asset.rgba.size());
+        if (result == VK_SUCCESS &&
+            !create_buffer(byte_count, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                           staging, staging_memory))
+            result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        void* mapped = nullptr;
+        if (result == VK_SUCCESS) result = vkMapMemory(device, staging_memory, 0U, byte_count, 0U, &mapped);
+        if (result == VK_SUCCESS) {
+            std::memcpy(mapped, asset.rgba.data(), asset.rgba.size());
+            vkUnmapMemory(device, staging_memory);
+        }
+        VkCommandBuffer commands{};
+        VkCommandBufferAllocateInfo command_info{};
+        command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        command_info.commandPool = command_pool;
+        command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        command_info.commandBufferCount = 1U;
+        if (result == VK_SUCCESS) result = vkAllocateCommandBuffers(device, &command_info, &commands);
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (result == VK_SUCCESS) result = vkBeginCommandBuffer(commands, &begin);
+        if (result == VK_SUCCESS) {
+            VkImageMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = texture.image;
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, texture.mip_levels, 0U, 1U};
+            vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U,
+                                 &barrier);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+            copy.imageExtent = {asset.width, asset.height, 1U};
+            vkCmdCopyBufferToImage(commands, staging, texture.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &copy);
+            // Each level is blitted from the one above, which then becomes readable by shaders.
+            auto width = static_cast<std::int32_t>(asset.width);
+            auto height = static_cast<std::int32_t>(asset.height);
+            for (std::uint32_t level = 0; level < texture.mip_levels; ++level) {
+                VkImageMemoryBarrier step{};
+                step.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                step.srcQueueFamilyIndex = step.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                step.image = texture.image;
+                step.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1U, 0U, 1U};
+                const bool last = level + 1U == texture.mip_levels;
+                step.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                step.dstAccessMask = last ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+                step.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                step.newLayout = last ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                      : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     last ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                          : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     0U, 0U, nullptr, 0U, nullptr, 1U, &step);
+                if (last) break;
+                VkImageBlit blit{};
+                blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0U, 1U};
+                blit.srcOffsets[1] = {width, height, 1};
+                width = std::max(width / 2, 1);
+                height = std::max(height / 2, 1);
+                blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level + 1U, 0U, 1U};
+                blit.dstOffsets[1] = {width, height, 1};
+                vkCmdBlitImage(commands, texture.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &blit,
+                               VK_FILTER_LINEAR);
+                // Levels above stay readable-only as shaders expect.
+                step.subresourceRange.baseMipLevel = level;
+                step.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                step.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                step.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                step.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     0U, 0U, nullptr, 0U, nullptr, 1U, &step);
+            }
+            result = vkEndCommandBuffer(commands);
+        }
+        VkFence fence{};
+        VkFenceCreateInfo fence_info{};
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (result == VK_SUCCESS) result = vkCreateFence(device, &fence_info, nullptr, &fence);
+        if (result == VK_SUCCESS) {
+            VkSubmitInfo submit{};
+            submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit.commandBufferCount = 1U;
+            submit.pCommandBuffers = &commands;
+            result = vkQueueSubmit(graphics_queue, 1U, &submit, fence);
+        }
+        if (result == VK_SUCCESS)
+            result = vkWaitForFences(device, 1U, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+        vkDestroyFence(device, fence, nullptr);
+        if (commands != VK_NULL_HANDLE) vkFreeCommandBuffers(device, command_pool, 1U, &commands);
+        vkDestroyBuffer(device, staging, nullptr);
+        vkFreeMemory(device, staging_memory, nullptr);
+        VkImageViewCreateInfo view_info{};
+        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image = texture.image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = image_info.format;
+        view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, texture.mip_levels, 0U, 1U};
+        if (result == VK_SUCCESS) result = vkCreateImageView(device, &view_info, nullptr, &texture.view);
+        // Around the horizon a panorama repeats; at the poles it stops.
+        VkSamplerCreateInfo sampler_info{};
+        sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sampler_info.magFilter = sampler_info.minFilter = VK_FILTER_LINEAR;
+        sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sampler_info.maxLod = static_cast<float>(texture.mip_levels);
+        sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sampler_info.addressModeV = sampler_info.addressModeW = material_image
+                                                                   ? VK_SAMPLER_ADDRESS_MODE_REPEAT
+                                                                   : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (result == VK_SUCCESS) result = vkCreateSampler(device, &sampler_info, nullptr, &texture.sampler);
+        if (result != VK_SUCCESS) {
+            destroy_sky_texture(texture);
+            last_error = vk_error("sky panorama upload", result);
+            return false;
+        }
+        return true;
+    }
+
+    void destroy_sky_texture(GpuTexture& texture) {
+        vkDestroySampler(device, texture.sampler, nullptr);
+        vkDestroyImageView(device, texture.view, nullptr);
+        vkDestroyImage(device, texture.image, nullptr);
+        vkFreeMemory(device, texture.memory, nullptr);
+        texture = {};
+    }
+
+    void write_sky_descriptors() {
+        const auto& texture = sky_panorama_texture.view != VK_NULL_HANDLE ? sky_panorama_texture
+                                                                           : sky_placeholder;
+        const VkDescriptorImageInfo image{texture.sampler, texture.view,
+                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        for (const auto set : texture_sets) {
+            if (set == VK_NULL_HANDLE || texture.view == VK_NULL_HANDLE) continue;
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = set;
+            write.dstBinding = 6U;
+            write.descriptorCount = 1U;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &image;
+            vkUpdateDescriptorSets(device, 1U, &write, 0U, nullptr);
+        }
+    }
+
+    // Makes the panorama on the GPU match the scene's sky material. Called before this frame's
+    // commands are recorded; a change waits for the device, since the other frame in flight may
+    // still sample the old image through its descriptor set. A panorama that cannot be uploaded
+    // leaves the gradient in place and its reason in sky_error.
+    void sync_sky_panorama(const RenderSky& sky) {
+        const std::uint64_t wanted = sky.visible && sky.panorama ? sky.panorama->revision : 0U;
+        if (wanted == sky_panorama_revision) return;
+        vkDeviceWaitIdle(device);
+        destroy_sky_texture(sky_panorama_texture);
+        sky_panorama_revision = wanted;
+        sky_error.clear();
+        if (wanted != 0U) {
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(physical_device, &properties);
+            const auto& image = sky.panorama->image;
+            const auto saved_error = last_error;
+            if (std::max(image.width, image.height) > properties.limits.maxImageDimension2D) {
+                sky_error = "the sky panorama is larger than this GPU's image limit";
+            } else if (!create_sky_texture(image, sky_panorama_texture)) {
+                sky_error = last_error;
+                last_error = saved_error;
+            }
+        }
+        write_sky_descriptors();
+    }
+
+    // Layouts, pools and images every shader material shares, and the built-in error and copy
+    // shaders. Created on first use, after the scene's set 0 layout exists.
+    bool ensure_shader_resources() {
+        if (shader_resources_ready || shader_resources_failed) return shader_resources_ready;
+        shader_resources_failed = true;
+        std::array<VkDescriptorSetLayoutBinding, 1U + maximum_shader_textures> bindings{};
+        for (std::uint32_t binding = 0; binding < bindings.size(); ++binding) {
+            bindings[binding].binding = binding;
+            bindings[binding].descriptorType = binding == 0U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                                                              : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bindings[binding].descriptorCount = 1U;
+            bindings[binding].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        {
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(physical_device, &properties);
+            parameter_alignment = std::max<VkDeviceSize>(properties.limits.minUniformBufferOffsetAlignment, 16U);
+            VkSamplerCreateInfo sampler_info{};
+            sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            sampler_info.magFilter = sampler_info.minFilter = VK_FILTER_LINEAR;
+            sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+            sampler_info.addressModeU = sampler_info.addressModeV = sampler_info.addressModeW =
+                VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            sampler_info.maxLod = VK_LOD_CLAMP_NONE;
+            if (vkCreateSampler(device, &sampler_info, nullptr, &post_sampler) != VK_SUCCESS) {
+                last_error = "could not create the post-processing sampler";
+                return false;
+            }
+        }
+        for (std::size_t frame = 0; frame < frames_in_flight; ++frame)
+            if (!ensure_parameter_buffer(frame, 64U * 1024U)) return false;
+        VkDescriptorSetLayoutCreateInfo layout_info{};
+        layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layout_info.bindingCount = static_cast<std::uint32_t>(bindings.size());
+        layout_info.pBindings = bindings.data();
+        auto result = vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &material_layout);
+        // Scene color, depth, normals and motion, then the camera buffer.
+        std::array<VkDescriptorSetLayoutBinding, 5> post_bindings{};
+        for (std::uint32_t binding = 0; binding < post_bindings.size(); ++binding) {
+            post_bindings[binding].binding = binding;
+            post_bindings[binding].descriptorType = binding == 4U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                                                                  : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            post_bindings[binding].descriptorCount = 1U;
+            post_bindings[binding].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        layout_info.bindingCount = static_cast<std::uint32_t>(post_bindings.size());
+        layout_info.pBindings = post_bindings.data();
+        if (result == VK_SUCCESS)
+            result = vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &post_input_layout);
+        VkPushConstantRange draw_push{};
+        draw_push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        draw_push.size = sizeof(DrawPushConstants);
+        const std::array custom_sets{texture_layout, material_layout};
+        VkPipelineLayoutCreateInfo pipeline_layout_info{};
+        pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipeline_layout_info.setLayoutCount = static_cast<std::uint32_t>(custom_sets.size());
+        pipeline_layout_info.pSetLayouts = custom_sets.data();
+        pipeline_layout_info.pushConstantRangeCount = 1U;
+        pipeline_layout_info.pPushConstantRanges = &draw_push;
+        if (result == VK_SUCCESS)
+            result = vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr, &custom_pipeline_layout);
+        VkPushConstantRange post_push{};
+        post_push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        post_push.size = sizeof(PostConstants);
+        const std::array post_sets{post_input_layout, material_layout};
+        pipeline_layout_info.pSetLayouts = post_sets.data();
+        pipeline_layout_info.pPushConstantRanges = &post_push;
+        if (result == VK_SUCCESS)
+            result = vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr, &post_pipeline_layout);
+        const std::array pool_sizes{
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<std::uint32_t>(8U * frames_in_flight)},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<std::uint32_t>(2U * frames_in_flight)}};
+        VkDescriptorPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.maxSets = static_cast<std::uint32_t>(2U * frames_in_flight);
+        pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
+        pool_info.pPoolSizes = pool_sizes.data();
+        if (result == VK_SUCCESS) result = vkCreateDescriptorPool(device, &pool_info, nullptr, &post_input_pool);
+        std::array<VkDescriptorSetLayout, 2U * frames_in_flight> post_layouts{};
+        post_layouts.fill(post_input_layout);
+        VkDescriptorSetAllocateInfo allocation{};
+        allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocation.descriptorPool = post_input_pool;
+        allocation.descriptorSetCount = static_cast<std::uint32_t>(post_layouts.size());
+        allocation.pSetLayouts = post_layouts.data();
+        std::array<VkDescriptorSet, 2U * frames_in_flight> sets{};
+        if (result == VK_SUCCESS) result = vkAllocateDescriptorSets(device, &allocation, sets.data());
+        if (result != VK_SUCCESS) {
+            last_error = vk_error("shader material layouts", result);
+            return false;
+        }
+        for (std::size_t frame = 0; frame < frames_in_flight; ++frame) {
+            post_input_sets[frame] = {sets[frame * 2U], sets[frame * 2U + 1U]};
+            if (!create_buffer(sizeof(PostCamera), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                               post_camera_buffers[frame], post_camera_memories[frame]))
+                return false;
+        }
+        const std::array<std::array<std::uint8_t, 4>, 3> plain{{{255U, 255U, 255U, 255U},
+                                                                {0U, 0U, 0U, 255U},
+                                                                {128U, 128U, 255U, 255U}}};
+        for (std::size_t index = 0; index < plain.size(); ++index) {
+            TextureAsset image;
+            image.width = image.height = 1U;
+            image.rgba.assign(plain[index].begin(), plain[index].end());
+            if (!create_sky_texture(image, default_material_images[index], false, true)) return false;
+        }
+        error_shader = compile_relay_shader("relay:error", R"(shader_type surface;
+render_mode unshaded;
+void fragment() {
+    vec2 cell = floor(UV * 8.0);
+    ALBEDO = mod(cell.x + cell.y, 2.0) < 1.0 ? vec3(1.0, 0.0, 1.0) : vec3(0.08, 0.0, 0.08);
+}
+)");
+        copy_shader = compile_relay_shader("relay:copy", "shader_type post_process;\n");
+        ResolvedShaderMaterial empty;
+        empty.path = "relay:error";
+        empty.parameters.assign(16U, 0U);
+        if (!create_custom_material(empty, {}, error_material)) return false;
+        shader_resources_ready = true;
+        // Scene targets made before now have unwritten post-processing inputs.
+        scene_extent = {};
+        return true;
+    }
+
+    void destroy_custom_material(CustomMaterial& material) {
+        vkDestroyDescriptorPool(device, material.pool, nullptr);
+        for (auto& texture : material.textures) destroy_sky_texture(texture);
+        material = {};
+    }
+
+    void destroy_parameter_buffer(ParameterBuffer& parameters) {
+        if (parameters.mapped) vkUnmapMemory(device, parameters.memory);
+        vkDestroyBuffer(device, parameters.buffer, nullptr);
+        vkFreeMemory(device, parameters.memory, nullptr);
+        parameters = {};
+    }
+
+    // Points a material's set for one frame at that frame's parameter buffer.
+    void write_parameter_binding(CustomMaterial& material, const std::size_t frame) {
+        if (material.sets[frame] == VK_NULL_HANDLE || parameter_buffers[frame].buffer == VK_NULL_HANDLE) return;
+        const VkDescriptorBufferInfo buffer_info{parameter_buffers[frame].buffer, 0U, material.block_size};
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = material.sets[frame];
+        write.dstBinding = 0U;
+        write.descriptorCount = 1U;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        write.pBufferInfo = &buffer_info;
+        vkUpdateDescriptorSets(device, 1U, &write, 0U, nullptr);
+    }
+
+    // Grows a frame's parameter buffer to hold `bytes`, repointing every material's set for that
+    // frame. Only called once the frame's fence has completed, so nothing reads the old buffer.
+    bool ensure_parameter_buffer(const std::size_t frame, const VkDeviceSize bytes) {
+        auto& parameters = parameter_buffers[frame];
+        if (bytes <= parameters.capacity) return true;
+        destroy_parameter_buffer(parameters);
+        const auto capacity = std::max<VkDeviceSize>(bytes + bytes / 2U, 64U * 1024U);
+        void* mapped = nullptr;
+        if (!create_buffer(capacity, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                           parameters.buffer, parameters.memory) ||
+            vkMapMemory(device, parameters.memory, 0U, capacity, 0U, &mapped) != VK_SUCCESS) {
+            destroy_parameter_buffer(parameters);
+            last_error = "could not create the shader parameter buffer";
+            return false;
+        }
+        parameters.capacity = capacity;
+        parameters.mapped = static_cast<std::uint8_t*>(mapped);
+        std::memset(parameters.mapped, 0, static_cast<std::size_t>(parameter_alignment));
+        for (auto& [path, material] : custom_materials) write_parameter_binding(material, frame);
+        write_parameter_binding(error_material, frame);
+        return true;
+    }
+
+    // What a material's GPU resources depend on: its shader, images and block size, but not the
+    // parameter values.
+    static std::uint64_t custom_material_key(const ResolvedShaderMaterial& material) {
+        std::uint64_t key = 1469598103934665603ULL;
+        const auto mix = [&](const std::uint64_t value) { key = (key ^ value) * 1099511628211ULL; };
+        mix(material.shader ? material.shader->revision : 0U);
+        mix(material.parameters.size());
+        for (const auto& texture : material.textures) mix(reinterpret_cast<std::uintptr_t>(texture.get()));
+        return key;
+    }
+
+    // Writes this frame's parameter blocks: each material's own once, and each instance's
+    // per-object block, recording the offsets draws bind.
+    bool write_frame_parameters(const RenderScene& render_scene) {
+        instance_parameter_offsets.assign(render_scene.instances.size(), 0U);
+        effect_parameter_offsets.assign(render_scene.post_effects.size(), 0U);
+        if (!shader_resources_ready) return true;
+        const auto aligned = [&](const std::size_t size) {
+            const auto bytes = static_cast<VkDeviceSize>(std::max<std::size_t>(size, 16U));
+            return (bytes + parameter_alignment - 1U) / parameter_alignment * parameter_alignment;
+        };
+        VkDeviceSize total = parameter_alignment;
+        std::unordered_map<const ResolvedShaderMaterial*, std::uint32_t> shared;
+        for (const auto& draw_instance : render_scene.instances) {
+            const auto& material = draw_instance.shader_material;
+            if (!material || !material->drawable()) continue;
+            if (shared.emplace(material.get(), 0U).second) total += aligned(material->parameters.size());
+            if (!draw_instance.shader_parameters.empty()) total += aligned(draw_instance.shader_parameters.size());
+        }
+        for (const auto& effect : render_scene.post_effects)
+            if (shared.emplace(effect.get(), 0U).second) total += aligned(effect->parameters.size());
+        if (preview_material && preview_material->drawable() && shared.emplace(preview_material.get(), 0U).second)
+            total += aligned(preview_material->parameters.size());
+        if (!ensure_parameter_buffer(current_frame, total)) return false;
+        auto* mapped = parameter_buffers[current_frame].mapped;
+        VkDeviceSize next = parameter_alignment;
+        const auto place = [&](const std::vector<std::uint8_t>& block) {
+            const auto offset = next;
+            std::memset(mapped + offset, 0, static_cast<std::size_t>(aligned(block.size())));
+            if (!block.empty()) std::memcpy(mapped + offset, block.data(), block.size());
+            next += aligned(block.size());
+            return static_cast<std::uint32_t>(offset);
+        };
+        for (auto& [material, offset] : shared) offset = place(material->parameters);
+        for (std::size_t index = 0; index < render_scene.instances.size(); ++index) {
+            const auto& draw_instance = render_scene.instances[index];
+            const auto& material = draw_instance.shader_material;
+            if (!material || !material->drawable()) continue;
+            instance_parameter_offsets[index] =
+                draw_instance.shader_parameters.size() == material->parameters.size()
+                    ? place(draw_instance.shader_parameters)
+                    : shared[material.get()];
+        }
+        for (std::size_t index = 0; index < render_scene.post_effects.size(); ++index)
+            effect_parameter_offsets[index] = shared[render_scene.post_effects[index].get()];
+        if (const auto found = preview_material ? shared.find(preview_material.get()) : shared.end(); found != shared.end())
+            preview_parameter_offset = found->second;
+        return true;
+    }
+
+    void destroy_custom_pipelines() {
+        for (auto& [revision, shader] : custom_shaders)
+            for (const auto pipeline_handle : {shader.surface, shader.shadow, shader.post})
+                vkDestroyPipeline(device, pipeline_handle, nullptr);
+        custom_shaders.clear();
+    }
+
+    // The images and per-frame sets of one material. `uniforms` lists the shader's uniforms so
+    // each sampler binding gets its image, or the default its hint asks for.
+    bool create_custom_material(const ResolvedShaderMaterial& resolved,
+                                const std::vector<ShaderUniform>& uniforms, CustomMaterial& material) {
+        material.key = custom_material_key(resolved);
+        material.block_size = static_cast<VkDeviceSize>(std::max<std::size_t>(resolved.parameters.size(), 16U));
+        std::array<const GpuTexture*, maximum_shader_textures> images{};
+        images.fill(&default_material_images[0]);
+        std::size_t sampler = 0;
+        for (const auto& uniform : uniforms) {
+            if (uniform.type != ShaderUniform::Type::sampler2d || uniform.offset < 1U ||
+                uniform.offset > maximum_shader_textures)
+                continue;
+            const auto* image = sampler < resolved.textures.size() ? resolved.textures[sampler].get() : nullptr;
+            ++sampler;
+            if (image) {
+                GpuTexture uploaded;
+                if (!create_sky_texture(*image, uploaded, image->color_space == TextureColorSpace::srgb, true))
+                    return false;
+                material.textures.push_back(uploaded);
+                images[uniform.offset - 1U] = nullptr; // Set below from the stable vector.
+            } else {
+                images[uniform.offset - 1U] =
+                    &default_material_images[uniform.hint == ShaderUniform::Hint::black    ? 1U
+                                             : uniform.hint == ShaderUniform::Hint::normal ? 2U
+                                                                                           : 0U];
+            }
+        }
+        // Uploaded images, in order, fill the bindings left open above.
+        std::size_t uploaded = 0;
+        for (const auto& uniform : uniforms)
+            if (uniform.type == ShaderUniform::Type::sampler2d && uniform.offset >= 1U &&
+                uniform.offset <= maximum_shader_textures && images[uniform.offset - 1U] == nullptr &&
+                uploaded < material.textures.size())
+                images[uniform.offset - 1U] = &material.textures[uploaded++];
+        const std::array pool_sizes{
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, static_cast<std::uint32_t>(frames_in_flight)},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                 static_cast<std::uint32_t>(maximum_shader_textures * frames_in_flight)}};
+        VkDescriptorPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.maxSets = static_cast<std::uint32_t>(frames_in_flight);
+        pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
+        pool_info.pPoolSizes = pool_sizes.data();
+        auto result = vkCreateDescriptorPool(device, &pool_info, nullptr, &material.pool);
+        std::array<VkDescriptorSetLayout, frames_in_flight> layouts{};
+        layouts.fill(material_layout);
+        VkDescriptorSetAllocateInfo allocation{};
+        allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocation.descriptorPool = material.pool;
+        allocation.descriptorSetCount = static_cast<std::uint32_t>(frames_in_flight);
+        allocation.pSetLayouts = layouts.data();
+        if (result == VK_SUCCESS) result = vkAllocateDescriptorSets(device, &allocation, material.sets.data());
+        if (result != VK_SUCCESS) {
+            last_error = vk_error("shader material set", result);
+            return false;
+        }
+        std::array<VkDescriptorImageInfo, maximum_shader_textures> image_infos{};
+        std::array<VkWriteDescriptorSet, maximum_shader_textures> writes{};
+        for (std::size_t frame = 0; frame < frames_in_flight; ++frame) {
+            for (std::uint32_t binding = 1; binding <= maximum_shader_textures; ++binding) {
+                auto& write = writes[binding - 1U];
+                write = {};
+                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet = material.sets[frame];
+                write.dstBinding = binding;
+                write.descriptorCount = 1U;
+                const auto* image = images[binding - 1U];
+                image_infos[binding - 1U] = {image->sampler, image->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                write.pImageInfo = &image_infos[binding - 1U];
+            }
+            vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0U, nullptr);
+            write_parameter_binding(material, frame);
+        }
+        return true;
+    }
+
+    enum class CustomVariant { geometry, transparent, shadow, post };
+
+    // One pipeline for a compiled shader. Surface variants use the scene's vertex layout and draw
+    // state; post-processing draws Relay's full-screen triangle.
+    VkPipeline create_custom_pipeline(const std::vector<std::uint32_t>& vertex_code,
+                                      const std::vector<std::uint32_t>& fragment_code,
+                                      const CustomVariant variant) {
+        std::vector<std::uint32_t> fullscreen;
+        if (variant == CustomVariant::post) {
+            fullscreen = read_shader(RELAY_TONE_VERTEX_PATH, last_error);
+            if (fullscreen.empty()) return VK_NULL_HANDLE;
+        }
+        const auto& vertex_words = variant == CustomVariant::post ? fullscreen : vertex_code;
+        VkShaderModuleCreateInfo module_info{};
+        module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        module_info.codeSize = vertex_words.size() * sizeof(std::uint32_t);
+        module_info.pCode = vertex_words.data();
+        VkShaderModule vertex_module{}, fragment_module{};
+        auto result = vkCreateShaderModule(device, &module_info, nullptr, &vertex_module);
+        module_info.codeSize = fragment_code.size() * sizeof(std::uint32_t);
+        module_info.pCode = fragment_code.data();
+        if (result == VK_SUCCESS) result = vkCreateShaderModule(device, &module_info, nullptr, &fragment_module);
+        const VkBool32 geometry_value = variant == CustomVariant::geometry ? VK_TRUE : VK_FALSE;
+        const VkBool32 shadow_value = variant == CustomVariant::shadow ? VK_TRUE : VK_FALSE;
+        const VkSpecializationMapEntry geometry_entry{0U, 0U, sizeof(VkBool32)};
+        const VkSpecializationMapEntry shadow_entry{1U, 0U, sizeof(VkBool32)};
+        const VkSpecializationInfo fragment_specialization{1U, &geometry_entry, sizeof(VkBool32), &geometry_value};
+        const VkSpecializationInfo vertex_specialization{1U, &shadow_entry, sizeof(VkBool32), &shadow_value};
+        const std::array stages{
+            VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0U,
+                                            VK_SHADER_STAGE_VERTEX_BIT, vertex_module, "main",
+                                            variant == CustomVariant::post ? nullptr : &vertex_specialization},
+            VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0U,
+                                            VK_SHADER_STAGE_FRAGMENT_BIT, fragment_module, "main",
+                                            variant == CustomVariant::post ? nullptr : &fragment_specialization}};
+        VkVertexInputBindingDescription vertex_binding{0U, sizeof(MeshVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+        const std::array attributes{
+            VkVertexInputAttributeDescription{0U, 0U, VK_FORMAT_R32G32B32_SFLOAT, 0U},
+            VkVertexInputAttributeDescription{1U, 0U, VK_FORMAT_R32G32_SFLOAT,
+                                              static_cast<std::uint32_t>(offsetof(MeshVertex, u))},
+            VkVertexInputAttributeDescription{2U, 0U, VK_FORMAT_R32G32B32_SFLOAT,
+                                              static_cast<std::uint32_t>(offsetof(MeshVertex, nx))},
+            VkVertexInputAttributeDescription{3U, 0U, VK_FORMAT_R32G32B32A32_SFLOAT,
+                                              static_cast<std::uint32_t>(offsetof(MeshVertex, tx))}};
+        VkPipelineVertexInputStateCreateInfo vertex_input{};
+        vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        if (variant != CustomVariant::post) {
+            vertex_input.vertexBindingDescriptionCount = 1U;
+            vertex_input.pVertexBindingDescriptions = &vertex_binding;
+            vertex_input.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());
+            vertex_input.pVertexAttributeDescriptions = attributes.data();
+        }
+        VkPipelineInputAssemblyStateCreateInfo assembly{};
+        assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo viewport{};
+        viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewport.viewportCount = viewport.scissorCount = 1U;
+        VkPipelineRasterizationStateCreateInfo raster{};
+        raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        raster.polygonMode = VK_POLYGON_MODE_FILL;
+        raster.cullMode = VK_CULL_MODE_NONE;
+        raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        raster.lineWidth = 1.0F;
+        if (variant == CustomVariant::shadow) {
+            // The same bias as the built-in shadow pipeline.
+            raster.depthBiasEnable = VK_TRUE;
+            raster.depthBiasConstantFactor = 1.25F;
+            raster.depthBiasSlopeFactor = 1.75F;
+        }
+        VkPipelineMultisampleStateCreateInfo multisample{};
+        multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo depth{};
+        depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depth.depthTestEnable = variant == CustomVariant::post ? VK_FALSE : VK_TRUE;
+        depth.depthWriteEnable = variant == CustomVariant::geometry || variant == CustomVariant::shadow;
+        depth.depthCompareOp = VK_COMPARE_OP_LESS;
+        VkPipelineColorBlendAttachmentState opaque{};
+        opaque.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendAttachmentState blended = opaque;
+        blended.blendEnable = VK_TRUE;
+        blended.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        blended.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blended.colorBlendOp = VK_BLEND_OP_ADD;
+        blended.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blended.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blended.alphaBlendOp = VK_BLEND_OP_ADD;
+        std::array<VkPipelineColorBlendAttachmentState, geometry_color_attachments> geometry_blend{};
+        geometry_blend.fill(opaque);
+        VkPipelineColorBlendStateCreateInfo blend{};
+        blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        switch (variant) {
+        case CustomVariant::geometry:
+            blend.attachmentCount = geometry_color_attachments;
+            blend.pAttachments = geometry_blend.data();
+            break;
+        case CustomVariant::transparent:
+            blend.attachmentCount = 1U;
+            blend.pAttachments = &blended;
+            break;
+        case CustomVariant::post:
+            blend.attachmentCount = 1U;
+            blend.pAttachments = &opaque;
+            break;
+        case CustomVariant::shadow: break;
+        }
+        const std::array dynamic_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{};
+        dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+        dynamic.pDynamicStates = dynamic_states.data();
+        VkGraphicsPipelineCreateInfo pipeline_info{};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipeline_info.stageCount = static_cast<std::uint32_t>(stages.size());
+        pipeline_info.pStages = stages.data();
+        pipeline_info.pVertexInputState = &vertex_input;
+        pipeline_info.pInputAssemblyState = &assembly;
+        pipeline_info.pViewportState = &viewport;
+        pipeline_info.pRasterizationState = &raster;
+        pipeline_info.pMultisampleState = &multisample;
+        pipeline_info.pDepthStencilState = &depth;
+        pipeline_info.pColorBlendState = &blend;
+        pipeline_info.pDynamicState = &dynamic;
+        pipeline_info.layout = variant == CustomVariant::post ? post_pipeline_layout : custom_pipeline_layout;
+        pipeline_info.renderPass = variant == CustomVariant::geometry    ? geometry_render_pass
+                                   : variant == CustomVariant::transparent ? scene_render_pass
+                                   : variant == CustomVariant::shadow      ? shadow_render_pass
+                                                                           : post_render_pass;
+        VkPipeline created{};
+        if (result == VK_SUCCESS)
+            result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1U, &pipeline_info, nullptr, &created);
+        vkDestroyShaderModule(device, fragment_module, nullptr);
+        vkDestroyShaderModule(device, vertex_module, nullptr);
+        if (result != VK_SUCCESS) {
+            shader_error = vk_error("shader pipeline creation", result);
+            return VK_NULL_HANDLE;
+        }
+        return created;
+    }
+
+    // The pipelines of a compiled shader, made the first time a frame needs them.
+    const CustomShader& custom_shader(const CompiledShader& shader) {
+        auto found = custom_shaders.find(shader.revision);
+        if (found == custom_shaders.end()) {
+            CustomShader created;
+            if (shader.ok()) {
+                if (shader.parsed.type == ShaderType::post_process) {
+                    created.post = create_custom_pipeline({}, shader.fragment, CustomVariant::post);
+                } else {
+                    created.surface = create_custom_pipeline(
+                        shader.vertex, shader.fragment,
+                        shader.parsed.transparent ? CustomVariant::transparent : CustomVariant::geometry);
+                    created.shadow = create_custom_pipeline(shader.vertex, shader.shadow_fragment,
+                                                            CustomVariant::shadow);
+                }
+            }
+            found = custom_shaders.emplace(shader.revision, created).first;
+        }
+        found->second.used = true;
+        return found->second;
+    }
+
+    // Makes the GPU's shader materials match this frame's: new or changed materials get their
+    // images and sets, shaders their pipelines. Replacing or dropping resources waits for the
+    // device, since the other frame in flight may still use them; that happens when a material's
+    // shader or images change, not when only its parameters do (see write_frame_parameters).
+    void sync_shader_materials(const RenderScene& render_scene) {
+        if (!shader_resources_ready) return;
+        std::vector<const ResolvedShaderMaterial*> wanted;
+        for (const auto& draw_instance : render_scene.instances)
+            if (draw_instance.shader_material && draw_instance.shader_material->drawable())
+                wanted.push_back(draw_instance.shader_material.get());
+        for (const auto& effect : render_scene.post_effects) wanted.push_back(effect.get());
+        if (preview_material && preview_material->drawable()) wanted.push_back(preview_material.get());
+        for (auto& [path, material] : custom_materials) material.used = false;
+        for (auto& [revision, shader] : custom_shaders) shader.used = false;
+        std::vector<const ResolvedShaderMaterial*> build;
+        bool replace = false;
+        for (const auto* material : wanted) {
+            const auto found = custom_materials.find(material->path);
+            if (found == custom_materials.end() || found->second.key != custom_material_key(*material)) {
+                if (std::find_if(build.begin(), build.end(), [&](const auto* other) {
+                        return other->path == material->path;
+                    }) == build.end())
+                    build.push_back(material);
+                replace = replace || found != custom_materials.end();
+            } else {
+                found->second.used = true;
+            }
+        }
+        for (const auto* material : wanted) (void)custom_shader(*material->shader);
+        if (error_shader) (void)custom_shader(*error_shader);
+        if (copy_shader) (void)custom_shader(*copy_shader);
+        std::size_t unused = 0;
+        for (const auto& [path, material] : custom_materials) unused += material.used ? 0U : 1U;
+        for (const auto& [revision, shader] : custom_shaders) unused += shader.used ? 0U : 1U;
+        if (replace || unused > 16U) {
+            vkDeviceWaitIdle(device);
+            for (auto it = custom_materials.begin(); it != custom_materials.end();) {
+                const bool rebuilt = std::find_if(build.begin(), build.end(), [&](const auto* material) {
+                                         return material->path == it->first;
+                                     }) != build.end();
+                if (!it->second.used || rebuilt) {
+                    destroy_custom_material(it->second);
+                    it = custom_materials.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (auto it = custom_shaders.begin(); it != custom_shaders.end();) {
+                if (!it->second.used) {
+                    for (const auto pipeline_handle : {it->second.surface, it->second.shadow, it->second.post})
+                        vkDestroyPipeline(device, pipeline_handle, nullptr);
+                    it = custom_shaders.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (const auto* material : build) {
+            CustomMaterial created;
+            const auto saved_error = last_error;
+            if (!create_custom_material(*material, material->shader->parsed.uniforms, created)) {
+                shader_error = last_error;
+                last_error = saved_error;
+                destroy_custom_material(created);
+                continue;
+            }
+            created.used = true;
+            custom_materials[material->path] = std::move(created);
+        }
+    }
+
+    // How a draw binds a shader material: its pipeline, this frame's set and the parameter block's
+    // dynamic offset.
+    struct CustomBinding {
+        VkPipeline pipeline{};
+        VkDescriptorSet set{};
+        std::uint32_t offset{};
+        bool operator==(const CustomBinding&) const = default;
+    };
+
+    // The pipeline and material set that draw an instance (by index in this frame's scene) with a
+    // shader material, or its error surface; nothing for instances with ordinary materials.
+    std::optional<CustomBinding> custom_binding(const RenderInstance& draw_instance, const std::size_t index,
+                                                const bool shadow) {
+        if (!shader_resources_ready || !valid_material_path(draw_instance.material)) return std::nullopt;
+        if (const auto& material = draw_instance.shader_material; material && material->drawable()) {
+            const auto shader = custom_shaders.find(material->shader->revision);
+            const auto set = custom_materials.find(material->path);
+            if (shader != custom_shaders.end() && set != custom_materials.end() &&
+                set->second.key == custom_material_key(*material) && index < instance_parameter_offsets.size()) {
+                const auto pipeline_handle = shadow ? shader->second.shadow : shader->second.surface;
+                if (pipeline_handle != VK_NULL_HANDLE)
+                    return CustomBinding{pipeline_handle, set->second.sets[current_frame],
+                                         instance_parameter_offsets[index]};
+            }
+        }
+        if (!error_shader) return std::nullopt;
+        const auto shader = custom_shaders.find(error_shader->revision);
+        if (shader == custom_shaders.end() || error_material.sets[current_frame] == VK_NULL_HANDLE) return std::nullopt;
+        const auto pipeline_handle = shadow ? shader->second.shadow : shader->second.surface;
+        if (pipeline_handle == VK_NULL_HANDLE) return std::nullopt;
+        return CustomBinding{pipeline_handle, error_material.sets[current_frame], 0U};
+    }
+
     bool create_texture_resources() {
         const auto texture_assets = assets->textures();
         if (texture_assets.empty() || texture_assets.size() > bindless_texture_capacity) {
@@ -1595,7 +2568,7 @@ struct VulkanWindow::Impl {
         }
         auto result = VK_SUCCESS;
         if (texture_layout == VK_NULL_HANDLE) {
-            std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+            std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
             bindings[0].binding = 0U;
             bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             bindings[0].descriptorCount = bindless_texture_capacity;
@@ -1619,6 +2592,10 @@ struct VulkanWindow::Impl {
             bindings[5] = bindings[1];
             bindings[5].binding = 5U;
             bindings[5].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+            // The sky panorama, for the sky pass, transparent surfaces and reflected rays.
+            bindings[6] = bindings[0];
+            bindings[6].binding = 6U;
+            bindings[6].descriptorCount = 1U;
             VkDescriptorSetLayoutCreateInfo layout_info{};
             layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
             layout_info.bindingCount = static_cast<std::uint32_t>(bindings.size());
@@ -1627,7 +2604,7 @@ struct VulkanWindow::Impl {
         }
         const std::array pool_sizes{
             VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                 (bindless_texture_capacity + shadow_map_count + 1U) *
+                                 (bindless_texture_capacity + shadow_map_count + 2U) *
                                      frames_in_flight},
             VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3U * frames_in_flight}};
         VkDescriptorPoolCreateInfo pool_info{};
@@ -1713,6 +2690,14 @@ struct VulkanWindow::Impl {
                                            shadow_sampler != VK_NULL_HANDLE ? 4U : 3U,
                                    writes.data(), 0U, nullptr);
         }
+        if (sky_placeholder.view == VK_NULL_HANDLE) {
+            TextureAsset placeholder;
+            placeholder.name = "sky placeholder";
+            placeholder.width = placeholder.height = 1U;
+            placeholder.rgba = {0U, 0U, 0U, 255U};
+            if (!create_sky_texture(placeholder, sky_placeholder)) return false;
+        }
+        write_sky_descriptors();
         uploaded_material_count = assets->materials().size();
         uploaded_texture_count = assets->textures().size();
         uploaded_asset_revision = assets->revision();
@@ -2272,17 +3257,81 @@ struct VulkanWindow::Impl {
             last_error = "device lacks the sampled RGBA8 sRGB or R32F scene target formats";
             return false;
         }
+        // Blurred scene colors for post processing come from blitting the HDR image down.
+        post_mips_supported = supports(hdr_format, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                                       VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
         return true;
     }
 
+    // Mip levels of the post-processing images: down to about 1/128 of their size, which is as
+    // blurred as scene_color_lod reaches.
+    [[nodiscard]] std::uint32_t post_mip_levels(const VkExtent2D extent) const {
+        if (!post_mips_supported) return 1U;
+        std::uint32_t levels = 1U;
+        for (auto size = std::max(extent.width, extent.height); size > 1U && levels < 8U; size /= 2U) ++levels;
+        return levels;
+    }
+
+    // Fills an image's smaller mip levels from its first, each a filtered half of the one before,
+    // leaving all of them ready for sampling. The first level must be ready for sampling already.
+    void build_mip_chain(const VkCommandBuffer commands, const SceneImage& target) {
+        const auto levels = target.info.mipLevels;
+        if (levels < 2U) return;
+        const auto barrier = [&](const std::uint32_t level, const std::uint32_t count, const VkImageLayout from,
+                                 const VkImageLayout to, const VkAccessFlags source_access,
+                                 const VkAccessFlags destination_access, const VkPipelineStageFlags source_stage,
+                                 const VkPipelineStageFlags destination_stage) {
+            VkImageMemoryBarrier transition{};
+            transition.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            transition.srcAccessMask = source_access;
+            transition.dstAccessMask = destination_access;
+            transition.oldLayout = from;
+            transition.newLayout = to;
+            transition.srcQueueFamilyIndex = transition.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            transition.image = target.image;
+            transition.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, count, 0U, 1U};
+            vkCmdPipelineBarrier(commands, source_stage, destination_stage, 0U, 0U, nullptr, 0U, nullptr, 1U,
+                                 &transition);
+        };
+        barrier(0U, 1U, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        // The smaller levels were last read by an effect, in the previous frame or earlier in this one.
+        barrier(1U, levels - 1U, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        auto width = static_cast<std::int32_t>(target.info.extent.width);
+        auto height = static_cast<std::int32_t>(target.info.extent.height);
+        for (std::uint32_t level = 1; level < levels; ++level) {
+            const auto next_width = std::max(width / 2, 1), next_height = std::max(height / 2, 1);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1U, 0U, 1U};
+            blit.srcOffsets[1] = {width, height, 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0U, 1U};
+            blit.dstOffsets[1] = {next_width, next_height, 1};
+            vkCmdBlitImage(commands, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &blit, VK_FILTER_LINEAR);
+            barrier(level, 1U, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+            width = next_width;
+            height = next_height;
+        }
+        barrier(0U, levels, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    }
+
     bool create_scene_image(const VkFormat format, const VkImageUsageFlags usage,
-                            const VkImageAspectFlags aspect, SceneImage& target) {
+                            const VkImageAspectFlags aspect, SceneImage& target, VkExtent2D extent = {},
+                            const std::uint32_t mip_levels = 1U) {
+        if (extent.width == 0U) extent = scene_extent;
         VkImageCreateInfo image_info{};
         image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         image_info.imageType = VK_IMAGE_TYPE_2D;
         image_info.format = format;
-        image_info.extent = {scene_extent.width, scene_extent.height, 1U};
-        image_info.mipLevels = 1U;
+        image_info.extent = {extent.width, extent.height, 1U};
+        image_info.mipLevels = mip_levels;
         image_info.arrayLayers = 1U;
         image_info.samples = VK_SAMPLE_COUNT_1_BIT;
         image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -2312,6 +3361,10 @@ struct VulkanWindow::Impl {
         view_info.subresourceRange.levelCount = 1U;
         view_info.subresourceRange.layerCount = 1U;
         result = vkCreateImageView(device, &view_info, nullptr, &target.view);
+        if (result == VK_SUCCESS && mip_levels > 1U) {
+            view_info.subresourceRange.levelCount = mip_levels;
+            result = vkCreateImageView(device, &view_info, nullptr, &target.sampled_view);
+        }
         if (result != VK_SUCCESS) { last_error = vk_error("scene target view creation", result); return false; }
         return true;
     }
@@ -2320,9 +3373,12 @@ struct VulkanWindow::Impl {
         for (auto& targets : scene_targets) {
             vkDestroyFramebuffer(device, targets.geometry_framebuffer, nullptr);
             vkDestroyFramebuffer(device, targets.forward_framebuffer, nullptr);
+            for (const auto framebuffer : targets.post_framebuffers)
+                vkDestroyFramebuffer(device, framebuffer, nullptr);
             for (auto* image : {&targets.hdr, &targets.normal_roughness, &targets.albedo_metallic,
                                 &targets.motion_occlusion, &targets.depth_value,
-                                &targets.diffuse_light, &targets.depth_stencil}) {
+                                &targets.diffuse_light, &targets.depth_stencil, &targets.post}) {
+                vkDestroyImageView(device, image->sampled_view, nullptr);
                 vkDestroyImageView(device, image->view, nullptr);
                 vkDestroyImage(device, image->image, nullptr);
                 vkFreeMemory(device, image->memory, nullptr);
@@ -2331,6 +3387,7 @@ struct VulkanWindow::Impl {
         }
         scene_extent = {};
         scene_targets_rendered.fill(false);
+        post_mips_ready.fill(false);
         previous_frame_valid = false;
     }
 
@@ -2350,7 +3407,8 @@ struct VulkanWindow::Impl {
                                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         for (std::size_t frame = 0; frame < frames_in_flight; ++frame) {
             auto& targets = scene_targets[frame];
-            if (!create_scene_image(hdr_format, color_usage, VK_IMAGE_ASPECT_COLOR_BIT, targets.hdr) ||
+            if (!create_scene_image(hdr_format, color_usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+                                    targets.hdr, extent, post_mip_levels(extent)) ||
                 !create_scene_image(normal_roughness_format, color_usage, VK_IMAGE_ASPECT_COLOR_BIT,
                                     targets.normal_roughness) ||
                 !create_scene_image(albedo_metallic_format, color_usage, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -2363,7 +3421,9 @@ struct VulkanWindow::Impl {
                                     targets.diffuse_light) ||
                 !create_scene_image(depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                                     VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                                    targets.depth_stencil))
+                                    targets.depth_stencil) ||
+                !create_scene_image(hdr_format, color_usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+                                    targets.post, extent, post_mip_levels(extent)))
                 return false;
             const std::array geometry_views{targets.hdr.view, targets.normal_roughness.view,
                                             targets.albedo_metallic.view,
@@ -2386,7 +3446,41 @@ struct VulkanWindow::Impl {
             if (result == VK_SUCCESS)
                 result = vkCreateFramebuffer(device, &framebuffer_info, nullptr,
                                              &targets.forward_framebuffer);
+            framebuffer_info.renderPass = post_render_pass;
+            framebuffer_info.attachmentCount = 1U;
+            for (std::size_t image = 0; image < 2U && result == VK_SUCCESS; ++image) {
+                framebuffer_info.pAttachments = image == 0U ? &targets.hdr.view : &targets.post.view;
+                result = vkCreateFramebuffer(device, &framebuffer_info, nullptr,
+                                             &targets.post_framebuffers[image]);
+            }
             if (result != VK_SUCCESS) { last_error = vk_error("scene framebuffer creation", result); return false; }
+            // Post-processing inputs: effects read one image of the pair and write the other.
+            for (std::size_t image = 0; image < 2U; ++image) {
+                const std::array<VkImageView, 4> inputs{image == 0U ? targets.hdr.sampled() : targets.post.sampled(),
+                                                        targets.depth_value.view,
+                                                        targets.normal_roughness.view,
+                                                        targets.motion_occlusion.view};
+                std::array<VkDescriptorImageInfo, 4> infos{};
+                std::array<VkWriteDescriptorSet, 5> writes{};
+                for (std::uint32_t binding = 0; binding < writes.size(); ++binding) {
+                    writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    writes[binding].dstSet = post_input_sets[frame][image];
+                    writes[binding].dstBinding = binding;
+                    writes[binding].descriptorCount = 1U;
+                    if (binding < 4U) {
+                        // The scene color is sampled smoothly and at any mip level; the others exactly.
+                        infos[binding] = {binding == 0U ? post_sampler : tone_sampler, inputs[binding],
+                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                        writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                        writes[binding].pImageInfo = &infos[binding];
+                    }
+                }
+                const VkDescriptorBufferInfo camera_info{post_camera_buffers[frame], 0U, sizeof(PostCamera)};
+                writes[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                writes[4].pBufferInfo = &camera_info;
+                if (post_input_sets[frame][image] != VK_NULL_HANDLE && post_camera_buffers[frame] != VK_NULL_HANDLE)
+                    vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0U, nullptr);
+            }
             VkDescriptorImageInfo image_info{tone_sampler, targets.hdr.view,
                                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkWriteDescriptorSet write{};
@@ -2486,10 +3580,12 @@ struct VulkanWindow::Impl {
         hdr_attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         hdr_attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         VkAttachmentDescription scene_depth = geometry_depth;
+        // Depth and stencil are kept: after post processing the pass runs again for the grid and
+        // selection outlines.
         scene_depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        scene_depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        scene_depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         scene_depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        scene_depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        scene_depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
         scene_depth.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         VkAttachmentReference hdr_reference{0U, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkAttachmentReference scene_depth_reference{1U, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
@@ -2533,6 +3629,45 @@ struct VulkanWindow::Impl {
         scene_info.pDependencies = scene_dependencies.data();
         result = vkCreateRenderPass(device, &scene_info, nullptr, &scene_render_pass);
         if (result != VK_SUCCESS) { last_error = vk_error("HDR render pass creation", result); return false; }
+
+        // Post processing: one full-screen effect writes a whole HDR image, which the next reads.
+        VkAttachmentDescription post_attachment = hdr_attachment;
+        post_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        post_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        post_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        post_attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkSubpassDescription post_subpass{};
+        post_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        post_subpass.colorAttachmentCount = 1U;
+        post_subpass.pColorAttachments = &hdr_reference;
+        std::array<VkSubpassDependency, 2> post_dependencies{};
+        // The image may last have been read by the previous effect or written by the scene.
+        post_dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        post_dependencies[0].dstSubpass = 0U;
+        post_dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        post_dependencies[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        post_dependencies[0].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        post_dependencies[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        post_dependencies[1].srcSubpass = 0U;
+        post_dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        post_dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        post_dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        post_dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        post_dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        VkRenderPassCreateInfo post_info{};
+        post_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        post_info.attachmentCount = 1U;
+        post_info.pAttachments = &post_attachment;
+        post_info.subpassCount = 1U;
+        post_info.pSubpasses = &post_subpass;
+        post_info.dependencyCount = static_cast<std::uint32_t>(post_dependencies.size());
+        post_info.pDependencies = post_dependencies.data();
+        result = vkCreateRenderPass(device, &post_info, nullptr, &post_render_pass);
+        if (result != VK_SUCCESS) { last_error = vk_error("post-processing render pass creation", result); return false; }
 
         VkAttachmentDescription color_attachment{};
         color_attachment.format = swapchain_format;
@@ -3052,14 +4187,27 @@ struct VulkanWindow::Impl {
         if (result == VK_SUCCESS)
             result = vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
                                             &composite_pipeline_layout);
+        const std::array sky_set_layouts{texture_layout, composite_layout};
+        pipeline_layout_info.setLayoutCount = static_cast<std::uint32_t>(sky_set_layouts.size());
+        pipeline_layout_info.pSetLayouts = sky_set_layouts.data();
+        if (result == VK_SUCCESS)
+            result = vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                            &sky_pipeline_layout);
         if (result != VK_SUCCESS) { last_error = vk_error("GI composite layout", result); return false; }
         const auto vertex_code = read_shader(RELAY_TONE_VERTEX_PATH, last_error);
         const auto fragment_code = read_shader(RELAY_GI_COMPOSITE_FRAGMENT_PATH, last_error);
-        if (vertex_code.empty() || fragment_code.empty()) return false;
+        const auto sky_code = read_shader(RELAY_SKY_FRAGMENT_PATH, last_error);
+        if (vertex_code.empty() || fragment_code.empty() || sky_code.empty()) return false;
         const auto fragment_interface_check = reflect_spirv(fragment_code);
         if (!fragment_interface_check.valid ||
             fragment_interface_check.push_constant_bytes != sizeof(CompositeConstants)) {
             last_error = "GI composite shader interface does not match its push constants";
+            return false;
+        }
+        const auto sky_interface_check = reflect_spirv(sky_code);
+        if (!sky_interface_check.valid ||
+            sky_interface_check.push_constant_bytes > sizeof(CompositeConstants)) {
+            last_error = "sky shader interface does not match its push constants";
             return false;
         }
         VkShaderModuleCreateInfo shader_info{};
@@ -3133,6 +4281,23 @@ struct VulkanWindow::Impl {
         if (result == VK_SUCCESS)
             result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1U, &pipeline_info, nullptr,
                                                &composite_pipeline);
+        // The sky pass: premultiplied, so the sky (alpha 1) replaces the background and fog
+        // (alpha = amount) covers surfaces. The target's alpha is kept.
+        VkShaderModule sky_module{};
+        shader_info.codeSize = sky_code.size() * sizeof(std::uint32_t);
+        shader_info.pCode = sky_code.data();
+        if (result == VK_SUCCESS) result = vkCreateShaderModule(device, &shader_info, nullptr, &sky_module);
+        auto sky_stages = stages;
+        sky_stages[1].module = sky_module;
+        VkPipelineColorBlendAttachmentState premultiplied = additive;
+        premultiplied.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend.pAttachments = &premultiplied;
+        pipeline_info.pStages = sky_stages.data();
+        pipeline_info.layout = sky_pipeline_layout;
+        if (result == VK_SUCCESS)
+            result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1U, &pipeline_info, nullptr,
+                                               &sky_pipeline);
+        vkDestroyShaderModule(device, sky_module, nullptr);
         vkDestroyShaderModule(device, fragment_module, nullptr);
         vkDestroyShaderModule(device, vertex_module, nullptr);
         if (result != VK_SUCCESS) { last_error = vk_error("GI composite pipeline", result); return false; }
@@ -3251,6 +4416,13 @@ struct VulkanWindow::Impl {
         composite_pipeline = VK_NULL_HANDLE;
         vkDestroyPipelineLayout(device, composite_pipeline_layout, nullptr);
         composite_pipeline_layout = VK_NULL_HANDLE;
+        vkDestroyPipeline(device, sky_pipeline, nullptr);
+        sky_pipeline = VK_NULL_HANDLE;
+        destroy_custom_pipelines();
+        vkDestroyRenderPass(device, post_render_pass, nullptr);
+        post_render_pass = VK_NULL_HANDLE;
+        vkDestroyPipelineLayout(device, sky_pipeline_layout, nullptr);
+        sky_pipeline_layout = VK_NULL_HANDLE;
         vkDestroyDescriptorPool(device, composite_pool, nullptr);
         composite_pool = VK_NULL_HANDLE;
         composite_sets.fill(VK_NULL_HANDLE);
@@ -3590,8 +4762,8 @@ struct VulkanWindow::Impl {
         frame.projection = render_scene.camera.projection.values;
         frame.previous_view = previous_view;
         frame.previous_projection = previous_projection;
-        frame.sky_color = sky_radiance;
-        frame.ground_color = ground_radiance;
+        frame.sky = &render_scene.sky;
+        frame.sky_key = sky_environment_key(render_scene.sky);
         frame.reset = reflections->extent().width != scene_extent.width ||
                       reflections->extent().height != scene_extent.height;
         if (!reflections->record_classification(frame, reflections_error)) return false;
@@ -3752,8 +4924,8 @@ struct VulkanWindow::Impl {
         frame.camera_position = {static_cast<float>(render_scene.camera_position.x),
                                  static_cast<float>(render_scene.camera_position.y),
                                  static_cast<float>(render_scene.camera_position.z)};
-        frame.sky_color = sky_radiance;
-        frame.ground_color = ground_radiance;
+        frame.sky = &render_scene.sky;
+        frame.sky_key = sky_environment_key(render_scene.sky);
         frame.index_buffer = mesh_index_buffer;
         frame.index_buffer_bytes = mesh_index_capacity;
         for (std::size_t index = 0; index < render_scene.instances.size(); ++index) {
@@ -3842,74 +5014,335 @@ struct VulkanWindow::Impl {
         profiler().record_gpu(gpu_profile_frames[current_frame], passes, latest_gpu_milliseconds);
     }
 
-    bool record_commands(const VkCommandBuffer commands, const std::uint32_t image_index,
-                         const float elapsed_seconds, const Scene* scene,
-                         const VkBuffer capture_buffer) {
-        static const auto shadow_pass = profiler().intern("Shadow maps");
-        static const auto point_shadow_pass = profiler().intern("Point light shadows");
-        static const auto geometry_pass = profiler().intern("Geometry (G-buffer)");
-        static const auto global_illumination_pass = profiler().intern("Global illumination");
-        static const auto reflections_pass = profiler().intern("Ray traced reflections");
-        static const auto forward_pass = profiler().intern("Composite, transparency and overlays");
-        static const auto display_pass = profiler().intern("Tone mapping and editor UI");
-        static const auto capture_pass = profiler().intern("Capture copy");
-        static const auto build_stage = profiler().intern("Build render scene");
-        static const auto upload_stage = profiler().intern("Upload frame data");
-        static const auto record_stage = profiler().intern("Record draw commands");
-        const auto region = (overlay ? overlay->scene_viewport() : EditorViewport{}).pixels(
-            swapchain_extent.width, swapchain_extent.height);
-        if (!ensure_scene_targets({region.width, region.height})) return false;
-        const bool lighting_wanted = scene != nullptr && prepare_global_illumination();
-        const bool reflections_wanted = scene != nullptr && prepare_reflections();
-        // Both effects start once the other frame's targets can serve as history.
-        const bool history_ready = previous_frame_valid &&
-                                   scene_targets_rendered[(current_frame + 1U) % frames_in_flight];
-        global_illumination_active = lighting_wanted && history_ready;
-        reflections_active = reflections_wanted && history_ready;
-        RenderScene render_scene;
-        std::optional<ProfileScope> cpu_stage;
-        cpu_stage.emplace(build_stage);
-        if (scene)
-            render_scene =
-                build_render_scene(*scene, *assets,
-                                   static_cast<float>(region.width) / static_cast<float>(region.height),
-                                   overlay != nullptr ? overlay->view_override() : nullptr, false,
-                                   lighting_wanted || reflections_wanted,
-                                   capture_buffer == VK_NULL_HANDLE ? render_interpolation : nullptr);
-        if (render_scene.deformation_overflow) {
-            last_error = "scene exceeds four million deformed vertices per frame";
+    void destroy_preview_resources() {
+        for (auto& frame : preview_frames) {
+            vkDestroyFramebuffer(device, frame.geometry_framebuffer, nullptr);
+            vkDestroyFramebuffer(device, frame.forward_framebuffer, nullptr);
+            for (auto* image : {&frame.color[0], &frame.color[1], &frame.color[2], &frame.color[3],
+                                &frame.color[4], &frame.color[5], &frame.depth_stencil}) {
+                vkDestroyImageView(device, image->view, nullptr);
+                vkDestroyImage(device, image->image, nullptr);
+                vkFreeMemory(device, image->memory, nullptr);
+            }
+            for (const auto& [buffer, memory] : {std::pair{frame.lighting, frame.lighting_memory},
+                                                 std::pair{frame.draw, frame.draw_memory},
+                                                 std::pair{frame.readback, frame.readback_memory}}) {
+                vkDestroyBuffer(device, buffer, nullptr);
+                vkFreeMemory(device, memory, nullptr);
+            }
+            frame = {};
+        }
+        vkDestroyDescriptorPool(device, preview_pool, nullptr);
+        preview_pool = VK_NULL_HANDLE;
+        preview_resources_ready = false;
+    }
+
+    // Targets, buffers and sets for material previews, and the scene they show: the sphere, a
+    // camera looking at it, and a Sky node with Relay's default colors and sun. Made on first use.
+    bool ensure_preview_resources() {
+        if (preview_resources_ready || preview_resources_failed) return preview_resources_ready;
+        preview_resources_failed = true;
+        const VkExtent2D extent{material_preview_size, material_preview_size};
+        const std::array<VkFormat, geometry_color_attachments> formats{
+            hdr_format, normal_roughness_format, albedo_metallic_format, motion_occlusion_format,
+            scene_depth_value_format, diffuse_light_format};
+        const std::array pool_sizes{
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                 (bindless_texture_capacity + shadow_map_count + 2U) * frames_in_flight},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3U * frames_in_flight}};
+        VkDescriptorPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.maxSets = frames_in_flight;
+        pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
+        pool_info.pPoolSizes = pool_sizes.data();
+        auto result = vkCreateDescriptorPool(device, &pool_info, nullptr, &preview_pool);
+        std::array<VkDescriptorSetLayout, frames_in_flight> layouts{};
+        layouts.fill(texture_layout);
+        std::array<VkDescriptorSet, frames_in_flight> sets{};
+        VkDescriptorSetAllocateInfo allocation{};
+        allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocation.descriptorPool = preview_pool;
+        allocation.descriptorSetCount = frames_in_flight;
+        allocation.pSetLayouts = layouts.data();
+        if (result == VK_SUCCESS) result = vkAllocateDescriptorSets(device, &allocation, sets.data());
+        if (result != VK_SUCCESS) {
+            last_error = vk_error("material preview sets", result);
             return false;
         }
-        cpu_stage.reset();
-        cpu_stage.emplace(upload_stage);
-        // This frame's fence has completed. Host writes never race another frame's reads.
-        const VkDeviceSize bytes = render_scene.deformed_vertices.size() * sizeof(MeshVertex);
-        if (bytes > deformed_capacities[current_frame]) {
-            vkDestroyBuffer(device, deformed_buffers[current_frame], nullptr);
-            vkFreeMemory(device, deformed_memories[current_frame], nullptr);
-            deformed_buffers[current_frame] = VK_NULL_HANDLE;
-            deformed_memories[current_frame] = VK_NULL_HANDLE;
-            if (!create_buffer(bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | geometry_buffer_usage(),
-                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                               deformed_buffers[current_frame], deformed_memories[current_frame]))
+        constexpr VkImageUsageFlags color_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        constexpr auto host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (std::size_t index = 0; index < frames_in_flight; ++index) {
+            auto& frame = preview_frames[index];
+            frame.set = sets[index];
+            for (std::size_t attachment = 0; attachment < formats.size(); ++attachment)
+                if (!create_scene_image(formats[attachment], color_usage, VK_IMAGE_ASPECT_COLOR_BIT,
+                                        frame.color[attachment], extent))
+                    return false;
+            if (!create_scene_image(depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, frame.depth_stencil,
+                                    extent) ||
+                !create_buffer(sizeof(GpuLighting), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, frame.lighting,
+                               frame.lighting_memory) ||
+                !create_buffer(sizeof(GpuDraw), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, frame.draw,
+                               frame.draw_memory) ||
+                !create_buffer(static_cast<VkDeviceSize>(material_preview_size) * material_preview_size * 8U,
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT, host, frame.readback, frame.readback_memory))
                 return false;
-            deformed_capacities[current_frame] = bytes;
-        }
-        const auto write_memory = [&](VkDeviceMemory memory, const void *data, VkDeviceSize size) {
-            void *mapped = nullptr;
-            const auto result = vkMapMemory(device, memory, 0, size, 0, &mapped);
+            std::array<VkImageView, geometry_color_attachments + 1U> views{};
+            for (std::size_t attachment = 0; attachment < formats.size(); ++attachment)
+                views[attachment] = frame.color[attachment].view;
+            views.back() = frame.depth_stencil.view;
+            VkFramebufferCreateInfo framebuffer_info{};
+            framebuffer_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebuffer_info.renderPass = geometry_render_pass;
+            framebuffer_info.attachmentCount = static_cast<std::uint32_t>(views.size());
+            framebuffer_info.pAttachments = views.data();
+            framebuffer_info.width = extent.width;
+            framebuffer_info.height = extent.height;
+            framebuffer_info.layers = 1U;
+            result = vkCreateFramebuffer(device, &framebuffer_info, nullptr, &frame.geometry_framebuffer);
+            const std::array forward_views{frame.color[0].view, frame.depth_stencil.view};
+            framebuffer_info.renderPass = scene_render_pass;
+            framebuffer_info.attachmentCount = static_cast<std::uint32_t>(forward_views.size());
+            framebuffer_info.pAttachments = forward_views.data();
+            if (result == VK_SUCCESS)
+                result = vkCreateFramebuffer(device, &framebuffer_info, nullptr, &frame.forward_framebuffer);
             if (result != VK_SUCCESS) {
-                last_error = vk_error("animation/light frame upload", result);
+                last_error = vk_error("material preview framebuffers", result);
                 return false;
             }
-            std::memcpy(mapped, data, static_cast<std::size_t>(size));
-            vkUnmapMemory(device, memory);
-            return true;
+        }
+        preview_scene = std::make_unique<Scene>();
+        auto& scene = *preview_scene;
+        const auto camera = scene.create("Camera");
+        (void)scene.set_transform(camera, {{0.0, 0.0, 1.65}, {}, {1.0, 1.0, 1.0}});
+        Camera lens;
+        lens.field_of_view_y_degrees = 36.0;
+        lens.near_plane = 0.1;
+        lens.far_plane = 20.0;
+        lens.active = true;
+        (void)scene.set_camera(camera, lens);
+        const auto sky = scene.create("Sky");
+        Sky settings;
+        settings.fog = false;
+        (void)scene.set_sky(sky, settings);
+        // The sun from above, left and in front, as in a studio shot.
+        (void)scene.set_transform(sky, {{}, {-40.0, -35.0, 0.0}, {1.0, 1.0, 1.0}});
+        Light sun;
+        sun.type = Light::Type::directional;
+        sun.color = default_sun_color;
+        sun.intensity = default_sun_intensity;
+        (void)scene.set_light(sky, sun);
+        preview_sphere = scene.create("Sphere");
+        preview_resources_ready = true;
+        preview_resources_failed = false;
+        return true;
+    }
+
+    // Hands the overlay a finished preview once its frame's fence has completed, then chooses
+    // what this frame previews: the overlay's material when it changed since the last preview.
+    void prepare_material_preview() {
+        preview_material.reset();
+        auto& frame = preview_frames[current_frame];
+        if (!frame.pending.empty()) {
+            auto path = std::exchange(frame.pending, {});
+            void* mapped = nullptr;
+            const auto size = static_cast<std::size_t>(material_preview_size) * material_preview_size;
+            if ((overlay || direct_preview_receiver) &&
+                vkMapMemory(device, frame.readback_memory, 0U, size * 8U, 0U, &mapped) == VK_SUCCESS) {
+                auto pixels = preview_pixels(static_cast<const std::uint16_t*>(mapped));
+                vkUnmapMemory(device, frame.readback_memory);
+                if (direct_preview_receiver)
+                    direct_preview_receiver(path, OwnedFrame{material_preview_size, material_preview_size, std::move(pixels)});
+                else
+                    overlay->material_preview_ready(path, material_preview_size, material_preview_size, std::move(pixels));
+            }
+        }
+        const auto wanted = direct_preview_receiver ? direct_preview
+                            : overlay               ? overlay->material_preview_request()
+                                                    : std::string{};
+        if (wanted.empty() || !shader_resources_ready) return;
+        auto material = assets->shader_material(wanted);
+        if (!material || (wanted == preview_path && material->revision == preview_revision)) return;
+        if (!ensure_preview_resources()) {
+            shader_error = last_error;
+            return;
+        }
+        (void)preview_scene->set_mesh_renderer(preview_sphere, MeshRenderer{"builtin.sphere", wanted});
+        preview_render = build_render_scene(*preview_scene, *assets, 1.0F);
+        if (preview_render.instances.size() != 1U) return;
+        preview_material = std::move(material);
+    }
+
+    // The preview's HDR pixels, tone mapped like the viewport and laid over a checkerboard so
+    // transparent materials show what is behind them.
+    static std::vector<std::uint8_t> preview_pixels(const std::uint16_t* half) {
+        const auto to_float = [](const std::uint16_t value) {
+            const std::uint32_t sign = (value & 0x8000U) << 16U, exponent = (value >> 10U) & 0x1FU,
+                                mantissa = value & 0x3FFU;
+            if (exponent == 0U) return (sign ? -1.0F : 1.0F) * std::ldexp(static_cast<float>(mantissa), -24);
+            if (exponent == 31U) return sign ? -65504.0F : 65504.0F;
+            return std::bit_cast<float>(sign | ((exponent + 112U) << 23U) | (mantissa << 13U));
         };
-        if (bytes && !write_memory(deformed_memories[current_frame],
-                                   render_scene.deformed_vertices.data(), bytes))
-            return false;
+        const auto encode = [](const float value) {
+            const float clamped = std::clamp(value, 0.0F, 1.0F);
+            const float srgb = clamped <= 0.0031308F ? clamped * 12.92F
+                                                     : 1.055F * std::pow(clamped, 1.0F / 2.4F) - 0.055F;
+            return static_cast<std::uint8_t>(std::lround(srgb * 255.0F));
+        };
+        std::vector<std::uint8_t> rgba(static_cast<std::size_t>(material_preview_size) * material_preview_size * 4U);
+        for (std::uint32_t y = 0; y < material_preview_size; ++y)
+            for (std::uint32_t x = 0; x < material_preview_size; ++x) {
+                const auto pixel = static_cast<std::size_t>(y) * material_preview_size + x;
+                const float alpha = std::clamp(to_float(half[pixel * 4U + 3U]), 0.0F, 1.0F);
+                const float background = ((x / 16U) + (y / 16U)) % 2U == 0U ? 0.03F : 0.1F;
+                for (std::size_t channel = 0; channel < 3U; ++channel) {
+                    const float value = std::max(to_float(half[pixel * 4U + channel]), 0.0F);
+                    const float mapped = std::clamp((value * (2.51F * value + 0.03F)) /
+                                                        (value * (2.43F * value + 0.59F) + 0.14F),
+                                                    0.0F, 1.0F);
+                    rgba[pixel * 4U + channel] = encode(mapped + background * (1.0F - alpha));
+                }
+                rgba[pixel * 4U + 3U] = 255U;
+            }
+        return rgba;
+    }
+
+    // Draws this frame's preview, if any, before the scene's own passes.
+    bool record_material_preview(const VkCommandBuffer commands) {
+        if (!preview_material) return true;
+        auto& frame = preview_frames[current_frame];
+        const auto& draw_instance = preview_render.instances.front();
+        const auto* mesh = assets->find_mesh(draw_instance.mesh);
+        const auto material_set = custom_materials.find(preview_material->path);
+        const auto shader = preview_material->drawable() ? custom_shaders.find(preview_material->shader->revision)
+                                                         : custom_shaders.end();
+        const bool drawable = shader != custom_shaders.end() && material_set != custom_materials.end() &&
+                              material_set->second.key == custom_material_key(*preview_material) &&
+                              shader->second.surface != VK_NULL_HANDLE;
+        const auto error = error_shader ? custom_shaders.find(error_shader->revision) : custom_shaders.end();
+        if (!mesh || (!drawable && (error == custom_shaders.end() || error->second.surface == VK_NULL_HANDLE)))
+            return true;
+        const VkPipeline preview_pipeline = drawable ? shader->second.surface : error->second.surface;
+        const VkDescriptorSet set = drawable ? material_set->second.sets[current_frame] : error_material.sets[current_frame];
+        const std::uint32_t offset = drawable ? preview_parameter_offset : 0U;
+        const bool transparent = drawable && preview_material->shader->parsed.transparent;
+
+        // Its own lighting (no shadows, no ambient from other passes) and draw data; everything
+        // else in set 0 comes from the frame's scene set.
+        auto lighting = gpu_lighting(preview_render, 1.0F, 0U);
+        lighting.shadow_parameters = {};
+        lighting.point_shadow_parameters = {};
+        GpuDraw draw{};
+        draw.previous_model_view_projection = draw_instance.model_view_projection.values;
+        for (const auto& [memory, data, bytes] :
+             {std::tuple{frame.lighting_memory, static_cast<const void*>(&lighting), sizeof(lighting)},
+              std::tuple{frame.draw_memory, static_cast<const void*>(&draw), sizeof(draw)}}) {
+            void* mapped = nullptr;
+            if (vkMapMemory(device, memory, 0U, bytes, 0U, &mapped) != VK_SUCCESS) return false;
+            std::memcpy(mapped, data, bytes);
+            vkUnmapMemory(device, memory);
+        }
+        std::array<VkCopyDescriptorSet, 5> copies{};
+        const std::array<std::pair<std::uint32_t, std::uint32_t>, 5> copied{
+            {{0U, bindless_texture_capacity}, {1U, 1U}, {3U, shadow_map_count}, {4U, 1U}, {6U, 1U}}};
+        std::size_t copy_count = 0;
+        for (const auto& [binding, count] : copied) {
+            if (binding == 3U && shadow_sampler == VK_NULL_HANDLE) continue;
+            if (binding == 4U && point_shadow_sampler == VK_NULL_HANDLE) continue;
+            auto& copy = copies[copy_count++];
+            copy.sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
+            copy.srcSet = texture_sets[current_frame];
+            copy.srcBinding = binding;
+            copy.dstSet = frame.set;
+            copy.dstBinding = binding;
+            copy.descriptorCount = count;
+        }
+        const VkDescriptorBufferInfo lighting_info{frame.lighting, 0U, sizeof(GpuLighting)};
+        const VkDescriptorBufferInfo draw_info{frame.draw, 0U, sizeof(GpuDraw)};
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        for (std::size_t index = 0; index < writes.size(); ++index) {
+            writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[index].dstSet = frame.set;
+            writes[index].dstBinding = index == 0U ? 2U : 5U;
+            writes[index].descriptorCount = 1U;
+            writes[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[index].pBufferInfo = index == 0U ? &lighting_info : &draw_info;
+        }
+        vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(),
+                               static_cast<std::uint32_t>(copy_count), copies.data());
+
+        const VkViewport viewport{0.0F, 0.0F, static_cast<float>(material_preview_size),
+                                  static_cast<float>(material_preview_size), 0.0F, 1.0F};
+        const VkRect2D scissor{{0, 0}, {material_preview_size, material_preview_size}};
+        const auto draw_sphere = [&] {
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, preview_pipeline);
+            vkCmdSetViewport(commands, 0U, 1U, &viewport);
+            vkCmdSetScissor(commands, 0U, 1U, &scissor);
+            const std::array bound{frame.set, set};
+            vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, custom_pipeline_layout, 0U,
+                                    static_cast<std::uint32_t>(bound.size()), bound.data(), 1U, &offset);
+            const VkDeviceSize vertex_offset = 0U;
+            vkCmdBindVertexBuffers(commands, 0U, 1U, &mesh_vertex_buffer, &vertex_offset);
+            vkCmdBindIndexBuffer(commands, mesh_index_buffer, 0U, VK_INDEX_TYPE_UINT32);
+            const DrawPushConstants constants{draw_instance.model_view_projection.values, draw_instance.model.values};
+            vkCmdPushConstants(commands, custom_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0U, sizeof(constants), &constants);
+            vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index, mesh->vertex_offset, 0U);
+        };
+        std::array<VkClearValue, geometry_color_attachments + 1U> clears{};
+        clears.back().depthStencil = {1.0F, 0U};
+        VkRenderPassBeginInfo pass{};
+        pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        pass.renderPass = geometry_render_pass;
+        pass.framebuffer = frame.geometry_framebuffer;
+        pass.renderArea.extent = {material_preview_size, material_preview_size};
+        pass.clearValueCount = static_cast<std::uint32_t>(clears.size());
+        pass.pClearValues = clears.data();
+        vkCmdBeginRenderPass(commands, &pass, VK_SUBPASS_CONTENTS_INLINE);
+        if (!transparent) draw_sphere();
+        vkCmdEndRenderPass(commands);
+        pass.renderPass = scene_render_pass;
+        pass.framebuffer = frame.forward_framebuffer;
+        pass.clearValueCount = 0U;
+        vkCmdBeginRenderPass(commands, &pass, VK_SUBPASS_CONTENTS_INLINE);
+        if (transparent) draw_sphere();
+        vkCmdEndRenderPass(commands);
+        VkImageMemoryBarrier to_copy{};
+        to_copy.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_copy.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        to_copy.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        to_copy.srcQueueFamilyIndex = to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_copy.image = frame.color[0].image;
+        to_copy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+        vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0U, 0U, nullptr, 0U, nullptr, 1U, &to_copy);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+        region.imageExtent = {material_preview_size, material_preview_size, 1U};
+        vkCmdCopyImageToBuffer(commands, frame.color[0].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, frame.readback,
+                               1U, &region);
+        VkBufferMemoryBarrier to_host{};
+        to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        to_host.srcQueueFamilyIndex = to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_host.buffer = frame.readback;
+        to_host.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0U, 0U, nullptr,
+                             1U, &to_host, 0U, nullptr);
+        frame.pending = preview_material->path;
+        preview_path = preview_material->path;
+        preview_revision = preview_material->revision;
+        return true;
+    }
+
+    // The lighting buffer for a render scene. `indirect` says which ambient terms other passes
+    // provide instead: 1 for global illumination, 2 for reflections.
+    GpuLighting gpu_lighting(const RenderScene& render_scene, const float frame_time, const std::uint32_t indirect) const {
         GpuLighting lighting;
         lighting.camera_count = {
             static_cast<float>(render_scene.camera_position.x),
@@ -3947,8 +5380,7 @@ struct VulkanWindow::Impl {
         lighting.camera_forward = {static_cast<float>(render_scene.camera_forward.x),
                                    static_cast<float>(render_scene.camera_forward.y),
                                    static_cast<float>(render_scene.camera_forward.z),
-                                   static_cast<float>((global_illumination_active ? 1U : 0U) |
-                                                      (reflections_active ? 2U : 0U))};
+                                   static_cast<float>(indirect)};
         lighting.point_shadow_position_far = {
             static_cast<float>(render_scene.point_shadow.position.x),
             static_cast<float>(render_scene.point_shadow.position.y),
@@ -3965,6 +5397,115 @@ struct VulkanWindow::Impl {
             static_cast<std::uint32_t>(render_scene.point_shadow.light_index);
         lighting.point_shadow_parameters[2] =
             std::bit_cast<std::uint32_t>(render_scene.point_shadow.near_plane);
+        const auto& sky = render_scene.sky;
+        const bool panorama = sky.visible && sky.panorama &&
+                              sky_panorama_texture.view != VK_NULL_HANDLE;
+        const auto with = [](const std::array<float, 3>& color, const float w) {
+            return std::array<float, 4>{color[0], color[1], color[2], w};
+        };
+        lighting.sky_horizon = with(sky.horizon, sky.panorama_rotation_degrees / 360.0F);
+        lighting.sky_zenith = with(sky.zenith, !sky.visible ? 0.0F : panorama ? 2.0F : 1.0F);
+        lighting.sky_tint = with(sky.panorama_tint, sky.ambient_scale);
+        lighting.ambient_up = with(sky.ambient_up, 0.0F);
+        lighting.ambient_down = with(sky.ambient_down, 0.0F);
+        lighting.fog_start_color = with(sky.fog_start_color, sky.fog_start);
+        lighting.fog_end_color = with(sky.fog_end_color, sky.fog_end);
+        lighting.fog_parameters = {sky.visible && sky.fog ? 1.0F : 0.0F, 0.0F, 0.0F, 0.0F};
+        lighting.sun_direction = {static_cast<float>(sky.sun_direction.x),
+                                  static_cast<float>(sky.sun_direction.y),
+                                  static_cast<float>(sky.sun_direction.z), sky.sun ? 1.0F : 0.0F};
+        lighting.sun_radiance = with(sky.sun_radiance, 0.0F);
+        lighting.frame_time = {frame_time, 0.0F, 0.0F, 0.0F};
+        return lighting;
+    }
+
+    bool record_commands(const VkCommandBuffer commands, const std::uint32_t image_index,
+                         const float elapsed_seconds, const Scene* scene,
+                         const VkBuffer capture_buffer) {
+        static const auto shadow_pass = profiler().intern("Shadow maps");
+        static const auto point_shadow_pass = profiler().intern("Point light shadows");
+        static const auto geometry_pass = profiler().intern("Geometry (G-buffer)");
+        static const auto global_illumination_pass = profiler().intern("Global illumination");
+        static const auto reflections_pass = profiler().intern("Ray traced reflections");
+        static const auto forward_pass = profiler().intern("Composite, transparency and overlays");
+        static const auto display_pass = profiler().intern("Tone mapping and editor UI");
+        static const auto post_pass = profiler().intern("Post processing");
+        static const auto capture_pass = profiler().intern("Capture copy");
+        static const auto material_preview_pass = profiler().intern("Material preview");
+        static const auto build_stage = profiler().intern("Build render scene");
+        static const auto upload_stage = profiler().intern("Upload frame data");
+        static const auto record_stage = profiler().intern("Record draw commands");
+        const auto region = (overlay ? overlay->scene_viewport() : EditorViewport{}).pixels(
+            swapchain_extent.width, swapchain_extent.height);
+        {
+            // Without these, shader materials draw as ordinary grey surfaces and effects are off.
+            const auto saved_error = last_error;
+            if (!ensure_shader_resources()) {
+                if (shader_error.empty()) shader_error = last_error;
+                last_error = saved_error;
+            }
+        }
+        if (!ensure_scene_targets({region.width, region.height})) return false;
+        const bool lighting_wanted = scene != nullptr && prepare_global_illumination();
+        const bool reflections_wanted = scene != nullptr && prepare_reflections();
+        // Both effects start once the other frame's targets can serve as history.
+        const bool history_ready = previous_frame_valid &&
+                                   scene_targets_rendered[(current_frame + 1U) % frames_in_flight];
+        global_illumination_active = lighting_wanted && history_ready;
+        reflections_active = reflections_wanted && history_ready;
+        RenderScene render_scene;
+        std::optional<ProfileScope> cpu_stage;
+        cpu_stage.emplace(build_stage);
+        if (scene)
+            render_scene =
+                build_render_scene(*scene, *assets,
+                                   static_cast<float>(region.width) / static_cast<float>(region.height),
+                                   overlay != nullptr ? overlay->view_override() : nullptr, false,
+                                   lighting_wanted || reflections_wanted,
+                                   capture_buffer == VK_NULL_HANDLE ? render_interpolation : nullptr);
+        if (render_scene.deformation_overflow) {
+            last_error = "scene exceeds four million deformed vertices per frame";
+            return false;
+        }
+        cpu_stage.reset();
+        cpu_stage.emplace(upload_stage);
+        sync_sky_panorama(render_scene.sky);
+        prepare_material_preview();
+        if (scene || preview_material) sync_shader_materials(render_scene);
+        if (!write_frame_parameters(render_scene)) return false;
+        // Animated shaders follow the host's clock in live views and the frame's time in captures.
+        const float frame_time = static_cast<float>(
+            capture_buffer == VK_NULL_HANDLE ? shader_time.value_or(elapsed_seconds) : elapsed_seconds);
+        // This frame's fence has completed. Host writes never race another frame's reads.
+        const VkDeviceSize bytes = render_scene.deformed_vertices.size() * sizeof(MeshVertex);
+        if (bytes > deformed_capacities[current_frame]) {
+            vkDestroyBuffer(device, deformed_buffers[current_frame], nullptr);
+            vkFreeMemory(device, deformed_memories[current_frame], nullptr);
+            deformed_buffers[current_frame] = VK_NULL_HANDLE;
+            deformed_memories[current_frame] = VK_NULL_HANDLE;
+            if (!create_buffer(bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | geometry_buffer_usage(),
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                               deformed_buffers[current_frame], deformed_memories[current_frame]))
+                return false;
+            deformed_capacities[current_frame] = bytes;
+        }
+        const auto write_memory = [&](VkDeviceMemory memory, const void *data, VkDeviceSize size) {
+            void *mapped = nullptr;
+            const auto result = vkMapMemory(device, memory, 0, size, 0, &mapped);
+            if (result != VK_SUCCESS) {
+                last_error = vk_error("animation/light frame upload", result);
+                return false;
+            }
+            std::memcpy(mapped, data, static_cast<std::size_t>(size));
+            vkUnmapMemory(device, memory);
+            return true;
+        };
+        if (bytes && !write_memory(deformed_memories[current_frame],
+                                   render_scene.deformed_vertices.data(), bytes))
+            return false;
+        const auto lighting = gpu_lighting(render_scene, frame_time,
+                                           (global_illumination_active ? 1U : 0U) | (reflections_active ? 2U : 0U));
         if (!write_memory(lighting_memories[current_frame], &lighting, sizeof(lighting)))
             return false;
 
@@ -3984,6 +5525,8 @@ struct VulkanWindow::Impl {
             instance_keys[index] = key;
         }
         const auto& view_projection = render_scene.camera.view_projection.values;
+        // One frame ago, for post shaders; the first frame moved nowhere.
+        const auto motion_previous_view_projection = previous_frame_valid ? previous_view_projection : view_projection;
         for (std::size_t index = 0; index < render_scene.instances.size(); ++index) {
             const auto& draw_instance = render_scene.instances[index];
             if (!draw_instance.camera_visible) continue;
@@ -4053,7 +5596,40 @@ struct VulkanWindow::Impl {
             vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamp_queries, first_query);
             gpu_marker_counts[current_frame] = 1U;
         }
+
         latest_draw_calls = 0U;
+        // Shadow draws with shader materials use their shader's shadow pipeline, so moved vertices
+        // and cut-out alpha cast matching shadows. The built-in shadow layout pushes to the vertex
+        // stage only, so switching back rebinds the scene set with it.
+        VkPipeline shadow_bound = VK_NULL_HANDLE;
+        std::optional<CustomBinding> shadow_material;
+        const auto push_shadow_draw = [&](const RenderInstance& draw_instance,
+                                          const DrawPushConstants& constants) {
+            const auto custom = custom_binding(
+                draw_instance, static_cast<std::size_t>(&draw_instance - render_scene.instances.data()), true);
+            const VkPipeline wanted = custom ? custom->pipeline : shadow_pipeline;
+            if (wanted != shadow_bound) {
+                vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, wanted);
+                const std::array sets{texture_sets[current_frame], custom ? custom->set : VK_NULL_HANDLE};
+                vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        custom ? custom_pipeline_layout : shadow_pipeline_layout, 0U,
+                                        custom ? 2U : 1U, sets.data(), custom ? 1U : 0U,
+                                        custom ? &custom->offset : nullptr);
+                shadow_bound = wanted;
+                shadow_material = custom;
+            } else if (custom && custom != shadow_material) {
+                vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, custom_pipeline_layout,
+                                        1U, 1U, &custom->set, 1U, &custom->offset);
+                shadow_material = custom;
+            }
+            if (custom)
+                vkCmdPushConstants(commands, custom_pipeline_layout,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0U,
+                                   sizeof(constants), &constants);
+            else
+                vkCmdPushConstants(commands, shadow_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0U,
+                                   sizeof(constants), &constants);
+        };
         VkClearValue shadow_clear{};
         shadow_clear.depthStencil = {1.0F, 0U};
         for (std::size_t map = 0; map < shadow_map_count; ++map) {
@@ -4077,6 +5653,8 @@ struct VulkanWindow::Impl {
             vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     shadow_pipeline_layout, 0U, 1U,
                                     &texture_sets[current_frame], 0U, nullptr);
+            shadow_bound = shadow_pipeline;
+            shadow_material.reset();
             vkCmdSetViewport(commands, 0U, 1U, &shadow_viewport);
             vkCmdSetScissor(commands, 0U, 1U, &shadow_scissor);
             const bool map_enabled = map < directional_shadow_cascade_count
@@ -4105,8 +5683,7 @@ struct VulkanWindow::Impl {
                 constants.model_view_projection = multiply_matrices(
                     shadow_view_projection.values, draw_instance.model.values);
                 constants.model = draw_instance.model.values;
-                vkCmdPushConstants(commands, shadow_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-                                   0U, sizeof(constants), &constants);
+                push_shadow_draw(draw_instance, constants);
                 vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
                                  draw_instance.deformed_vertex_offset >= 0
                                      ? draw_instance.deformed_vertex_offset : mesh->vertex_offset,
@@ -4129,6 +5706,8 @@ struct VulkanWindow::Impl {
             vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     shadow_pipeline_layout, 0U, 1U,
                                     &texture_sets[current_frame], 0U, nullptr);
+            shadow_bound = shadow_pipeline;
+            shadow_material.reset();
             VkViewport viewport{0.0F, 0.0F, static_cast<float>(point_shadow_resolution),
                                 static_cast<float>(point_shadow_resolution), 0.0F, 1.0F};
             VkRect2D scissor{{0, 0}, {point_shadow_resolution, point_shadow_resolution}};
@@ -4152,9 +5731,7 @@ struct VulkanWindow::Impl {
                         render_scene.point_shadow.view_projections[face].values,
                         draw_instance.model.values);
                     constants.model = draw_instance.model.values;
-                    vkCmdPushConstants(commands, shadow_pipeline_layout,
-                                       VK_SHADER_STAGE_VERTEX_BIT, 0U, sizeof(constants),
-                                       &constants);
+                    push_shadow_draw(draw_instance, constants);
                     vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
                                      draw_instance.deformed_vertex_offset >= 0
                                          ? draw_instance.deformed_vertex_offset
@@ -4166,6 +5743,12 @@ struct VulkanWindow::Impl {
             vkCmdEndRenderPass(commands);
         }
         mark_gpu_pass(commands, point_shadow_pass);
+        // After the shadow passes, which leave the shadow maps the preview's set also holds in the
+        // layout it expects.
+        if (preview_material) {
+            if (!record_material_preview(commands)) return false;
+            mark_gpu_pass(commands, material_preview_pass);
+        }
         std::array<VkClearValue, geometry_color_attachments + 1U> clear{};
         clear[0].color = overlay ? VkClearColorValue{{0.014444F, 0.014444F, 0.014444F, 1.0F}}
                                  : VkClearColorValue{{0.012F, 0.018F, 0.045F, 1.0F}};
@@ -4198,19 +5781,37 @@ struct VulkanWindow::Impl {
             vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0U,
                                     1U, &texture_sets[current_frame], 0U, nullptr);
         };
+        // Instances with shader materials switch to their shader's pipeline and material set; the
+        // scene's set 0 stays bound, since both pipeline layouts share it and the push constants.
         const auto draw_instances = [&](const bool alpha_blended) {
+            const VkPipeline scene_pipeline = alpha_blended ? transparent_pipeline : pipeline;
+            VkPipeline bound = scene_pipeline;
+            std::optional<CustomBinding> bound_material;
             for (std::size_t index = 0; index < render_scene.instances.size(); ++index) {
                 const auto& draw_instance = render_scene.instances[index];
                 if (!draw_instance.camera_visible || draw_instance.alpha_blended != alpha_blended)
                     continue;
                 const auto* mesh = assets->find_mesh(draw_instance.mesh);
                 if (mesh == nullptr || draw_slots[index] == no_draw_slot) continue;
+                const auto custom = custom_binding(draw_instance, index, false);
+                const VkPipeline wanted = custom ? custom->pipeline : scene_pipeline;
+                if (wanted != bound) {
+                    vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, wanted);
+                    bound = wanted;
+                }
+                if (custom && (!bound_material || custom->set != bound_material->set ||
+                               custom->offset != bound_material->offset)) {
+                    vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            custom_pipeline_layout, 1U, 1U, &custom->set, 1U,
+                                            &custom->offset);
+                    bound_material = custom;
+                }
                 const auto buffer = draw_instance.deformed_vertex_offset >= 0
                                         ? deformed_buffers[current_frame] : mesh_vertex_buffer;
                 vkCmdBindVertexBuffers(commands, 0, 1, &buffer, &vertex_offset);
                 const DrawPushConstants constants{draw_instance.model_view_projection.values,
                                                   draw_instance.model.values};
-                vkCmdPushConstants(commands, pipeline_layout,
+                vkCmdPushConstants(commands, custom ? custom_pipeline_layout : pipeline_layout,
                                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                    sizeof(constants), &constants);
                 vkCmdDrawIndexed(commands, mesh->index_count, 1U, mesh->first_index,
@@ -4271,31 +5872,159 @@ struct VulkanWindow::Impl {
         scene_pass_info.clearValueCount = 0U;
         scene_pass_info.pClearValues = nullptr;
         vkCmdBeginRenderPass(commands, &scene_pass_info, VK_SUBPASS_CONTENTS_INLINE);
-        if (global_illumination_active || reflections_active) {
-            update_composite_descriptors();
+        CompositeConstants fullscreen{};
+        fullscreen.inverse_view_projection = invert_matrix(view_projection);
+        fullscreen.camera_position = {static_cast<float>(render_scene.camera_position.x),
+                                      static_cast<float>(render_scene.camera_position.y),
+                                      static_cast<float>(render_scene.camera_position.z), 1.0F};
+        fullscreen.extent = {static_cast<float>(scene_extent.width),
+                            static_cast<float>(scene_extent.height),
+                            static_cast<float>((global_illumination_active ? 1U : 0U) |
+                                               (reflections_active ? 2U : 0U)),
+                            reflection_roughness_limit};
+        fullscreen.ambient_up = lighting.ambient_up;
+        fullscreen.ambient_down = lighting.ambient_down;
+        const bool composite_wanted = global_illumination_active || reflections_active;
+        const bool sky_wanted = scene != nullptr && render_scene.sky.visible;
+        if (composite_wanted || sky_wanted) update_composite_descriptors();
+        if (composite_wanted) {
             vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, composite_pipeline);
             vkCmdSetViewport(commands, 0, 1, &scene_viewport);
             vkCmdSetScissor(commands, 0, 1, &scene_scissor);
             vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     composite_pipeline_layout, 0U, 1U,
                                     &composite_sets[current_frame], 0U, nullptr);
-            CompositeConstants constants{};
-            constants.inverse_view_projection = invert_matrix(view_projection);
-            constants.camera_position = {static_cast<float>(render_scene.camera_position.x),
-                                         static_cast<float>(render_scene.camera_position.y),
-                                         static_cast<float>(render_scene.camera_position.z), 1.0F};
-            constants.extent = {static_cast<float>(scene_extent.width),
-                                static_cast<float>(scene_extent.height),
-                                static_cast<float>((global_illumination_active ? 1U : 0U) |
-                                                   (reflections_active ? 2U : 0U)),
-                                reflection_roughness_limit};
             vkCmdPushConstants(commands, composite_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
-                               0U, sizeof(constants), &constants);
+                               0U, sizeof(fullscreen), &fullscreen);
+            vkCmdDraw(commands, 3U, 1U, 0U, 0U);
+            ++latest_draw_calls;
+        }
+        // The sky fills the background and fog covers the finished opaque scene, before
+        // transparent geometry, which fogs itself.
+        if (sky_wanted) {
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_pipeline);
+            vkCmdSetViewport(commands, 0, 1, &scene_viewport);
+            vkCmdSetScissor(commands, 0, 1, &scene_scissor);
+            const std::array sky_sets{texture_sets[current_frame], composite_sets[current_frame]};
+            vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_pipeline_layout,
+                                    0U, static_cast<std::uint32_t>(sky_sets.size()),
+                                    sky_sets.data(), 0U, nullptr);
+            vkCmdPushConstants(commands, sky_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0U,
+                               sizeof(fullscreen), &fullscreen);
             vkCmdDraw(commands, 3U, 1U, 0U, 0U);
             ++latest_draw_calls;
         }
         bind_scene_state(transparent_pipeline);
         if (scene != nullptr) draw_instances(true);
+        // Post processing runs on the finished scene, between it and the editor's grid and
+        // selection outlines, which the forward pass draws again afterwards.
+        std::vector<CustomBinding> effects;
+        std::vector<bool> effects_read_blurred;
+        if (scene != nullptr && shader_resources_ready)
+            for (std::size_t index = 0; index < render_scene.post_effects.size(); ++index) {
+                const auto& effect = render_scene.post_effects[index];
+                const auto shader = custom_shaders.find(effect->shader->revision);
+                const auto material = custom_materials.find(effect->path);
+                if (shader != custom_shaders.end() && shader->second.post != VK_NULL_HANDLE &&
+                    material != custom_materials.end() && material->second.key == custom_material_key(*effect) &&
+                    index < effect_parameter_offsets.size())
+                {
+                    effects.push_back({shader->second.post, material->second.sets[current_frame],
+                                       effect_parameter_offsets[index]});
+                    effects_read_blurred.push_back(effect->shader->parsed.reads_blurred);
+                }
+            }
+        const auto copy_back = copy_shader ? custom_shaders.find(copy_shader->revision) : custom_shaders.end();
+        // An odd number of effects ends in the second image; a copy brings it back.
+        if (effects.size() % 2U == 1U) {
+            if (copy_back != custom_shaders.end() && copy_back->second.post != VK_NULL_HANDLE)
+            {
+                effects.push_back({copy_back->second.post, error_material.sets[current_frame], 0U});
+                effects_read_blurred.push_back(false);
+            }
+            else
+                effects.clear();
+        }
+        if (!effects.empty()) {
+            vkCmdEndRenderPass(commands);
+            mark_gpu_pass(commands, forward_pass);
+            PostConstants post_constants{};
+            post_constants.inverse_projection = invert_matrix(render_scene.camera.projection.values);
+            // DELTA_TIME: live views measure it; captures, which have no real frame rate, use 1/60 s.
+            const double delta = capture_buffer != VK_NULL_HANDLE || last_frame_time < 0.0
+                                     ? 1.0 / 60.0
+                                     : std::clamp(static_cast<double>(frame_time) - last_frame_time, 1.0 / 1000.0, 0.25);
+            post_constants.extent_time = {static_cast<float>(scene_extent.width),
+                                          static_cast<float>(scene_extent.height), frame_time,
+                                          static_cast<float>(delta)};
+            PostCamera post_camera{invert_matrix(view_projection), motion_previous_view_projection};
+            if (void* mapped = nullptr;
+                vkMapMemory(device, post_camera_memories[current_frame], 0U, sizeof(post_camera), 0U, &mapped) == VK_SUCCESS) {
+                std::memcpy(mapped, &post_camera, sizeof(post_camera));
+                vkUnmapMemory(device, post_camera_memories[current_frame]);
+            }
+            // The smaller mip levels start undefined; they are made ready for sampling once.
+            if (!post_mips_ready[current_frame]) {
+                for (const auto* image : {&targets.hdr, &targets.post}) {
+                    if (image->info.mipLevels < 2U) continue;
+                    VkImageMemoryBarrier ready{};
+                    ready.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    ready.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    ready.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    ready.srcQueueFamilyIndex = ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    ready.image = image->image;
+                    ready.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 1U, image->info.mipLevels - 1U, 0U, 1U};
+                    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0U,
+                                         0U, nullptr, 0U, nullptr, 1U, &ready);
+                }
+                post_mips_ready[current_frame] = true;
+            }
+            std::size_t source = 0U;
+            for (std::size_t effect_index = 0; effect_index < effects.size(); ++effect_index) {
+                const auto& [effect_pipeline, material_set, material_offset] = effects[effect_index];
+                const auto target = 1U - source;
+                // Effects that read blurred colors get the source image's smaller copies first.
+                if (effects_read_blurred[effect_index]) build_mip_chain(commands, source == 0U ? targets.hdr : targets.post);
+                VkRenderPassBeginInfo post_info{};
+                post_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+                post_info.renderPass = post_render_pass;
+                post_info.framebuffer = targets.post_framebuffers[target];
+                post_info.renderArea.extent = scene_extent;
+                vkCmdBeginRenderPass(commands, &post_info, VK_SUBPASS_CONTENTS_INLINE);
+                vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, effect_pipeline);
+                vkCmdSetViewport(commands, 0, 1, &scene_viewport);
+                vkCmdSetScissor(commands, 0, 1, &scene_scissor);
+                const std::array post_sets{post_input_sets[current_frame][source], material_set};
+                vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, post_pipeline_layout, 0U,
+                                        static_cast<std::uint32_t>(post_sets.size()), post_sets.data(), 1U,
+                                        &material_offset);
+                vkCmdPushConstants(commands, post_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0U,
+                                   sizeof(post_constants), &post_constants);
+                vkCmdDraw(commands, 3U, 1U, 0U, 0U);
+                ++latest_draw_calls;
+                vkCmdEndRenderPass(commands);
+                source = target;
+            }
+            // The HDR image is drawn into again for the overlays.
+            VkImageMemoryBarrier to_attachment{};
+            to_attachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_attachment.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            to_attachment.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            to_attachment.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            to_attachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            to_attachment.srcQueueFamilyIndex = to_attachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_attachment.image = targets.hdr.image;
+            to_attachment.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            vkCmdPipelineBarrier(commands,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U,
+                                 &to_attachment);
+            mark_gpu_pass(commands, post_pass);
+            vkCmdBeginRenderPass(commands, &scene_pass_info, VK_SUBPASS_CONTENTS_INLINE);
+            bind_scene_state(transparent_pipeline);
+        }
         {
             if (overlay && overlay->ground_grid_visible() && capture_buffer == VK_NULL_HANDLE) {
                 DrawPushConstants grid_constants{};
@@ -4360,6 +6089,7 @@ struct VulkanWindow::Impl {
         mark_gpu_pass(commands, forward_pass);
         scene_targets_rendered[current_frame] = true;
         previous_view = render_scene.camera.view.values;
+        if (capture_buffer == VK_NULL_HANDLE) last_frame_time = frame_time;
         previous_projection = render_scene.camera.projection.values;
         std::array<VkClearValue, 2> swapchain_clear{};
         swapchain_clear[0].color = clear[0].color;
@@ -4773,6 +6503,11 @@ bool VulkanWindow::draw(const Scene& scene, const double elapsed_seconds) {
     return impl_ && impl_->draw(elapsed_seconds, &scene);
 }
 
+void VulkanWindow::set_material_preview(std::string path, MaterialPreviewReceiver receiver) {
+    impl_->direct_preview = std::move(path);
+    impl_->direct_preview_receiver = impl_->direct_preview.empty() ? MaterialPreviewReceiver{} : std::move(receiver);
+}
+
 bool VulkanWindow::readback_async(const Scene& scene, double elapsed, FrameReceiver receiver, std::string& error) {
     if (!impl_) { error = "Vulkan window is unavailable"; return false; }
     return impl_->readback_async(&scene, elapsed, std::move(receiver), error);
@@ -4860,6 +6595,14 @@ void VulkanWindow::set_global_illumination(const bool enabled) {
     // A new request gets a new attempt; failures stay reported until then.
     impl_->global_illumination_failed = false;
     impl_->global_illumination_error.clear();
+}
+
+void VulkanWindow::set_shader_time(const double seconds) {
+    if (impl_) impl_->shader_time = seconds;
+}
+
+std::string VulkanWindow::shader_status_error() const {
+    return impl_ ? impl_->shader_error : std::string{};
 }
 
 void VulkanWindow::set_vsync(const bool enabled) {

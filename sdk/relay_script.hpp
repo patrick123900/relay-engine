@@ -74,6 +74,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -217,6 +218,39 @@ public:
         return api().music_stop(api().context, handle_, fade_seconds) != 0;
     }
     [[nodiscard]] int music_track() const { return api().music_track(api().context, handle_); }
+
+    // This object's own value for a parameter of its shader material (a uniform in the material's
+    // .relay-shader), without changing the material file or other objects that use it: make one
+    // enemy flash, fade a door out, pulse a light. Colors are linear RGB. The Inspector shows and
+    // edits the same per-object values; Stop Game restores the authored ones. False when the
+    // entity has no shader material, or the shader has no such number, vector or bool uniform.
+    //
+    //     self().set_material_parameter("flash", 1.0);
+    //     self().set_material_parameter("tint", relay::Vec3{1.0, 0.1, 0.1});
+    bool set_material_parameter(std::string_view name, double value) const {
+        return api().set_material_parameter(api().context, handle_, name.data(), name.size(), &value, 1U) != 0;
+    }
+    bool set_material_parameter(std::string_view name, Vec3 value) const {
+        const double values[3] = {value.x, value.y, value.z};
+        return api().set_material_parameter(api().context, handle_, name.data(), name.size(), values, 3U) != 0;
+    }
+    // For vec2, vec4 or any uniform: its numbers in order.
+    bool set_material_parameter(std::string_view name, std::initializer_list<double> values) const {
+        return api().set_material_parameter(api().context, handle_, name.data(), name.size(), values.begin(),
+                                            values.size()) != 0;
+    }
+    // The parameter's current numbers (this object's own value, else the material's); empty when
+    // there is no such parameter.
+    [[nodiscard]] std::vector<double> material_parameter(std::string_view name) const {
+        double values[16];
+        const size_t count =
+            api().get_material_parameter(api().context, handle_, name.data(), name.size(), values, 16U);
+        return std::vector<double>(values, values + std::min<size_t>(count, 16U));
+    }
+    // Goes back to the material's own value.
+    bool clear_material_parameter(std::string_view name) const {
+        return api().clear_material_parameter(api().context, handle_, name.data(), name.size()) != 0;
+    }
 
     // Enabled colliders touching this entity's enabled collider, sorted. Each side's layer must
     // be in the other's mask.

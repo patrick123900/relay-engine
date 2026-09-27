@@ -1,0 +1,1 @@
+{"format":"relay.material","version":1,"type":"post_process","shader":"shaders/Bloom.relay-shader","parameters":{"intensity":[0.35],"threshold":[1.5]}}

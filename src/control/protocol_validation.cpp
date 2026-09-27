@@ -45,10 +45,12 @@ bool validate_field(const ProtocolFieldSpec& spec, const JsonValue& scalar, std:
                     error = "array entries must be finite numbers";
                     return false;
                 }
-            } else if (!value.string() || value.string()->size() > 32U ||
+            } else if (!value.string() || value.string()->size() > 128U ||
                        (!spec.pattern.empty() &&
                         !std::regex_match(*value.string(), std::regex(std::string(spec.pattern))))) {
-                error = "array entries must be valid entity handles";
+                // Entries are entity handles or project paths, each checked by the field's pattern.
+                error = "entries of field '" + std::string(spec.name) + "' must be at most 128 characters "
+                        "and match its pattern";
                 return false;
             }
         }

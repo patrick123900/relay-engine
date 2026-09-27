@@ -43,6 +43,7 @@ void Engine::tick() {
     }
     sync_input_map();
     sync_audio();
+    sync_render_assets();
     if (running_ && mode_ == RuntimeMode::game && !paused_) {
         advance_one_frame();
     } else {
@@ -285,9 +286,58 @@ AudioSystem& Engine::audio() {
     return audio_;
 }
 
+std::filesystem::path Engine::asset_root() const {
+    return std::filesystem::absolute(project_ ? project_->root() : "assets").lexically_normal();
+}
+
+void Engine::sync_sky() {
+    const auto sky = scene_.active_sky();
+    const auto* record = sky ? scene_.get(*sky) : nullptr;
+    if (!record || record->sky->material.empty()) {
+        assets_.set_sky_material(nullptr);
+        return;
+    }
+    assets_.set_sky_material(sky_materials_.resolve(asset_root(), record->sky->material));
+}
+
+void Engine::sync_materials() {
+    AssetRegistry::ShaderMaterials used;
+    const auto root = asset_root();
+    const auto use = [&](const std::string& path) {
+        if (!valid_material_path(path) || used.contains(path)) return;
+        used.emplace(path, materials_.resolve(root, path, shaders_));
+    };
+    for (const auto entity : scene_.entities()) {
+        const auto* record = scene_.get(entity);
+        if (record->mesh_renderer) use(record->mesh_renderer->material);
+    }
+    if (const auto post = scene_.active_post_process())
+        for (const auto& effect : scene_.get(*post)->post_process->effects)
+            if (effect.enabled) use(effect.material);
+    use(previewed_material_);
+    assets_.set_shader_materials(std::move(used));
+}
+
+void Engine::sync_render_assets() {
+    sync_sky();
+    sync_materials();
+}
+
+std::shared_ptr<const CompiledShader> Engine::shader(const std::string_view path) {
+    return shaders_.resolve(asset_root(), path);
+}
+
+std::shared_ptr<const ResolvedShaderMaterial> Engine::shader_material(const std::string_view path) {
+    return materials_.resolve(asset_root(), path, shaders_);
+}
+
+std::shared_ptr<const ResolvedSkyMaterial> Engine::sky_material(const std::string_view path) {
+    return sky_materials_.resolve(asset_root(), path);
+}
+
 void Engine::sync_audio() {
     // Clips resolve where the asset browser lists files: the project folder, or ./assets.
-    const auto root = std::filesystem::absolute(project_ ? project_->root() : "assets").lexically_normal();
+    const auto root = asset_root();
     if (root != audio_root_) audio_preview_.reset();
     audio_root_ = root;
     audio_.set_project_root(root);

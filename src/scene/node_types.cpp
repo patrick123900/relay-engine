@@ -15,6 +15,7 @@ bool matches(const std::string_view id, const EntityRecord& record) {
     if (id == "Node") return true;
     if (id == "Model") return record.animator.has_value();
     if (id == "Camera") return record.camera.has_value();
+    if (id == "Sky") return record.sky.has_value();
     if (id == "Light") return record.light.has_value();
     if (id == "DirectionalLight") return light(Light::Type::directional);
     if (id == "PointLight") return light(Light::Type::point);
@@ -26,6 +27,7 @@ bool matches(const std::string_view id, const EntityRecord& record) {
     if (id == "AudioSource") return record.audio_source.has_value();
     if (id == "ReverbZone") return record.reverb_zone.has_value();
     if (id == "MusicPlayer") return record.music_player.has_value();
+    if (id == "PostProcess") return record.post_process.has_value();
     return false;
 }
 
@@ -38,6 +40,13 @@ void contribute(const std::string_view id, EntityRecord& record, const bool came
     if (id == "Camera") {
         record.camera = Camera{};
         record.camera->active = camera_free;
+    } else if (id == "Sky") {
+        record.sky = Sky{};
+        // The sun: warm white, bright enough to lead the sky's ambient light.
+        record.light = Light{};
+        record.light->type = Light::Type::directional;
+        record.light->color = default_sun_color;
+        record.light->intensity = default_sun_intensity;
     } else if (id == "Light") {
         record.light = Light{};
     } else if (id == "DirectionalLight") {
@@ -60,6 +69,8 @@ void contribute(const std::string_view id, EntityRecord& record, const bool came
         record.reverb_zone = ReverbZone{};
     } else if (id == "MusicPlayer") {
         record.music_player = MusicPlayer{};
+    } else if (id == "PostProcess") {
+        record.post_process = PostProcess{};
     }
 }
 
@@ -83,6 +94,11 @@ const std::vector<NodeTypeInfo>& node_types() {
          {"physics_body"}, true},
         {"Camera", "Camera", "Node", "A viewpoint. The active camera is what Run Game shows.",
          {"camera"}, true},
+        // Before Light, so a node with a sky and its sun is a Sky rather than a Directional Light.
+        {"Sky", "Sky", "Node",
+         "The sky, sun and fog: a color gradient or sky material behind everything, a directional "
+         "light for the sun (turn the node to aim it), and distance fog.",
+         {"sky", "light"}, true},
         {"Light", "Light", "Node", "Lights the scene. Choose a directional, point or spot light.",
          {"light"}, false},
         {"DirectionalLight", "Directional Light", "Light",
@@ -101,6 +117,10 @@ const std::vector<NodeTypeInfo>& node_types() {
          {"reverb_zone"}, true},
         {"MusicPlayer", "Music Player", "Node",
          "Plays a playlist of music, crossfading between tracks on the beat.", {"music_player"}, true},
+        {"PostProcess", "Post Process", "Node",
+         "Full-screen effects on the lit scene, such as color grading, vignettes or outlines, from "
+         "post_process shaders.",
+         {"post_process"}, true},
     };
     return types;
 }
@@ -157,9 +177,22 @@ bool apply_node_type(Scene& scene, const Entity entity, const std::string_view i
         !scene.set_mesh_renderer(entity, record.mesh_renderer) ||
         !scene.set_audio_source(entity, record.audio_source) ||
         !scene.set_reverb_zone(entity, record.reverb_zone) ||
-        !scene.set_music_player(entity, record.music_player)) {
+        !scene.set_music_player(entity, record.music_player) ||
+        !scene.set_sky(entity, record.sky) ||
+        !scene.set_post_process(entity, record.post_process)) {
         error = "could not give the node its components";
         return false;
+    }
+    // A new sky's sun comes from above and to one side rather than along the horizon.
+    if (record.sky) {
+        auto transform = scene.get(entity)->transform;
+        if (transform.rotation_degrees == Vec3{}) {
+            transform.rotation_degrees = {-50.0, 30.0, 0.0};
+            if (!scene.set_transform(entity, transform)) {
+                error = "could not aim the sun";
+                return false;
+            }
+        }
     }
     return true;
 }

@@ -5,6 +5,8 @@
 // traced through that field, producing diffuse and specular indirect light). Only compiled when
 // the FidelityFX library is available; see third_party/fidelityfx.
 
+#include "relay/render/scene_render.hpp"
+
 #include <vulkan/vulkan.h>
 
 #include <array>
@@ -56,7 +58,10 @@ struct LightingFrame {
     // Column-major matrices with Relay's Vulkan conventions (depth 0..1, y down in clip space).
     std::array<float, 16> view{}, projection{}, previous_view{}, previous_projection{};
     std::array<float, 3> camera_position{};
-    std::array<float, 3> sky_color{}, ground_color{};
+    // The environment for rays that leave the scene (sky_environment), and a key that changes
+    // whenever it does.
+    const RenderSky* sky{};
+    std::uint64_t sky_key{};
     VkBuffer index_buffer{};
     VkDeviceSize index_buffer_bytes{};
     std::vector<LightingInstance> instances;
@@ -103,7 +108,10 @@ struct ReflectionFrame {
     LightingImage depth, normal_roughness, motion;
     // Column-major matrices with Relay's Vulkan conventions, as in LightingFrame.
     std::array<float, 16> view{}, projection{}, previous_view{}, previous_projection{};
-    std::array<float, 3> sky_color{}, ground_color{};
+    // The environment for rays that leave the scene (sky_environment), and a key that changes
+    // whenever it does.
+    const RenderSky* sky{};
+    std::uint64_t sky_key{};
     // The history is invalid, for example after the targets were recreated.
     bool reset{false};
 };

@@ -8,7 +8,7 @@ This file records only the state needed to continue development. User-facing mat
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v45: 148 native methods. Scene v20, project v2, import manifest v3.
+- Protocol schema v47: 159 native methods. Scene v23, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
@@ -16,8 +16,10 @@ This file records only the state needed to continue development. User-facing mat
   C++ gameplay scripts, per-project input mapping, a scripted first person controller template in
   the demo project, portable project export, and FidelityFX global illumination and hardware ray
   traced reflections, a frame profiler, and audio (sources, listeners, spatialisation and mixer
-  buses, bus effects, reverb zones, occlusion, streaming, music players and headphone output) are
-  implemented. Preserve unrelated working-tree
+  buses, bus effects, reverb zones, occlusion, streaming, music players and headphone output),
+  a Sky node (gradient or panorama sky material, sky lighting, sun and distance fog), and custom
+  shaders (a GLSL-based language for surfaces and post processing, shader materials, a Shader
+  Editor) are implemented. Preserve unrelated working-tree
   edits and inspect `git diff` before changing them.
 
 ## Product intent
@@ -249,7 +251,8 @@ without blocking simultaneous human editing.
   The Transform and imported model animation (`animator`, which model-node children depend on)
   cannot be removed. A camera added to a scene without an active camera becomes active.
 - Node types are a tree in `src/scene/node_types.cpp`: Node > Model, PhysicsBody
-  (> RigidBody, StaticBody), Camera, Light (> DirectionalLight, PointLight, SpotLight), StaticMesh. Each type
+  (> RigidBody, StaticBody), Camera, Sky, Light (> DirectionalLight, PointLight, SpotLight),
+  StaticMesh, AudioSource, ReverbZone, MusicPlayer, PostProcess. Each type
   adds components to its parent's; `apply_node_type` applies them root first when
   `scene.create` receives a `type`. Light, PhysicsBody and Model are not creatable (Model comes
   from import). `node_type()` walks down the tree taking the first child whose own additions the
@@ -576,7 +579,173 @@ Phase 3:
   Agents can read and write sources (`scripts.read`/`write` are file-scoped on `path`) but cannot
   make them run in an untrusted project.
 
+### Custom shaders and materials
+
+- Language (`src/render/shader_language.cpp`, reference in `docs/shaders.md`): `.relay-shader`
+  files start with `shader_type surface;` or `shader_type post_process;`, may declare
+  `render_mode transparent, unshaded;` (surfaces) and `uniform` parameters (float, vec2-4, int,
+  bool, sampler2D; hints source_color, hint_range(min, max[, step]), hint_normal/black/white;
+  defaults), and define `void vertex()` / `void fragment()` over built-ins (VERTEX, ALBEDO,
+  COLOR...). The parser blanks Relay's declarations (keeping lines), records top-level function
+  spans, lays uniforms out by std140 (images get set 1 bindings 1-8), and checks names, hints,
+  defaults and the stage function signatures. `generate_shader_glsl` wraps the code: a vertex stage
+  (fragment() blanked, so fragment-only built-ins like dFdx stay out; spec constant 1 marks the
+  shadow pass), a fragment stage built on `surface_lighting.glsl` that fills `Surface` from the
+  outputs and writes the G-buffer like `first_light.frag` (spec constant 0 = geometry pass;
+  unshaded writes black, fully metallic G-buffer albedo so GI and reflections add nothing), a
+  shadow fragment stage (alpha scissor only), and for post shaders one fragment stage over the
+  tone pass's full-screen triangle. User code follows `#line 1`; Relay's code is numbered from
+  100000 (main) and 200000 (preamble), and errors there are reported for line 0. glslang (system
+  package, optional: `RELAY_HAS_GLSLANG`) compiles to SPIR-V 1.0; glslang's "compilation
+  terminated" note is dropped. `shaders/scene_bindings.glsl` (set 0, split out of
+  `surface_lighting.glsl`) and `surface_lighting.glsl` are embedded at build time
+  (`tools/embed_shader_sources.cmake`) and expanded in place of `#include`. The lighting buffer
+  gained `frame_time` (TIME): the host's clock (`VulkanWindow::set_shader_time`, the live editor
+  passes wall-clock seconds) in presented frames, the frame's elapsed time in captures.
+- `ShaderLibrary` caches compiles by file stamp and holds previews (in-memory text per path,
+  `shaders.preview`). Materials (`src/render/materials.cpp`): `.relay-material` with type surface
+  or post_process, a shader path and parameters (number arrays or image paths). `MaterialLibrary`
+  resolves one into a `ResolvedShaderMaterial` (compiled shader, packed std140 block, decoded
+  images, error and warnings, revision), reloading when the file, shader revision or an image
+  changes. `Engine::sync_materials` (tick, and `sync_render_assets` in scene captures) resolves every
+  mesh renderer material path and the active post processing's enabled effects into
+  `AssetRegistry::set_shader_materials`, apart from the asset revision.
+- Scene v22: `MeshRenderer::material` may be a surface `.relay-material` path; component
+  `post_process` (stable id 0x14, `PostProcess` of `PostEffect{material, enabled}`, at most 16,
+  first node in entity order is used, creatable node type `PostProcess`). v23 adds
+  `PostEffect::editor` (default true; v22 files load with it on): `build_render_scene` leaves
+  effects with it off out when given a `ViewOverride` (the editor's own camera), so they show only
+  through the scene camera. `build_render_scene`
+  gives instances with material paths `shader_material` (and `builtin.grey`, a new built-in
+  appended after the others, as their material-buffer stand-in for ray traced hits); transparent
+  shaders make instances alpha blended. `RenderScene::post_effects` lists drawable enabled effects.
+- Protocol: `shaders.read`, `shaders.write` (create from a template of a type, clears the preview),
+  `shaders.preview` (text, or none to stop), `assets.material`, `assets.set_material` (create with a
+  type; change the shader), `assets.set_material_parameter` (value, texture, reset; checked against
+  the shader when it compiles), `scene.set_post_process` (effects that stay in a replaced list keep
+  their enabled flag), `scene.set_post_effect`; `scene.set_renderer` accepts surface material
+  paths. `.relay-shader` files are asset kind `shader`.
+- Post shaders' set 0 also has the G-buffer motion (binding 3) and a per-frame `PostCamera` uniform
+  buffer (binding 4: inverse view-projection and the previous frame's view-projection, the current
+  one on the first frame). `scene_motion(uv)`/`MOTION` read motion vectors on surfaces and reproject
+  the far plane for the sky; `DELTA_TIME` (push constants' w) is measured between live frames and
+  1/60 in captures. The demo scene has a Post Process node with `materials/MotionBlur.relay-material`
+  (editor view off), added by hand like its Sky; `tools/generate_demo_project.py` does not create
+  either. `relay_demo --vulkan-scene-capture <project> <png> [frames] [turn-degrees]` turns the
+  active camera before the capture so it holds one frame of camera motion.
+- Vulkan (`vulkan_window.cpp`): set 1 layout (UBO + 8 samplers), `custom_pipeline_layout` (set 0 +
+  set 1, the draw push constants for both stages, so set 0 stays bound across pipeline switches),
+  `post_pipeline_layout` (post inputs + set 1, 80 bytes of push constants). Pipelines per shader
+  revision (surface: geometry or forward pass + shadow; post: full-screen), made on first use and
+  destroyed with the swapchain. Per material path: parameter UBO, images uploaded synchronously
+  with mipmaps (`create_sky_texture`, generalized), a pool and set. `sync_shader_materials` builds
+  new ones each frame before recording and, when a material is replaced or more than 16 things
+  are unused, waits for the device and destroys the stale ones. `custom_binding` picks an
+  instance's pipeline and set, or the built-in error shader's (magenta checkerboard, unshaded)
+  when its material cannot be drawn. Geometry, forward and all shadow passes switch pipelines per
+  instance. Post processing: after transparent geometry the forward pass ends; each effect draws
+  from one HDR image of a pair (the scene's HDR image and a second one, `targets.post`) into the
+  other with `post_render_pass`; an odd count adds a copy (a built-in post shader) so the result
+  is back in the scene image; a barrier returns it to attachment layout and the forward pass runs
+  again for the grid and selection. The forward pass now stores depth and stencil for that.
+- Shader graphs (`src/render/shader_graph.cpp`): people edit shaders as nodes; the language is the
+  saved form. `shader_to_graph` parses each stage body (comments masked) with a GLSL-subset
+  expression parser and builds SSA dataflow: declarations and assignments (plain, compound and
+  component-wise) of locals and output built-ins; nodes are input (built-in read), parameter
+  (uniform), binary, unary, select, swizzle, set (component replace), call (GLSL functions,
+  constructors, the shader's own functions) and one output per stage; constant sub-expressions
+  become pin values; a local's name becomes its node id. Control flow, blocks, indexing,
+  increments, bare calls and field access keep the stage as code (`code_only`, with a reason). Other
+  top-level code is the graph's `functions`. `update_graph_types` infers types (widest-type rules,
+  a function table, helper signatures). `graph_to_shader` writes canonical code (one typed local
+  per node in dependency order, `set` as declare-then-assign, unknown types inlined), then outputs,
+  then `// relay-graph {stage:{id:[x,y]}}` sorted; it records which line each node wrote, for
+  errors. Round trips are exact after the first write; positions missing from the layout come from
+  `layout_graph_stage` (columns by depth).
+- Editor: **Shader Editor** panel (index 11; Tools → Shader editor; double-click a shader in Assets;
+  Edit shader in the Inspector; first opens as a tab beside the Viewport) showing each tab's graph
+  on a canvas (`src/editor/shader_graph_canvas.cpp`): pan, zoom, box select, drag nodes (the view
+  keeps a draw order; nodes carry invisible covers so the top node takes the pointer), drag wires
+  both ways with loop refusal, detach by dragging an input, values on free pins, split/set
+  components, add-node menu (right-click, Space, or a wire dropped on empty space) listing inputs,
+  parameters, operators, GLSL functions and the shader's functions, node menu, Delete, F to frame,
+  errors outlined on nodes via the line map. Side panel: parameters (add by kind, rename
+  everywhere, remove, put on canvas), render modes, and the functions as a code box
+  (ImGuiColorTextEdit v1.92.9, MIT, fetched by CMake). Code-only stages and files whose
+  declarations do not parse are edited as code in place. Undo/redo are text snapshots; live preview
+  follows committed edits after 0.35 s (moving nodes changes only the layout line and does not
+  recompile). While the panel has focus the editor's global shortcuts stand aside. The Mesh renderer section lists surface
+  materials (and New material, drops) and shows the material's shader picker, Edit shader, errors,
+  warnings and typed parameter fields (sliders for ranges, sRGB color pickers, image pickers with
+  drops, Reset), all saved to the file. The Post Process section lists effects with on/off, order,
+  remove, each effect's parameters, and an Add effect picker. Assets Create has Surface shader,
+  Post-processing shader, Material and Post-processing material.
+
+- Later additions (details in `docs/shaders.md`): scene v24 `MeshRenderer::parameters` (per-object
+  uniform values; protocol `scene.set_renderer_parameter`; script ABI `set/get/clear_material_parameter`;
+  Inspector "This object only"). Material parameter blocks now live in a per-frame buffer bound as a
+  dynamic UBO, so parameter changes rebuild nothing (`write_frame_parameters`). Material preview:
+  `builtin.sphere` drawn with the material's pipelines into small per-frame targets after the shadow
+  passes, read back and handed to `EditorOverlay::material_preview_ready`
+  (`relay_demo --vulkan-material-preview <project> <material> <png>`). Graph copy/paste/duplicate
+  (`copy_graph_nodes`, `paste_graph_nodes`). Ready-made effects in `shaders/effects/` (Bloom, Color
+  Grading, Vignette; `shaders.write` `effect`). Post images have mip chains built before effects that
+  call `scene_color_lod`. Shader Editor tabs check their file once a second and reload (or, with
+  unsaved edits, offer to) when an agent changes it. Checked on a desktop (preview, per-object
+  values, Add effect, bloom and vignette in the live viewport, graph shortcuts, reload).
+  The demo scene gained a "Shader showcase" group (three plasma orbs on pedestals at z 4.8, per-object
+  colors) and Bloom ahead of motion blur, added by editing the scene file; the demo generator does
+  not create them.
+
 ### Rendering and assets
+
+- Sky (scene v21, component `sky`, stable id 0x13, `Sky` in `scene.hpp`): `material` (a
+  `.relay-material` path, empty for the gradient), `horizon_color` (the horizon and below),
+  `zenith_color` (straight up), `intensity` (visible sky, 0-100), `ambient_intensity` (0-10), and
+  linear fog (`fog`, `fog_start`, `fog_end` > start, `fog_start_color`, `fog_end_color`). Colors
+  are linear, 0-1000. `Scene::active_sky()` is the first node in entity order with one. The
+  creatable node type `Sky` sits before Light among Node's children, so a sky with its sun is a Sky;
+  it adds `sky` and a directional light (`default_sun_color`, `default_sun_intensity` 2.5) and
+  turns a new node to (-50, 30, 0) degrees. The `Sky` defaults (horizon and zenith colors,
+  intensity 2) and the sun's intensity are the demo's daylight sky; the fog colors keep their own
+  pale blue. Protocol `scene.set_sky` (colors as 3-number arrays). The gradient position is
+  `1 - (1 - max(y, 0))^2` (`sky_gradient_position`, mirrored in `surface_lighting.glsl`).
+- Sky materials (`src/render/sky.cpp`): `.relay-material` JSON (`format` `relay.material`,
+  `version` 1, `type` `sky`, `panorama`, `tint`, `intensity`, `rotation_degrees`), asset kind
+  `material`. Paths go through `workspace_file`; writes are atomic. Protocol
+  `assets.sky_material` (with the image size or why it cannot load) and
+  `assets.set_sky_material` (`create` refuses to replace). Panoramas are PNG or JPEG, at most
+  128 MiB and 8192 x 4096, equirectangular with -Z at the centre (`sky_panorama_uv`).
+  `SkyMaterialCache` reloads on file size or time changes and keeps the decoded image when only
+  the material changed; `Engine::sync_sky` (every tick, and in `--vulkan-scene-capture`) puts the
+  active sky's material into `AssetRegistry::set_sky_material`, apart from the asset revision.
+- `build_render_scene` fills `RenderScene::sky` (`RenderSky`): visible radiance (colors times
+  intensity, or the panorama times tint and both intensities), and the analytic hemisphere
+  (`ambient_up`/`ambient_down`, irradiance scale): pi * ambient_intensity times the cosine-weighted
+  upper average (gradient: horizon + 5/6 of the way to the zenith; panorama: averages computed at
+  load) and the horizon color or the panorama's lower average. Without a sky the defaults
+  (`default_ambient_up/down`, the old shader constants) apply and nothing else changes.
+  `sky_radiance`, `sky_environment` and `fog_amount` are the CPU versions of the shader code.
+- The sun: when the active sky's node has a directional light with intensity above zero,
+  `RenderSky::sun` is set with the direction towards it and its color times intensity.
+  `sun_glow` (mirrored in `surface_lighting.glsl`) draws a disc of 0.8 degrees radius at 40 times
+  that radiance with a soft edge, two exponential glows, and a fade below the horizon. It is part
+  of `sky_radiance` and the sky pass only: `sky_environment` (GI's cube, reflected rays, ambient)
+  leaves it out, because the light already lights the scene. Panoramas get the disc too.
+- Vulkan: `GpuLighting` gained sky, ambient and fog vectors, which replace the shaders' constant
+  sky and ground; `CompositeConstants` carries the ambient pair (128 bytes). Set 0 binding 6 is
+  the panorama (a 1x1 placeholder without one), uploaded synchronously after `vkDeviceWaitIdle`
+  when its revision changes (`sync_sky_panorama`), before recording. `shaders/sky.frag` runs in
+  the forward pass after the GI composite, using set 0 and the composite's depth: premultiplied,
+  it draws the sky where depth is clear and fog over opaque surfaces by camera distance.
+  Transparent surfaces fog themselves in `first_light.frag`. Reflection misses and the GI
+  environment cube (3 x 3 samples per texel, rebuilt when `sky_environment_key` changes) use
+  `sky_environment`, so both see the sky times its ambient intensity.
+- Editor: the Inspector's Sky section (Skybox picker with Gradient, material files and New sky
+  material, drop target; sRGB color pickers storing linear values with a gradient bar; the
+  material's panorama, tint, brightness and rotation, saved to its file as they change and not
+  undoable; intensity, ambient light; Sun status with Add sun or Make it the sun; Fog). Assets
+  gains Create → Sky material and a Materials filter.
 
 - Deterministic CPU renderer for headless verification.
 - The Vulkan scene renders into viewport-sized targets, one set per frame in flight, recreated
@@ -790,6 +959,27 @@ Phase 3:
    headless-editor coverage only: sound through a real device has not been heard, and none of the
    audio UI has been looked at on a desktop. Resampling is linear. Dropping a sound into the
    viewport makes three undo steps (create, place, clip) rather than one.
+15. The Sky has headless, protocol and offscreen-render coverage (gradient, fog and a panorama,
+   under the validation layer with synchronization checks), not a desktop review of the Inspector
+   section or of switching materials in the live editor, whose panorama upload waits for the
+   device. Panoramas are 8-bit PNG or JPEG only (no HDR or EXR, no mipmaps, so very large images
+   alias when minified) and sampled at level 0. Only the first sky is used, and skies do not blend.
+   Ambient light from the sky is a two-colour hemisphere (plus GI's cube and reflected rays); there
+   is no image-based specular convolution, the sun disc has a fixed size and is drawn over
+   panoramas that may already show a sun, reflections show no sun disc, and fog is linear distance fog without
+   height falloff or scattering. The analytic rough specular term keeps its old scale, pi times
+   GI's.
+16. Custom shaders have headless, protocol and offscreen-render coverage (a custom surface, the
+   error surface, shadows and a post effect, under the validation layer with synchronization
+   checks), not a desktop review of the Shader Editor, the material fields or live preview on a
+   real display. Ray traced reflections draw shader-material surfaces with `builtin.grey`; motion
+   vectors ignore vertex movement since the last frame; selection outlines ignore vertex movement;
+   shadows of transparent shaders are not cast. Compiling and swapping pipelines run on the engine
+   thread and wait for the device (preview keystrokes after a pause, so at most a few per second).
+   Shader materials are not yet usable for skies, and imported models' materials cannot be
+   converted to shader materials. Graphs: no per-node previews, comments inside converted stages
+   are dropped, and stages with control flow stay code. The canvas has been looked at only through
+   the headless test's rasterized snapshots (`RELAY_UI_SNAPSHOT_DIR`), not on a desktop.
 
 ## Next priorities
 
@@ -888,6 +1078,25 @@ page (buses, speakers and headphones) and the Mixer panel (mute, effects, a para
 and saved on release). The release build caught an editor bug the dev build hid (a panel reading
 settings it had just replaced), so run both.
 
+The Sky is covered by the workflow suite (component and node type, `scene.set_sky` validation
+and undo, the first sky winning, v21 save and load and v20 migration, sky material files and
+their protocol, the render description of gradients, panoramas, lighting and fog, and a missing
+image falling back), the headless editor suite (fog toggle, New sky material, choosing a panorama,
+back to the gradient) and `relay_lighting_render_tests` (an offscreen demo copy with a gradient
+sky, fog and a panorama material, checked by pixel).
+
+Custom shaders are covered by the workflow suite (the language: templates, parsing, std140
+layout, hints, refusals, errors at user lines, stage isolation; the protocol: write, read,
+preview, materials and parameters, renderers with material paths, broken shaders, post
+processing with reorder and undo, v22 save and load; graphs: agent code to nodes with types,
+exact round trips, edits that compile, positions kept, loops refused, code-only stages), the
+headless editor suite (material fields; the graph editor: add-node menu, wiring by drag, pin
+values, Ctrl+S, errors on nodes, undo, parameters, render modes, delete, stages, revert, code
+stages; Post Process add and toggle; `RELAY_UI_SNAPSHOT_DIR` saves rasterized pictures of it) and
+`relay_lighting_render_tests` (a demo copy with an unshaded custom ground and a post effect,
+checked by pixel; the demo's motion blur keeps a still camera sharp and blurs one turning 3 degrees
+in a frame, by counting sharp edges).
+
 Run native suites sequentially because some fixtures share temporary import paths:
 
 ```sh
@@ -925,6 +1134,8 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Agent bridge | `tools/mcp-bridge/src/` |
 | Input | `src/core/input.cpp`, `src/platform/sdl_input.cpp` |
 | Audio | `src/audio/`, `include/relay/audio/`, Audio source Inspector section and Audio page in `src/editor/editor_ui.cpp` |
+| Shaders and materials | `src/render/shader_graph.cpp`, `src/editor/shader_graph_canvas.cpp`, `src/render/shader_language.cpp`, `src/render/materials.cpp`, `include/relay/render/shader_language.hpp`, `include/relay/render/materials.hpp`, `shaders/scene_bindings.glsl`, `tools/embed_shader_sources.cmake`, custom pipelines and post processing in `src/platform/vulkan_window.cpp`, Shader Editor in `src/editor/editor_ui.cpp`, `docs/shaders.md` |
+| Sky and fog | `src/render/sky.cpp`, `include/relay/render/sky.hpp`, `RenderSky` in `scene_render.hpp`, `shaders/sky.frag`, Sky section in `src/editor/editor_ui.cpp` |
 | Frame profiler | `src/observe/profiler.cpp`, `include/relay/observe/profiler.hpp`, Profiler panel in `src/editor/editor_ui.cpp` |
 | Native tests | `tests/engine_tests.cpp`, `tests/script_tests.cpp`, `tests/editor_*tests.cpp` |
 | Bridge tests | `tools/mcp-bridge/tests/` |

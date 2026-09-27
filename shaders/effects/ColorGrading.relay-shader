@@ -1,0 +1,46 @@
+shader_type post_process;
+
+// Color grading: the look of the whole picture, as a photographer or film colorist sets it.
+// Effects run before tone mapping, on the scene's real light levels.
+uniform float exposure : hint_range(-4.0, 4.0) = 0.0;
+uniform float contrast : hint_range(0.0, 2.0) = 1.0;
+uniform float saturation : hint_range(0.0, 2.0) = 1.0;
+uniform float temperature : hint_range(-1.0, 1.0) = 0.0;
+uniform vec3 shadows : source_color = vec3(1.0);
+uniform vec3 highlights : source_color = vec3(1.0);
+
+// How bright a color looks, from 0 (black) upwards.
+float luminance(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Warmer (towards orange) for positive amounts, cooler (towards blue) for negative ones.
+vec3 white_balance(vec3 color, float amount) {
+    return color * vec3(1.0 + 0.25 * amount, 1.0, 1.0 - 0.25 * amount);
+}
+
+// Spreads light levels away from mid grey (above 1) or pulls them towards it (below 1), in
+// photographic stops so dark and bright parts change alike.
+vec3 apply_contrast(vec3 color, float amount) {
+    vec3 stops = log2(max(color, vec3(0.00001)) / 0.18);
+    return 0.18 * exp2(stops * amount);
+}
+
+// 0 is black and white, 1 unchanged, above 1 more colorful.
+vec3 apply_saturation(vec3 color, float amount) {
+    return max(mix(vec3(luminance(color)), color, amount), vec3(0.0));
+}
+
+// Tints dark parts with one color and bright parts with another.
+vec3 split_tone(vec3 color, vec3 dark, vec3 bright) {
+    float level = luminance(color);
+    return color * mix(dark, bright, smoothstep(0.0, 1.0, level / (level + 0.18)));
+}
+
+void fragment() {
+    vec3 exposed = COLOR * exp2(exposure);
+    vec3 balanced = white_balance(exposed, temperature);
+    vec3 contrasted = apply_contrast(balanced, contrast);
+    vec3 saturated = apply_saturation(contrasted, saturation);
+    COLOR = split_tone(saturated, shadows, highlights);
+}

@@ -10,6 +10,9 @@
 #include "relay/editor/editor_timeline.hpp"
 #include "relay/physics/collision.hpp"
 #include "relay/render/asset_manifest.hpp"
+#include "relay/render/scene_render.hpp"
+#include "relay/render/shader_graph.hpp"
+#include "relay/render/shader_language.hpp"
 #include "relay/scene/components.hpp"
 #include "relay/scene/node_types.hpp"
 #include "relay/scene/project.hpp"
@@ -20,6 +23,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
+#include <numbers>
+#include <array>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -524,9 +531,13 @@ void demo_project() {
         const auto& record = *engine.scene().get(entity);
         if (record.mesh_renderer) {
             ++renderers;
+            // Materials are imported ones or the project's shader materials, which must draw.
+            const auto& material = record.mesh_renderer->material;
+            const auto shader_material =
+                relay::valid_material_path(material) ? engine.shader_material(material) : nullptr;
             check(engine.assets().find_mesh(record.mesh_renderer->mesh) &&
-                      engine.assets().find_material(record.mesh_renderer->material),
-                  "every demo renderer resolves its imported mesh and material");
+                      (engine.assets().find_material(material) || (shader_material && shader_material->drawable())),
+                  "every demo renderer resolves its mesh and material");
         }
         colliders += record.collider.has_value();
         bodies += record.physics_body.has_value();
@@ -534,6 +545,18 @@ void demo_project() {
     }
     check(renderers >= 25U && bodies >= 10U && wrecking_ball.valid(),
           "demo scene showcases rendering and physics");
+    {
+        const auto all = engine.scene().entities();
+        const auto orbs = std::count_if(all.begin(), all.end(),
+                                        [&](const relay::Entity entity) {
+                                            const auto& renderer = engine.scene().get(entity)->mesh_renderer;
+                                            return renderer && renderer->material == "materials/PlasmaOrb.relay-material";
+                                        });
+        const auto post = engine.scene().active_post_process();
+        check(orbs == 3 && post && engine.scene().get(*post)->post_process->effects.front().material ==
+                                           "materials/Bloom.relay-material",
+              "the demo's shader showcase has three plasma orbs and bloom");
+    }
     check(relay::collision_debug_boxes(engine.scene(), true, &engine.assets()).boxes.size() == colliders,
           "every demo collider, including convex and mesh shapes, builds");
     const double start = engine.scene().get(wrecking_ball)->transform.position.y;
@@ -1019,7 +1042,7 @@ void first_person_migration() {
         text.replace(at, from.size(), to);
     };
     replace("\"version\":" + std::to_string(relay::scene_file_version), "\"version\":15");
-    replace("\"scripts\":[],\"joint\":null,\"audio_source\":null,\"audio_listener\":null,\"reverb_zone\":null,\"music_player\":null}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
+    replace("\"scripts\":[],\"joint\":null,\"audio_source\":null,\"audio_listener\":null,\"reverb_zone\":null,\"music_player\":null,\"sky\":null,\"post_process\":null}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
                                "\"sprint_speed\":8,\"jump_speed\":4,\"mouse_sensitivity\":0.2,"
                                "\"stick_look_speed\":120,\"invert_y\":true,\"ground_distance\":1.1,"
                                "\"camera\":\"Eyes\"}}");
@@ -1931,6 +1954,643 @@ void audio_music_and_streams() {
     request(protocol, "runtime.stop");
 }
 
+// A PNG with stored (uncompressed) deflate blocks, so tests need no image library.
+void write_test_png(const std::filesystem::path& path, const std::uint32_t width,
+                    const std::uint32_t height,
+                    const std::function<std::array<std::uint8_t, 3>(std::uint32_t, std::uint32_t)>& pixel) {
+    std::vector<std::uint8_t> raw;
+    for (std::uint32_t y = 0; y < height; ++y) {
+        raw.push_back(0U);
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const auto color = pixel(x, y);
+            raw.insert(raw.end(), {color[0], color[1], color[2], 255U});
+        }
+    }
+    std::vector<std::uint8_t> zlib{0x78U, 0x01U};
+    for (std::size_t offset = 0; offset < raw.size() || offset == 0U; offset += 65535U) {
+        const auto length = static_cast<std::uint16_t>(std::min<std::size_t>(65535U, raw.size() - offset));
+        zlib.push_back(offset + length >= raw.size() ? 1U : 0U);
+        zlib.insert(zlib.end(), {static_cast<std::uint8_t>(length & 0xffU), static_cast<std::uint8_t>(length >> 8U),
+                                 static_cast<std::uint8_t>(~length & 0xffU),
+                                 static_cast<std::uint8_t>((~length >> 8U) & 0xffU)});
+        zlib.insert(zlib.end(), raw.begin() + static_cast<std::ptrdiff_t>(offset),
+                    raw.begin() + static_cast<std::ptrdiff_t>(offset + length));
+    }
+    std::uint32_t a = 1U, b = 0U;
+    for (const auto byte : raw) {
+        a = (a + byte) % 65521U;
+        b = (b + a) % 65521U;
+    }
+    const std::uint32_t adler = (b << 16U) | a;
+    zlib.insert(zlib.end(), {static_cast<std::uint8_t>(adler >> 24U), static_cast<std::uint8_t>(adler >> 16U),
+                             static_cast<std::uint8_t>(adler >> 8U), static_cast<std::uint8_t>(adler)});
+    const auto crc = [](const std::vector<std::uint8_t>& bytes) {
+        std::uint32_t value = 0xffffffffU;
+        for (const auto byte : bytes) {
+            value ^= byte;
+            for (int bit = 0; bit < 8; ++bit) value = (value >> 1U) ^ (0xedb88320U & (0U - (value & 1U)));
+        }
+        return ~value;
+    };
+    std::ofstream output(path, std::ios::binary);
+    const auto big_endian = [&](const std::uint32_t value) {
+        const std::array<char, 4> bytes{static_cast<char>(value >> 24U), static_cast<char>(value >> 16U),
+                                        static_cast<char>(value >> 8U), static_cast<char>(value)};
+        output.write(bytes.data(), 4);
+    };
+    const auto chunk = [&](const char* type, const std::vector<std::uint8_t>& data) {
+        big_endian(static_cast<std::uint32_t>(data.size()));
+        std::vector<std::uint8_t> checked(type, type + 4);
+        checked.insert(checked.end(), data.begin(), data.end());
+        output.write(reinterpret_cast<const char*>(checked.data()), static_cast<std::streamsize>(checked.size()));
+        big_endian(crc(checked));
+    };
+    output.write("\x89PNG\r\n\x1a\n", 8);
+    chunk("IHDR", {static_cast<std::uint8_t>(width >> 24U), static_cast<std::uint8_t>(width >> 16U),
+                   static_cast<std::uint8_t>(width >> 8U), static_cast<std::uint8_t>(width),
+                   static_cast<std::uint8_t>(height >> 24U), static_cast<std::uint8_t>(height >> 16U),
+                   static_cast<std::uint8_t>(height >> 8U), static_cast<std::uint8_t>(height), 8U, 6U,
+                   0U, 0U, 0U});
+    chunk("IDAT", zlib);
+    chunk("IEND", {});
+}
+
+bool near(const std::array<float, 3>& value, const std::array<double, 3>& expected,
+          const double tolerance = 1e-4) {
+    for (std::size_t channel = 0; channel < 3U; ++channel)
+        if (std::abs(value[channel] - expected[channel]) > tolerance) return false;
+    return true;
+}
+
+bool same_color(const std::array<float, 3>& value, const std::array<float, 3>& expected,
+                const double tolerance = 1e-4) {
+    return near(value, std::array<double, 3>{expected[0], expected[1], expected[2]}, tolerance);
+}
+
+// The Sky node type, scene.set_sky, sky material files and what the renderer is given.
+void sky() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    const auto* kind = relay::find_component_kind("sky");
+    check(kind && kind->addable && kind->removable && kind->category == "Rendering",
+          "the sky is an addable rendering component");
+    const auto components = relay::node_type_components("Sky");
+    check(std::find(components.begin(), components.end(), "sky") != components.end() &&
+              std::find(components.begin(), components.end(), "light") != components.end(),
+          "the Sky node type adds a sky and a light");
+
+    const auto created = request(protocol, "scene.create", "\"type\":\"Sky\"");
+    const auto handle = *relay::field(*created.object(), "entity")->string();
+    const auto sky_node = *relay::Entity::parse(handle);
+    const auto* record = engine.scene().get(sky_node);
+    check(record->name == "Sky" && record->sky && *record->sky == relay::Sky{} && record->light &&
+              record->light->type == relay::Light::Type::directional &&
+              record->transform.rotation_degrees.x < 0.0 && relay::node_type(*record) == "Sky",
+          "a new Sky node has the default sky and a sun aimed down from the side");
+    check(engine.scene().active_sky() == sky_node, "the only sky is the one in use");
+
+    const auto node = "\"entity\":\"" + handle + "\"";
+    request(protocol, "scene.set_sky",
+            node + ",\"horizon_color\":[1,0.5,0.25],\"zenith_color\":[0,0,2],\"intensity\":2,"
+                   "\"ambient_intensity\":0.5,\"fog_start\":10,\"fog_end\":20,"
+                   "\"fog_start_color\":[1,1,1],\"fog_end_color\":[0,0,0]");
+    record = engine.scene().get(sky_node);
+    check(record->sky->horizon_color == relay::Vec3{1, 0.5, 0.25} &&
+              record->sky->zenith_color == relay::Vec3{0, 0, 2} && record->sky->intensity == 2.0 &&
+              record->sky->fog_end == 20.0 && record->sky->fog,
+          "scene.set_sky changes the named fields");
+    request(protocol, "scene.set_sky", node + ",\"fog_start\":30", false);
+    request(protocol, "scene.set_sky", node + ",\"horizon_color\":[1,2]", false);
+    request(protocol, "scene.set_sky", node + ",\"zenith_color\":[1,2,5000]", false);
+    request(protocol, "scene.set_sky", node + ",\"material\":\"../outside.relay-material\"", false);
+    check(engine.scene().get(sky_node)->sky->fog_start == 10.0,
+          "fog ending before it starts, bad colors and unsafe paths are refused");
+
+    // What the renderer draws.
+    auto rendered = relay::build_render_scene(engine.scene(), engine.assets(), 1.0F);
+    // The sun's glow reaches across the sky, so the colors are checked without it.
+    auto sky = rendered.sky;
+    sky.sun = false;
+    check(sky.visible && sky.entity == sky_node && near(sky.horizon, {2, 1, 0.5}) &&
+              near(sky.zenith, {0, 0, 4}) && !sky.panorama,
+          "the gradient is drawn at the sky's intensity");
+    check(near(relay::sky_radiance(sky, {0, 1, 0}), {0, 0, 4}) &&
+              near(relay::sky_radiance(sky, {0, -1, 0}), {2, 1, 0.5}) &&
+              near(relay::sky_radiance(sky, {1, 0, 0}), {2, 1, 0.5}),
+          "straight up shows the zenith; the horizon and everything below show the horizon color");
+    const double scale = std::numbers::pi * 0.5;
+    check(near(sky.ambient_up, {2 * scale / 6.0, 1 * scale / 6.0, (0.5 + 3.5 * 5.0 / 6.0) * scale}) &&
+              near(sky.ambient_down, {2 * scale, 1 * scale, 0.5 * scale}),
+          "the sky lights upward surfaces with its upper hemisphere and downward ones with the horizon");
+    check(relay::fog_amount(sky, 5.0F) == 0.0F && std::abs(relay::fog_amount(sky, 15.0F) - 0.5F) < 1e-6F &&
+              relay::fog_amount(sky, 50.0F) == 1.0F,
+          "fog rises linearly from its start to its end distance");
+    // The sun sits where the node's light comes from, and only in what is seen.
+    {
+        const auto& lit = rendered.sky;
+        const auto towards = lit.sun_direction;
+        const auto away = relay::Vec3{-towards.x, std::abs(towards.y), -towards.z};
+        const auto at_sun = relay::sky_radiance(lit, towards);
+        const auto background = relay::sky_radiance(sky, towards);
+        check(lit.sun && towards.y > 0.5 && near(lit.sun_radiance, {2.5, 2.375, 2.15}) &&
+                  at_sun[0] > background[0] + 2.5 * relay::sun_disc_brightness * 0.9,
+              "the sky node's directional light is drawn as a bright disc towards the light");
+        check(same_color(relay::sky_radiance(lit, away), relay::sky_radiance(sky, away), 1e-3),
+              "away from the sun the sky keeps its colors");
+        check(same_color(relay::sky_environment(lit, towards), relay::sky_environment(sky, towards)),
+              "the sun is not part of the sky's light, since its light already lights the scene");
+        auto set_below = lit;
+        set_below.sun_direction = {0, -0.5, -0.866};
+        check(near(relay::sun_glow(set_below, set_below.sun_direction), {0, 0, 0}),
+              "a sun below the horizon is hidden");
+    }
+    request(protocol, "scene.set_sky", node + ",\"fog\":false");
+    check(relay::fog_amount(relay::build_render_scene(engine.scene(), engine.assets(), 1.0F).sky, 50.0F) == 0.0F,
+          "turning fog off clears it");
+    request(protocol, "scene.undo");
+    check(engine.scene().get(sky_node)->sky->fog, "sky changes undo");
+
+    // A second sky waits until the first goes.
+    const auto second = *relay::Entity::parse(
+        *relay::field(*request(protocol, "scene.create", "\"type\":\"Sky\"").object(), "entity")->string());
+    check(engine.scene().active_sky() == sky_node, "the first sky stays in use");
+    request(protocol, "component.remove", node + ",\"component\":\"light\"");
+    check(!relay::build_render_scene(engine.scene(), engine.assets(), 1.0F).sky.sun,
+          "a sky without a directional light shows no sun");
+    request(protocol, "scene.undo");
+    request(protocol, "component.remove", node + ",\"component\":\"sky\"");
+    check(engine.scene().active_sky() == second &&
+              relay::node_type(*engine.scene().get(sky_node)) == "DirectionalLight",
+          "removing the first sky hands over to the next; its sun stays a directional light");
+    request(protocol, "scene.undo");
+
+    // Saving and loading, and scenes from before skies.
+    std::string error;
+    check(relay::save_scene_file_atomic(engine.scene(), "sky.relay.json", error), "save the sky scene");
+    const auto loaded = relay::load_scene_file("sky.relay.json");
+    check(loaded && loaded.state->slots[sky_node.index].record.sky ==
+                        engine.scene().get(sky_node)->sky,
+          "the sky survives a save and load");
+    {
+        relay::Scene plain;
+        (void)plain.create("Thing");
+        check(relay::save_scene_file_atomic(plain, "plain.relay.json", error), "save a plain scene");
+        std::ifstream input("plain.relay.json");
+        std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        input.close();
+        const auto version = "\"version\":" + std::to_string(relay::scene_file_version);
+        text.replace(text.find(version), version.size(), "\"version\":20");
+        text.replace(text.find(",\"sky\":null"), 11, "");
+        text.replace(text.find(",\"post_process\":null"), 20, "");
+        std::ofstream("plain.relay.json", std::ios::trunc) << text;
+        const auto old = relay::load_scene_file("plain.relay.json");
+        check(old && old.migrated && !old.state->slots[0].record.sky, "a version 20 scene loads without skies");
+    }
+
+    // Sky materials: files wrapping a panorama image.
+    std::filesystem::create_directories("assets/skies");
+    write_test_png("assets/skies/pano.png", 64, 32, [](std::uint32_t, std::uint32_t y) {
+        return y < 16U ? std::array<std::uint8_t, 3>{255U, 128U, 0U} : std::array<std::uint8_t, 3>{0U, 255U, 0U};
+    });
+    const std::string day = "\"path\":\"skies/Day.relay-material\"";
+    request(protocol, "assets.set_sky_material", day + ",\"create\":true,\"panorama\":\"skies/pano.png\","
+                                                       "\"intensity\":2,\"tint\":[1,1,0.5]");
+    request(protocol, "assets.set_sky_material", day + ",\"create\":true", false);
+    request(protocol, "assets.set_sky_material", "\"path\":\"skies/Missing.relay-material\"", false);
+    request(protocol, "assets.set_sky_material", "\"path\":\"skies/Bad.relay-material\",\"create\":true,"
+                                                 "\"panorama\":\"skies/pano.gif\"", false);
+    const auto read = request(protocol, "assets.sky_material", day);
+    const auto& material = *relay::field(*read.object(), "material")->object();
+    const auto* image = relay::field(material, "image")->object();
+    check(*relay::field(material, "panorama")->string() == "skies/pano.png" && image &&
+              *relay::field(*image, "width")->number() == 64.0 && relay::field(material, "error")->is_null(),
+          "a sky material reads back with its image's size");
+    const auto found = request(protocol, "assets.search", "\"kinds\":[\"material\"]");
+    const auto& entries = *relay::field(*found.object(), "entries")->array();
+    check(entries.size() == 1U &&
+              *relay::field(*entries[0].object(), "path")->string() == "skies/Day.relay-material" &&
+              *relay::field(*entries[0].object(), "kind")->string() == "material",
+          "sky materials are assets of kind material");
+
+    request(protocol, "scene.set_sky", node + ",\"material\":\"skies/Day.relay-material\"");
+    engine.sync_sky();
+    rendered = relay::build_render_scene(engine.scene(), engine.assets(), 1.0F);
+    rendered.sky.sun = false;
+    check(rendered.sky.panorama && rendered.sky.panorama->image.width == 64U &&
+              near(rendered.sky.panorama_tint, {4, 4, 2}) && rendered.sky.material_error.empty(),
+          "a sky showing a material draws its panorama at both intensities and the tint");
+    const double orange = std::pow((128.0 / 255.0 + 0.055) / 1.055, 2.4);
+    check(near(relay::sky_radiance(rendered.sky, {0, 1, 0}), {4, orange * 4, 0}, 1e-3) &&
+              near(relay::sky_radiance(rendered.sky, {0, -1, 0}), {0, 4, 0}, 1e-3),
+          "the panorama's top is up and its bottom is down");
+    check(near(rendered.sky.ambient_up, {4 * scale, orange * 4 * scale, 0}, 1e-3) &&
+              near(rendered.sky.ambient_down, {0, 4 * scale, 0}, 1e-3),
+          "the panorama's hemispheres light up- and downward surfaces");
+    const auto first_image = rendered.sky.panorama;
+    request(protocol, "assets.set_sky_material", day + ",\"rotation_degrees\":90");
+    engine.sync_sky();
+    rendered = relay::build_render_scene(engine.scene(), engine.assets(), 1.0F);
+    check(rendered.sky.panorama == first_image && rendered.sky.panorama_rotation_degrees == 90.0F,
+          "editing the material reloads it without decoding the image again");
+    request(protocol, "assets.set_sky_material", day + ",\"panorama\":\"skies/gone.png\"");
+    engine.sync_sky();
+    rendered = relay::build_render_scene(engine.scene(), engine.assets(), 1.0F);
+    rendered.sky.sun = false;
+    check(!rendered.sky.panorama && !rendered.sky.material_error.empty() &&
+              near(relay::sky_radiance(rendered.sky, {0, 1, 0}), {0, 0, 4}),
+          "a material whose image is missing falls back to the gradient and says why");
+    std::cout << "Sky workflow tests passed\n";
+}
+
+// Relay's shading language: parsing, generated GLSL, compile errors at the user's lines.
+void shader_language() {
+    using relay::ShaderUniform;
+    for (const auto type : {relay::ShaderType::surface, relay::ShaderType::post_process}) {
+        const auto compiled = relay::compile_relay_shader("t.relay-shader", relay::shader_template(type));
+        if (!compiled->ok())
+            for (const auto& message : compiled->errors)
+                std::cerr << "line " << message.line << ": " << message.text << '\n';
+        check(compiled->ok() && !compiled->fragment.empty() &&
+                  (type == relay::ShaderType::post_process) == compiled->vertex.empty(),
+              "both shader templates compile");
+    }
+    const auto parsed = relay::parse_relay_shader(R"(shader_type surface;
+render_mode transparent;
+// A comment with uniform int ignored = 3;
+uniform float a : hint_range(-1.0, 2.0, 0.5) = -0.5;
+uniform vec3 tint : source_color = vec3(0.1, 0.2, 0.3);
+uniform float b;
+uniform vec2 c = vec2(4.0);
+uniform bool flag = true;
+uniform sampler2D albedo_map : source_color;
+uniform sampler2D bumps : hint_normal;
+uniform int count = 3;
+void fragment() { ALBEDO = tint * a; }
+)");
+    check(parsed.errors.empty() && parsed.type == relay::ShaderType::surface && parsed.transparent &&
+              !parsed.unshaded && parsed.has_fragment && !parsed.has_vertex && parsed.uniforms.size() == 8U,
+          "a surface shader's type, render modes, uniforms and functions are read");
+    const auto offset = [&](const char* name) { return parsed.find_uniform(name)->offset; };
+    check(offset("a") == 0U && offset("tint") == 16U && offset("b") == 28U && offset("c") == 32U &&
+              offset("flag") == 40U && offset("count") == 44U && parsed.uniform_bytes == 48U &&
+              offset("albedo_map") == 1U && offset("bumps") == 2U && parsed.texture_count == 2U,
+          "parameters are laid out by std140 rules and images get bindings from 1");
+    const auto* a = parsed.find_uniform("a");
+    check(a->hint == ShaderUniform::Hint::range && a->minimum == -1.0 && a->maximum == 2.0 && a->step == 0.5 &&
+              a->default_value[0] == -0.5 && parsed.find_uniform("c")->default_value[1] == 4.0 &&
+              parsed.find_uniform("flag")->default_value[0] == 1.0 &&
+              parsed.find_uniform("tint")->hint == ShaderUniform::Hint::color && a->line == 4U,
+          "hints, ranges and defaults are read");
+    check(parsed.code.find("uniform") == parsed.code.find("uniform int ignored") &&
+              std::count(parsed.code.begin(), parsed.code.end(), '\n') == 12,
+          "Relay's declarations are blanked out of the code, keeping every line");
+
+    const auto errors = [](std::string_view text) { return relay::parse_relay_shader(text).errors; };
+    check(!errors("uniform float x;").empty() && errors("uniform float x;").front().line == 1U,
+          "a shader must start with its type");
+    check(!errors("shader_type surface;\nuniform mat4 m;").empty() &&
+              errors("shader_type surface;\nuniform mat4 m;").front().line == 2U,
+          "unsupported uniform types are reported at their line");
+    check(!errors("shader_type surface;\nuniform float ALBEDO;").empty() &&
+              !errors("shader_type surface;\nuniform float x = vec3(1.0);").empty() &&
+              !errors("shader_type surface;\nuniform float x;\nuniform float x;").empty() &&
+              !errors("shader_type surface;\nvoid main() {}").empty() &&
+              !errors("shader_type post_process;\nrender_mode unshaded;").empty() &&
+              !errors("shader_type surface;\n#version 450").empty() &&
+              !errors("shader_type surface;\nvoid fragment() {").empty(),
+          "reserved names, mismatched defaults, duplicates, main(), post render modes, #version "
+          "and unclosed braces are refused");
+
+    const auto broken = relay::compile_relay_shader("b.relay-shader", R"(shader_type surface;
+uniform float strength = 1.0;
+
+void fragment() {
+    ALBEDO = vec3(strength);
+    ROUGHNESS = missing_value;
+}
+)");
+    check(!broken->ok() && !broken->errors.empty() && broken->errors.front().line == 6U &&
+              broken->errors.front().text.find("missing_value") != std::string::npos,
+          "compile errors point at the user's line");
+    const auto wrong_signature = relay::compile_relay_shader("w.relay-shader", "shader_type surface;\n"
+                                                                               "float fragment() { return 1.0; }\n");
+    check(!wrong_signature->ok() && wrong_signature->errors.front().line == 2U,
+          "a fragment() with the wrong signature is reported at its line");
+    const auto vertex_only_helpers = relay::compile_relay_shader("v.relay-shader", R"(shader_type surface;
+float wave(float x) { return sin(x); }
+void vertex() { VERTEX.y += wave(TIME); }
+void fragment() { ALBEDO = vec3(dFdx(UV.x)); }
+)");
+    check(vertex_only_helpers->ok(), "fragment-only functions such as dFdx stay out of the vertex stage");
+    std::cout << "Shader language tests passed\n";
+}
+
+// Project shaders and materials through the protocol, and what the renderer is given.
+void shader_materials() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    std::filesystem::create_directories("assets/fx");
+    const auto shader_of = [](const relay::JsonValue& result) -> const relay::JsonValue::Object& {
+        return *relay::field(*result.object(), "shader")->object();
+    };
+    const auto errors_of = [&](const relay::JsonValue& result) {
+        return relay::field(shader_of(result), "errors")->array()->size();
+    };
+    // Shaders: created from a template, written, previewed.
+    const std::string glow = "\"path\":\"fx/Glow.relay-shader\"";
+    auto created = request(protocol, "shaders.write", glow + ",\"create\":true");
+    check(*relay::field(shader_of(created), "compiled")->boolean() &&
+              relay::field(shader_of(created), "uniforms")->array()->size() == 3U,
+          "a new shader starts from a template that compiles, with its uniforms reported");
+    request(protocol, "shaders.write", glow + ",\"create\":true", false);
+    request(protocol, "shaders.write", "\"path\":\"../out.relay-shader\",\"text\":\"x\"", false);
+    const std::string text = "shader_type surface;\nrender_mode transparent;\n"
+                             "uniform vec3 tint : source_color = vec3(1.0, 0.5, 0.25);\n"
+                             "uniform float power : hint_range(0.0, 4.0) = 2.0;\n"
+                             "uniform sampler2D mask;\n"
+                             "void fragment() { ALBEDO = tint * power * texture(mask, UV).r; ALPHA = 0.5; }\n";
+    request(protocol, "shaders.write", glow + ",\"text\":\"" + relay::json_escape(text) + "\"");
+    const auto read = request(protocol, "shaders.read", glow);
+    check(*relay::field(shader_of(read), "text")->string() == text &&
+              *relay::field(shader_of(read), "transparent")->boolean() &&
+              !*relay::field(shader_of(read), "previewing")->boolean(),
+          "shaders.read returns the text, render modes and uniforms");
+    auto previewed = request(protocol, "shaders.preview",
+                             glow + ",\"text\":\"shader_type surface;\\nvoid fragment() {\\n ALBEDO = oops;\\n}\\n\"");
+    const auto& preview_error = *(*relay::field(shader_of(previewed), "errors")->array())[0].object();
+    check(errors_of(previewed) >= 1U && *relay::field(preview_error, "line")->number() == 3.0 &&
+              *relay::field(shader_of(previewed), "previewing")->boolean() &&
+              !engine.shader("fx/Glow.relay-shader")->ok(),
+          "a preview compiles unsaved text and reports its errors by line");
+    request(protocol, "shaders.preview", glow);
+    check(engine.shader("fx/Glow.relay-shader")->ok() &&
+              relay::read_shader_file("assets", "fx/Glow.relay-shader", *std::make_unique<std::string>()) == text,
+          "stopping the preview goes back to the file, which the preview never touched");
+
+    // Materials.
+    const std::string material = "\"path\":\"fx/Glow.relay-material\"";
+    request(protocol, "assets.set_material", material + ",\"create\":true", false);
+    request(protocol, "assets.set_material", material + ",\"create\":true,\"type\":\"surface\","
+                                                        "\"shader\":\"fx/Glow.relay-shader\"");
+    request(protocol, "assets.set_material_parameter", material + ",\"name\":\"power\",\"value\":[3]");
+    request(protocol, "assets.set_material_parameter", material + ",\"name\":\"power\",\"value\":[3,4]", false);
+    request(protocol, "assets.set_material_parameter", material + ",\"name\":\"nothing\",\"value\":[1]", false);
+    request(protocol, "assets.set_material_parameter", material + ",\"name\":\"mask\",\"value\":[1]", false);
+    request(protocol, "assets.set_material_parameter", material + ",\"name\":\"tint\",\"value\":[0.5,0.25,0.125]");
+    request(protocol, "assets.set_material_parameter", material + ",\"name\":\"tint\",\"reset\":true");
+    auto summary = request(protocol, "assets.material", material);
+    const auto& info = *relay::field(*summary.object(), "material")->object();
+    const auto& parameters = *relay::field(info, "parameters")->array();
+    const auto parameter = [&](const std::string& name) {
+        return *std::find_if(parameters.begin(), parameters.end(), [&](const relay::JsonValue& item) {
+                    return *relay::field(*item.object(), "name")->string() == name;
+                })->object();
+    };
+    check(*relay::field(info, "drawable")->boolean() && parameters.size() == 3U &&
+              *relay::field(parameter("power"), "set")->boolean() &&
+              *(*relay::field(parameter("power"), "value")->array())[0].number() == 3.0 &&
+              !*relay::field(parameter("tint"), "set")->boolean() &&
+              *(*relay::field(parameter("tint"), "value")->array())[1].number() == 0.5 &&
+              *relay::field(parameter("mask"), "texture")->string() == "",
+          "a material reports every uniform with its value or the shader's default");
+    request(protocol, "assets.material", "\"path\":\"fx/Missing.relay-material\"", false);
+
+    // A mesh drawn with it.
+    const auto node = *relay::Entity::parse(
+        *relay::field(*request(protocol, "scene.create", "\"type\":\"StaticMesh\"").object(), "entity")->string());
+    const auto node_field = "\"entity\":\"" + node.to_string() + "\"";
+    request(protocol, "scene.set_renderer", node_field + ",\"mesh\":\"builtin.quad\",\"material\":\"fx/Glow.relay-material\"");
+    request(protocol, "scene.set_renderer", node_field + ",\"material\":\"fx/Nothing.relay-material\"", false);
+    engine.sync_render_assets();
+    auto rendered = relay::build_render_scene(engine.scene(), engine.assets(), 1.0F);
+    const auto instance = std::find_if(rendered.instances.begin(), rendered.instances.end(),
+                                       [&](const relay::RenderInstance& item) { return item.entity == node; });
+    check(instance != rendered.instances.end() && instance->shader_material &&
+              instance->shader_material->drawable() && instance->alpha_blended &&
+              instance->material_index == engine.assets().material_index("builtin.grey"),
+          "a mesh with a surface material is drawn by its shader, blended when the shader is transparent");
+    const auto& block = instance->shader_material->parameters;
+    float power = 0.0F, tint_green = 0.0F;
+    std::memcpy(&power, block.data() + 12U, 4U);
+    std::memcpy(&tint_green, block.data() + 4U, 4U);
+    check(block.size() == 16U && power == 3.0F && tint_green == 0.5F,
+          "the parameter block holds the material's values and the shader's defaults at std140 offsets");
+    // Per-object values: this node's own power and tint, checked against the shader.
+    request(protocol, "scene.set_renderer_parameter", node_field + ",\"name\":\"power\",\"value\":[1.5]");
+    request(protocol, "scene.set_renderer_parameter", node_field + ",\"name\":\"tint\",\"value\":[0,1,0]");
+    request(protocol, "scene.set_renderer_parameter", node_field + ",\"name\":\"power\",\"value\":[1,2]", false);
+    request(protocol, "scene.set_renderer_parameter", node_field + ",\"name\":\"mask\",\"value\":[1]", false);
+    request(protocol, "scene.set_renderer_parameter", node_field + ",\"name\":\"nothing\",\"value\":[1]", false);
+    request(protocol, "scene.set_renderer_parameter", node_field + ",\"name\":\"tint\",\"clear\":true");
+    request(protocol, "scene.set_renderer", node_field + ",\"mesh\":\"builtin.triangle\",\"material\":\"fx/Glow.relay-material\"");
+    check(engine.scene().get(node)->mesh_renderer->parameters ==
+              std::map<std::string, std::vector<double>, std::less<>>{{"power", {1.5}}},
+          "per-object values are checked against the shader, cleared one by one, and kept with the material");
+    rendered = relay::build_render_scene(engine.scene(), engine.assets(), 1.0F);
+    const auto own = std::find_if(rendered.instances.begin(), rendered.instances.end(),
+                                  [&](const relay::RenderInstance& item) { return item.entity == node; });
+    float own_power = 0.0F;
+    std::memcpy(&own_power, own->shader_parameters.data() + 12U, 4U);
+    std::memcpy(&tint_green, own->shader_parameters.data() + 4U, 4U);
+    check(own->shader_parameters.size() == 16U && own_power == 1.5F && tint_green == 0.5F &&
+              own->shader_material->parameters == block,
+          "an object's own values fill its own parameter block; the material's stays as it was");
+    std::string saved_error;
+    check(relay::save_scene_file_atomic(engine.scene(), "own.relay-scene.json", saved_error), "save per-object values");
+    const auto reloaded = relay::load_scene_file("own.relay-scene.json");
+    check(reloaded && reloaded.state->slots[node.index].record.mesh_renderer->parameters ==
+                          engine.scene().get(node)->mesh_renderer->parameters,
+          "per-object values survive a save and load");
+    // Back past the renderer change and the clear.
+    for (int step = 0; step < 2; ++step) request(protocol, "scene.undo");
+    check(engine.scene().get(node)->mesh_renderer->parameters.size() == 2U, "per-object values undo");
+    for (int step = 0; step < 2; ++step) request(protocol, "scene.redo");
+    const auto first_revision = instance->shader_material->revision;
+    request(protocol, "shaders.write", glow + ",\"text\":\"shader_type surface;\\nvoid fragment() { ALBEDO = broken; }\\n\"");
+    engine.sync_render_assets();
+    rendered = relay::build_render_scene(engine.scene(), engine.assets(), 1.0F);
+    const auto broken = std::find_if(rendered.instances.begin(), rendered.instances.end(),
+                                     [&](const relay::RenderInstance& item) { return item.entity == node; });
+    check(broken->shader_material && !broken->shader_material->drawable() && !broken->alpha_blended &&
+              broken->shader_material->revision != first_revision &&
+              broken->shader_material->error.find("fx/Glow.relay-shader:2") != std::string::npos,
+          "a shader that stops compiling makes its materials undrawable, saying where");
+
+    // Relay's ready-made effects: copied into the project, compiled, and shown as nodes.
+    for (const auto& effect : relay::shader_effects()) {
+        const auto effect_path = "fx/" + std::string{effect.name} + ".relay-shader";
+        request(protocol, "shaders.write", "\"path\":\"" + effect_path + "\",\"create\":true,\"effect\":\"" +
+                                               std::string{effect.id} + '"');
+        const auto compiled = engine.shader(effect_path);
+        const auto graph = relay::shader_to_graph(effect.text);
+        check(compiled && compiled->ok() && compiled->parsed.type == relay::ShaderType::post_process &&
+                  graph.errors.empty() && !graph.fragment.code_only &&
+                  compiled->parsed.reads_blurred == (effect.id == "bloom"),
+              ("the ready-made effect " + std::string{effect.name} + " compiles and opens as nodes").c_str());
+    }
+    request(protocol, "shaders.write", "\"path\":\"fx/Other.relay-shader\",\"create\":true,\"effect\":\"sparkles\"", false);
+
+    // Post processing.
+    request(protocol, "shaders.write", "\"path\":\"fx/Grade.relay-shader\",\"create\":true,\"type\":\"post_process\"");
+    for (const char* name : {"A", "B"})
+        request(protocol, "assets.set_material", std::string("\"path\":\"fx/") + name +
+                                                     ".relay-material\",\"create\":true,\"type\":\"post_process\","
+                                                     "\"shader\":\"fx/Grade.relay-shader\"");
+    const auto post = *relay::Entity::parse(
+        *relay::field(*request(protocol, "scene.create", "\"type\":\"PostProcess\"").object(), "entity")->string());
+    const auto post_field = "\"entity\":\"" + post.to_string() + "\"";
+    check(relay::node_type(*engine.scene().get(post)) == "PostProcess" &&
+              engine.scene().get(post)->post_process->effects.empty(),
+          "a Post Process node starts without effects");
+    request(protocol, "scene.set_post_process", post_field + ",\"effects\":[\"fx/Glow.relay-material\"]", false);
+    request(protocol, "scene.set_post_process",
+            post_field + ",\"effects\":[\"fx/A.relay-material\",\"fx/B.relay-material\"]");
+    request(protocol, "scene.set_post_effect", post_field + ",\"index\":0,\"enabled\":false");
+    request(protocol, "scene.set_post_effect", post_field + ",\"index\":5,\"enabled\":false", false);
+    request(protocol, "scene.set_post_process",
+            post_field + ",\"effects\":[\"fx/B.relay-material\",\"fx/A.relay-material\"]");
+    const auto& effects = engine.scene().get(post)->post_process->effects;
+    check(effects.size() == 2U && effects[0].material == "fx/B.relay-material" && effects[0].enabled &&
+              !effects[1].enabled,
+          "reordering effects keeps which are off");
+    engine.sync_render_assets();
+    rendered = relay::build_render_scene(engine.scene(), engine.assets(), 1.0F);
+    check(rendered.post_effects.size() == 1U && rendered.post_effects[0]->path == "fx/B.relay-material",
+          "the renderer gets the enabled effects that can be drawn, in order");
+    request(protocol, "scene.set_post_effect", post_field + ",\"index\":0,\"editor\":false");
+    const relay::ViewOverride editor_view{};
+    check(engine.scene().get(post)->post_process->effects[0].enabled &&
+              relay::build_render_scene(engine.scene(), engine.assets(), 1.0F, &editor_view).post_effects.empty() &&
+              relay::build_render_scene(engine.scene(), engine.assets(), 1.0F).post_effects.size() == 1U,
+          "an effect kept out of the editor view still shows through the scene camera");
+    request(protocol, "scene.set_post_process",
+            post_field + ",\"effects\":[\"fx/B.relay-material\",\"fx/A.relay-material\"]");
+    check(!engine.scene().get(post)->post_process->effects[0].editor,
+          "resending the list keeps each effect's editor-view setting");
+    std::string error;
+    check(relay::save_scene_file_atomic(engine.scene(), "post.relay.json", error), "save post processing");
+    const auto loaded = relay::load_scene_file("post.relay.json");
+    check(loaded && loaded.state->slots[post.index].record.post_process == engine.scene().get(post)->post_process &&
+              loaded.state->slots[node.index].record.mesh_renderer->material == "fx/Glow.relay-material",
+          "post processing and material paths survive a save and load");
+    // Back past the resend, the editor-view switch and the reorder.
+    for (int step = 0; step < 3; ++step) request(protocol, "scene.undo");
+    check(engine.scene().get(post)->post_process->effects[0].material == "fx/A.relay-material",
+          "post-processing changes undo");
+    const auto found = request(protocol, "assets.search", "\"kinds\":[\"shader\"]");
+    check(relay::field(*found.object(), "entries")->array()->size() == 5U, "shader files are assets of kind shader");
+    std::cout << "Shader material workflow tests passed\n";
+}
+
+// Shader graphs: code becomes nodes and back, stably, and graph edits make shaders that compile.
+void shader_graphs() {
+    using Kind = relay::GraphNode::Kind;
+    const std::string agent = R"(shader_type surface;
+uniform vec3 tint : source_color = vec3(1.0, 0.5, 0.25);
+uniform sampler2D mask;
+// Helpers stay code the nodes can call.
+float wave(float x) { return sin(x) * 0.5 + 0.5; }
+
+void vertex() {
+    VERTEX.y += wave(TIME) * 0.1;
+}
+
+void fragment() {
+    float edge = texture(mask, UV * 2.0).r;
+    ALBEDO = tint * edge;
+    ROUGHNESS = UV.x > 0.5 ? 0.2 : 0.8;
+    EMISSION = -tint;
+}
+)";
+    auto graph = relay::shader_to_graph(agent);
+    check(graph.errors.empty() && graph.uniforms.size() == 2U && graph.functions.find("float wave") != std::string::npos &&
+              !graph.vertex.code_only && !graph.fragment.code_only,
+          "an agent's shader converts to a graph, keeping helper functions as code");
+    const auto& fragment = graph.fragment;
+    const auto* edge = fragment.find("edge");
+    const auto* output = fragment.find("output");
+    check(edge && edge->kind == Kind::swizzle && edge->op == "r" && edge->type == "float" &&
+              fragment.find("input:UV") && fragment.find("uniform:mask") && output,
+          "a named local becomes a node with that name; built-ins and uniforms become input nodes");
+    const auto pin = [&](const relay::GraphNode& node, const std::string& name) {
+        return *std::find_if(node.inputs.begin(), node.inputs.end(),
+                             [&](const relay::GraphInput& input) { return input.name == name; });
+    };
+    const auto* albedo = fragment.find(pin(*output, "ALBEDO").source);
+    const auto* roughness = fragment.find(pin(*output, "ROUGHNESS").source);
+    const auto* texture = fragment.find(fragment.find("edge")->inputs[0].source);
+    const auto* scaled_uv = fragment.find(texture->inputs[1].source);
+    check(albedo && albedo->kind == Kind::binary && albedo->op == "*" && albedo->type == "vec3" && roughness &&
+              roughness->kind == Kind::select && roughness->inputs[1].value == "0.2" && texture->op == "texture" &&
+              texture->type == "vec4" && scaled_uv->inputs[1].value == "2.0" &&
+              fragment.find(pin(*output, "EMISSION").source)->kind == Kind::unary && pin(*output, "ALPHA").value.empty(),
+          "operators, calls, ternaries and literals on pins are read, with their types");
+    const auto* moved = graph.vertex.find(pin(*graph.vertex.find("output"), "VERTEX").source);
+    check(moved && moved->kind == Kind::set && moved->op == "y" &&
+              graph.vertex.find(moved->inputs[1].source)->op == "+" &&
+              graph.vertex.find(graph.vertex.find(moved->inputs[1].source)->inputs[1].source)->type == "float",
+          "a component assignment becomes a set node; a helper's result has its declared type");
+
+    const auto written = relay::graph_to_shader(graph);
+    const auto compiled = relay::compile_relay_shader("graph.relay-shader", written.text);
+    check(compiled->ok() && written.text.find("// relay-graph {") != std::string::npos &&
+              written.text.find("float edge = ") != std::string::npos,
+          "the graph writes a shader that compiles, one line per node, with its layout at the end");
+    const auto again = relay::shader_to_graph(written.text);
+    check(relay::graph_to_shader(again).text == written.text && again.fragment.nodes.size() == graph.fragment.nodes.size(),
+          "written graphs read back the same, node for node");
+
+    // Editing: positions persist; new nodes and wires compile.
+    auto edited = again;
+    edited.fragment.find("edge")->x = 777.0F;
+    auto* out = edited.fragment.find("output");
+    relay::GraphNode sine;
+    sine.id = relay::unused_graph_id(edited.fragment);
+    sine.kind = Kind::call;
+    sine.op = "sin";
+    sine.inputs = {{"1", "input:TIME", {}}};
+    edited.fragment.nodes.insert(edited.fragment.nodes.begin(), sine);
+    if (!edited.fragment.find("input:TIME")) {
+        relay::GraphNode time;
+        time.id = "input:TIME";
+        time.kind = Kind::input;
+        time.op = "TIME";
+        edited.fragment.nodes.push_back(time);
+    }
+    out = edited.fragment.find("output");
+    for (auto& input : out->inputs)
+        if (input.name == "METALLIC") input.source = sine.id;
+    check(relay::graph_would_cycle(edited.fragment, "edge", texture->id) &&
+              !relay::graph_would_cycle(edited.fragment, texture->id, "edge"),
+          "wiring a node into what feeds it is recognised as a loop");
+    (void)relay::update_graph_types(edited, edited.fragment);
+    const auto edited_text = relay::graph_to_shader(edited).text;
+    const auto reread = relay::shader_to_graph(edited_text);
+    check(relay::compile_relay_shader("edited.relay-shader", edited_text)->ok() &&
+              edited_text.find("METALLIC = " + sine.id) != std::string::npos &&
+              reread.fragment.find("edge")->x == 777.0F,
+          "a node added and wired in the graph compiles, and moved nodes keep their place");
+
+    // Control flow keeps a stage as code; the file's other stage is still nodes.
+    const auto branching = relay::shader_to_graph(
+        "shader_type surface;\nvoid fragment() {\n    // keep me\n    if (UV.x > 0.5) { ALBEDO = vec3(1.0); }\n}\n");
+    check(branching.fragment.code_only && branching.fragment.reason.find("if") != std::string::npos &&
+              branching.fragment.code.find("// keep me") != std::string::npos &&
+              relay::compile_relay_shader("b.relay-shader", relay::graph_to_shader(branching).text)->ok(),
+          "a stage with if stays code, comments and all, and still compiles");
+    const auto broken = relay::shader_to_graph("shader_type surface;\nuniform mat4 m;\n");
+    check(!broken.errors.empty(), "declaration errors keep a file from becoming a graph");
+    const auto post = relay::shader_to_graph(relay::shader_template(relay::ShaderType::post_process));
+    check(post.type == relay::ShaderType::post_process && !post.fragment.code_only &&
+              relay::compile_relay_shader("p.relay-shader", relay::graph_to_shader(post).text)->ok(),
+          "the post-processing template converts and compiles");
+    std::cout << "Shader graph tests passed\n";
+}
+
 int main() {
     const auto original = std::filesystem::current_path();
     const auto temporary = std::filesystem::temp_directory_path() /
@@ -1956,6 +2616,10 @@ int main() {
         audio();
         audio_effects();
         audio_music_and_streams();
+        sky();
+        shader_language();
+        shader_materials();
+        shader_graphs();
         std::cout << "Background editor workflow tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

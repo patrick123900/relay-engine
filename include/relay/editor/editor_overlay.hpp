@@ -67,6 +67,17 @@ public:
         return entity.valid() ? std::vector<Entity>{entity} : std::vector<Entity>{};
     }
     [[nodiscard]] virtual bool ground_grid_visible() const { return false; }
+    // Material previews: the surface .relay-material the UI wants shown on a sphere (empty for
+    // none), and the rendered result, as 8-bit sRGB RGBA rows, delivered a frame or two after the
+    // material or its parameters last changed.
+    [[nodiscard]] virtual std::string material_preview_request() const { return {}; }
+    virtual void material_preview_ready(const std::string& path, std::uint32_t width, std::uint32_t height,
+                                        std::vector<std::uint8_t> rgba) {
+        (void)path;
+        (void)width;
+        (void)height;
+        (void)rgba;
+    }
 };
 
 } // namespace relay

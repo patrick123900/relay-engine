@@ -52,6 +52,12 @@ public:
     using FrameReceiver = std::function<void(OwnedFrame, std::string)>;
     bool readback_async(const Scene& scene, double elapsed_seconds, FrameReceiver receiver, std::string& error);
     void flush_readbacks();
+    // Material previews for callers without an editor overlay (the overlay's requests are used
+    // otherwise): renders the surface material on a sphere whenever it changes, calling
+    // `receiver` with 8-bit sRGB RGBA pixels. An empty path stops. The material must be one the
+    // asset registry resolves (Engine::set_previewed_material).
+    using MaterialPreviewReceiver = std::function<void(const std::string& path, OwnedFrame frame)>;
+    void set_material_preview(std::string path, MaterialPreviewReceiver receiver);
     void resize(std::uint32_t width, std::uint32_t height);
     // Turns FidelityFX global illumination on or off. When the device or build cannot provide it,
     // the renderer keeps its analytic sky light and lighting_status_json() says why.
@@ -62,6 +68,11 @@ public:
     // else mailbox). A change rebuilds the swapchain after the next present.
     void set_vsync(bool enabled);
     [[nodiscard]] std::string lighting_status_json() const;
+    // Seconds that animated shaders read as TIME in presented frames. Without it they use the
+    // elapsed time passed to draw(); captures always do, so they stay reproducible.
+    void set_shader_time(double seconds);
+    // Why shader materials or post effects could not be set up on the GPU, if they could not.
+    [[nodiscard]] std::string shader_status_error() const;
     // Installs the human-facing UI layer. The overlay must outlive the window. It is drawn into the
     // swapchain render pass for presentation only and is deliberately excluded from every capture
     // and readback, so screenshots, recordings and golden comparisons keep showing scene pixels.

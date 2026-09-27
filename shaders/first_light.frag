@@ -53,6 +53,12 @@ void main() {
                  : (indirect & 2u) != 0u ? ambient_diffuse(surface) * surface.occlusion
                                          : ambient_lighting(surface, view_direction);
     vec3 color = ambient + direct_color + emissive;
+    // Opaque surfaces are fogged after the composite pass completes their light; transparent ones
+    // blend over already fogged pixels, so they carry their own.
+    if (!geometry_pass) {
+        float fog = fog_amount(length(lighting.camera_count.xyz - world_position));
+        color = mix(color, fog_color(fog), fog);
+    }
     output_color = vec4(color, surface.base_color.a);
     // Motion is the offset from this pixel to where the surface was last frame, in UV units.
     vec2 current_uv = current_clip.xy / current_clip.w * 0.5 + 0.5;

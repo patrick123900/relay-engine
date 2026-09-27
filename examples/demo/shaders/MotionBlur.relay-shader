@@ -1,0 +1,31 @@
+shader_type post_process;
+
+uniform float shutter : hint_range(0.0, 1.0) = 0.5;
+uniform float max_blur : hint_range(0.0, 0.2) = 0.04;
+
+// Motion blur, as a camera sees it with its shutter open for part of each frame: every pixel is
+// smeared along the path it moved on screen since the last frame. Turning the camera blurs the
+// whole view; things that move blur on their own. `shutter` is how much of a 60 fps frame the
+// shutter stays open (0 is off); `max_blur` caps a streak's length, in screen widths.
+
+// The average of the scene along a streak centred on a pixel, from 12 samples.
+vec3 motion_blur(vec2 uv, vec2 streak) {
+    vec3 total = vec3(0.0);
+    for (int index = 0; index < 12; ++index) {
+        float along = (float(index) + 0.5) / 12.0 - 0.5;
+        total += scene_color(clamp(uv + streak * along, vec2(0.0), vec2(1.0)));
+    }
+    return total / 12.0;
+}
+
+// The same direction, no longer than `longest`.
+vec2 limit_length(vec2 streak, float longest) {
+    float size = length(streak);
+    return size > longest ? streak * (longest / size) : streak;
+}
+
+void fragment() {
+    float frames = shutter * (1.0 / 60.0) / DELTA_TIME;
+    vec2 streak = limit_length(MOTION * frames, max_blur);
+    COLOR = motion_blur(SCREEN_UV, streak);
+}

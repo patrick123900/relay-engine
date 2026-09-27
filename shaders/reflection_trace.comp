@@ -64,8 +64,9 @@ vec3 sample_visible_normal(vec3 view, float alpha, vec2 u) {
 }
 
 vec3 environment(vec3 direction) {
-    // The sky and ground as global illumination sees them: the analytic ambient scale.
-    return mix(ground_radiance, sky_radiance, clamp(direction.y * 0.5 + 0.5, 0.0, 1.0)) / pi;
+    // The sky as global illumination sees it: the ambient scale divided by pi, which with a sky
+    // is its visible radiance times the ambient intensity.
+    return sky_environment(direction) / pi;
 }
 
 vec3 vertex_vector(InstanceData instance, uint vertex, uint offset) {

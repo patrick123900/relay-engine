@@ -11,6 +11,9 @@
 #include "relay/render/assets.hpp"
 #include "relay/render/renderer.hpp"
 #include "relay/render/scene_render.hpp"
+#include "relay/render/materials.hpp"
+#include "relay/render/shader_language.hpp"
+#include "relay/render/sky.hpp"
 #include "relay/scene/scene.hpp"
 #include "relay/scene/scene_edit.hpp"
 #include "relay/scene/project.hpp"
@@ -123,6 +126,24 @@ public:
     [[nodiscard]] const RenderInterpolation* render_interpolation(double alpha);
     // Why the last run_game() refused to start, or empty.
     [[nodiscard]] const std::string& run_game_error() const { return run_game_error_; }
+    // Loads the active sky's material into the asset registry, reloading it when its file or image
+    // changed. tick() calls it; hosts that draw without ticking call it before drawing.
+    void sync_sky();
+    // Loads the scene's surface and post-processing materials, their shaders and images into the
+    // asset registry, recompiling shaders whose files (or previews) changed. tick() calls it.
+    void sync_materials();
+    // sync_sky() and sync_materials(), for hosts that draw without ticking.
+    void sync_render_assets();
+    // A surface material the editor previews, loaded by sync_materials() whether or not the
+    // scene uses it; empty for none.
+    void set_previewed_material(std::string path) { previewed_material_ = std::move(path); }
+    [[nodiscard]] ShaderLibrary& shaders() { return shaders_; }
+    [[nodiscard]] std::shared_ptr<const CompiledShader> shader(std::string_view path);
+    [[nodiscard]] std::shared_ptr<const ResolvedShaderMaterial> shader_material(std::string_view path);
+    // A sky material from the open project (or ./assets without one), through the same cache.
+    [[nodiscard]] std::shared_ptr<const ResolvedSkyMaterial> sky_material(std::string_view path);
+    // Where project files resolve: the project folder, or ./assets without a project.
+    [[nodiscard]] std::filesystem::path asset_root() const;
 
 private:
     void advance_one_frame();
@@ -159,6 +180,10 @@ private:
     // Points audio at the open project's files and buses.
     void sync_audio();
     AudioSystem audio_;
+    SkyMaterialCache sky_materials_;
+    ShaderLibrary shaders_;
+    std::string previewed_material_;
+    MaterialLibrary materials_;
     std::optional<AudioSettings> audio_preview_;
     std::optional<std::filesystem::path> audio_root_;
     // Declared last: script callbacks reach every other member, so it is destroyed first.

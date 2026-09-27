@@ -1,0 +1,46 @@
+shader_type post_process;
+
+// Bloom: light spreads from bright parts of the picture into their surroundings, as it does in a
+// camera lens or the eye, so the sun, lamps and glowing surfaces seem to shine. It moves light
+// rather than adding it. Effects run before tone mapping, where bright light is far above 1.0.
+uniform float intensity : hint_range(0.0, 1.0) = 0.1;
+uniform float spread : hint_range(0.0, 1.0) = 0.7;
+uniform float threshold : hint_range(0.0, 10.0) = 0.0;
+uniform vec3 tint : source_color = vec3(1.0);
+
+// The light that spreads: all of it with no threshold, else only what is brighter than it.
+vec3 bright_part(vec3 color) {
+    float brightness = max(color.r, max(color.g, color.b));
+    return color * max(brightness - threshold, 0.0) / max(brightness, 0.0001);
+}
+
+// The scene blurred to one level, smoothed further with a small tent filter so it has no blocks.
+vec3 blurred(vec2 uv, float level) {
+    vec2 step = SCREEN_PIXEL_SIZE * exp2(level);
+    vec3 sum = scene_color_lod(uv, level) * 4.0;
+    sum += scene_color_lod(uv + vec2(step.x, 0.0), level) * 2.0;
+    sum += scene_color_lod(uv - vec2(step.x, 0.0), level) * 2.0;
+    sum += scene_color_lod(uv + vec2(0.0, step.y), level) * 2.0;
+    sum += scene_color_lod(uv - vec2(0.0, step.y), level) * 2.0;
+    sum += scene_color_lod(uv + step, level) + scene_color_lod(uv - step, level);
+    sum += scene_color_lod(uv + vec2(step.x, -step.y), level) + scene_color_lod(uv + vec2(-step.x, step.y), level);
+    return sum / 16.0;
+}
+
+// Bright light around a point: blurs from small to wide, wider ones counting less as spread falls.
+vec3 glow(vec2 uv) {
+    vec3 sum = vec3(0.0);
+    float total = 0.0;
+    float weight = 1.0;
+    for (int level = 1; level <= 7; level++) {
+        sum += bright_part(blurred(uv, float(level))) * weight;
+        total += weight;
+        weight *= spread;
+    }
+    return sum / total;
+}
+
+void fragment() {
+    vec3 spreading = bright_part(COLOR) * intensity;
+    COLOR = COLOR - spreading + glow(SCREEN_UV) * tint * intensity;
+}

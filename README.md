@@ -35,7 +35,16 @@ in control of the same project.
   FidelityFX Brixelizer GI, and smooth surfaces show hardware ray traced reflections denoised with
   FidelityFX. Both are per-project settings and fall back to the analytic sky light on GPUs that
   cannot run them.
-- **One typed API** — 131 versioned native methods cover scene editing, rendering, projects,
+- **Sky, sun and fog** — a Sky node draws a color gradient or a panorama sky material behind
+  the scene, lights it from the sky, carries the sun as a directional light, and adds distance
+  fog.
+- **Shader graphs** — mesh surfaces (vertex movement, colors, textures, transparency) and
+  full-screen post-processing effects built from nodes in a Shader Editor with live preview,
+  copy and paste, and errors on the nodes they come from. Agents write the same shaders as code in
+  a GLSL-based shading language, which is what graphs save as. Custom surfaces stay lit, shadowed
+  and part of global illumination; materials show a preview sphere, objects can have their own
+  parameter values (scripts animate them), and Bloom, Color Grading and Vignette come ready-made.
+- **One typed API** — 160 versioned native methods cover scene editing, rendering, projects,
   observability, capture, and session authorization. A generated MCP bridge exposes the supported
   model-facing subset.
 - **Frame profiler** — a Profiler panel shows what limits the frame rate: whether the CPU, the
@@ -243,6 +252,35 @@ playlist during Run Game, crossfading between tracks on the next beat or bar; lo
 so tracks can be any length. The Audio page switches between **Speakers** and **Headphones**. Set
 `RELAY_AUDIO=0` to run the editor silently.
 
+A **Sky** node (Add Node → Sky) sets the scene's sky, sun and fog. Its **Skybox** is either a
+gradient, with a **Horizon** color for the horizon and everything below it and a **Zenith** color
+for straight up, or a sky material: a `.relay-material` file wrapping an equirectangular (2:1)
+PNG or JPEG panorama, such as an exported photo sphere, with a tint, brightness and rotation.
+Create one with **New sky material** in the Skybox picker or **Create → Sky material** in Assets,
+choose its panorama in the Inspector, and drop material files onto the picker. **Intensity**
+brightens the visible sky and **Ambient light** sets how strongly the sky lights the scene,
+including global illumination and reflections of the sky. The node's directional light is the
+sun: it is drawn in the sky where its light comes from, so rotate the node to move both. **Fog** fades surfaces from its **Start** distance to its
+**End** distance, blending from the start color to the end color; the sky itself is not fogged.
+Only the first Sky node in the scene is used. Without one, the scene keeps its plain background
+and default ambient light.
+
+Custom shaders are `.relay-shader` files, edited as node graphs. Create one with **Create →
+Surface shader** or **Post-processing shader** in Assets and it opens in the **Shader Editor**
+(Tools → Shader editor), beside the viewport: add nodes with right-click or Space, drag between
+pins to wire them, type values into free pins, and wire results into the output node (Albedo,
+Roughness, Emission... for surfaces; Color for post processing; the Vertex tab moves a mesh's
+vertices). Parameters in the side panel become material fields. The viewport shows each change a
+moment later, **Ctrl+S** saves, and errors outline the node they come from. The saved file is
+readable GLSL-based code, which is how agents write shaders too; their code opens as nodes. A material (`.relay-material`) names a
+shader and sets its uniforms: pick one as a Mesh renderer's **Material**, where a preview
+sphere, its shader and fields appear, with **This object only** for values that belong to one
+object (scripts change them with `set_material_parameter`). Add post-processing materials to a
+**Post Process** node, or pick Bloom, Color Grading or Vignette from its **Add effect** menu to
+copy one of Relay's ready-made effects into the project (each effect can be kept out of the
+editor's view). The demo has three hovering plasma orbs, bloom and motion blur for the player's
+camera. See the [shader guide](docs/shaders.md).
+
 ## Built-in agent workspace
 
 <p align="center">
@@ -273,14 +311,18 @@ Audio sources, listeners, mixer buses and effects, reverb zones, occlusion, stre
 headphone output are in place with headless, protocol and script tests; playback through a real sound device has not been checked by ear
 yet.
 Global illumination and ray traced reflections run on Linux with RADV and have been checked on a
-desktop and in offscreen captures.
+desktop and in offscreen captures. The Sky node (gradient and panorama skies, sky light and fog)
+has been checked in offscreen captures and headless editor tests, not yet on a desktop. Custom
+shaders (surfaces, per-object values, material previews, post-processing effects and the Shader
+Editor) have been checked in offscreen captures, headless editor tests and on a desktop.
 
 ## Build
 
 You need CMake 3.25+, Ninja, Python 3.10+, and a C++20 compiler. The graphical editor additionally
 needs SDL3, Vulkan, and `glslc`, and its lighting effects `glslangValidator`. The AMD FidelityFX
-SDK parts they use are included under [`third_party/fidelityfx`](third_party/fidelityfx). CMake fetches pinned Jolt 5.6 sources for physics, plus Dear ImGui
-and ImGuizmo sources when the editor is enabled. The editor compiles projects' gameplay scripts
+SDK parts they use are included under [`third_party/fidelityfx`](third_party/fidelityfx). CMake fetches pinned Jolt 5.6 sources for physics, plus Dear ImGui,
+ImGuizmo and ImGuiColorTextEdit sources when the editor is enabled. Custom shaders compile at
+runtime with glslang (the system package; without it they report that they cannot compile). The editor compiles projects' gameplay scripts
 with the same C++ compiler (`RELAY_SCRIPT_COMPILER` chooses another).
 
 ```sh
@@ -373,6 +415,7 @@ drifting apart.
 
 - [Protocol reference](docs/protocol.md) — generated methods, parameters, and safety annotations
 - [Gameplay scripting](docs/scripting.md) — writing, building, trusting, and hot reloading scripts
+- [Shaders and materials](docs/shaders.md) — the shading language, built-in variables and materials
 - [Agent bridge](tools/mcp-bridge/README.md) — provider integration and bridge behavior
 - [Engineering handoff](HANDOFF.md) — current implementation state, limits, and next priorities
 - [Agent instructions](AGENTS.md) — repository working and verification rules

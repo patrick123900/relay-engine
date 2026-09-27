@@ -8,9 +8,12 @@
 #include "relay/editor/wrapped_input.hpp"
 #include "relay/observe/profiler.hpp"
 #include "relay/render/scene_render.hpp"
+#include "relay/render/sky.hpp"
+#include "relay/render/shader_language.hpp"
 #include "relay/scene/project.hpp"
 #include "relay/script/script_system.hpp"
 #include <imgui.h>
+#include "ui_snapshot.hpp"
 #include <imgui_internal.h>
 #include <SDL3/SDL.h>
 
@@ -1700,6 +1703,330 @@ void scripts_ui() {
     std::cout << "Headless script editor tests passed\n";
 }
 
+// The Sky section switches between the gradient and sky materials, edits a material's panorama
+// and turns fog off.
+void sky_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/skies/project.relayproject","name":"Skies"})")
+              .find("\"ok\":true") != std::string::npos, "create sky project");
+    // Pickers list images by name; this one cannot be decoded, which the section reports.
+    std::ofstream("projects/skies/sunset.png") << "not an image";
+    const auto created = protocol.handle(R"({"id":2,"method":"scene.create","type":"Sky"})");
+    const auto start = created.find("\"entity\":\"") + 10U;
+    const auto sky = *relay::Entity::parse(created.substr(start, created.find('"', start) - start));
+    auto& scene = engine.scene();
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize sky editor without windows");
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + sky.to_string()));
+    frame(ui, 3);
+    check(ui.headless_item_rect("inspector:component:sky") && ui.headless_item_rect("inspector:sky:horizon") &&
+              ui.headless_item_rect("inspector:component:light"),
+          "a Sky node shows the Sky section with gradient colors, and its sun's Light section");
+
+    // The Sky's Intensity and its sun's share a label but are separate fields.
+    const auto drag_right = [&](const char* item) {
+        const auto rect = *ui.headless_item_rect(item);
+        const float y = (rect[1] + rect[3]) / 2.0F;
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(rect[0] + 10.0F, y);
+        frame(ui);
+        io.AddMouseButtonEvent(0, true);
+        frame(ui);
+        io.AddMousePosEvent(rect[0] + 60.0F, y);
+        frame(ui, 2);
+        io.AddMouseButtonEvent(0, false);
+        frame(ui, 3);
+    };
+    drag_right("inspector:sky:intensity");
+    check(scene.get(sky)->sky->intensity > relay::Sky{}.intensity &&
+              scene.get(sky)->light->intensity == relay::default_sun_intensity,
+          "dragging the sky's Intensity leaves the sun's alone");
+    const auto sky_intensity = scene.get(sky)->sky->intensity;
+    // Collapsing the Sky section brings the Light section into view.
+    click_center(ui, *ui.headless_item_rect("inspector:component:sky"));
+    frame(ui, 3);
+    drag_right("inspector:light:intensity");
+    check(scene.get(sky)->light->intensity > relay::default_sun_intensity && scene.get(sky)->sky->intensity == sky_intensity,
+          "dragging the sun's Intensity leaves the sky's alone");
+
+    click_center(ui, *ui.headless_item_rect("inspector:component:sky"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("inspector:sky:fog"));
+    frame(ui, 3);
+    check(!scene.get(sky)->sky->fog && !ui.headless_item_rect("inspector:sky:fog_start_color"),
+          "the Fog checkbox turns fog off and hides its settings");
+
+    click_center(ui, *ui.headless_item_rect("inspector:sky:material"));
+    click_center(ui, *ui.headless_item_rect("inspector:sky:material:new"));
+    frame(ui, 3);
+    check(scene.get(sky)->sky->material == "New sky material.relay-material" &&
+              std::filesystem::exists("projects/skies/New sky material.relay-material") &&
+              ui.headless_item_rect("inspector:sky:panorama") &&
+              !ui.headless_item_rect("inspector:sky:horizon"),
+          "New sky material creates the file and shows its settings in place of the gradient");
+    click_center(ui, *ui.headless_item_rect("inspector:sky:panorama"));
+    click_center(ui, *ui.headless_item_rect("inspector:sky:panorama:sunset.png"));
+    frame(ui, 3);
+    {
+        std::string read_error;
+        const auto material =
+            relay::read_sky_material("projects/skies", "New sky material.relay-material", read_error);
+        check(material && material->panorama == "sunset.png", "choosing a panorama saves it in the material");
+    }
+    click_center(ui, *ui.headless_item_rect("inspector:sky:material"));
+    click_center(ui, *ui.headless_item_rect("inspector:sky:material:gradient"));
+    frame(ui, 3);
+    check(scene.get(sky)->sky->material.empty() && ui.headless_item_rect("inspector:sky:horizon"),
+          "choosing Gradient goes back to the colors");
+    std::cout << "Headless sky UI tests passed\n";
+}
+
+// The Shader Editor previews typing, saves with Ctrl+S and shows errors; the Inspector edits a
+// mesh's shader material and a Post Process node's effects.
+void shader_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    const auto handle = [&](const std::string& request) {
+        const auto reply = protocol.handle(request);
+        check(reply.find("\"ok\":true") != std::string::npos, reply.c_str());
+        return reply;
+    };
+    handle(R"({"id":1,"method":"project.create","filename":"projects/shading/project.relayproject","name":"Shading"})");
+    handle(R"({"id":2,"method":"shaders.write","path":"Glow.relay-shader","create":true})");
+    handle(R"({"id":3,"method":"assets.set_material","path":"Glow.relay-material","create":true,"type":"surface","shader":"Glow.relay-shader"})");
+    handle(R"({"id":4,"method":"shaders.write","path":"Grade.relay-shader","create":true,"type":"post_process"})");
+    handle(R"({"id":5,"method":"assets.set_material","path":"Grade.relay-material","create":true,"type":"post_process","shader":"Grade.relay-shader"})");
+    const auto created = handle(R"({"id":6,"method":"scene.create","type":"StaticMesh"})");
+    const auto start = created.find("\"entity\":\"") + 10U;
+    const auto node = *relay::Entity::parse(created.substr(start, created.find('"', start) - start));
+    handle(R"({"id":7,"method":"scene.set_renderer","entity":")" + node.to_string() +
+           R"(","mesh":"builtin.quad","material":"Glow.relay-material"})");
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize shader editor without windows");
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + node.to_string()));
+    frame(ui, 3);
+    check(ui.headless_item_rect("inspector:material:shader") && ui.headless_item_rect("inspector:material:color") &&
+              ui.headless_item_rect("inspector:material:roughness"),
+          "a mesh with a shader material shows the material's shader and its uniforms");
+    // The material's preview: asked of the renderer while shown, drawn once it arrives.
+    check(ui.headless_item_rect("inspector:material:preview") && ui.material_preview_request() == "Glow.relay-material",
+          "the Inspector asks for a preview of the material it shows");
+    {
+        std::vector<std::uint8_t> sphere(192U * 192U * 4U, 255U);
+        ui.material_preview_ready("Glow.relay-material", 192U, 192U, sphere);
+        frame(ui, 2);
+        check(ui.headless_item_rect("inspector:material:preview").has_value(), "a delivered preview is drawn");
+    }
+    // Values for this object alone: set by an agent, shown in the Inspector once it refreshes,
+    // reset there.
+    handle(R"({"id":8,"method":"scene.set_renderer_parameter","entity":")" + node.to_string() +
+           R"(","name":"roughness","value":[0.9]})");
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("inspector:object:parameters"));
+    frame(ui, 30);
+    check(ui.headless_item_rect("inspector:object:roughness:reset") && ui.headless_item_rect("inspector:object:color") &&
+              !ui.headless_item_rect("inspector:object:color:reset") &&
+              (*ui.headless_item_rect("inspector:object:roughness:reset"))[2] <= 1920.0F,
+          "the object's own values show a Reset; values it takes from the material do not");
+    if (const char* directory = std::getenv("RELAY_UI_SNAPSHOT_DIR"))
+        (void)relay_test::write_ui_snapshot(std::filesystem::path(directory) / "material-inspector.png");
+    click_center(ui, *ui.headless_item_rect("inspector:object:roughness:reset"));
+    frame(ui, 3);
+    check(engine.scene().get(node)->mesh_renderer->parameters.empty(), "Reset gives the object the material's value again");
+    click_center(ui, *ui.headless_item_rect("inspector:material:edit_shader"));
+    frame(ui, 3);
+    check(ui.panel_visible("Shader Editor") && ui.headless_item_rect("shader_graph:canvas") &&
+              ui.headless_item_rect("shader_editor:tab:Glow.relay-shader") &&
+              ui.headless_item_rect("shader_graph:node:uniform:color") && ui.headless_item_rect("shader_graph:node:output"),
+          "Edit shader opens the shader's nodes in the Shader Editor");
+    const auto current = [&] {
+        const auto* preview = engine.shaders().preview("Glow.relay-shader");
+        std::string read_error;
+        return preview ? *preview : relay::read_shader_file("projects/shading", "Glow.relay-shader", read_error).value_or("");
+    };
+    // With RELAY_UI_SNAPSHOT_DIR set, the test also saves pictures of the editor for review.
+    const auto snapshot = [](const char* name) {
+        if (const char* directory = std::getenv("RELAY_UI_SNAPSHOT_DIR"))
+            (void)relay_test::write_ui_snapshot(std::filesystem::path(directory) / name);
+    };
+    auto& io = ImGui::GetIO();
+    const auto centre = [](const std::array<float, 4>& rect) {
+        return ImVec2{(rect[0] + rect[2]) / 2.0F, (rect[1] + rect[3]) / 2.0F};
+    };
+    const auto drag = [&](const ImVec2 from, const ImVec2 to) {
+        io.AddMousePosEvent(from.x, from.y);
+        frame(ui);
+        io.AddMouseButtonEvent(0, true);
+        frame(ui);
+        for (int step = 1; step <= 4; ++step) {
+            io.AddMousePosEvent(from.x + (to.x - from.x) * static_cast<float>(step) / 4.0F,
+                                from.y + (to.y - from.y) * static_cast<float>(step) / 4.0F);
+            frame(ui);
+        }
+        io.AddMouseButtonEvent(0, false);
+        frame(ui, 2);
+    };
+
+    // Space opens the node menu where the pointer is; a Multiply node joins the graph.
+    const auto canvas = *ui.headless_item_rect("shader_graph:canvas");
+    const ImVec2 empty{canvas[0] + (canvas[2] - canvas[0]) * 0.5F, canvas[1] + (canvas[3] - canvas[1]) * 0.4F};
+    click(ui, {empty.x - 60.0F, empty.y - 10.0F, empty.x + 60.0F, empty.y + 10.0F});
+    key(ui, ImGuiKey_Space, false);
+    check(ui.headless_item_rect("shader_graph:add:search").has_value(), "Space opens the add-node menu");
+    snapshot("shader-add-menu.png");
+    type_text(ui, "Multiply");
+    click_center(ui, *ui.headless_item_rect("shader_graph:add:Multiply"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("shader_graph:node:n1").has_value(), "choosing Multiply adds a node");
+    // Wires: the color parameter into the multiply, the multiply into the output's Albedo.
+    drag(centre(*ui.headless_item_rect("shader_graph:out:uniform:color")), centre(*ui.headless_item_rect("shader_graph:in:n1:a")));
+    drag(centre(*ui.headless_item_rect("shader_graph:out:n1")), centre(*ui.headless_item_rect("shader_graph:in:output:ALBEDO")));
+    frame(ui, 30);
+    check(current().find("vec3 n1 = color * 1.0;") != std::string::npos &&
+              current().find("ALBEDO = n1;") != std::string::npos && engine.shader("Glow.relay-shader")->ok(),
+          "dragging wires connects nodes, and the preview shows the graph's code");
+    // A value on an unconnected pin.
+    click_center(ui, *ui.headless_item_rect("shader_graph:value:n1:b"));
+    key(ui, ImGuiKey_A, true);
+    type_text(ui, "0.25");
+    key(ui, ImGuiKey_Enter, false);
+    frame(ui, 30);
+    check(current().find("vec3 n1 = color * 0.25;") != std::string::npos, "a pin's value is edited in place");
+    snapshot("shader-graph.png");
+    // Save, then a mistake shown on its node, then undo.
+    click_center(ui, *ui.headless_item_rect("shader_graph:canvas"));
+    key(ui, ImGuiKey_S, true);
+    frame(ui, 3);
+    {
+        std::string read_error;
+        const auto saved = relay::read_shader_file("projects/shading", "Glow.relay-shader", read_error);
+        check(saved && saved->find("vec3 n1 = color * 0.25;") != std::string::npos &&
+                  saved->find("// relay-graph {") != std::string::npos && !engine.shaders().preview("Glow.relay-shader"),
+              "Ctrl+S saves the graph as code, with its layout");
+    }
+    click_center(ui, *ui.headless_item_rect("shader_graph:value:n1:b"));
+    key(ui, ImGuiKey_A, true);
+    type_text(ui, "oops");
+    key(ui, ImGuiKey_Enter, false);
+    frame(ui, 30);
+    check(ui.headless_item_rect("shader_graph:error:n1").has_value() && !engine.shader("Glow.relay-shader")->ok(),
+          "a compile error is shown on the node it comes from");
+    click_center(ui, *ui.headless_item_rect("shader_editor:undo"));
+    frame(ui, 30);
+    check(!ui.headless_item_rect("shader_graph:error:n1") && engine.shader("Glow.relay-shader")->ok(),
+          "undo goes back to the graph before the mistake");
+    // Parameters and render modes from the side panel.
+    click_center(ui, *ui.headless_item_rect("shader_editor:parameter:new"));
+    click_center(ui, *ui.headless_item_rect("shader_editor:parameter:new:Image"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("shader_editor:transparent"));
+    frame(ui, 30);
+    check(current().find("uniform sampler2D image : source_color;") != std::string::npos &&
+              current().find("render_mode transparent;") != std::string::npos,
+          "the side panel adds parameters and sets render modes");
+    // Duplicating keeps the wires coming into the copies; pasting leaves them out.
+    {
+        const auto title = *ui.headless_item_rect("shader_graph:node:n1");
+        click_center(ui, {title[0] + 20.0F, title[1] + 4.0F, title[2] - 20.0F, title[1] + 12.0F});
+    }
+    key(ui, ImGuiKey_D, true);
+    frame(ui, 30);
+    check(ui.headless_item_rect("shader_graph:node:n2") && current().find("vec3 n2 = color * 0.25;") != std::string::npos,
+          "Ctrl+D duplicates the selected node beside it, still fed by the same inputs");
+    key(ui, ImGuiKey_C, true);
+    click(ui, {empty.x - 60.0F, empty.y + 60.0F, empty.x + 60.0F, empty.y + 80.0F});
+    key(ui, ImGuiKey_V, true);
+    frame(ui, 30);
+    {
+        const auto all = current();
+        const auto text = all.substr(all.find("void fragment"));
+        const auto line = text.substr(text.find("n3 ="), text.find('\n', text.find("n3 =")) - text.find("n3 ="));
+        check(ui.headless_item_rect("shader_graph:node:n3") && line.find("color") == std::string::npos &&
+                  line.find("0.25") != std::string::npos,
+              "Ctrl+C and Ctrl+V paste a copy with its values but without wires from outside the copy");
+    }
+    snapshot("shader-graph-pasted.png");
+    // Deleting a node removes its wires.
+    {
+        // Its title bar, clear of the value fields.
+        const auto title = *ui.headless_item_rect("shader_graph:node:n1");
+        click_center(ui, {title[0] + 20.0F, title[1] + 4.0F, title[2] - 20.0F, title[1] + 12.0F});
+    }
+    key(ui, ImGuiKey_Delete, false);
+    frame(ui, 30);
+    check(!ui.headless_item_rect("shader_graph:node:n1") &&
+              current().substr(current().find("void fragment")).find("n1 =") == std::string::npos,
+          "Delete removes the selected node and its wires");
+    click_center(ui, *ui.headless_item_rect("shader_editor:stage:vertex"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("shader_graph:node:input:VERTEX").has_value(), "the Vertex stage shows its own nodes");
+    snapshot("shader-vertex.png");
+    click_center(ui, *ui.headless_item_rect("shader_editor:revert"));
+    frame(ui, 30);
+    check(!engine.shaders().preview("Glow.relay-shader"), "Revert goes back to the saved shader");
+    // An agent rewriting the open shader: the tab, with no unsaved edits, shows the new version.
+    handle(R"({"id":19,"method":"shaders.write","path":"Glow.relay-shader","text":"shader_type surface;\nuniform vec3 color : source_color = vec3(1.0);\nvoid fragment() {\n    vec3 agent_lit = color * 2.0;\n    ALBEDO = agent_lit;\n}\n"})");
+    frame(ui, 90);
+    click_center(ui, *ui.headless_item_rect("shader_editor:stage:fragment"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("shader_graph:node:agent_lit").has_value(),
+          "an open shader without unsaved edits reloads when an agent changes its file");
+    // With unsaved edits the tab keeps them and asks; loading the new version replaces them.
+    click_center(ui, *ui.headless_item_rect("shader_editor:parameter:new"));
+    click_center(ui, *ui.headless_item_rect("shader_editor:parameter:new:Image"));
+    frame(ui, 3);
+    handle(R"({"id":21,"method":"shaders.write","path":"Glow.relay-shader","text":"shader_type surface;\nuniform vec3 color : source_color = vec3(1.0);\nvoid fragment() {\n    vec3 second = color * 3.0;\n    ALBEDO = second;\n}\n"})");
+    frame(ui, 90);
+    check(ui.headless_item_rect("shader_editor:disk:reload") && ui.headless_item_rect("shader_graph:node:agent_lit") &&
+              !ui.headless_item_rect("shader_graph:node:second"),
+          "a shader with unsaved edits keeps them and says the file changed");
+    click_center(ui, *ui.headless_item_rect("shader_editor:disk:reload"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("shader_graph:node:second") && !ui.headless_item_rect("shader_editor:disk:reload"),
+          "loading the new version shows the changed file's nodes");
+
+    // An agent's shader with control flow: that stage is a code box, the other stays nodes.
+    handle(R"({"id":20,"method":"shaders.write","path":"Branch.relay-shader","text":"shader_type surface;\nvoid fragment() {\n    if (UV.x > 0.5) { ALBEDO = vec3(1.0, 0.0, 0.0); }\n}\n"})");
+    ui.set_panel_visible("Shader Editor", true);
+    frame(ui, 40);
+    click(ui, *ui.headless_item_rect("asset:Branch.relay-shader"));
+    io.AddMouseButtonEvent(0, true);
+    frame(ui);
+    io.AddMouseButtonEvent(0, false);
+    frame(ui, 3);
+    check(ui.headless_item_rect("shader_editor:tab:Branch.relay-shader") && ui.headless_item_rect("shader_editor:stage_code"),
+          "double-clicking a shader opens it, and a stage with if is edited as code");
+    snapshot("shader-code-stage.png");
+
+    // Post processing.
+    const auto post_reply = handle(R"({"id":8,"method":"scene.create","type":"PostProcess"})");
+    const auto post_start = post_reply.find("\"entity\":\"") + 10U;
+    const auto post = *relay::Entity::parse(post_reply.substr(post_start, post_reply.find('"', post_start) - post_start));
+    // The hierarchy picks up nodes made elsewhere at its next refresh.
+    frame(ui, 40);
+    click(ui, *ui.headless_item_rect("entity:" + post.to_string()));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("inspector:post:add"));
+    click_center(ui, *ui.headless_item_rect("inspector:post:add:Grade.relay-material"));
+    frame(ui, 3);
+    check(engine.scene().get(post)->post_process->effects.size() == 1U &&
+              ui.headless_item_rect("inspector:post:enabled:0").has_value(),
+          "Add effect puts a post-processing material in the list");
+    click_center(ui, *ui.headless_item_rect("inspector:post:enabled:0"));
+    frame(ui, 3);
+    check(!engine.scene().get(post)->post_process->effects[0].enabled, "its checkbox turns the effect off");
+    std::cout << "Headless shader UI tests passed\n";
+}
+
 int main() {
     const auto original = std::filesystem::current_path();
     const auto temporary = std::filesystem::temp_directory_path() /
@@ -1724,6 +2051,8 @@ int main() {
         fresh(audio_ui);
         fresh(mixer_ui);
         fresh(music_ui);
+        fresh(sky_ui);
+        fresh(shader_ui);
         fresh(hierarchy_search_ui);
         fresh(profiler_ui);
         fresh(game_configuration_ui);

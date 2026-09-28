@@ -309,6 +309,14 @@ void InputState::begin_step() {
             control.still_down = control.down;
         }
         control.presses = control.releases = 0U;
+        control.raw_held = control.held;
+        control.raw_pressed = control.pressed;
+        control.raw_released = control.released;
+        // A consumed control stays hidden from the game until a step that begins with it up.
+        if (control.consumed) {
+            if (!control.held && !control.pressed) control.consumed = false;
+            control.held = control.pressed = control.released = control.still_down = false;
+        }
     }
     step_dx_ = pending_dx_;
     step_dy_ = pending_dy_;
@@ -326,11 +334,29 @@ void InputState::begin_step() {
     }
 }
 
+void InputState::consume(const std::string_view id) {
+    const auto found = controls_.find(id);
+    if (found == controls_.end()) return;
+    auto& control = found->second;
+    control.consumed = control.raw_held || control.raw_pressed;
+    control.held = control.pressed = control.released = control.still_down = false;
+}
+
+bool InputState::raw_control(const std::string_view id, const Query query) const {
+    const auto* found = find(id);
+    if (!found) return false;
+    return query == Query::held ? found->raw_held : query == Query::pressed ? found->raw_pressed
+                                                                            : found->raw_released;
+}
+
 void InputState::clear_edges() {
+    mouse_lock_.reset();
     for (auto& [id, control] : controls_) {
         control.presses = control.releases = 0U;
-        control.pressed = control.released = false;
+        control.pressed = control.released = control.consumed = false;
         control.held = control.still_down = control.down;
+        control.raw_held = control.held;
+        control.raw_pressed = control.raw_released = false;
     }
     pending_dx_ = pending_dy_ = pending_wheel_ = step_dx_ = step_dy_ = step_wheel_ = 0.0;
     simulations_.clear();
@@ -436,7 +462,8 @@ std::string InputState::state_json() const {
             first = false;
         }
     output << "],\"mouse\":{\"x\":" << mouse_x_ << ",\"y\":" << mouse_y_ << ",\"dx\":" << step_dx_
-           << ",\"dy\":" << step_dy_ << ",\"wheel\":" << step_wheel_ << "}}";
+           << ",\"dy\":" << step_dy_ << ",\"wheel\":" << step_wheel_
+           << ",\"locked\":" << (mouse_locked() ? "true" : "false") << "}}";
     return output.str();
 }
 

@@ -42,6 +42,25 @@ const std::vector<ComponentKind>& engine_components() {
         {"music_player", "Music player", "Audio", true, true, false,
          "Plays a playlist of music files, crossfading between tracks, with changes that can wait "
          "for the next beat or bar."},
+        {"ui_canvas", "Canvas", "UI", true, true, false,
+         "A layer for game interface controls, drawn over the game's view during Run Game only. "
+         "It scales the controls below it to the screen."},
+        {"ui_control", "Control", "UI", true, true, false,
+         "Places a rectangle on the screen for interface widgets: anchors on the parent control "
+         "or screen, offsets, pivot, rotation and scale."},
+        {"ui_panel", "Panel", "UI", true, true, false,
+         "A filled rectangle with rounded corners, a border and a shadow."},
+        {"ui_label", "Label", "UI", true, true, false, "Text, aligned and optionally wrapped."},
+        {"ui_image", "Image", "UI", true, true, false,
+         "A PNG or JPEG image, stretched, fitted, tiled or nine-sliced."},
+        {"ui_button", "Button", "UI", true, true, false,
+         "Makes the control clickable; scripts hear clicks through on_ui."},
+        {"ui_toggle", "Check box", "UI", true, true, false, "A check box or switch that flips on click."},
+        {"ui_slider", "Slider", "UI", true, true, false, "A value chosen by dragging a handle."},
+        {"ui_progress_bar", "Progress bar", "UI", true, true, false,
+         "Fills part of the control from one edge, for health, loading or timers."},
+        {"ui_container", "Container", "UI", true, true, false,
+         "Arranges child controls in a column, a row or a grid."},
         {"keyframes", "Transform keyframes", "Animation", true, true, false,
          "Animates position, rotation and scale between keys you set on a timeline."},
         {"animator", "Model animation", "Animation", false, false, false,
@@ -76,6 +95,7 @@ bool has_component(const EntityRecord& record, const std::string_view id) {
     if (id == "post_process") return record.post_process.has_value();
     if (id == "animator") return record.animator.has_value();
     if (id == "script") return !record.scripts.empty();
+    if (const auto* ui = find_ui_component(id); ui && ui->id == id) return ui->present(record.ui);
     return false;
 }
 
@@ -96,7 +116,26 @@ bool add_component(Scene& scene, const Entity entity, const std::string_view id,
         return false;
     }
     bool added = false;
-    if (id == "mesh_renderer") {
+    if (const auto* ui = find_ui_component(id); ui && ui->id == id) {
+        // Widgets bring the Control that places them, like Unity's RectTransform.
+        auto components = record->ui;
+        if (id == "ui_canvas" && components.control) {
+            error = "a Control cannot also be a Canvas; add the canvas to a parent node";
+            return false;
+        }
+        if (id != "ui_canvas" && components.canvas) {
+            error = "a Canvas cannot also be a Control; add controls as its children";
+            return false;
+        }
+        if (id != "ui_canvas" && !components.control) components.control = UiControl{};
+        ui->attach(components, true);
+        std::string reason;
+        if (!valid_ui(components, &reason)) {
+            error = reason;
+            return false;
+        }
+        added = scene.set_ui(entity, std::move(components));
+    } else if (id == "mesh_renderer") {
         added = scene.set_mesh_renderer(entity, MeshRenderer{"builtin.quad", "builtin.azure", {}});
     } else if (id == "camera") {
         Camera camera;
@@ -160,7 +199,16 @@ bool remove_component(Scene& scene, const Entity entity, const std::string_view 
         error = "the node has no such component";
         return false;
     }
-    if (id == "mesh_renderer") return scene.set_mesh_renderer(entity, std::nullopt);
+    if (const auto* ui = find_ui_component(id); ui && ui->id == id) {
+        auto components = record->ui;
+        ui->attach(components, false);
+        if (!valid_ui(components)) {
+            error = "remove the node's UI widgets before its Control";
+            return false;
+        }
+        return scene.set_ui(entity, std::move(components));
+    }
+        if (id == "mesh_renderer") return scene.set_mesh_renderer(entity, std::nullopt);
     if (id == "camera") return scene.set_camera(entity, std::nullopt);
     if (id == "light") return scene.set_light(entity, std::nullopt);
     if (id == "collider") return scene.set_collider(entity, std::nullopt);

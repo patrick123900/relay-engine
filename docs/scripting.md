@@ -76,8 +76,12 @@ void on_update(double dt) override {
   scales diagonals down to length 1.
 - `key_held`/`key_pressed` read raw keys by physical position ("w", "space", "left_shift"),
   `mouse_held`/`mouse_pressed` read "left", "middle" and "right", and `mouse_position`,
-  `mouse_delta` and `mouse_wheel` read the pointer. Prefer actions, so players and other people can
-  rebind them.
+  `mouse_delta` and `mouse_wheel` read the pointer (its position in pixels from the game view's
+  top-left corner). Prefer actions, so players and other people can rebind them.
+- `set_mouse_locked(false)` frees the cursor for the rest of the game, for a menu, and
+  `set_mouse_locked(true)` hides and locks it again for mouse look; `mouse_locked()` says which.
+  Interface controls react to the pointer only while it is free, and clicks they take never reach
+  the game's actions.
 - Unknown action or axis names read as released and zero.
 
 ## Example: a first person controller
@@ -102,7 +106,9 @@ The demo's input map locks the mouse while the game has input.
 ## Callbacks
 
 A behaviour can override `on_start`, `on_update(dt)`, `on_contact_begin(other)`,
-`on_contact_end(other)`, `on_destroy`, `on_stop` and `on_reload`. Scripts can find a child node by
+`on_contact_end(other)`, `on_ui(event)`, `on_destroy`, `on_stop` and `on_reload`. `on_ui` hears
+clicks, toggles and slider moves from the game interface, on the script's own control or any
+control below it; see the [interface guide](interface.md). Scripts can find a child node by
 name (`self().child("Camera")`) or list them all (`children()`), make a camera the one the game
 renders through (`camera.make_active_camera()`, restored by Stop Game), read and set local
 transforms, read world positions, set velocities, apply impulses, raycast and test overlaps
@@ -110,8 +116,8 @@ against the live physics world, find entities by name, spawn and destroy entitie
 editor, read and drive joints, play sounds and music and adjust the mixer. The header documents
 each call.
 
-Each frame runs every `on_update`, then animation and physics, then the contact callbacks for that
-step. Stop Game calls `on_stop` and restores the authored scene, so scripts can change the scene
+Each frame delivers the step's interface events (`on_ui`), runs every `on_update`, then animation
+and physics, then the contact callbacks for that step. Stop Game calls `on_stop` and restores the authored scene, so scripts can change the scene
 freely during a run.
 
 ## Spawning and destroying
@@ -247,7 +253,7 @@ its BPM, and changes land on them to the sample.
 The demo's `scripts/ImpactSound.cpp` (thumps when bodies hit things), `scripts/ToneButton.cpp` (a
 button that plays the next note of a scale and ducks the music under it),
 `scripts/MusicSwitch.cpp` (a pad that moves the soundtrack on at the next bar) and the shot sound in
-`scripts/FirstPersonController.cpp` are complete examples.
+`scripts/FirstPersonController.cpp` are complete examples. `scripts/GameMenu.cpp` runs the showcase's HUD and pause menu.
 
 ## Trust
 

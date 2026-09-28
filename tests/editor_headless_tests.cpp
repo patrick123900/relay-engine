@@ -2385,6 +2385,119 @@ void asset_browser_ui() {
     std::cout << "Headless asset browser tests passed\n";
 }
 
+// Interface nodes: Add Node puts a first control under a new Canvas, the Inspector replaces the
+// Transform with the control's layout, and the Interface editor selects, moves and resizes
+// controls by dragging, as one undo step each.
+void interface_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/hud/project.relayproject","name":"HUD"})")
+              .find("\"ok\":true") != std::string::npos, "create interface project");
+    auto& scene = engine.scene();
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize interface editor without windows");
+    const auto rect = [&](const std::string& key) {
+        const auto found = ui.headless_item_rect(key);
+        if (!found) throw std::runtime_error("missing headless item " + key);
+        return *found;
+    };
+    frame(ui, 5);
+    const auto find = [&](const std::string& name) {
+        for (const auto entity : scene.entities())
+            if (scene.get(entity)->name == name) return entity;
+        return relay::Entity{};
+    };
+    click_center(ui, rect("hierarchy:add_node"));
+    frame(ui, 2);
+    check(ui.headless_item_rect("node_window:type:Canvas") && ui.headless_item_rect("node_window:type:Button") &&
+              ui.headless_item_rect("node_window:type:VBoxContainer"),
+          "the Add Node window lists interface types");
+    // The type list is long; searching brings Button into view.
+    click_center(ui, rect("node_window:search"));
+    type_text(ui, "Button");
+    frame(ui, 2);
+    click(ui, rect("node_window:type:Button"));
+    click_center(ui, rect("node_window:create"));
+    frame(ui, 3);
+    const auto canvas = find("Canvas");
+    const auto button = find("Button");
+
+    check(canvas.valid() && scene.get(canvas)->ui.canvas && button.valid() && scene.get(button)->parent == canvas &&
+              scene.get(button)->ui.button,
+          "a Button made outside any interface gets a Canvas above it");
+    check(ui.headless_item_rect("inspector:component:ui_control") && ui.headless_item_rect("inspector:component:ui_label") &&
+              ui.headless_item_rect("inspector:ui_label:text") && !ui.headless_item_rect("inspector:transform"),
+          "the Inspector shows the Control and widgets instead of the Transform");
+    // Typing a label's text updates the node as it is typed. Collapsing the Control and Panel
+    // sections brings the Label's text into view.
+    click_center(ui, rect("inspector:component:ui_control"));
+    frame(ui, 2);
+    click_center(ui, rect("inspector:component:ui_panel"));
+    frame(ui, 2);
+    click_center(ui, rect("inspector:ui_label:text"));
+    key(ui, ImGuiKey_A, true);
+    type_text(ui, "Play");
+    frame(ui, 2);
+    check(scene.get(button)->ui.label->text == "Play", "typing edits the label's text");
+    // Anchor presets.
+    click_center(ui, rect("inspector:component:ui_control"));
+    frame(ui, 2);
+    click_center(ui, rect("inspector:ui_control:anchor_presets"));
+    frame(ui, 2);
+    click_center(ui, rect("inspector:ui_control:preset:bottom_right"));
+    frame(ui, 3);
+    const auto& control = *scene.get(button)->ui.control;
+    check(control.anchor_min.x == 1.0 && control.anchor_max.y == 1.0 &&
+              std::abs((control.offset_max.x - control.offset_min.x) - 220.0) < 1e-6,
+          "an anchor preset attaches the control to the bottom right, keeping its size");
+
+    // The Interface editor, opened from the Inspector.
+    click_center(ui, rect("inspector:ui_control:open_interface_editor"));
+    frame(ui, 4);
+    check(ui.panel_visible("Interface") && ui.headless_item_rect("interface:canvas"), "the Interface editor opens");
+    click_center(ui, rect("interface:size"));
+    frame(ui, 2);
+    if (const char* directory = std::getenv("RELAY_UI_SNAPSHOT_DIR"))
+        (void)relay_test::write_ui_snapshot(std::filesystem::path(directory) / "interface-editor.png");
+    click_center(ui, rect("interface:size"));
+    frame(ui, 2);
+    // Put the button in the middle, then drag it in the editor. The panel fits a 1920x1080 view.
+    click_center(ui, rect("inspector:ui_control:anchor_presets"));
+    frame(ui, 2);
+    click_center(ui, rect("inspector:ui_control:preset:center"));
+    frame(ui, 4);
+    check(scene.get(button)->ui.control->anchor_min.x == 0.5, "center the button");
+    const auto area = rect("interface:canvas");
+    const float middle_x = (area[0] + area[2]) / 2.0F, middle_y = (area[1] + area[3]) / 2.0F;
+    const auto before = scene.get(button)->ui.control->offset_min;
+    const auto undo_before = engine.scene_history().undo_depth();
+    auto& io = ImGui::GetIO();
+    io.AddMousePosEvent(middle_x, middle_y);
+    frame(ui);
+    io.AddMouseButtonEvent(0, true);
+    frame(ui);
+    io.AddMousePosEvent(middle_x + 40.0F, middle_y + 20.0F);
+    frame(ui, 2);
+    io.AddMousePosEvent(middle_x + 80.0F, middle_y + 40.0F);
+    frame(ui, 2);
+    io.AddMouseButtonEvent(0, false);
+    frame(ui, 3);
+    const auto after = scene.get(button)->ui.control->offset_min;
+    check(after.x > before.x + 20.0 && after.y > before.y + 10.0, "dragging a control in the Interface editor moves it");
+    check(engine.scene_history().undo_depth() == undo_before + 1U, "one drag is one undo step");
+    // Arrow keys nudge the selected control.
+    const auto nudged_from = scene.get(button)->ui.control->offset_min;
+    key(ui, ImGuiKey_RightArrow, false);
+    check(scene.get(button)->ui.control->offset_min.x == nudged_from.x + 1.0, "arrow keys nudge the control");
+    // A label in a container is placed by it, so the Interface editor leaves it where it is.
+    if (const char* directory = std::getenv("RELAY_UI_SNAPSHOT_DIR"))
+        (void)relay_test::write_ui_snapshot(std::filesystem::path(directory) / "interface-editor-dragged.png");
+    std::cout << "Headless interface editor tests passed\n";
+}
+
 int main() {
     const auto original = std::filesystem::current_path();
     const auto temporary = std::filesystem::temp_directory_path() /
@@ -2412,6 +2525,7 @@ int main() {
         fresh(sky_ui);
         fresh(shader_ui);
         fresh(asset_browser_ui);
+        fresh(interface_ui);
         fresh(hierarchy_search_ui);
         fresh(profiler_ui);
         fresh(game_configuration_ui);

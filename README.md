@@ -27,7 +27,7 @@ edits the same project alongside it.
   profiler, mixer and shader graph editor, built with SDL3 and Dear ImGui.
 - **Agents built in** — an embedded chat workspace with sign-in, attachments, inline renders and
   permission controls; agents frame, capture and review the viewport as they work.
-- **One typed API** — 160 versioned native methods for scenes, assets, rendering, capture and
+- **One typed API** — 164 versioned native methods for scenes, assets, rendering, capture and
   authorization, generated for C++, TypeScript and an MCP bridge.
 - **Rendering** — Vulkan HDR pipeline with PBR materials, cascaded and punctual shadows, sky, sun
   and fog, and AMD FidelityFX global illumination and ray traced reflections.
@@ -35,6 +35,9 @@ edits the same project alongside it.
   GLSL-based code, with materials, per-object values and ready-made effects.
 - **Gameplay** — components, node types and templates, native C++ scripts with hot reload, input
   mapping, Jolt physics with joints, and a playable first person demo.
+- **Game interface** — Godot-style canvases, anchored controls and containers: labels, images,
+  buttons, check boxes, sliders and progress bars, laid out and drawn in an Interface editor and
+  shown over the game while it runs.
 - **Audio** — spatial sources, mixer buses and effects, reverb zones, occlusion, streaming music
   and a headphone mode.
 - **Assets** — glTF/GLB, OBJ, FBX, DAE and sandboxed Blender import with animation, skinning and
@@ -111,6 +114,7 @@ generates the C++, TypeScript and reference documentation.
 - [Using the editor](docs/editor.md) — panels, workflows, physics, audio, sky and the demo
 - [Gameplay scripting](docs/scripting.md) — writing, building, trusting and hot reloading scripts
 - [Shaders and materials](docs/shaders.md) — the shading language and materials
+- [Game interface](docs/interface.md) — canvases, controls, the Interface editor and UI scripting
 - [Protocol reference](docs/protocol.md) — every method, its parameters and safety annotations
 - [Agent bridge](tools/mcp-bridge/README.md) — provider integration and bridge behavior
 - [Engineering handoff](HANDOFF.md) — implementation state, limits and next priorities

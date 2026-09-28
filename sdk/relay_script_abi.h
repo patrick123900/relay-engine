@@ -36,8 +36,21 @@ enum RelayCallback {
     RELAY_CALLBACK_CONTACT_END = 3,
     RELAY_CALLBACK_STOP = 4,
     RELAY_CALLBACK_RELOAD = 5,
-    RELAY_CALLBACK_DESTROY = 6
+    RELAY_CALLBACK_DESTROY = 6,
+    /* An interface event on the entity or one of its descendants; `other` is the control, and
+     * ui_event() describes it during the call. */
+    RELAY_CALLBACK_UI = 7
 };
+
+enum RelayUiEventType {
+    RELAY_UI_CLICKED = 0,
+    RELAY_UI_TOGGLED = 1,
+    RELAY_UI_VALUE_CHANGED = 2,
+    RELAY_UI_PRESSED = 3,
+    RELAY_UI_RELEASED = 4
+};
+
+enum RelayUiState { RELAY_UI_HOVERED = 1, RELAY_UI_HELD = 2 };
 
 enum RelayInputQuery { RELAY_INPUT_HELD = 0, RELAY_INPUT_PRESSED = 1, RELAY_INPUT_RELEASED = 2 };
 
@@ -101,7 +114,8 @@ typedef struct RelayHostApi {
     double (*input_axis)(void* context, const char* name, size_t length);
     int (*input_control)(void* context, const char* control, size_t length, int query);
     double (*input_control_value)(void* context, const char* control, size_t length);
-    /* Window position in pixels, and this step's movement with the wheel in delta->z. */
+    /* Pointer position in the game view in pixels, and this step's movement with the wheel in
+     * delta->z. */
     void (*input_mouse)(void* context, RelayVec3* position, RelayVec3* delta);
     /* The first direct child with this name, or 0. */
     RelayEntity (*child)(void* context, RelayEntity parent, const char* name, size_t length);
@@ -177,6 +191,29 @@ typedef struct RelayHostApi {
                                      size_t length, double* values, size_t capacity);
     /* Returns the object to the material's value; 0 when it had none of its own. */
     int (*clear_material_parameter)(void* context, RelayEntity entity, const char* name, size_t length);
+    /* The game interface. Fields are named "<component>.<field>" as in the protocol's
+     * scene.set_ui, such as "label.text", "control.visible", "slider.value" or "panel.color".
+     * Booleans, numbers, vectors, colors and margins are numbers (booleans 0 or 1); text, file
+     * paths and choices (such as "label.horizontal_align" = "center") are text. Setting checks
+     * the value like the Inspector does and returns 0, logging why, when the entity lacks the
+     * component or the value does not fit. Changes last until Stop Game. */
+    size_t (*ui_get_numbers)(void* context, RelayEntity entity, const char* field, size_t length,
+                             double* values, size_t capacity);
+    int (*ui_set_numbers)(void* context, RelayEntity entity, const char* field, size_t length,
+                          const double* values, size_t count);
+    /* Copies up to `capacity` bytes and returns the text's full length. */
+    size_t (*ui_get_text)(void* context, RelayEntity entity, const char* field, size_t length,
+                          char* buffer, size_t capacity);
+    int (*ui_set_text)(void* context, RelayEntity entity, const char* field, size_t length,
+                       const char* text, size_t text_length);
+    /* RELAY_UI_HOVERED and RELAY_UI_HELD bits for an interactive control this game step. */
+    int (*ui_state)(void* context, RelayEntity entity);
+    /* The event being delivered by RELAY_CALLBACK_UI; 0 outside that callback. */
+    int (*ui_event)(void* context, int* type, RelayEntity* control, double* value);
+    /* Shows (0) or hides and locks (1) the cursor for the rest of the game, overriding the input
+     * map's lock_mouse. Controls react to the pointer only while it is unlocked. */
+    int (*set_mouse_locked)(void* context, int locked);
+    int (*mouse_locked)(void* context);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

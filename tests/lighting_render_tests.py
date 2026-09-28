@@ -317,10 +317,26 @@ def sharp_edges(image) -> int:
     return count
 
 
+def hide_interface(project: pathlib.Path) -> None:
+    """Hides every canvas in a copy of the demo's showcase, so only the 3D view is measured."""
+    path = project / "scenes" / "showcase.relay.json"
+    document = json.loads(path.read_text())
+    for entity in document["scene"]["entities"]:
+        if (entity.get("ui") or {}).get("canvas"):
+            entity["ui"]["canvas"]["visible"] = False
+    path.write_text(json.dumps(document))
+
+
 def motion_blur_checks(binary: str, folder: pathlib.Path) -> list:
     """The demo's motion blur: a still camera stays sharp, a camera turning between frames blurs."""
-    still_result, _ = render(binary, folder / "still.png", True, True)
-    turning_result, _ = render(binary, folder / "turning.png", True, True, turn=3.0)
+    # The game interface draws over the view and never blurs, so the copy leaves it out.
+    project = folder / "blur-demo"
+    shutil.copytree(ROOT / "examples" / "demo", project, ignore=shutil.ignore_patterns(".relay-cache"))
+    hide_interface(project)
+    still_result, _ = render(binary, folder / "still.png", True, True, cwd=folder,
+                             project="blur-demo/demo.relayproject")
+    turning_result, _ = render(binary, folder / "turning.png", True, True, cwd=folder,
+                               project="blur-demo/demo.relayproject", turn=3.0)
     if still_result.returncode != 0 or turning_result.returncode != 0:
         return [f"motion blur renders failed: {(still_result.stderr or turning_result.stderr).strip()[-400:]}"]
     still, turning = sharp_edges(read_png(folder / "still.png")), sharp_edges(read_png(folder / "turning.png"))

@@ -13,6 +13,7 @@
 namespace relay {
 
 class Engine;
+struct UiEvent;
 
 // Project scripts live under scripts/; builds and their libraries under the hidden cache below.
 inline constexpr std::string_view script_source_directory = "scripts";
@@ -115,6 +116,8 @@ public:
     void start();
     void update(double delta_seconds);
     void dispatch_contacts();
+    // Delivers this step's interface events to scripts on each control and its ancestors.
+    void dispatch_ui(const std::vector<UiEvent>& events);
     void stop();
 
 private:

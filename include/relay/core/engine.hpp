@@ -19,6 +19,7 @@
 #include "relay/scene/project.hpp"
 #include "relay/scene/scene_history.hpp"
 #include "relay/script/script_system.hpp"
+#include "relay/ui/ui_system.hpp"
 
 #include <cstdint>
 #include <deque>
@@ -104,6 +105,10 @@ public:
     [[nodiscard]] const AssetRegistry& assets() const;
     [[nodiscard]] ScriptSystem& scripts() { return scripts_; }
     [[nodiscard]] AudioSystem& audio();
+    // The game interface: layout, pointer interaction and events during Run Game, and the draw
+    // list hosts draw over the game's view.
+    [[nodiscard]] UiSystem& ui() { return ui_; }
+    [[nodiscard]] const UiSystem& ui() const { return ui_; }
     // The open project's mixer buses, or the defaults without a project or saved settings.
     [[nodiscard]] AudioSettings audio_settings() const;
     // Validates and saves mixer buses in the open project; the mixer follows immediately.
@@ -180,6 +185,7 @@ private:
     // Points audio at the open project's files and buses.
     void sync_audio();
     AudioSystem audio_;
+    UiSystem ui_;
     SkyMaterialCache sky_materials_;
     ShaderLibrary shaders_;
     std::string previewed_material_;

@@ -59,7 +59,7 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_assets_search{{
     {"query", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 64U, "", ""},
     {"folder", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^([A-Za-z0-9][A-Za-z0-9._ /-]*)?$", ""},
     {"paths", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
-    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 12U, "^(folder|model|scene|template|image|material|shader|script|text|media|audio|other)$", ""},
+    {"kinds", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 13U, "^(folder|model|scene|template|image|material|shader|script|text|media|audio|font|other)$", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_assets_create_folder{{
@@ -162,6 +162,22 @@ constexpr std::array<ProtocolFieldSpec, 3> fields_input_simulate{{
     {"frames", ProtocolValueType::integer, false, false, true, true, 1, 3600, 0U, 0U, "", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 2> fields_ui_layout{{
+    {"width", ProtocolValueType::integer, false, false, true, true, 1, 16384, 0U, 0U, "", ""},
+    {"height", ProtocolValueType::integer, false, false, true, true, 1, 16384, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 4> fields_ui_render{{
+    {"path", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^(captures/)?[A-Za-z0-9][A-Za-z0-9._-]*\\.png$", ""},
+    {"width", ProtocolValueType::integer, false, false, true, true, 16, 8192, 0U, 0U, "", ""},
+    {"height", ProtocolValueType::integer, false, false, true, true, 16, 8192, 0U, 0U, "", ""},
+    {"background", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "checker|black|transparent"},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_ui_click{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 4> fields_video_start{{
     {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.webm$", ""},
     {"fps", ProtocolValueType::integer, false, false, true, true, 1, 60, 0U, 0U, "", ""},
@@ -176,7 +192,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scene_inspect{{
 constexpr std::array<ProtocolFieldSpec, 3> fields_scene_create{{
     {"name", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 128U, "", ""},
     {"parent", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "Node|Camera|Sky|PostProcess|DirectionalLight|PointLight|SpotLight|RigidBody|StaticBody|StaticMesh|AudioSource|ReverbZone|MusicPlayer"},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "Node|Camera|Sky|PostProcess|DirectionalLight|PointLight|SpotLight|RigidBody|StaticBody|StaticMesh|AudioSource|ReverbZone|MusicPlayer|Canvas|Control|Button|CheckBox|Slider|ProgressBar|VBoxContainer|HBoxContainer|GridContainer|Panel|Label|Image"},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_scene_destroy{{
@@ -443,6 +459,16 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_post_effect{{
     {"index", ProtocolValueType::integer, true, false, true, true, 0, 15, 0U, 0U, "", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"editor", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 7> fields_scene_set_ui{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "ui_canvas|ui_control|ui_panel|ui_label|ui_image|ui_button|ui_toggle|ui_slider|ui_progress_bar|ui_container"},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"values", ProtocolValueType::object, false, false, false, false, 0, 0, 0U, 64U, "", ""},
+    {"anchor_preset", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "top_left|top|top_right|left|center|right|bottom_left|bottom|bottom_right|full_rect|top_wide|bottom_wide|left_wide|right_wide|vcenter_wide|hcenter_wide"},
+    {"preset_margin", ProtocolValueType::number, false, false, true, true, -100000, 100000, 0U, 0U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 3> fields_component_add{{
@@ -782,7 +808,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_audio_set_spatialization{{
     {"mode", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "stereo|binaural"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 160> methods{{
+constexpr std::array<ProtocolMethodSpec, 164> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -829,6 +855,9 @@ constexpr std::array<ProtocolMethodSpec, 160> methods{{
     {"input.state", "input_state", "Inspect game input", "Read the current game step's input: each action's held and pressed state, each axis value, held controls and mouse movement.", true, false, false, false, false, no_fields},
     {"input.simulate", "input_simulate", "Simulate game input", "Hold an action, or set an axis value, for a number of game steps during Run Game, as if a player pressed it. Use it with runtime.step to play-test scripts.", false, false, false, false, false, fields_input_simulate},
     {"input.release", "input_release", "Release game input", "Host-only. Release every held control, used when the game viewport loses input focus.", false, false, false, true, false, no_fields},
+    {"ui.layout", "ui_layout", "Inspect interface layout", "Lay out the scene's game interface for a view size (by default the game view's) and report every canvas and control: its rectangle in view pixels (the bounds of its drawn, possibly rotated, shape), its position and size in its parent's canvas units, whether it shows, its opacity, and during Run Game whether the pointer hovers or holds it, plus the latest game step's interface events (clicked, toggled, value_changed, pressed, released). Works in the editor and during Run Game.", true, false, false, false, false, fields_ui_layout},
+    {"ui.render", "ui_render", "Render interface image", "Draw the scene's game interface alone, without the 3D scene, into a PNG in the captures directory, on a checkerboard, black or transparent background. Use it to check an interface while editing, since interface nodes do not show in the editor's view; during Run Game it shows the controls as they are now. Reports fonts and images that could not be used.", false, false, false, false, false, fields_ui_render},
+    {"ui.click", "ui_click", "Click interface control", "Run Game only. Press and release the pointer over a button, check box or slider at its center during the next two game steps, as a player would, even while the cursor is locked. The control's scripts hear the click through on_ui; step the game (runtime.step) or let it run to deliver it, then read ui.layout's events.", false, false, false, false, false, fields_ui_click},
     {"video.start", "video_start", "Start Relay video", "Record real Vulkan or deterministic CPU frames to WebM with explicit frame drops.", false, false, false, false, false, fields_video_start},
     {"video.capabilities", "video_capabilities", "Inspect video capabilities", "Report whether this Relay build found the FFmpeg WebM encoder.", true, false, false, false, false, no_fields},
     {"video.stop", "video_stop", "Stop Relay video", "Drain pending readbacks and start background WebM finalization; poll video.status for completion and errors.", false, false, false, false, false, no_fields},
@@ -871,6 +900,7 @@ constexpr std::array<ProtocolMethodSpec, 160> methods{{
     {"scene.set_sky", "scene_set_sky", "Configure sky", "Add, edit or remove a sky: what is drawn behind everything, the ambient light it gives the scene, and linear distance fog. The first node with a sky is the one in use; its directional light, if any, is the sun, aimed by turning the node. The sky is a gradient from horizon_color (at the horizon and below) to zenith_color (straight up), unless material names a sky material (.relay-material, see assets.set_sky_material), which draws its panorama instead. Colors are linear RGB triples from 0 to 1000. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_sky},
     {"scene.set_post_process", "scene_set_post_process", "Configure post processing", "Add, change or remove post processing: an ordered list of post_process materials (full-screen effects from post_process shaders) applied to the lit scene before tone mapping, in every view. The first node with post processing is used. Effects that stay in a replaced list keep their settings; new ones start on and show in the editor's view too. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_post_process},
     {"scene.set_post_effect", "scene_set_post_effect", "Configure post effect", "Turn one post-processing effect on or off by its position in the list, without removing it, and choose whether it also shows in the editor's own view (off for effects meant for the game camera, such as motion blur). Undoable.", false, false, false, false, false, fields_scene_set_post_effect},
+    {"scene.set_ui", "scene_set_ui", "Configure interface component", "Add, edit or remove one game interface (UI) component on a node. Interface nodes are drawn over the game's view during Run Game only, never in the editor's own view. A Canvas (ui_canvas) scales the controls below it to the screen; a Control (ui_control) places a rectangle, Godot style, by anchors (fractions of the parent control's or screen's size) plus offsets in canvas units, with a pivot for rotation and scale; widgets draw into it or react to the pointer: ui_panel, ui_label, ui_image, ui_button, ui_toggle (check box or switch), ui_slider, ui_progress_bar and ui_container (column, row or grid that places its children). values maps field names to JSON values: numbers, booleans, strings (text, project file paths, choice names), [x, y] vectors, [red, green, blue, alpha] sRGB colors from 0 to 1 and [left, top, right, bottom] margins. Omitted fields keep their values; a missing component is added with its defaults first, and a widget brings its Control. anchor_preset (ui_control) places the control by a preset before values apply, keeping its size. component.types lists every field with its type, range and choices; ui.layout and ui.render show the result. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_ui},
     {"component.add", "component_add", "Add component", "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.", false, false, false, false, false, fields_component_add},
     {"component.remove", "component_remove", "Remove component", "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.", false, true, false, false, false, fields_component_remove},
     {"scene.set_script", "scene_set_script", "Configure script component", "Change the behaviour or enabled state of one of a node's script components, as an undoable transaction.", false, false, false, false, false, fields_scene_set_script},

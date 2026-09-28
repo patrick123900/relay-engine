@@ -249,6 +249,18 @@ copy one of Relay's ready-made effects into the project (each effect can be kept
 editor's view). The demo has three hovering plasma orbs, bloom and motion blur for the player's
 camera. See the [shader guide](shaders.md).
 
+## Game interface
+
+Interface nodes (Add Node → **Canvas**, then Label, Button, Panel, Image, Check Box, Slider,
+Progress Bar and the Vertical Box, Horizontal Box and Grid containers under it) make HUDs and
+menus. They draw over the game's view during **Run Game** only; the viewport's own camera never
+shows them. Their Inspector replaces the Transform with the **Control** section: Godot-style
+anchors with presets, position and size (or margins when stretched), pivot, rotation, scale,
+opacity and order. **Tools → Interface editor** (or **Open the Interface editor** in the Inspector)
+opens a panel beside the viewport that draws the interface at a chosen screen size; click controls
+to select them, drag to move them and drag their handles to resize them. Scripts hear clicks through
+`on_ui`. See the [interface guide](interface.md).
+
 ## Demo project
 
 In the development build, the editor opens the demo
@@ -262,7 +274,10 @@ around it pans and fades the sound; and the glowing button just ahead and to the
 next note of a scale when you look at it and press **E** (or shoot it). The joints playground
 sits in a hall reverb zone, and crates between you and a sound muffle it. A generated soundtrack
 plays throughout; the blue pad to the left of the start moves it to the next track on the next bar,
-the tone button ducks it under each note, and every shot has its own sound. The first Run Game
+the tone button ducks it under each note, and every shot has its own sound. A HUD shows control
+hints, a crosshair and how many balls you have fired; **Tab** opens a menu (the project's
+`scripts/GameMenu.cpp`) with a Resume button, a switch for the hints and a music volume slider,
+freeing the cursor while it is open. The first Run Game
 asks you to trust the project so its scripts can build. The player is also a **First Person
 Controller** template for other scenes, and its script is editable like any other (see the
 [scripting guide](scripting.md)). The player's camera is the scene's camera. Set

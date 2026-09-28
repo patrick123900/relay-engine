@@ -51,6 +51,32 @@ target_link_libraries(relay_miniaudio PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 if(UNIX AND NOT APPLE)
     target_link_libraries(relay_miniaudio PUBLIC m)
 endif()
+# stb_truetype (public domain or MIT): TrueType and OpenType glyph rasterizing for the game
+# interface. Pinned to a commit; only the header is used.
+FetchContent_Declare(stb
+    URL https://github.com/nothings/stb/archive/2c980bb59875b0d32144a71867fbdebb2f77cd20.tar.gz
+    URL_HASH SHA256=9a955b1b49a4410088a2e0ee2a9c057c3c907d0c1d75454144cb980aca0ba515
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SOURCE_SUBDIR relay-sources-only)
+FetchContent_MakeAvailable(stb)
+add_library(relay_stb_truetype STATIC src/ui/stb_truetype_impl.c)
+target_include_directories(relay_stb_truetype SYSTEM PUBLIC "${stb_SOURCE_DIR}")
+if(UNIX)
+    target_link_libraries(relay_stb_truetype PUBLIC m)
+endif()
+# The built-in interface font (Inter, SIL Open Font License), embedded so games need no font file.
+set(RELAY_EMBEDDED_FILE_INPUTS
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/inter/Inter-Regular.ttf"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/inter/Inter-Bold.ttf")
+set(RELAY_EMBEDDED_FILES "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_files.cpp")
+add_custom_command(
+    OUTPUT "${RELAY_EMBEDDED_FILES}"
+    COMMAND "${CMAKE_COMMAND}" "-DOUTPUT=${RELAY_EMBEDDED_FILES}"
+            "-DINPUTS=${RELAY_EMBEDDED_FILE_INPUTS}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_binary_files.cmake"
+    DEPENDS ${RELAY_EMBEDDED_FILE_INPUTS} "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_binary_files.cmake"
+    COMMENT "Embedding the built-in interface font"
+    VERBATIM)
 add_custom_target(relay_protocol_codegen_check ALL
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_protocol.py" --check
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -126,10 +152,15 @@ add_library(relay_engine
     src/scene/scene_edit.cpp
     src/scene/scene_history.cpp
     src/scene/scene_io.cpp
+    src/scene/ui.cpp
     src/script/script_system.cpp
+    src/ui/ui_font.cpp
+    src/ui/ui_render.cpp
+    src/ui/ui_system.cpp
+    ${RELAY_EMBEDDED_FILES}
 )
 add_library(Relay::Engine ALIAS relay_engine)
-target_link_libraries(relay_engine PRIVATE Jolt relay_miniaudio ${CMAKE_DL_LIBS})
+target_link_libraries(relay_engine PRIVATE Jolt relay_miniaudio relay_stb_truetype ${CMAKE_DL_LIBS})
 # Project scripts compile with the same compiler as Relay unless RELAY_SCRIPT_COMPILER overrides it.
 target_compile_definitions(relay_engine PRIVATE
     RELAY_SCRIPT_DEFAULT_COMPILER="${CMAKE_CXX_COMPILER}"
@@ -290,6 +321,17 @@ if(RELAY_ENABLE_SDL)
             endforeach()
             foreach(stage vert frag)
                 add_custom_command(
+                    OUTPUT "${RELAY_SHADER_OUTPUT_DIR}/ui.${stage}.spv"
+                    COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
+                    COMMAND "${RELAY_GLSLC}" -fshader-stage=${stage}
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ui.${stage}"
+                            -o "${RELAY_SHADER_OUTPUT_DIR}/ui.${stage}.spv"
+                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ui.${stage}"
+                    VERBATIM
+                )
+            endforeach()
+            foreach(stage vert frag)
+                add_custom_command(
                     OUTPUT "${RELAY_SHADER_OUTPUT_DIR}/directional_shadow.${stage}.spv"
                     COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
                     COMMAND "${RELAY_GLSLC}" -fshader-stage=${stage}
@@ -365,6 +407,7 @@ if(RELAY_ENABLE_SDL)
                               "${RELAY_reflection_trace_SHADER}"
                               "${RELAY_reflection_arguments_SHADER}"
                               "${RELAY_TONE_VERTEX}" "${RELAY_TONE_FRAGMENT}"
+                              "${RELAY_SHADER_OUTPUT_DIR}/ui.vert.spv" "${RELAY_SHADER_OUTPUT_DIR}/ui.frag.spv"
                               "${RELAY_SHADOW_VERTEX}" "${RELAY_SHADOW_FRAGMENT}"
                               "${RELAY_GRID_vert}" "${RELAY_GRID_frag}"
                               "${RELAY_SELECTION_vert}" "${RELAY_SELECTION_frag}")
@@ -391,6 +434,8 @@ if(RELAY_ENABLE_SDL)
                 RELAY_FRAGMENT_SHADER_PATH="${RELAY_FRAGMENT_SHADER}"
                 RELAY_TONE_VERTEX_PATH="${RELAY_TONE_VERTEX}"
                 RELAY_TONE_FRAGMENT_PATH="${RELAY_TONE_FRAGMENT}"
+                RELAY_UI_VERTEX_PATH="${RELAY_SHADER_OUTPUT_DIR}/ui.vert.spv"
+                RELAY_UI_FRAGMENT_PATH="${RELAY_SHADER_OUTPUT_DIR}/ui.frag.spv"
                 RELAY_SHADOW_VERTEX_PATH="${RELAY_SHADOW_VERTEX}"
                 RELAY_SHADOW_FRAGMENT_PATH="${RELAY_SHADOW_FRAGMENT}"
                 RELAY_GRID_VERTEX_PATH="${RELAY_GRID_vert}"
@@ -466,7 +511,8 @@ if(RELAY_ENABLE_SDL)
                 target_sources(relay_demo PRIVATE src/editor/editor_ui.cpp src/editor/editor_theme.cpp
                     src/editor/editor_layout.cpp src/editor/chat_media.cpp
                     src/editor/file_browser.cpp src/editor/shader_graph_canvas.cpp
-                    src/editor/editor_widgets.cpp src/editor/asset_thumbnails.cpp)
+                    src/editor/editor_widgets.cpp src/editor/asset_thumbnails.cpp
+                    src/editor/interface_preview.cpp)
                 find_package(PkgConfig QUIET)
                 if(PkgConfig_FOUND)
                     pkg_check_modules(CHAT_VIDEO QUIET IMPORTED_TARGET libavformat libavcodec libswscale libavutil)
@@ -543,7 +589,7 @@ if(RELAY_BUILD_TESTS)
         add_executable(relay_editor_headless_tests tests/editor_headless_tests.cpp
             src/editor/editor_ui.cpp src/editor/editor_theme.cpp src/editor/editor_layout.cpp src/editor/chat_media.cpp
             src/editor/file_browser.cpp src/editor/shader_graph_canvas.cpp src/editor/editor_widgets.cpp
-            src/editor/asset_thumbnails.cpp src/platform/sdl_input.cpp)
+            src/editor/asset_thumbnails.cpp src/editor/interface_preview.cpp src/platform/sdl_input.cpp)
         target_link_libraries(relay_editor_headless_tests PRIVATE Relay::Engine relay_imgui)
         target_compile_definitions(relay_editor_headless_tests PRIVATE RELAY_CHAT_MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat-media")
         relay_enable_warnings(relay_editor_headless_tests)

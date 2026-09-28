@@ -18,6 +18,10 @@
 #include "relay/scene/scene_history.hpp"
 #include "relay/scene/scene_io.hpp"
 #include "relay/scene/project.hpp"
+#include "relay/scene/node_types.hpp"
+#include "relay/scene/components.hpp"
+#include "relay/core/json.hpp"
+#include "relay/ui/ui_render.hpp"
 #include "../src/render/gltf_animation.hpp"
 
 #include <algorithm>
@@ -134,7 +138,376 @@ std::string textured_external_gltf(const std::string& buffer_uri) {
 
 } // namespace
 
+// The sRGB byte at a pixel of an RGBA image.
+std::array<int, 4> pixel_at(const std::vector<std::uint8_t>& rgba, std::uint32_t width, std::uint32_t x, std::uint32_t y) {
+    const auto at = (static_cast<std::size_t>(y) * width + x) * 4U;
+    return {rgba[at], rgba[at + 1U], rgba[at + 2U], rgba[at + 3U]};
+}
+
+bool near_color(const std::array<int, 4>& pixel, int r, int g, int b, int tolerance = 3) {
+    return std::abs(pixel[0] - r) <= tolerance && std::abs(pixel[1] - g) <= tolerance && std::abs(pixel[2] - b) <= tolerance;
+}
+
+std::optional<relay::JsonValue> parse_json(const std::string& text) {
+    relay::JsonParser parser(text);
+    return parser.parse();
+}
+
+void test_game_interface() {
+    using namespace relay;
+    // The reflection table describes every component once, and JSON round-trips through it.
+    {
+        UiComponents ui;
+        ui.control = UiControl{};
+        ui.control->offset_min = {12.5, -3.0};
+        ui.control->mouse_filter = UiControl::MouseFilter::stop;
+        ui.panel = UiPanel{};
+        ui.panel->color = {0.25, 0.5, 0.75, 1.0};
+        ui.label = UiLabel{};
+        ui.label->text = "Héllo \"world\"\nline";
+        ui.label->horizontal_align = UiLabel::Align::center;
+        ui.button = UiButton{};
+        ui.button->padding = {1, 2, 3, 4};
+        const auto json = ui_components_json(ui);
+        const auto parsed = parse_json(json);
+        UiComponents loaded;
+        std::string error;
+        expect(parsed && read_ui_components(*parsed, loaded, error) && loaded == ui,
+               "UI components round-trip through JSON: " + error + ' ' + json);
+        expect(json.find("\"horizontal_align\":\"center\"") != std::string::npos &&
+                   json.find("\"mouse_filter\":\"stop\"") != std::string::npos,
+               "choices are written by name");
+        expect(ui_components_json({}) == "null", "nodes without UI write null");
+        UiComponents widget_only;
+        widget_only.label = UiLabel{};
+        expect(!valid_ui(widget_only, &error) && error.find("Control") != std::string::npos,
+               "widgets need a Control");
+        UiComponents both;
+        both.canvas = UiCanvas{};
+        both.control = UiControl{};
+        expect(!valid_ui(both), "a node cannot be a canvas and a control");
+        UiComponents slider;
+        slider.control = UiControl{};
+        const auto* slider_info = find_ui_component("ui_slider");
+        expect(slider_info && apply_ui_values(slider, *slider_info, *parse_json(R"({"minimum":0,"maximum":10,"step":2,"value":5.2})"), error) &&
+                   slider.slider && std::abs(slider.slider->value - 6.0) < 1e-9,
+               "slider values snap to their step: " + error);
+        expect(!apply_ui_values(slider, *slider_info, *parse_json(R"({"maximum":-5})"), error),
+               "a slider's maximum must stay above its minimum");
+        expect(!apply_ui_values(slider, *slider_info, *parse_json(R"({"colour":[1,0,0,1]})"), error) &&
+                   error.find("track_color") != std::string::npos,
+               "unknown fields are refused with the field list");
+        expect(!apply_ui_values(slider, *find_ui_component("label"), *parse_json(R"({"font":"../x.ttf"})"), error),
+               "font paths stay inside the project");
+        UiControl preset;
+        expect(apply_ui_anchor_preset(preset, "bottom_right", Vec2{200, 50}, 10) && preset.anchor_min.x == 1.0 &&
+                   preset.offset_min.x == -210.0 && preset.offset_max.y == -10.0,
+               "anchor presets hang the control from the chosen corner");
+        expect(apply_ui_anchor_preset(preset, "full_rect") && preset.anchor_max.x == 1.0 && preset.offset_max.x == 0.0,
+               "full_rect fills the parent");
+    }
+    // Node types give interface nodes their components; new controls go in front of siblings.
+    {
+        Scene scene;
+        const auto canvas = scene.create("HUD");
+        std::string error;
+        expect(apply_node_type(scene, canvas, "Canvas", error) && node_type(*scene.get(canvas)) == "Canvas", "Canvas node");
+        const auto first = scene.create("Play", canvas);
+        const auto second = scene.create("Quit", canvas);
+        expect(apply_node_type(scene, first, "Button", error) && apply_node_type(scene, second, "Button", error),
+               "Button nodes: " + error);
+        const auto& button = scene.get(second)->ui;
+        expect(node_type(*scene.get(second)) == "Button" && button.panel && button.label && button.button &&
+                   button.label->text == "Button" && button.control->order == scene.get(first)->ui.control->order + 1,
+               "a Button has a panel, label and button, ordered after its sibling");
+        const auto box = scene.create("Menu", canvas);
+        expect(apply_node_type(scene, box, "VBoxContainer", error) && node_type(*scene.get(box)) == "VBoxContainer",
+               "vertical box node");
+        const auto plain = scene.create("Plain", canvas);
+        expect(add_component(scene, plain, "ui_label", {}, error) && scene.get(plain)->ui.control &&
+                   node_type(*scene.get(plain)) == "Label",
+               "adding a label brings its Control");
+        expect(!remove_component(scene, plain, "ui_control", 0U, error), "the Control stays while widgets need it");
+        expect(!add_component(scene, canvas, "ui_panel", {}, error), "a canvas takes no widgets");
+        expect(scene.serialize_json().find("\"UiProgressBar\"") != std::string::npos,
+               "scene files describe the UI components");
+        // Scene files keep the interface.
+        const auto path = std::filesystem::temp_directory_path() / "relay-ui-scene-test.relay.json";
+        expect(save_scene_file_atomic(scene, path, error), "save a scene with UI");
+        const auto loaded = load_scene_file(path);
+        bool same = loaded.state.has_value();
+        if (loaded.state)
+            for (const auto entity : scene.entities())
+                same = same && loaded.state->slots[entity.index].record.ui == scene.get(entity)->ui;
+        expect(same && loaded.source_version == scene_file_version, "scene files round-trip UI components: " + loaded.error);
+        std::filesystem::remove(path);
+    }
+    // Layout: canvases scale to the view, anchors and offsets place controls, containers stack.
+    {
+        Scene scene;
+        const auto root = scene.create("HUD");
+        auto ui = scene.get(root)->ui;
+        ui.canvas = UiCanvas{};
+        expect(scene.set_ui(root, ui), "canvas");
+        const auto corner = scene.create("Corner", root);
+        ui = {};
+        ui.control = UiControl{};
+        (void)apply_ui_anchor_preset(*ui.control, "bottom_right", Vec2{200, 100}, 20);
+        ui.panel = UiPanel{};
+        ui.panel->corner_radius = 0.0;
+        ui.panel->color = {1.0, 0.0, 0.0, 1.0};
+        expect(scene.set_ui(corner, ui), "corner panel");
+        const auto menu = scene.create("Menu", root);
+        ui = {};
+        ui.control = UiControl{};
+        (void)apply_ui_anchor_preset(*ui.control, "top_left", Vec2{400, 600}, 0);
+        ui.container = UiContainer{};
+        ui.container->spacing = 10.0;
+        ui.container->padding = {5, 5, 5, 5};
+        expect(scene.set_ui(menu, ui), "menu container");
+        std::vector<Entity> items;
+        for (int index = 0; index < 3; ++index) {
+            const auto item = scene.create("Item", menu);
+            ui = {};
+            ui.control = UiControl{};
+            ui.control->min_size = {100, 50};
+            ui.control->order = 2 - index; // Reversed, to check ordering.
+            ui.control->expand_y = index == 0;
+            ui.control->size_x = index == 2 ? UiControl::Placement::center : UiControl::Placement::fill;
+            expect(scene.set_ui(item, ui), "menu item");
+            items.push_back(item);
+        }
+        UiPainter painter;
+        const auto layout = painter.layout(ui_sources(scene), 960, 540);
+        const auto* corner_node = layout.find(corner);
+        const auto corners = corner_node ? layout.corners(*corner_node) : std::array<Vec2, 4>{};
+        expect(corner_node && std::abs(corners[0].x - 850.0) < 1e-6 && std::abs(corners[2].x - 950.0) < 1e-6 &&
+                   std::abs(corners[2].y - 530.0) < 1e-6,
+               "a bottom-right control scales with a half-size screen");
+        // Items are ordered 2, 1, 0; the expanding one (0) takes the spare height, last.
+        const auto* top = layout.find(items[2]);
+        const auto* middle = layout.find(items[1]);
+        const auto* bottom = layout.find(items[0]);
+        expect(top && middle && bottom && std::abs(top->position.y - 5.0) < 1e-6 &&
+                   std::abs(middle->position.y - 65.0) < 1e-6 && std::abs(bottom->position.y - 125.0) < 1e-6 &&
+                   std::abs(bottom->size.y - 470.0) < 1e-6 && std::abs(middle->size.x - 390.0) < 1e-6 &&
+                   std::abs(top->size.x - 100.0) < 1e-6 && std::abs(top->position.x - 150.0) < 1e-6,
+               "a vertical box stacks children by order, expands and centers them");
+        expect(layout.hit({900, 500})->entity == corner && layout.hit({900, 100}) == nullptr, "hit testing");
+        UiPainter sizes;
+        const auto least = sizes.minimum_size(ui_sources(scene), menu);
+        expect(std::abs(least.x - 110.0) < 1e-6 && std::abs(least.y - 180.0) < 1e-6, "container minimum size");
+    }
+    // Drawing: panels, borders and text rasterize like the GPU would draw them.
+    {
+        Scene scene;
+        const auto root = scene.create("HUD");
+        UiComponents ui;
+        ui.control = UiControl{};
+        (void)apply_ui_anchor_preset(*ui.control, "center", Vec2{300, 120});
+        ui.panel = UiPanel{};
+        ui.panel->color = {0.2, 0.4, 0.8, 1.0};
+        ui.panel->border_width = 4.0;
+        ui.panel->border_color = {1.0, 1.0, 1.0, 1.0};
+        ui.panel->shadow_color = {0.0, 0.0, 0.0, 0.6};
+        ui.label = UiLabel{};
+        ui.label->text = "Relay 123";
+        ui.label->size = 40.0;
+        ui.label->horizontal_align = UiLabel::Align::center;
+        ui.label->outline_size = 2.0;
+        expect(scene.set_ui(root, ui), "drawn panel");
+        const auto check = scene.create("Check");
+        ui = {};
+        ui.control = UiControl{};
+        (void)apply_ui_anchor_preset(*ui.control, "top_left", Vec2{260, 40}, 16);
+        ui.toggle = UiToggle{};
+        ui.toggle->checked = true;
+        ui.label = UiLabel{};
+        ui.label->text = "Checked";
+        expect(scene.set_ui(check, ui), "check box");
+        UiPainter painter;
+        const auto layout = painter.layout(ui_sources(scene), 640, 360);
+        const auto list = painter.draw(layout);
+        expect(!list.empty() && !list.textures.empty() && list.indices.size() % 3U == 0U, "the interface draws triangles");
+        std::vector<std::uint8_t> rgba(640U * 360U * 4U, 0U);
+        for (std::size_t index = 3; index < rgba.size(); index += 4U) rgba[index] = 255U;
+        rasterize_ui(list, rgba);
+        const auto fill = pixel_at(rgba, 640, 200, 150);
+        const auto border = pixel_at(rgba, 640, 172, 180);
+        const auto outside = pixel_at(rgba, 640, 100, 330);
+        expect(near_color(fill, 51, 102, 204), "panel colors are sRGB");
+        expect(near_color(border, 255, 255, 255), "panel border");
+        expect(near_color(outside, 0, 0, 0), "nothing outside controls");
+        int text_pixels = 0;
+        for (std::uint32_t x = 230; x < 410; ++x)
+            for (std::uint32_t y = 160; y < 200; ++y)
+                if (pixel_at(rgba, 640, x, y)[0] > 200 && pixel_at(rgba, 640, x, y)[2] > 200 &&
+                    pixel_at(rgba, 640, x, y)[1] > 200)
+                    ++text_pixels;
+        expect(text_pixels > 200, "the label's glyphs draw over the panel");
+        expect(near_color(pixel_at(rgba, 640, 22, 28), 89, 179, 255, 6), "a checked box shows its check color");
+        if (const char* output = std::getenv("RELAY_UI_TEST_OUTPUT")) {
+            std::string error;
+            (void)write_frame_image({640, 360, rgba}, output, error);
+        }
+    }
+    // Project fonts and images load from the project folder only, and missing files are reported.
+    {
+        const auto root = std::filesystem::temp_directory_path() / "relay-ui-files-test";
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root / "fonts");
+        std::filesystem::create_directories(root / "images");
+        std::filesystem::copy_file(std::filesystem::path(RELAY_TEST_SOURCE_DIR) / "third_party/inter/Inter-Bold.ttf",
+                                   root / "fonts/Heading.ttf");
+        std::vector<std::uint8_t> checker(8U * 8U * 4U, 255U);
+        for (std::size_t pixel = 0; pixel < 64U; ++pixel) {
+            checker[pixel * 4U] = 255U;
+            checker[pixel * 4U + 1U] = pixel % 2U ? 0U : 255U;
+            checker[pixel * 4U + 2U] = 0U;
+        }
+        std::string error;
+        expect(write_frame_image({8, 8, checker}, root / "images/tile.png", error), "write a test image: " + error);
+        std::error_code ignored;
+        std::filesystem::create_directory_symlink(std::filesystem::temp_directory_path(), root / "outside", ignored);
+        Scene scene;
+        const auto title = scene.create("Title");
+        UiComponents ui;
+        ui.control = UiControl{};
+        (void)apply_ui_anchor_preset(*ui.control, "top_left", Vec2{300, 60});
+        ui.label = UiLabel{};
+        ui.label->text = "Heading";
+        ui.label->font = "fonts/Heading.ttf";
+        ui.label->size = 40.0;
+        expect(scene.set_ui(title, ui), "a label with a project font");
+        const auto picture = scene.create("Picture");
+        ui = {};
+        ui.control = UiControl{};
+        (void)apply_ui_anchor_preset(*ui.control, "bottom_right", Vec2{64, 64});
+        ui.image = UiImage{};
+        ui.image->image = "images/tile.png";
+        ui.image->mode = UiImage::Mode::stretch;
+        expect(scene.set_ui(picture, ui), "an image control");
+        const auto missing = scene.create("Missing");
+        ui.image->image = "images/none.png";
+        (void)apply_ui_anchor_preset(*ui.control, "top_right", Vec2{64, 64});
+        expect(scene.set_ui(missing, ui), "an image control with a missing file");
+        const auto escaping = scene.create("Escaping");
+        ui.label = UiLabel{};
+        ui.label->font = "outside/font.ttf";
+        ui.image.reset();
+        expect(scene.set_ui(escaping, ui), "a label whose font path leaves through a link");
+        UiPainter painter;
+        painter.set_root(root);
+        const auto list = painter.draw(painter.layout(ui_sources(scene), 320, 180));
+        std::vector<std::uint8_t> rgba(320U * 180U * 4U, 0U);
+        rasterize_ui(list, rgba);
+        const auto corner = pixel_at(rgba, 320, 318, 178);
+        expect(corner[0] > 200 && (corner[1] > 200 || corner[1] < 30), "the project image draws in its control");
+        const auto warnings = painter.take_warnings();
+        const auto warned = [&](const std::string& text) {
+            return std::any_of(warnings.begin(), warnings.end(),
+                               [&](const std::string& warning) { return warning.find(text) != std::string::npos; });
+        };
+        expect(warned("images/none.png") && warned("outside/font.ttf") && !warned("Heading.ttf"),
+               "missing files and paths out of the project are reported; the project font loads");
+        int ink = 0;
+        for (std::uint32_t y = 0; y < 30; ++y)
+            for (std::uint32_t x = 0; x < 150; ++x)
+                if (pixel_at(rgba, 320, x, y)[0] > 128) ++ink;
+        expect(ink > 100, "the project font draws the heading");
+        std::filesystem::remove_all(root);
+    }
+    // Pointer interaction during the game: hover, click, consumption, toggles and sliders.
+    {
+        Engine engine;
+        auto& scene = engine.scene();
+        const auto canvas = scene.create("HUD");
+        std::string error;
+        expect(apply_node_type(scene, canvas, "Canvas", error), "interaction canvas");
+        auto ui = scene.get(canvas)->ui;
+        ui.canvas->scale_mode = UiCanvas::ScaleMode::constant_pixel_size;
+        expect(scene.set_ui(canvas, ui), "constant canvas");
+        const auto button = scene.create("Play", canvas);
+        expect(apply_node_type(scene, button, "Button", error), "interaction button");
+        const auto check = scene.create("Sound", canvas);
+        expect(apply_node_type(scene, check, "CheckBox", error), "interaction check box");
+        ui = scene.get(check)->ui;
+        (void)apply_ui_anchor_preset(*ui.control, "top_left", Vec2{200, 40}, 0);
+        expect(scene.set_ui(check, ui), "check box at the top left");
+        const auto slider = scene.create("Volume", canvas);
+        expect(apply_node_type(scene, slider, "Slider", error), "interaction slider");
+        ui = scene.get(slider)->ui;
+        (void)apply_ui_anchor_preset(*ui.control, "bottom_left", Vec2{220, 20}, 0);
+        expect(scene.set_ui(slider, ui), "slider at the bottom left");
+        engine.ui().set_view_size(640, 360);
+        const auto events = [&] {
+            std::vector<std::string> names;
+            for (const auto& event : engine.ui().events())
+                names.push_back(std::string(ui_event_name(event.type)) + '@' + event.control.to_string());
+            return names;
+        };
+        const auto has = [&](const std::string& name, Entity control) {
+            const auto list = events();
+            return std::find(list.begin(), list.end(), name + '@' + control.to_string()) != list.end();
+        };
+        engine.apply_input_event("mouse_motion:320:180:0:0");
+        engine.tick();
+        expect(engine.ui().visual_state().hovered == button, "the pointer hovers the centered button");
+        engine.apply_input_event("mouse_button:down:left");
+        engine.tick();
+        expect(has("pressed", button) && !engine.input().action("fire", InputState::Query::pressed) &&
+                   engine.input().raw_control("mouse:left", InputState::Query::pressed),
+               "pressing a button hides the press from the game's actions");
+        engine.tick();
+        expect(!engine.input().action("fire", InputState::Query::held), "the consumed press stays hidden while held");
+        engine.apply_input_event("mouse_button:up:left");
+        engine.tick();
+        expect(has("clicked", button) && !engine.input().action("fire", InputState::Query::released),
+               "releasing over the button clicks it");
+        // Away from controls the game gets the mouse.
+        engine.apply_input_event("mouse_motion:600:180:0:0");
+        engine.apply_input_event("mouse_button:down:left");
+        engine.tick();
+        expect(engine.ui().events().empty() && engine.input().action("fire", InputState::Query::pressed),
+               "clicks outside the interface reach the game");
+        engine.apply_input_event("mouse_button:up:left");
+        engine.tick();
+        // A tap within one step still clicks the check box.
+        engine.apply_input_event("mouse_motion:20:20:0:0");
+        engine.apply_input_event("mouse_button:down:left");
+        engine.apply_input_event("mouse_button:up:left");
+        engine.tick();
+        expect(has("toggled", check) && scene.get(check)->ui.toggle->checked, "a click flips the check box");
+        // Dragging the slider.
+        engine.apply_input_event("mouse_motion:10:350:0:0");
+        engine.apply_input_event("mouse_button:down:left");
+        engine.tick();
+        engine.apply_input_event("mouse_motion:210:350:0:0");
+        engine.tick();
+        expect(has("value_changed", slider) && std::abs(scene.get(slider)->ui.slider->value - 1.0) < 1e-9,
+               "dragging the slider to its end sets its maximum");
+        engine.apply_input_event("mouse_button:up:left");
+        engine.tick();
+        // A locked cursor leaves the interface alone; simulated clicks still work.
+        auto map = engine.input().map();
+        map.lock_mouse = true;
+        engine.input().set_map(map);
+        engine.apply_input_event("mouse_motion:320:180:0:0");
+        engine.tick();
+        expect(!engine.ui().visual_state().hovered.valid(), "a locked cursor hovers nothing");
+        expect(engine.ui().simulate_click(scene, button, error), "simulate a click: " + error);
+        engine.tick();
+        engine.tick();
+        expect(has("clicked", button), "a simulated click clicks");
+        auto hidden = scene.get(button)->ui;
+        hidden.control->visible = false;
+        expect(scene.set_ui(button, hidden) && !engine.ui().simulate_click(scene, button, error),
+               "hidden controls cannot be clicked");
+    }
+}
+
 int main() {
+    test_game_interface();
     {
         relay::Camera camera;
         camera.field_of_view_y_degrees = 90.0;
@@ -2135,7 +2508,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 49U && relay::protocol_methods().size() == 160U,
+    expect(relay::protocol_schema_version == 50U && relay::protocol_methods().size() == 164U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");

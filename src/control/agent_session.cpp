@@ -47,7 +47,7 @@ std::string_view file_parameter(std::string_view method) {
 bool supports_entity(std::string_view method) {
     static const std::set<std::string_view> supported{"scene.inspect", "scene.bounds", "scene.set_transform",
         "scene.set_morph", "scene.set_light", "scene.set_renderer", "scene.set_renderer_parameter", "scene.rename", "scene.set_script",
-        "scene.set_script_property", "scene.set_sky", "scene.set_post_process", "scene.set_post_effect", "component.add", "component.remove"};
+        "scene.set_script_property", "scene.set_sky", "scene.set_post_process", "scene.set_post_effect", "scene.set_ui", "ui.click", "component.add", "component.remove"};
     return supported.contains(method);
 }
 } // namespace

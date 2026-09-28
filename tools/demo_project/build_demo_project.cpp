@@ -1,8 +1,11 @@
 // Authors the dev-build demo project through the trusted control protocol, using the same requests
 // the editor and agents send. Run by tools/generate_demo_project.py from the repository root, after
 // it has written models/primitives.glb and the sounds into the project folder. The committed scripts
-// (FirstPersonController.cpp, Projectile.cpp, ImpactSound.cpp, ToneButton.cpp, MusicSwitch.cpp)
-// are project source and are left as they are.
+// (FirstPersonController.cpp, Projectile.cpp, ImpactSound.cpp, ToneButton.cpp, MusicSwitch.cpp,
+// GameMenu.cpp) are project source and are left as they are.
+//
+// `relay_build_demo_project --add-interface [root]` instead adds (or replaces) only the showcase's
+// game interface in an existing demo, keeping everything else in its scene.
 
 #include "relay/control/control_protocol.hpp"
 #include "relay/core/engine.hpp"
@@ -20,6 +23,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -115,6 +119,65 @@ struct Builder {
     }
 };
 
+// The showcase's game interface (scripts/GameMenu.cpp): a crosshair, control hints and a count of
+// balls fired while playing, and a menu on Tab with a button, a switch and a slider. Interface
+// nodes draw only during Run Game, over the game's view.
+void add_interface(Builder& demo) {
+    const auto node = [&](const std::string& name, const char* type, const std::string& parent) {
+        const auto result = demo.call("scene.create", "\"name\":" + Builder::text(name) + ",\"type\":\"" + type + '"' +
+                                                          (parent.empty() ? "" : ",\"parent\":" + Builder::text(parent)));
+        return *relay::field(*result.object(), "entity")->string();
+    };
+    const auto ui = [&](const std::string& entity, const char* component, const std::string& values) {
+        demo.call("scene.set_ui", "\"entity\":" + Builder::text(entity) + ",\"component\":\"" + component +
+                                      "\",\"values\":{" + values + '}');
+    };
+    const std::string shadow = "\"shadow_color\":[0,0,0,0.65],\"shadow_offset\":[2,2]";
+    const auto hud = node("HUD", "Canvas", {});
+    const auto crosshair = node("Crosshair", "Panel", hud);
+    ui(crosshair, "ui_control", "\"offset_min\":[-4,-4],\"offset_max\":[4,4],\"mouse_filter\":\"ignore\"");
+    ui(crosshair, "ui_panel", "\"color\":[1,1,1,0.9],\"corner_radius\":4,\"border_width\":1,\"border_color\":[0,0,0,0.55]");
+    const auto hints = node("Hints", "Label", hud);
+    ui(hints, "ui_control", "\"anchor_min\":[0,0],\"anchor_max\":[0,0],\"offset_min\":[28,20],\"offset_max\":[1100,60]");
+    ui(hints, "ui_label", "\"text\":\"WASD move \u00b7 Space jump \u00b7 Shift sprint \u00b7 Click shoot \u00b7 E ring the "
+                          "bell \u00b7 Tab menu\",\"size\":22," + shadow);
+    const auto shots = node("Shots", "Label", hud);
+    ui(shots, "ui_control", "\"anchor_min\":[1,0],\"anchor_max\":[1,0],\"offset_min\":[-328,16],\"offset_max\":[-28,64]");
+    ui(shots, "ui_label", "\"text\":\"Balls 0\",\"size\":30,\"bold\":true,\"horizontal_align\":\"right\","
+                          "\"color\":[1,0.84,0.36,1]," + shadow);
+    // The menu is hidden until Tab opens it; its column places everything inside.
+    const auto menu = node("Menu", "Panel", hud);
+    ui(menu, "ui_control", "\"offset_min\":[-240,-236],\"offset_max\":[240,236],\"visible\":false");
+    ui(menu, "ui_panel", "\"color\":[0.07,0.08,0.1,0.93],\"corner_radius\":18,\"border_width\":1,"
+                         "\"border_color\":[1,1,1,0.1],\"shadow_color\":[0,0,0,0.55],\"shadow_size\":48,"
+                         "\"shadow_offset\":[0,12]");
+    const auto column = node("Menu layout", "VBoxContainer", menu);
+    ui(column, "ui_control", "\"anchor_min\":[0,0],\"anchor_max\":[1,1],\"offset_min\":[0,0],\"offset_max\":[0,0]");
+    ui(column, "ui_container", "\"padding\":[36,30,36,30],\"spacing\":18");
+    const auto title = node("Title", "Label", column);
+    ui(title, "ui_control", "\"min_size\":[0,64]");
+    ui(title, "ui_label", "\"text\":\"Paused\",\"size\":44,\"bold\":true,\"horizontal_align\":\"center\"");
+    const auto resume = node("Resume", "Button", column);
+    ui(resume, "ui_control", "\"min_size\":[0,60]");
+    ui(resume, "ui_panel", "\"color\":[0.2,0.45,0.9,1],\"corner_radius\":12");
+    ui(resume, "ui_button", "\"hover_color\":[0.28,0.54,1,1],\"pressed_color\":[0.14,0.33,0.7,1]");
+    ui(resume, "ui_label", "\"text\":\"Resume\",\"size\":24,\"bold\":true");
+    const auto switch_node = node("Show hints", "CheckBox", column);
+    ui(switch_node, "ui_toggle", "\"checked\":true,\"style\":\"switch\",\"box_size\":28");
+    ui(switch_node, "ui_label", "\"text\":\"Show hints\",\"size\":22");
+    const auto volume_label = node("Music volume label", "Label", column);
+    ui(volume_label, "ui_control", "\"min_size\":[0,28]");
+    ui(volume_label, "ui_label", "\"text\":\"Music volume\",\"size\":20,\"color\":[0.8,0.82,0.86,1]");
+    const auto volume = node("Music volume", "Slider", column);
+    ui(volume, "ui_control", "\"min_size\":[0,32]");
+    ui(volume, "ui_slider", "\"value\":1");
+    const auto footer = node("Footer", "Label", column);
+    ui(footer, "ui_control", "\"expand_y\":true");
+    ui(footer, "ui_label", "\"text\":\"Tab closes the menu\",\"size\":18,\"horizontal_align\":\"center\","
+                           "\"vertical_align\":\"bottom\",\"color\":[0.6,0.62,0.66,1]");
+    demo.script(hud, "GameMenu");
+}
+
 std::string string_of(const relay::JsonValue::Object& object, const char* key) {
     const auto* value = relay::field(object, key);
     return value && value->string() ? *value->string() : std::string{};
@@ -134,7 +197,24 @@ std::vector<std::string> strings(const relay::JsonValue& result, const char* key
 
 } // namespace
 
+// Adds the interface to an existing demo's startup scene, replacing an older one.
+int add_interface_only(const std::filesystem::path& root) {
+    Builder demo;
+    const auto project_file = (root / "demo.relayproject").generic_string();
+    demo.call("project.open", "\"filename\":" + Builder::text(project_file));
+    const auto listed = demo.call("scene.list");
+    for (const auto& value : *relay::field(*listed.object(), "entities")->array())
+        if (const auto& entity = *value.object(); string_of(entity, "name") == "HUD" && string_of(entity, "type") == "Canvas")
+            demo.call("scene.destroy", "\"entity\":" + Builder::text(string_of(entity, "entity")));
+    add_interface(demo);
+    demo.call("scene.save", "\"filename\":\"showcase.relay.json\"");
+    std::cout << "Added the interface to " << project_file << '\n';
+    return 0;
+}
+
 int main(const int argument_count, char** arguments) {
+    if (argument_count > 1 && std::string_view(arguments[1]) == "--add-interface")
+        return add_interface_only(argument_count > 2 ? arguments[2] : "examples/demo");
     const std::filesystem::path root = argument_count > 1 ? arguments[1] : "examples/demo";
     const auto project_file = (root / "demo.relayproject").generic_string();
     // Start from a clean project, keeping the generated models.
@@ -414,6 +494,7 @@ int main(const int argument_count, char** arguments) {
     demo.call("templates.save", player_field + ",\"name\":\"First Person Controller\",\"replace\":true");
     demo.transform(player, {0, 1, 8});
     demo.call("scene.set_camera", "\"entity\":" + Builder::text(player_camera) + ",\"active\":true");
+    add_interface(demo);
 
     demo.call("scene.save", "\"filename\":\"showcase.relay.json\"");
     demo.call("project.add_scene", "\"scene_file\":\"showcase.relay.json\"");

@@ -74,8 +74,17 @@ public:
     [[nodiscard]] double control_value(std::string_view id) const;
     [[nodiscard]] bool action(std::string_view name, Query query) const;
     [[nodiscard]] double axis(std::string_view name) const;
+    // The pointer in the game view, in pixels from its top-left corner.
     [[nodiscard]] double mouse_x() const { return mouse_x_; }
     [[nodiscard]] double mouse_y() const { return mouse_y_; }
+    // Hides a control from the game until it is released, because the interface took the press
+    // (a click on a button must not also fire). raw_control() still sees it.
+    void consume(std::string_view id);
+    [[nodiscard]] bool raw_control(std::string_view id, Query query) const;
+    // Whether the cursor is locked (hidden, for mouse look): the map's lock_mouse unless a script
+    // changed it for this game, as a menu does to show the cursor.
+    [[nodiscard]] bool mouse_locked() const { return mouse_lock_.value_or(map_.lock_mouse); }
+    void set_mouse_locked(std::optional<bool> locked) { mouse_lock_ = locked; }
     [[nodiscard]] double mouse_dx() const { return step_dx_; }
     [[nodiscard]] double mouse_dy() const { return step_dy_; }
     [[nodiscard]] double mouse_wheel() const { return step_wheel_; }
@@ -91,6 +100,8 @@ private:
         double value{};
         bool held{}, pressed{}, released{}, was_active{};
         bool still_down{}; // Down when the step began, unlike a tap that ended within it.
+        bool consumed{};   // Taken by the interface until released.
+        bool raw_held{}, raw_pressed{}, raw_released{};
     };
     struct Simulation {
         double value{};
@@ -104,6 +115,7 @@ private:
     std::map<std::string, Simulation, std::less<>> simulations_;
     double mouse_x_{}, mouse_y_{}, pending_dx_{}, pending_dy_{}, pending_wheel_{};
     double step_dx_{}, step_dy_{}, step_wheel_{};
+    std::optional<bool> mouse_lock_;
 };
 
 } // namespace relay

@@ -33,7 +33,7 @@ bool editor_slider(const char* label, float* value, float minimum, float maximum
 
 enum class AssetIcon : std::uint8_t {
     folder, model, mesh, scene, node_template, image, material, sky_material, post_material, shader,
-    script, text, audio, video, node, other
+    script, text, audio, video, font, node, other
 };
 
 // The icon for an asset kind as the protocol names it ("model", "material" and so on). Materials

@@ -54,7 +54,8 @@ def validate_schema(schema: dict) -> None:
         wire_names: set[str] = set()
         input_names: set[str] = set()
         for field in method["params"]:
-            if field.get("type") not in {"string", "integer", "number", "boolean", "string_array", "number_array"}:
+            if field.get("type") not in {"string", "integer", "number", "boolean", "string_array", "number_array",
+                                         "object"}:
                 raise ValueError(f"unsupported field type in {method['method']}")
             input_name = field["name"]
             wire_name = field.get("wire", input_name)
@@ -77,7 +78,7 @@ namespace relay {{
 
 inline constexpr unsigned protocol_schema_version = {schema["version"]}U;
 
-enum class ProtocolValueType {{ string, integer, number, boolean, string_array, number_array }};
+enum class ProtocolValueType {{ string, integer, number, boolean, string_array, number_array, object }};
 
 struct ProtocolFieldSpec {{
     std::string_view name;
@@ -119,7 +120,7 @@ struct ProtocolMethodSpec {{
 def generate_cpp(schema: dict) -> str:
     arrays: list[str] = []
     method_rows: list[str] = []
-    type_names = {"string": "string", "integer": "integer", "number": "number", "boolean": "boolean", "string_array": "string_array", "number_array": "number_array"}
+    type_names = {"string": "string", "integer": "integer", "number": "number", "boolean": "boolean", "string_array": "string_array", "number_array": "number_array", "object": "object"}
     for method in schema["methods"]:
         array_name = f"fields_{symbol(method['method'])}"
         params = method["params"]
@@ -203,6 +204,9 @@ def zod_expression(field: dict) -> str:
             expression += f".min({field['minimumLength']})"
         if "maximumLength" in field:
             expression += f".max({field['maximumLength']})"
+    elif field_type == "object":
+        # Free-form members, checked natively against the method's own rules.
+        expression = "z.record(z.string(), z.unknown())"
     elif field_type == "string":
         expression = "z.string()"
         if "minimumLength" in field:

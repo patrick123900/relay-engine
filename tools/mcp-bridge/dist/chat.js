@@ -50,6 +50,12 @@ export function parameterSchema(parameter) {
         if (parameter.maximumLength !== undefined)
             schema.maxLength = parameter.maximumLength;
     }
+    else if (schema.type === "object") {
+        // Free-form members, such as scene.set_ui's field values; Relay checks them natively.
+        schema.additionalProperties = true;
+        if (parameter.maximumLength !== undefined)
+            schema.maxProperties = parameter.maximumLength;
+    }
     if (parameter.nullable)
         schema.type = [schema.type, "null"];
     return schema;

@@ -992,6 +992,18 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                 slot.record.post_process = std::move(post_process);
             }
         }
+        if (result.source_version >= 25U) {
+            const auto* value = field(*entity_object, "ui");
+            if (!value) {
+                result.error = "version 25 entity requires ui";
+                return result;
+            }
+            std::string ui_error;
+            if (!read_ui_components(*value, slot.record.ui, ui_error)) {
+                result.error = "invalid ui: " + ui_error;
+                return result;
+            }
+        }
         ++result.entity_count;
     }
 

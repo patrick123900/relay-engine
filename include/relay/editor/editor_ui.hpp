@@ -45,6 +45,9 @@ public:
     [[nodiscard]] bool game_has_input() const;
     // True while the game has input and the editor keeps the pointer locked for it.
     [[nodiscard]] bool pointer_locked_for_game() const;
+    // Host seam: whether the running game wants the cursor locked (the input map's lock_mouse
+    // until a script changes it). A cursor a script frees for a menu appears mid-viewport.
+    void set_game_cursor_locked(bool locked);
     // Changes editor view state without mutating the scene.
     void set_panel_visible(std::string_view name, bool visible);
     [[nodiscard]] bool panel_visible(std::string_view name) const;

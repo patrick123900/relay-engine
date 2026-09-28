@@ -14,6 +14,7 @@ class AssetRegistry;
 class EditorOverlay;
 struct RenderInterpolation;
 class Scene;
+struct UiDrawList;
 
 class VulkanWindow {
 public:
@@ -44,6 +45,13 @@ public:
     // Game state to blend between steps in presented frames; captures always draw the scene as
     // it is. Null draws the scene as it is. The pointer must stay valid until it is replaced.
     void set_render_interpolation(const RenderInterpolation* interpolation);
+    // The game interface to draw over the game view, asked for each frame that shows the scene
+    // through its own camera (never the editor's camera) with the view's size in pixels. Return
+    // null to draw none, as outside Run Game. The list must stay valid until the next call.
+    using GameUiSource = std::function<const UiDrawList*(std::uint32_t width, std::uint32_t height)>;
+    void set_game_ui_source(GameUiSource source);
+    // Why the interface pass could not be set up, if it could not.
+    [[nodiscard]] std::string game_ui_error() const;
     [[nodiscard]] std::uint32_t draw_call_count() const;
     [[nodiscard]] std::uint32_t render_resource_count() const;
     [[nodiscard]] std::string render_graph_json() const;

@@ -242,6 +242,7 @@ AssetIcon asset_icon_for_kind(const std::string_view kind, const std::string_vie
     if (kind == "text") return AssetIcon::text;
     if (kind == "audio") return AssetIcon::audio;
     if (kind == "media") return AssetIcon::video;
+    if (kind == "font") return AssetIcon::font;
     if (kind == "node") return AssetIcon::node;
     return AssetIcon::other;
 }
@@ -263,6 +264,8 @@ AssetIcon asset_icon_for_file(const std::string_view name) {
         if (ends(sound)) return AssetIcon::audio;
     for (const auto* video : {".mp4", ".webm", ".mov", ".mkv"})
         if (ends(video)) return AssetIcon::video;
+    for (const auto* font : {".ttf", ".otf"})
+        if (ends(font)) return AssetIcon::font;
     for (const auto* code : {".cpp", ".hpp", ".h", ".cc", ".cxx"})
         if (ends(code)) return AssetIcon::script;
     for (const auto* text : {".txt", ".md", ".json"})
@@ -286,6 +289,7 @@ const char* asset_icon_label(const AssetIcon icon) {
     case AssetIcon::text: return "Text";
     case AssetIcon::audio: return "Sound";
     case AssetIcon::video: return "Video";
+    case AssetIcon::font: return "Font";
     case AssetIcon::node: return "Node";
     case AssetIcon::other: break;
     }
@@ -308,6 +312,7 @@ ImU32 asset_icon_color(const AssetIcon icon, const float alpha) {
     case AssetIcon::text: return srgb(168, 176, 190, alpha);
     case AssetIcon::audio: return srgb(236, 110, 142, alpha);
     case AssetIcon::video: return srgb(226, 104, 92, alpha);
+    case AssetIcon::font: return srgb(232, 214, 150, alpha);
     case AssetIcon::node: return srgb(146, 178, 255, alpha);
     case AssetIcon::other: break;
     }
@@ -446,6 +451,12 @@ void draw_asset_type_icon(ImDrawList* list, const ImVec2 min, const float size, 
     case AssetIcon::video:
         list->AddRect(at(0.08F, 0.2F), at(0.92F, 0.8F), color, size * 0.1F, 0, stroke);
         list->AddTriangleFilled(at(0.4F, 0.34F), at(0.68F, 0.5F), at(0.4F, 0.66F), color);
+        break;
+    case AssetIcon::font:
+        // A capital A.
+        line(0.18F, 0.86F, 0.5F, 0.12F);
+        line(0.5F, 0.12F, 0.82F, 0.86F);
+        line(0.32F, 0.58F, 0.68F, 0.58F);
         break;
     case AssetIcon::node:
         // A node with its three axes.

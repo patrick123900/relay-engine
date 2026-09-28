@@ -7,6 +7,8 @@
 #include "relay/control/generated_protocol.hpp"
 #include "relay/editor/editor_camera.hpp"
 #include "relay/editor/wrapped_input.hpp"
+#include "relay/editor/interface_preview.hpp"
+#include "relay/ui/ui_render.hpp"
 #include "relay/editor/editor_layout.hpp"
 #include "relay/editor/file_browser.hpp"
 #include "relay/editor/editor_math.hpp"
@@ -101,12 +103,13 @@ const JsonValue::Object* component(const JsonValue::Object& entity, const std::s
 }
 
 // Dockable panels, in the order of EditorUi::Impl::panel_open.
-constexpr std::array<const char*, 12> panel_names{"Hierarchy", "Inspector", "Assets", "History",
+constexpr std::array<const char*, 13> panel_names{"Hierarchy", "Inspector", "Assets", "History",
                                                   "Diagnostics", "Viewport", "Timeline", "Project",
-                                                  "Agent", "Profiler", "Mixer", "Shader Editor"};
+                                                  "Agent", "Profiler", "Mixer", "Shader Editor",
+                                                  "Interface"};
 constexpr std::array<bool, panel_names.size()> default_panels{true, true, true, false, true,
                                                               true, false, false, false, false,
-                                                              false, false};
+                                                              false, false, false};
 
 // A dim caption in a fixed column, so every inspector row lines up down the panel.
 void row_label(const char* const label, const float width) {
@@ -452,6 +455,31 @@ struct EditorUi::Impl {
         std::vector<std::uint8_t> rgba;
     } last_preview;
     AssetThumbnails thumbnails;
+    // The Interface editor: the scene's game interface, parsed from scene.list, drawn at a chosen
+    // screen size. The 3D viewport never shows it.
+    std::vector<UiComponents> interface_components; // By index into `entities`.
+    std::vector<UiSourceNode> interface_sources;
+    UiPainter interface_painter;
+    InterfacePreview interface_preview;
+    int interface_resolution{1};
+    std::array<int, 2> interface_custom_size{1920, 1080};
+    float interface_zoom{}; // Zero fits the view to the panel.
+    ImVec2 interface_pan{};
+    bool interface_outlines{true};
+    bool interface_focus_pending{};
+    struct InterfaceDrag {
+        std::string entity;
+        int handle{-1}; // -1 moves; 0-7 are corners and edges clockwise from the top-left.
+        ImVec2 start{};
+        Vec2 offset_min, offset_max;
+        UiAffine to_parent; // View pixels to the parent's space.
+        float scale{1.0F};  // Panel pixels per view pixel.
+        std::uint64_t gesture{};
+        bool moved{};
+    };
+    std::optional<InterfaceDrag> interface_drag;
+    std::uint64_t interface_gesture{};
+    std::map<std::string, std::array<char, maximum_ui_text_bytes + 1U>, std::less<>> ui_text_buffers;
     std::map<std::string, std::array<float, 4>, std::less<>> headless_items;
     void note_item(const std::string& key) {
         note_rect(key, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
@@ -718,6 +746,8 @@ struct EditorUi::Impl {
     } binding_capture;
     // During Run Game the viewport owns keyboard and mouse only after a click; Escape returns them.
     bool game_input_focus{}, game_lock_mouse{}, capture_requested{};
+    // The host reports the game's cursor lock every frame; without it the input map decides.
+    bool cursor_from_host{};
     std::string last_runtime_mode;
     std::map<std::string, std::array<char, 1025>> script_text_buffers;
     // The project's saved node trees (custom templates).
@@ -879,7 +909,7 @@ struct EditorUi::Impl {
         const auto* status = runtime_status.object();
         const auto mode = status ? string_or(*status, "mode") : std::string{};
         if (mode != "game") set_game_input_focus(false);
-        if (mode == "game" && last_runtime_mode != "game") {
+        if (mode == "game" && last_runtime_mode != "game" && !cursor_from_host) {
             const auto map = call("input.map", {}, false);
             const auto* object = map ? map->object() : nullptr;
             const auto* current = object ? field(*object, "map") : nullptr;
@@ -2884,6 +2914,19 @@ struct EditorUi::Impl {
             else
                 children[parent].push_back(index);
         }
+        // Interface controls list in their drawing order, as containers place them.
+        const auto control_order = [&](std::size_t index) {
+            const auto* ui = ui_object(*entities[index]);
+            const auto* control = ui ? field(*ui, "control") : nullptr;
+            return control && control->object() ? number_or(*control->object(), "order", 0.0) : 0.0;
+        };
+        const auto by_order = [&](std::vector<std::size_t>& members) {
+            std::stable_sort(members.begin(), members.end(),
+                             [&](std::size_t a, std::size_t b) { return control_order(a) < control_order(b); });
+        };
+        by_order(roots);
+        for (auto& [parent, members] : children) by_order(members);
+        rebuild_interface_sources();
         // A destroyed selection must not keep driving the inspector.
         const auto previous = selection;
         selections.prune([&](const auto& handle) { return find_entity(handle) != nullptr; });
@@ -3734,7 +3777,8 @@ struct EditorUi::Impl {
             gizmo_active = false;
             return;
         }
-        if (find_entity(selection) == nullptr) {
+        // Interface nodes are placed on the screen, in the Interface editor, not in the world.
+        if (const auto* chosen = find_entity(selection); chosen == nullptr || interface_node(*chosen)) {
             gizmo_active = false;
             return;
         }
@@ -3955,8 +3999,28 @@ struct EditorUi::Impl {
             select(string_or(*created->object(), "entity"));
             return;
         }
+        // Like Unity, a control made outside any interface gets a Canvas to live in.
+        static const std::set<std::string, std::less<>> control_types{
+            "Control", "Button", "CheckBox", "Slider", "ProgressBar", "VBoxContainer", "HBoxContainer",
+            "GridContainer", "Panel", "Label", "Image"};
+        auto container = parent;
+        if (control_types.contains(choice)) {
+            bool inside = false;
+            for (auto current = parent; !current.empty() && !inside;) {
+                const auto* ancestor = find_entity(current);
+                if (!ancestor) break;
+                inside = interface_node(*ancestor);
+                current = string_or(*ancestor, "parent");
+            }
+            if (!inside) {
+                const auto canvas = call("scene.create", "\"type\":\"Canvas\",\"name\":\"Canvas\"" +
+                                                             (parent.empty() ? std::string{} : ",\"parent\":\"" + parent + '"'));
+                if (!canvas || !canvas->object()) return;
+                container = string_or(*canvas->object(), "entity");
+            }
+        }
         std::string fields = "\"type\":\"" + json_escape(choice) + '"';
-        if (!parent.empty()) fields += ",\"parent\":\"" + parent + '"';
+        if (!container.empty()) fields += ",\"parent\":\"" + container + '"';
         if (!name.empty()) fields += ",\"name\":\"" + json_escape(name) + '"';
         const auto created = call("scene.create", fields);
         if (!created || !created->object()) return;
@@ -4480,7 +4544,9 @@ struct EditorUi::Impl {
     }
 
     void draw_transform_section(const JsonValue::Object& entity) {
-        if (!ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) return;
+        const bool open = ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen);
+        note_item("inspector:transform");
+        if (!open) return;
         const auto* transform = component(entity, "transform");
         if (!transform) return;
         constexpr std::array<const char*, 3> labels{"Position", "Rotation", "Scale"};
@@ -6203,6 +6269,742 @@ struct EditorUi::Impl {
         ImGui::EndChild();
     }
 
+    // ---- Game interface components in the Inspector ----
+
+    static const JsonValue::Object* ui_object(const JsonValue::Object& entity) {
+        const auto* value = field(entity, "ui");
+        return value ? value->object() : nullptr;
+    }
+
+    // Canvases and controls are laid out on the screen, not in the 3D world.
+    static bool interface_node(const JsonValue::Object& entity) {
+        const auto* ui = ui_object(entity);
+        return ui && (field(*ui, "canvas") || field(*ui, "control"));
+    }
+
+    // A field's value as the entity JSON holds it, or the component's default.
+    static UiValue ui_json_value(const UiComponentInfo& component, const std::size_t index,
+                                 const JsonValue::Object& values) {
+        std::string error;
+        if (const auto* value = field(values, component.fields[index].name))
+            if (auto parsed = ui_value_from_json(component.fields[index], *value, error)) return *parsed;
+        UiComponents defaults;
+        component.attach(defaults, true);
+        return component.get(defaults, index);
+    }
+
+    void set_ui_values(const std::string_view component, const std::string& values, const std::string& success) {
+        mutate("scene.set_ui",
+               entity_field(selection) + ",\"component\":\"" + std::string(component) + "\",\"values\":{" + values + '}',
+               success);
+    }
+
+    static std::string choice_label(const std::string_view choice) {
+        return field_display_name(choice);
+    }
+
+    // A color with alpha, as picked (sRGB). One pick or drag is one undo step.
+    bool ui_color_edit(const char* label, UiColor& color) {
+        ImGui::PushID(label);
+        inspector_field_label(label);
+        std::array<float, 4> shown{static_cast<float>(color.r), static_cast<float>(color.g), static_cast<float>(color.b),
+                                   static_cast<float>(color.a)};
+        const bool changed = ImGui::ColorEdit4("##color", shown.data(),
+                                               ImGuiColorEditFlags_Float | ImGuiColorEditFlags_AlphaBar |
+                                                   ImGuiColorEditFlags_AlphaPreviewHalf);
+        const auto key = ImGui::GetID("##color");
+        ImGui::PushID("##color");
+        const bool editing = ImGui::IsItemActive() || ImGui::IsPopupOpen("picker");
+        ImGui::PopID();
+        if (editing && color_gestures.insert(key).second) inspector_gesture = ++gesture_serial;
+        if (!editing) color_gestures.erase(key);
+        if (changed) {
+            pending_gesture = inspector_gesture;
+            color = {std::clamp<double>(shown[0], 0.0, 1.0), std::clamp<double>(shown[1], 0.0, 1.0),
+                     std::clamp<double>(shown[2], 0.0, 1.0), std::clamp<double>(shown[3], 0.0, 1.0)};
+        }
+        ImGui::PopID();
+        return changed;
+    }
+
+    // Several numbers in one row, each with a small tag, dragged like other Inspector numbers.
+    unsigned drag_numbers(const char* label, const std::vector<const char*>& tags, double* values, const float speed,
+                          const char* format) {
+        ImGui::PushID(label);
+        const auto& style = ImGui::GetStyle();
+        inspector_field_label(label);
+        float tag_width = 0.0F;
+        for (const auto* tag : tags) tag_width += ImGui::CalcTextSize(tag).x + style.ItemInnerSpacing.x;
+        const auto count = static_cast<float>(tags.size());
+        const float width = (ImGui::CalcItemWidth() - tag_width - style.ItemSpacing.x * (count - 1.0F)) / count;
+        unsigned committed = 0;
+        for (std::size_t index = 0; index < tags.size(); ++index) {
+            ImGui::PushID(static_cast<int>(index));
+            if (index > 0U) ImGui::SameLine(0.0F, style.ItemSpacing.x);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(editor_color(editor_palette().text_dim), "%s", tags[index]);
+            ImGui::SameLine(0.0F, style.ItemInnerSpacing.x);
+            ImGui::SetNextItemWidth(std::max(width, 24.0F * ui_scale));
+            if (drag_scalar("##number", values[index], speed, format)) committed |= 1U << index;
+            ImGui::PopID();
+        }
+        ImGui::PopID();
+        return committed;
+    }
+
+    // One field of an interface component, drawn from the reflection table.
+    void draw_ui_field(const UiComponentInfo& component, const std::size_t index, const JsonValue::Object& values) {
+        const auto& info = component.fields[index];
+        const std::string name(info.name);
+        const std::string id(component.id);
+        const auto key = "inspector:" + id + ':' + name;
+        const auto label = field_display_name(name);
+        const auto value = ui_json_value(component, index, values);
+        const auto send = [&](const UiValue& next) {
+            std::string error;
+            if (!check_ui_value(info, next, error)) return;
+            set_ui_values(id, '"' + name + "\":" + ui_value_json(next), std::string(component.name) + ' ' + label + " changed");
+        };
+        const double range = info.maximum - info.minimum;
+        const float speed = info.type == UiFieldType::integer ? 0.2F
+                            : range <= 1.0                     ? 0.005F
+                            : range <= 20.0                    ? 0.02F
+                                                               : 0.5F;
+        const char* format = info.type == UiFieldType::integer ? "%.0f" : range <= 1.0 ? "%.3f" : "%.2f";
+        switch (info.type) {
+        case UiFieldType::boolean: {
+            bool flag = std::get<bool>(value);
+            if (inspector_checkbox(label.c_str(), &flag)) send(flag);
+            break;
+        }
+        case UiFieldType::number:
+        case UiFieldType::integer: {
+            double number = std::get<double>(value);
+            if (drag_scalar(label.c_str(), number, speed, format)) {
+                number = std::clamp(number, info.minimum, info.maximum);
+                if (info.type == UiFieldType::integer) number = std::round(number);
+                send(number);
+            }
+            break;
+        }
+        case UiFieldType::vec2: {
+            auto vector = std::get<Vec2>(value);
+            std::array<double, 2> numbers{vector.x, vector.y};
+            if (drag_numbers(label.c_str(), {"X", "Y"}, numbers.data(), speed, format))
+                send(Vec2{std::clamp(numbers[0], info.minimum, info.maximum), std::clamp(numbers[1], info.minimum, info.maximum)});
+            break;
+        }
+        case UiFieldType::margins: {
+            const auto margins = std::get<UiMargins>(value);
+            std::array<double, 4> numbers{margins.left, margins.top, margins.right, margins.bottom};
+            if (drag_numbers(label.c_str(), {"L", "T", "R", "B"}, numbers.data(), speed, "%.0f")) {
+                for (auto& number : numbers) number = std::clamp(number, info.minimum, info.maximum);
+                send(UiMargins{numbers[0], numbers[1], numbers[2], numbers[3]});
+            }
+            break;
+        }
+        case UiFieldType::color: {
+            auto color = std::get<UiColor>(value);
+            if (ui_color_edit(label.c_str(), color)) send(color);
+            break;
+        }
+        case UiFieldType::text: {
+            auto& buffer = ui_text_buffers[selection + ':' + key];
+            const auto text_id = "##" + name;
+            // Show the stored text unless the person is typing in this field.
+            if (ImGui::GetActiveID() != ImGui::GetID(text_id.c_str())) {
+                buffer.fill('\0');
+                const auto& stored = std::get<std::string>(value);
+                std::copy_n(stored.begin(), std::min(stored.size(), buffer.size() - 1U), buffer.begin());
+            }
+            inspector_field_label(label.c_str());
+            const float lines = static_cast<float>(std::clamp<std::size_t>(
+                static_cast<std::size_t>(std::count(buffer.begin(), buffer.end(), '\n')) + 1U, 2U, 6U));
+            const bool changed = ImGui::InputTextMultiline(
+                text_id.c_str(), buffer.data(), buffer.size(),
+                ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * lines + ImGui::GetStyle().FramePadding.y * 2.0F));
+            if (ImGui::IsItemActivated()) inspector_gesture = ++gesture_serial;
+            // Typing shows at once in the Interface editor; one edit is one undo step.
+            if (changed) {
+                pending_gesture = inspector_gesture;
+                send(std::string(buffer.data()));
+            }
+            break;
+        }
+        case UiFieldType::asset: {
+            const auto path = std::get<std::string>(value);
+            const std::vector<std::string_view> kinds = info.kinds;
+            const auto kind = kinds.empty() ? std::string{} : std::string(kinds.front());
+            const auto handle = selection;
+            const auto component_id = id;
+            asset_field(
+                label.c_str(), path, key,
+                [=, this] {
+                    AssetPick pick;
+                    pick.key = key;
+                    pick.title = "Choose " + (kind == "image" ? std::string("an image") : kind == "font" ? "a font" : "a sound");
+                    pick.current = path;
+                    pick.kinds = {kind};
+                    pick.accepts = [kinds](const std::string& file) { return valid_ui_asset_path(file, kinds); };
+                    pick.what = kind == "image" ? "a PNG or JPEG image" : kind == "font" ? "a .ttf or .otf font" : "a sound file";
+                    pick.choices.push_back({"", kind == "font" ? "Built-in (Inter)" : "None",
+                                            kind == "font" ? AssetIcon::font : AssetIcon::other, "", "", std::nullopt});
+                    pick.choose = [this, handle, component_id, name](const std::string& chosen) {
+                        mutate("scene.set_ui",
+                               entity_field(handle) + ",\"component\":\"" + component_id + "\",\"values\":{\"" + name +
+                                   "\":\"" + json_escape(chosen) + "\"}",
+                               chosen.empty() ? "File cleared" : "File chosen");
+                    };
+                    return pick;
+                },
+                kind == "font" ? "Built-in (Inter)" : "None", asset_icon_for_kind(kind));
+            break;
+        }
+        case UiFieldType::choice: {
+            const auto& current = std::get<std::string>(value);
+            if (inspector_begin_combo(label.c_str(), choice_label(current).c_str())) {
+                for (const auto choice : info.choices) {
+                    const bool chosen = choice == current;
+                    if (ImGui::Selectable(choice_label(choice).c_str(), chosen) && !chosen) send(std::string(choice));
+                    if (chosen) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            break;
+        }
+        }
+        note_item(key);
+        if (!info.description.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("%s", std::string(info.description).c_str());
+    }
+
+    void draw_ui_fields(const UiComponentInfo& component, const JsonValue::Object& values,
+                        const std::vector<std::string_view>& skip = {}) {
+        for (std::size_t index = 0; index < component.fields.size(); ++index)
+            if (std::find(skip.begin(), skip.end(), component.fields[index].name) == skip.end())
+                draw_ui_field(component, index, values);
+    }
+
+    // The anchor preset a control's anchors match, if any.
+    static std::string anchor_preset_of(const Vec2 low, const Vec2 high) {
+        for (const auto preset : ui_anchor_presets()) {
+            UiControl probe;
+            (void)apply_ui_anchor_preset(probe, preset, Vec2{10.0, 10.0});
+            if (probe.anchor_min == low && probe.anchor_max == high) return std::string(preset);
+        }
+        return {};
+    }
+
+    // A small picture of an anchor preset: the parent's outline with the control's place in it.
+    void draw_anchor_icon(ImDrawList* list, const ImVec2 low, const float side, const std::string_view preset,
+                          const bool selected) {
+        const auto& palette = editor_palette();
+        UiControl probe;
+        (void)apply_ui_anchor_preset(probe, preset, Vec2{0.34, 0.34});
+        const float inset = side * 0.18F, box = side - inset * 2.0F;
+        const auto at = [&](double x, double y) {
+            return ImVec2(low.x + inset + static_cast<float>(x) * box, low.y + inset + static_cast<float>(y) * box);
+        };
+        list->AddRect(at(0, 0), at(1, 1), ImGui::GetColorU32(editor_color(palette.text_faint)), 2.0F * ui_scale);
+        // Wide axes span the parent; fixed ones show a third of it hung from the anchor.
+        const auto span = [](double anchor_low, double anchor_high) -> std::pair<double, double> {
+            if (anchor_low != anchor_high) return {0.08, 0.92};
+            if (anchor_low == 0.0) return {0.08, 0.42};
+            if (anchor_low == 1.0) return {0.58, 0.92};
+            return {0.33, 0.67};
+        };
+        const auto [x0, x1] = span(probe.anchor_min.x, probe.anchor_max.x);
+        const auto [y0, y1] = span(probe.anchor_min.y, probe.anchor_max.y);
+        list->AddRectFilled(at(x0, y0), at(x1, y1),
+                            ImGui::GetColorU32(editor_color(selected ? palette.accent : palette.text_dim)), 1.5F * ui_scale);
+    }
+
+    void draw_ui_control_section(const JsonValue::Object& entity, const JsonValue::Object& values) {
+        const auto& palette = editor_palette();
+        const auto* info = find_ui_component("ui_control");
+        const auto get = [&](std::string_view name) { return ui_json_value(*info, *ui_field_index(*info, name), values); };
+        const auto vector = [&](std::string_view name) { return std::get<Vec2>(get(name)); };
+        const auto pair = [](Vec2 value) { return '[' + number_text(value.x) + ',' + number_text(value.y) + ']'; };
+        const auto anchor_min = vector("anchor_min"), anchor_max = vector("anchor_max");
+        auto offset_min = vector("offset_min"), offset_max = vector("offset_max");
+        // Controls in a container are placed by it; their own anchors and offsets do nothing.
+        bool contained = false;
+        if (const auto* parent = find_entity(string_or(entity, "parent")))
+            if (const auto* ui = ui_object(*parent)) contained = field(*ui, "container") != nullptr;
+        if (contained) {
+            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+            ImGui::TextWrapped("Its container places it. Set its minimum size and whether it expands below.");
+            ImGui::PopStyleColor();
+        } else {
+            // Presets, like Godot's layout menu.
+            const auto preset = anchor_preset_of(anchor_min, anchor_max);
+            inspector_field_label("Anchors");
+            const float button = ImGui::GetFrameHeight();
+            const auto shown = preset.empty() ? std::string("Custom") : field_display_name(preset);
+            if (ImGui::Button((shown + "##anchor_presets").c_str(), ImVec2(-FLT_MIN, button)))
+                ImGui::OpenPopup("anchor_presets");
+            note_item("inspector:ui_control:anchor_presets");
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                ImGui::SetTooltip("Where the control attaches to its parent: a corner, an edge, the center, or "
+                                  "stretched across. Choosing one keeps the control's size.");
+            if (ImGui::BeginPopup("anchor_presets")) {
+                static constexpr std::array<std::string_view, 16> grid{
+                    "top_left",    "top",          "top_right",    "top_wide",
+                    "left",        "center",       "right",        "hcenter_wide",
+                    "bottom_left", "bottom",       "bottom_right", "bottom_wide",
+                    "left_wide",   "vcenter_wide", "right_wide",   "full_rect"};
+                const float side = 34.0F * ui_scale;
+                for (std::size_t item = 0; item < grid.size(); ++item) {
+                    if (item % 4U != 0U) ImGui::SameLine();
+                    ImGui::PushID(static_cast<int>(item));
+                    const auto low = ImGui::GetCursorScreenPos();
+                    if (ImGui::Selectable("##preset", grid[item] == preset, 0, ImVec2(side, side))) {
+                        mutate("scene.set_ui",
+                               entity_field(selection) + ",\"component\":\"ui_control\",\"anchor_preset\":\"" +
+                                   std::string(grid[item]) + '"',
+                               "Anchored " + field_display_name(grid[item]));
+                        ImGui::CloseCurrentPopup();
+                    }
+                    note_item("inspector:ui_control:preset:" + std::string(grid[item]));
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", field_display_name(grid[item]).c_str());
+                    draw_anchor_icon(ImGui::GetWindowDrawList(), low, side, grid[item], grid[item] == preset);
+                    ImGui::PopID();
+                }
+                ImGui::EndPopup();
+            }
+            // Each axis reads as a position and size when both anchors agree, or as distances in
+            // from the parent's edges when the control stretches.
+            const auto axis = [&](bool horizontal) {
+                const double low = horizontal ? anchor_min.x : anchor_min.y, high = horizontal ? anchor_max.x : anchor_max.y;
+                double& start = horizontal ? offset_min.x : offset_min.y;
+                double& end = horizontal ? offset_max.x : offset_max.y;
+                const auto commit = [&](const char* what) {
+                    set_ui_values("ui_control", "\"offset_min\":" + pair(offset_min) + ",\"offset_max\":" + pair(offset_max),
+                                  std::string("Control ") + what + " changed");
+                };
+                if (low == high) {
+                    std::array<double, 2> numbers{start, end - start};
+                    const auto moved = drag_numbers(horizontal ? "Position X##axis" : "Position Y##axis",
+                                                    {horizontal ? "X" : "Y", horizontal ? "W" : "H"}, numbers.data(), 0.5F,
+                                                    "%.1f");
+                    if (moved) {
+                        numbers[1] = std::max(numbers[1], 0.0);
+                        start = numbers[0];
+                        end = numbers[0] + numbers[1];
+                        commit(horizontal ? "position" : "position");
+                    }
+                    note_item(horizontal ? "inspector:ui_control:x" : "inspector:ui_control:y");
+                } else {
+                    std::array<double, 2> numbers{start, -end};
+                    if (drag_numbers(horizontal ? "Margins X##axis" : "Margins Y##axis",
+                                     {horizontal ? "L" : "T", horizontal ? "R" : "B"}, numbers.data(), 0.5F, "%.1f")) {
+                        start = numbers[0];
+                        end = -numbers[1];
+                        commit("margins");
+                    }
+                    note_item(horizontal ? "inspector:ui_control:x" : "inspector:ui_control:y");
+                }
+            };
+            axis(true);
+            axis(false);
+            if (ImGui::TreeNodeEx("Anchors and offsets", ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                for (const auto name : {"anchor_min", "anchor_max", "offset_min", "offset_max"})
+                    draw_ui_field(*info, *ui_field_index(*info, name), values);
+                ImGui::TreePop();
+            }
+        }
+        for (const auto name : {"pivot", "rotation", "scale", "visible", "opacity", "clip_contents", "mouse_filter"})
+            draw_ui_field(*info, *ui_field_index(*info, name), values);
+        // Order among siblings, with buttons that swap places with the neighbour.
+        inspector_field_reserve = ImGui::GetFrameHeight() * 2.0F + ImGui::GetStyle().ItemSpacing.x * 2.0F;
+        draw_ui_field(*info, *ui_field_index(*info, "order"), values);
+        inspector_field_reserve = 0.0F;
+        for (const int direction : {-1, 1}) {
+            ImGui::SameLine();
+            ImGui::PushID(direction);
+            if (ImGui::ArrowButton("##move", direction < 0 ? ImGuiDir_Up : ImGuiDir_Down)) move_control(entity, direction);
+            note_item(direction < 0 ? "inspector:ui_control:move_up" : "inspector:ui_control:move_down");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(direction < 0 ? "Move behind the previous sibling" : "Move in front of the next sibling");
+            ImGui::PopID();
+        }
+        ImGui::SeparatorText("In a container");
+        for (const auto name : {"min_size", "expand_x", "expand_y", "size_x", "size_y"})
+            draw_ui_field(*info, *ui_field_index(*info, name), values);
+    }
+
+    // Swaps a control's order with its previous (-1) or next (+1) sibling control, as one undo step.
+    void move_control(const JsonValue::Object& entity, const int direction) {
+        const auto handle = string_or(entity, "entity");
+        const auto parent = string_or(entity, "parent");
+        const auto& siblings = parent.empty() ? roots : children[parent];
+        std::vector<std::pair<std::string, double>> controls;
+        for (const auto index : siblings) {
+            const auto* ui = ui_object(*entities[index]);
+            const auto* control = ui ? field(*ui, "control") : nullptr;
+            if (control && control->object())
+                controls.emplace_back(string_or(*entities[index], "entity"), number_or(*control->object(), "order", 0.0));
+        }
+        const auto here = std::find_if(controls.begin(), controls.end(), [&](const auto& item) { return item.first == handle; });
+        if (here == controls.end()) return;
+        const auto position = static_cast<std::ptrdiff_t>(here - controls.begin()) + direction;
+        if (position < 0 || position >= static_cast<std::ptrdiff_t>(controls.size())) return;
+        auto [other, other_order] = controls[static_cast<std::size_t>(position)];
+        double order = here->second;
+        // Equal orders fall back to creation order; separate them so the swap shows.
+        if (order == other_order) other_order += direction;
+        const auto gesture = ++gesture_serial;
+        const auto set_order = [&](const std::string& target, double value) {
+            pending_gesture = gesture;
+            mutate("scene.set_ui",
+                   entity_field(target) + ",\"component\":\"ui_control\",\"values\":{\"order\":" + number_text(value) + '}',
+                   direction < 0 ? "Control moved back" : "Control moved forward");
+        };
+        set_order(handle, other_order);
+        set_order(other, order);
+    }
+
+    void draw_ui_sections(const JsonValue::Object& entity) {
+        const auto* ui = ui_object(entity);
+        if (!ui) return;
+        for (const auto& component : ui_components()) {
+            const auto* values = field(*ui, component.key);
+            if (!values || !values->object()) continue;
+            const std::string id(component.id);
+            ImGui::PushID(id.c_str());
+            if (component_header(std::string(component.name).c_str(), id)) {
+                if (id == "ui_control") draw_ui_control_section(entity, *values->object());
+                else draw_ui_fields(component, *values->object());
+                if (id == "ui_canvas" || id == "ui_control") {
+                    if (ImGui::Button("Open the Interface editor", ImVec2(-FLT_MIN, 0.0F))) {
+                        panel_open[12] = true;
+                        interface_focus_pending = true;
+                    }
+                    note_item("inspector:" + id + ":open_interface_editor");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("The game's interface shows only while the game runs; the Interface "
+                                          "editor shows it now, at a chosen screen size.");
+                }
+            }
+            ImGui::PopID();
+        }
+    }
+
+    // ---- Interface editor ----
+
+    // Every entity's interface components, parsed from scene.list for the Interface editor.
+    void rebuild_interface_sources() {
+        interface_components.assign(entities.size(), {});
+        interface_sources.clear();
+        interface_sources.reserve(entities.size());
+        for (std::size_t index = 0; index < entities.size(); ++index) {
+            const auto entity = Entity::parse(string_or(*entities[index], "entity"));
+            if (!entity) continue;
+            const auto parent = Entity::parse(string_or(*entities[index], "parent")).value_or(Entity{});
+            const UiComponents* ui = nullptr;
+            if (const auto* value = field(*entities[index], "ui"); value && value->object()) {
+                std::string error;
+                if (read_ui_components(*value, interface_components[index], error) && !interface_components[index].empty())
+                    ui = &interface_components[index];
+            }
+            interface_sources.push_back({*entity, parent, ui});
+        }
+    }
+
+    struct InterfaceSize {
+        const char* label;
+        int width, height;
+    };
+    static constexpr std::array<InterfaceSize, 7> interface_sizes{{{"Game view", 0, 0},
+                                                                  {"1920 x 1080 (Full HD)", 1920, 1080},
+                                                                  {"1280 x 720 (HD)", 1280, 720},
+                                                                  {"2560 x 1440 (QHD)", 2560, 1440},
+                                                                  {"3840 x 2160 (4K)", 3840, 2160},
+                                                                  {"1080 x 1920 (portrait)", 1080, 1920},
+                                                                  {"Custom", 0, 0}}};
+    std::array<int, 2> interface_game_view{1920, 1080};
+
+    std::array<int, 2> interface_view_size() const {
+        if (interface_resolution == 0) return interface_game_view;
+        if (interface_resolution == 6) return interface_custom_size;
+        const auto& size = interface_sizes[static_cast<std::size_t>(interface_resolution)];
+        return {size.width, size.height};
+    }
+
+    void draw_interface_editor() {
+        const auto& palette = editor_palette();
+        const auto& io = ImGui::GetIO();
+        const bool game = runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game";
+        interface_preview.begin_frame(headless);
+        if (!assets_root.empty()) interface_painter.set_root(assets_root);
+
+        // Toolbar: the screen size to lay out for, zoom and outlines.
+        ImGui::SetNextItemWidth(210.0F * ui_scale);
+        const auto current = interface_resolution == 0
+                                 ? "Game view (" + std::to_string(interface_game_view[0]) + " x " +
+                                       std::to_string(interface_game_view[1]) + ')'
+                                 : std::string(interface_sizes[static_cast<std::size_t>(interface_resolution)].label);
+        if (ImGui::BeginCombo("##interface_size", current.c_str())) {
+            for (std::size_t index = 0; index < interface_sizes.size(); ++index)
+                if (ImGui::Selectable(interface_sizes[index].label, static_cast<int>(index) == interface_resolution)) {
+                    interface_resolution = static_cast<int>(index);
+                    interface_zoom = 0.0F;
+                    interface_pan = {};
+                }
+            ImGui::EndCombo();
+        }
+        note_item("interface:size");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The screen size the interface is laid out for");
+        if (interface_resolution == 6) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(150.0F * ui_scale);
+            if (ImGui::InputInt2("##interface_custom", interface_custom_size.data()))
+                for (auto& side : interface_custom_size) side = std::clamp(side, 16, 16384);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Fit")) {
+            interface_zoom = 0.0F;
+            interface_pan = {};
+        }
+        note_item("interface:fit");
+        ImGui::SameLine();
+        editor_checkbox("Outlines", &interface_outlines);
+        note_item("interface:outlines");
+        const auto [view_width, view_height] = interface_view_size();
+        const float width = static_cast<float>(view_width), height = static_cast<float>(view_height);
+        ImGui::SameLine();
+        ImGui::TextColored(editor_color(palette.text_faint),
+                           game ? "Running: the game's interface, as it is now"
+                                : "Drag controls to move them, their handles to resize. Ctrl snaps to 8.");
+
+        const auto low = ImGui::GetCursorScreenPos();
+        const auto area = ImGui::GetContentRegionAvail();
+        if (area.x < 32.0F || area.y < 32.0F) return;
+        ImGui::InvisibleButton("##interface_canvas", area,
+                               ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle);
+        note_item("interface:canvas");
+        const bool hovered = ImGui::IsItemHovered();
+        const ImVec2 high{low.x + area.x, low.y + area.y};
+        auto* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(low, high, ImGui::GetColorU32(editor_color(palette.window)));
+
+        // Zoom about the pointer with the wheel; pan with the middle button.
+        const float fit = std::max(std::min((area.x - 32.0F * ui_scale) / width, (area.y - 32.0F * ui_scale) / height), 0.01F);
+        float scale = interface_zoom > 0.0F ? interface_zoom : fit;
+        const ImVec2 centre{low.x + area.x * 0.5F, low.y + area.y * 0.5F};
+        if (hovered && io.MouseWheel != 0.0F) {
+            const float next = std::clamp(scale * std::pow(1.15F, io.MouseWheel), 0.02F, 16.0F);
+            const ImVec2 from_centre{io.MousePos.x - centre.x - interface_pan.x, io.MousePos.y - centre.y - interface_pan.y};
+            interface_pan.x -= from_centre.x * (next / scale - 1.0F);
+            interface_pan.y -= from_centre.y * (next / scale - 1.0F);
+            interface_zoom = scale = next;
+        }
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0F)) {
+            interface_pan.x += io.MouseDelta.x;
+            interface_pan.y += io.MouseDelta.y;
+            interface_zoom = scale;
+        }
+        const ImVec2 origin{centre.x - width * scale * 0.5F + interface_pan.x, centre.y - height * scale * 0.5F + interface_pan.y};
+        const ImVec2 corner{origin.x + width * scale, origin.y + height * scale};
+        draw->PushClipRect(low, high, true);
+        // A checkerboard where nothing draws, like an empty game view.
+        {
+            const float cell = 12.0F * ui_scale;
+            const ImVec2 from{std::max(origin.x, low.x), std::max(origin.y, low.y)};
+            const ImVec2 to{std::min(corner.x, high.x), std::min(corner.y, high.y)};
+            // Mid greys (linear values), so dark and light interfaces both read against it.
+            draw->AddRectFilled(from, to, IM_COL32(50, 50, 54, 255));
+            const auto first_x = static_cast<int>(std::floor((from.x - origin.x) / cell));
+            const auto first_y = static_cast<int>(std::floor((from.y - origin.y) / cell));
+            for (int row = first_y; origin.y + static_cast<float>(row) * cell < to.y && row - first_y < 400; ++row)
+                for (int column = first_x; origin.x + static_cast<float>(column) * cell < to.x && column - first_x < 400; ++column)
+                    if ((row + column) % 2 != 0)
+                        draw->AddRectFilled({std::max(origin.x + static_cast<float>(column) * cell, from.x),
+                                             std::max(origin.y + static_cast<float>(row) * cell, from.y)},
+                                            {std::min(origin.x + static_cast<float>(column + 1) * cell, to.x),
+                                             std::min(origin.y + static_cast<float>(row + 1) * cell, to.y)},
+                                            IM_COL32(64, 64, 68, 255));
+        }
+        const auto laid_out = interface_painter.layout(interface_sources, static_cast<std::uint32_t>(view_width),
+                                                     static_cast<std::uint32_t>(view_height));
+        const auto list = interface_painter.draw(laid_out);
+        interface_preview.draw(draw, list, origin, scale, low, high);
+        draw->AddRect(origin, corner, ImGui::GetColorU32(editor_color(palette.border)), 0.0F, 0, 1.0F);
+        if (laid_out.nodes.empty()) {
+            const char* hint = "No interface yet. Add a Canvas, then Labels, Buttons and other controls under it.";
+            const auto size = ImGui::CalcTextSize(hint);
+            draw->AddText({centre.x - size.x * 0.5F, centre.y - size.y * 0.5F}, ImGui::GetColorU32(editor_color(palette.text_dim)), hint);
+        }
+
+        const auto faded = [](ImU32 color, float alpha) {
+            auto value = editor_color(color);
+            value.w *= alpha;
+            return ImGui::GetColorU32(value);
+        };
+        const auto to_panel = [&](Vec2 point) {
+            return ImVec2(origin.x + static_cast<float>(point.x) * scale, origin.y + static_cast<float>(point.y) * scale);
+        };
+        const Vec2 pointer{(io.MousePos.x - origin.x) / scale, (io.MousePos.y - origin.y) / scale};
+        const auto outline = [&](const UiLayoutNode& node, ImU32 color, float thickness) {
+            const auto corners = laid_out.corners(node);
+            std::array<ImVec2, 4> points{};
+            for (std::size_t index = 0; index < 4U; ++index) points[index] = to_panel(corners[index]);
+            draw->AddPolyline(points.data(), 4, color, ImDrawFlags_Closed, thickness);
+        };
+        const auto contained = [&](const UiLayoutNode& node) {
+            return node.parent != UiLayoutNode::none && laid_out.nodes[node.parent].ui->container.has_value();
+        };
+        if (interface_outlines)
+            for (const auto index : laid_out.order)
+                if (const auto& node = laid_out.nodes[index]; node.visible && node.ui->control)
+                    outline(node, faded(palette.text_faint, 0.35F), 1.0F);
+        const UiLayoutNode* under = nullptr;
+        if (hovered && !interface_drag)
+            for (auto it = laid_out.order.rbegin(); it != laid_out.order.rend(); ++it)
+                if (const auto& node = laid_out.nodes[*it]; node.visible && node.ui->control && laid_out.contains(node, pointer)) {
+                    under = &node;
+                    break;
+                }
+        if (under) outline(*under, faded(palette.accent_hovered, 0.7F), 1.0F);
+
+        const auto chosen_entity = Entity::parse(selection);
+        const auto* chosen = chosen_entity ? laid_out.find(*chosen_entity) : nullptr;
+        if (chosen && !chosen->ui->control) chosen = nullptr;
+        // Handles clockwise from the top-left corner, in the control's own space.
+        std::array<Vec2, 8> handles{};
+        int handle_under = -1;
+        const float grab = 5.0F * ui_scale;
+        if (chosen) {
+            const auto size = chosen->size;
+            const std::array<Vec2, 8> places{Vec2{0, 0}, Vec2{size.x * 0.5, 0}, Vec2{size.x, 0}, Vec2{size.x, size.y * 0.5},
+                                             Vec2{size.x, size.y}, Vec2{size.x * 0.5, size.y}, Vec2{0, size.y}, Vec2{0, size.y * 0.5}};
+            for (std::size_t index = 0; index < places.size(); ++index) handles[index] = chosen->transform.apply(places[index]);
+            outline(*chosen, ImGui::GetColorU32(editor_color(palette.accent)), 2.0F);
+            // The anchors: where each corner attaches in the parent.
+            const auto& control = *chosen->ui->control;
+            const Vec2 parent_size = chosen->parent != UiLayoutNode::none ? laid_out.nodes[chosen->parent].size
+                                     : Vec2{static_cast<double>(view_width) / std::max(chosen->parent_transform.scale(), 1e-9),
+                                            static_cast<double>(view_height) / std::max(chosen->parent_transform.scale(), 1e-9)};
+            if (!contained(*chosen))
+                for (const auto& anchor : {Vec2{control.anchor_min.x, control.anchor_min.y}, Vec2{control.anchor_max.x, control.anchor_min.y},
+                                           Vec2{control.anchor_max.x, control.anchor_max.y}, Vec2{control.anchor_min.x, control.anchor_max.y}}) {
+                    const auto at = to_panel(chosen->parent_transform.apply({anchor.x * parent_size.x, anchor.y * parent_size.y}));
+                    const float s = 5.0F * ui_scale;
+                    draw->AddTriangleFilled({at.x, at.y - s}, {at.x + s, at.y + s * 0.6F}, {at.x - s, at.y + s * 0.6F},
+                                            IM_COL32(120, 220, 140, 230));
+                }
+            const auto pivot = to_panel(chosen->transform.apply({control.pivot.x * size.x, control.pivot.y * size.y}));
+            draw->AddCircle(pivot, 4.0F * ui_scale, ImGui::GetColorU32(editor_color(palette.accent)), 12, 1.5F);
+            if (!contained(*chosen) && !game)
+                for (std::size_t index = 0; index < handles.size(); ++index) {
+                    const auto at = to_panel(handles[index]);
+                    const bool near = hovered && std::abs(io.MousePos.x - at.x) <= grab && std::abs(io.MousePos.y - at.y) <= grab;
+                    if (near && handle_under < 0) handle_under = static_cast<int>(index);
+                    draw->AddRectFilled({at.x - grab * 0.7F, at.y - grab * 0.7F}, {at.x + grab * 0.7F, at.y + grab * 0.7F},
+                                        near ? ImGui::GetColorU32(editor_color(palette.accent_hovered)) : IM_COL32(245, 245, 248, 255));
+                    draw->AddRect({at.x - grab * 0.7F, at.y - grab * 0.7F}, {at.x + grab * 0.7F, at.y + grab * 0.7F},
+                                  ImGui::GetColorU32(editor_color(palette.accent)));
+                }
+            // What is selected, and where.
+            const auto* record = find_entity(selection);
+            const auto caption = (record ? string_or(*record, "name") : std::string{}) + "  " + number_text(std::round(size.x)) +
+                                 " x " + number_text(std::round(size.y)) + (contained(*chosen) ? "  (placed by its container)" : "");
+            draw->AddText({low.x + 8.0F * ui_scale, high.y - ImGui::GetTextLineHeight() - 6.0F * ui_scale},
+                          ImGui::GetColorU32(editor_color(palette.text_dim)), caption.c_str());
+        }
+        if (handle_under == 1 || handle_under == 5) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        if (handle_under == 3 || handle_under == 7) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (handle_under == 0 || handle_under == 4) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
+        if (handle_under == 2 || handle_under == 6) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNESW);
+
+        // Editing: select with a click, move by dragging, resize by the handles. The game's own
+        // interface is only watched while it runs.
+        if (!game) {
+            const auto begin_drag = [&](const UiLayoutNode& node, int handle) {
+                const auto inverse = node.parent_transform.inverse();
+                if (!inverse || contained(node)) return;
+                InterfaceDrag drag;
+                drag.entity = node.entity.to_string();
+                drag.handle = handle;
+                drag.start = io.MousePos;
+                drag.offset_min = node.ui->control->offset_min;
+                drag.offset_max = node.ui->control->offset_max;
+                drag.to_parent = *inverse;
+                drag.scale = scale;
+                drag.gesture = ++gesture_serial;
+                interface_drag = drag;
+            };
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                if (chosen && handle_under >= 0) {
+                    begin_drag(*chosen, handle_under);
+                } else if (under) {
+                    if (under->entity.to_string() != selection) select(under->entity.to_string());
+                    begin_drag(*under, -1);
+                }
+            }
+            if (interface_drag && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                auto& drag = *interface_drag;
+                const double dx = (io.MousePos.x - drag.start.x) / drag.scale, dy = (io.MousePos.y - drag.start.y) / drag.scale;
+                // View pixels to the parent's units (its scale and rotation, without translation).
+                const Vec2 delta{drag.to_parent.a * dx + drag.to_parent.c * dy, drag.to_parent.b * dx + drag.to_parent.d * dy};
+                auto low_offset = drag.offset_min, high_offset = drag.offset_max;
+                const auto snap = [&](double value) { return io.KeyCtrl ? std::round(value / 8.0) * 8.0 : std::round(value); };
+                const int handle = drag.handle;
+                if (handle < 0) {
+                    low_offset = {snap(low_offset.x + delta.x), snap(low_offset.y + delta.y)};
+                    high_offset = {low_offset.x + (drag.offset_max.x - drag.offset_min.x),
+                                   low_offset.y + (drag.offset_max.y - drag.offset_min.y)};
+                } else {
+                    if (handle == 0 || handle == 6 || handle == 7) low_offset.x = std::min(snap(low_offset.x + delta.x), high_offset.x);
+                    if (handle == 2 || handle == 3 || handle == 4) high_offset.x = std::max(snap(high_offset.x + delta.x), low_offset.x);
+                    if (handle == 0 || handle == 1 || handle == 2) low_offset.y = std::min(snap(low_offset.y + delta.y), high_offset.y);
+                    if (handle == 4 || handle == 5 || handle == 6) high_offset.y = std::max(snap(high_offset.y + delta.y), low_offset.y);
+                }
+                const auto* record = find_entity(drag.entity);
+                const auto* ui = record ? ui_object(*record) : nullptr;
+                const auto* control = ui ? field(*ui, "control") : nullptr;
+                const auto now_min = control && control->object() ? editor_vector2(*control->object(), "offset_min") : Vec2{};
+                const auto now_max = control && control->object() ? editor_vector2(*control->object(), "offset_max") : Vec2{};
+                if (now_min != low_offset || now_max != high_offset) {
+                    drag.moved = true;
+                    pending_gesture = drag.gesture;
+                    mutate("scene.set_ui",
+                           entity_field(drag.entity) + ",\"component\":\"ui_control\",\"values\":{\"offset_min\":[" +
+                               number_text(low_offset.x) + ',' + number_text(low_offset.y) + "],\"offset_max\":[" +
+                               number_text(high_offset.x) + ',' + number_text(high_offset.y) + "]}",
+                           handle < 0 ? "Control moved" : "Control resized");
+                }
+            }
+            if (interface_drag && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) interface_drag.reset();
+            // Arrow keys nudge the selected control by a unit, or eight with Shift.
+            if (chosen && !contained(*chosen) && ImGui::IsWindowFocused() && !io.WantTextInput) {
+                const double step = io.KeyShift ? 8.0 : 1.0;
+                Vec2 nudge{};
+                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) nudge.x -= step;
+                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) nudge.x += step;
+                if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) nudge.y -= step;
+                if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) nudge.y += step;
+                if (nudge != Vec2{}) {
+                    const auto& control = *chosen->ui->control;
+                    set_ui_values("ui_control",
+                                  "\"offset_min\":[" + number_text(control.offset_min.x + nudge.x) + ',' +
+                                      number_text(control.offset_min.y + nudge.y) + "],\"offset_max\":[" +
+                                      number_text(control.offset_max.x + nudge.x) + ',' +
+                                      number_text(control.offset_max.y + nudge.y) + ']',
+                                  "Control nudged");
+                }
+            }
+        }
+        draw->PopClipRect();
+    }
+
+    static Vec2 editor_vector2(const JsonValue::Object& object, const std::string_view name) {
+        const auto* value = field(object, name);
+        const auto* items = value ? value->array() : nullptr;
+        if (!items || items->size() != 2U || !(*items)[0].number() || !(*items)[1].number()) return {};
+        return {*(*items)[0].number(), *(*items)[1].number()};
+    }
+
     void draw_inspector() {
         if (selection.empty()) {
             ImGui::Dummy(ImVec2(0.0F, 24.0F * ui_scale));
@@ -6240,7 +7042,9 @@ struct EditorUi::Impl {
         ImGui::Separator();
         ImGui::Spacing();
 
-        draw_transform_section(*entity);
+        // Interface nodes are placed on the screen by their Control, which replaces the Transform.
+        if (interface_node(*entity)) draw_ui_sections(*entity);
+        else draw_transform_section(*entity);
         // Each section gets its own ID scope, so fields with the same label in two sections of
         // one node, such as a Sky's and its sun's Intensity, stay separate widgets.
         const auto section = [&](const char* id, const auto& draw) {
@@ -6670,6 +7474,11 @@ struct EditorUi::Impl {
             note_item("menu:asset_browser");
             if (ImGui::MenuItem("Shader editor")) panel_open[11] = true;
             note_item("menu:shader_editor");
+            if (ImGui::MenuItem("Interface editor")) {
+                panel_open[12] = true;
+                interface_focus_pending = true;
+            }
+            note_item("menu:interface_editor");
             if (ImGui::MenuItem("Animation timeline")) panel_open[6] = true;
             if (ImGui::MenuItem("Profiler")) panel_open[9] = true;
             if (ImGui::MenuItem("Audio mixer")) {
@@ -11155,6 +11964,18 @@ void EditorUi::set_attachment_picker(AttachmentPicker picker) { impl_->attachmen
 
 bool EditorUi::game_has_input() const { return impl_->game_input_focus; }
 
+void EditorUi::set_game_cursor_locked(const bool locked) {
+    auto& impl = *impl_;
+    impl.cursor_from_host = true;
+    if (impl.game_lock_mouse == locked) return;
+    impl.game_lock_mouse = locked;
+    if (!impl.game_input_focus) return;
+    impl.capture_pointer(locked, false);
+    if (!locked && impl.sdl_window && impl.imgui_context_created)
+        SDL_WarpMouseInWindow(impl.sdl_window, (impl.viewport_min.x + impl.viewport_max.x) * 0.5F,
+                              (impl.viewport_min.y + impl.viewport_max.y) * 0.5F);
+}
+
 bool EditorUi::pointer_locked_for_game() const {
     return impl_->game_input_focus && impl_->capture_requested;
 }
@@ -11171,6 +11992,7 @@ EditorUi::~EditorUi() {
         impl_->layout.save();
         impl_->chat_media.clear();
         impl_->thumbnails.clear();
+        impl_->interface_preview.clear();
         if (impl_->preview_texture) ImGui::UnregisterUserTexture(impl_->preview_texture.get());
         impl_->preview_texture.reset();
         ImGui::DestroyContext();
@@ -11565,6 +12387,13 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
                                (impl_->viewport_max.y - impl_->viewport_min.y) / display.y};
             impl_->viewport_visible = impl_->viewport_max.x > impl_->viewport_min.x &&
                                       impl_->viewport_max.y > impl_->viewport_min.y;
+            // The game view's size in pixels, which the Interface editor can lay out for.
+            if (impl_->viewport_visible) {
+                const auto framebuffer = ImGui::GetIO().DisplayFramebufferScale;
+                impl_->interface_game_view = {
+                    std::max(16, static_cast<int>(std::lround((impl_->viewport_max.x - impl_->viewport_min.x) * framebuffer.x))),
+                    std::max(16, static_cast<int>(std::lround((impl_->viewport_max.y - impl_->viewport_min.y) * framebuffer.y)))};
+            }
             if (impl_->headless)
                 impl_->headless_items["viewport"] = {impl_->viewport_min.x, impl_->viewport_min.y,
                                                      impl_->viewport_max.x, impl_->viewport_max.y};
@@ -11639,6 +12468,21 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         ImGui::End();
     } else {
         impl_->shader_editor_focused = false;
+    }
+    if (impl_->panel_open[12]) {
+        // Like the Shader Editor, the Interface editor opens beside the viewport the first time.
+        if (!ImGui::FindWindowSettingsByID(ImHashStr("Interface")))
+            if (const auto* viewport_window = ImGui::FindWindowByName("Viewport");
+                viewport_window && viewport_window->DockId)
+                ImGui::SetNextWindowDockID(viewport_window->DockId, ImGuiCond_FirstUseEver);
+        if (impl_->interface_focus_pending) {
+            ImGui::SetNextWindowFocus();
+            impl_->interface_focus_pending = false;
+        }
+        if (panel("Interface", 12)) impl_->draw_interface_editor();
+        ImGui::End();
+    } else {
+        impl_->interface_drag.reset();
     }
     if (impl_->panel_open[10]) {
         // Like the profiler, the mixer joins Diagnostics the first time it opens.

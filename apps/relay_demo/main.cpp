@@ -134,6 +134,19 @@ void apply_graphics_settings(relay::VulkanWindow& window, const relay::Engine& e
     window.set_vsync(vsync);
 }
 
+// Draws the game interface over the game view, and only while the game runs: the editor's own
+// camera never shows it. Files the interface could not use are reported in the log.
+void connect_game_ui(relay::VulkanWindow& window, relay::Engine& engine) {
+    window.set_game_ui_source([&engine](std::uint32_t width, std::uint32_t height) -> const relay::UiDrawList* {
+        if (engine.status().mode != relay::RuntimeMode::game) return nullptr;
+        engine.ui().set_view_size(width, height);
+        const auto& list = engine.ui().draw(engine.scene(), width, height);
+        for (auto& warning : engine.ui().painter().take_warnings())
+            engine.logs().write(relay::LogLevel::warning, "Interface: " + warning);
+        return &list;
+    });
+}
+
 int run_windowed() {
     relay::Engine engine(windowed_config());
     relay::VulkanWindow window("Relay Engine — Vulkan First Light", 1280, 720, engine.assets());
@@ -142,6 +155,7 @@ int run_windowed() {
         return 1;
     }
     std::cout << "Rendering with Vulkan on " << window.device_name() << '\n';
+    connect_game_ui(window, engine);
 
     using namespace std::chrono_literals;
     while (engine.status().running && !window.poll_quit()) {
@@ -225,6 +239,7 @@ int run_vulkan_scene_capture(const std::string& project, const std::string& outp
         std::cerr << window.error() << '\n';
         return 1;
     }
+    connect_game_ui(window, engine);
     for (unsigned frame = 0; frame < frames; ++frame) {
         (void)window.poll_quit();
         apply_graphics_settings(window, engine);
@@ -395,6 +410,7 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
         std::cerr << "Live editor initialization failed: " << window.error() << '\n';
         return 1;
     }
+    connect_game_ui(window, engine);
     engine.set_gpu_capture_source([&](relay::Engine::FrameReceiver receiver, std::string& error) {
         return window.readback_async(engine.scene(), engine.status().elapsed_seconds, std::move(receiver), error);
     }, [&] { window.flush_readbacks(); });
@@ -511,6 +527,8 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
 #ifdef RELAY_HAS_EDITOR_UI
         // The Inspector's material preview needs its material loaded even when nothing uses it.
         if (editor) engine.set_previewed_material(editor->material_preview_request());
+        // Scripts lock and unlock the cursor, as a menu opens and closes, during the game.
+        if (editor) editor->set_game_cursor_locked(engine.input().mouse_locked());
 #endif
         {
             RELAY_PROFILE_SCOPE("Simulation");

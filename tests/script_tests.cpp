@@ -897,6 +897,94 @@ void material_parameters(relay::Engine& engine, relay::ControlProtocol& protocol
     scene.restore_state(earlier);
 }
 
+const char* menu_source = R"(#include "relay_script.hpp"
+
+// One script on the canvas handles every control below it.
+class Menu : public relay::Behaviour {
+public:
+    void on_start() override {
+        relay::input::set_mouse_locked(false);
+        score = self().child("Score");
+        relay::world::log(std::string("locked ") + (relay::input::mouse_locked() ? "yes" : "no"));
+        relay::world::log("title " + self().child("Title").text());
+        if (!score.set_ui("label.size", -5.0)) relay::world::log("size refused");
+        if (!score.set_ui("label.nope", 1)) relay::world::log("unknown refused");
+        score.set_ui("label.horizontal_align", "center");
+        score.set_ui("label.color", {1.0, 0.0, 0.0, 1.0});
+        const auto color = score.ui_numbers("label.color");
+        relay::world::log("color " + std::to_string(color.size()) + " " + std::to_string(static_cast<int>(color[0])));
+        relay::world::log("align " + score.ui_text("label.horizontal_align"));
+    }
+    void on_ui(const relay::ui::Event& event) override {
+        if (event.clicked()) {
+            ++clicks;
+            score.set_text("Clicks: " + std::to_string(clicks));
+            relay::world::log("clicked " + event.control.name());
+        }
+        if (event.toggled()) relay::world::log("toggled " + std::to_string(static_cast<int>(event.value)) +
+                                               (event.control.checked() ? " checked" : " clear"));
+    }
+private:
+    relay::Entity score;
+    int clicks = 0;
+};
+RELAY_BEHAVIOUR(Menu)
+
+// A button's own script hears its clicks too.
+class HideOnClick : public relay::Behaviour {
+public:
+    void on_ui(const relay::ui::Event& event) override {
+        if (event.clicked() && event.control == self()) self().set_visible(false);
+    }
+};
+RELAY_BEHAVIOUR(HideOnClick)
+)";
+
+void game_interface(relay::Engine& engine, relay::ControlProtocol& protocol) {
+    expect(ok(request(protocol, "scripts.trust", "\"trusted\":true")), "trust the project for the menu script");
+    expect(ok(write_script(protocol, "menu.cpp", menu_source)) && ok(request(protocol, "scripts.build")) &&
+               wait_for_build(engine, protocol).find("\"state\":\"ready\"") != std::string::npos,
+           "the menu script builds");
+    auto& scene = engine.scene();
+    const auto earlier = scene.capture_state();
+    expect(ok(request(protocol, "scene.clear")), "start the menu scene empty");
+    const auto create = [&](const std::string& name, const std::string& type, relay::Entity parent) {
+        return entity_from(request(protocol, "scene.create",
+                                   "\"name\":\"" + name + "\",\"type\":\"" + type + "\"" +
+                                       (parent.valid() ? ",\"parent\":\"" + parent.to_string() + '"' : std::string{})));
+    };
+    const auto hud = create("HUD", "Canvas", {});
+    const auto title = create("Title", "Label", hud);
+    const auto score = create("Score", "Label", hud);
+    const auto play = create("Play", "Button", hud);
+    const auto sound = create("Sound", "CheckBox", hud);
+    expect(ok(request(protocol, "scene.set_ui", "\"entity\":\"" + title.to_string() +
+                                                     R"(","component":"ui_label","values":{"text":"Main menu"})")) &&
+               ok(request(protocol, "scene.set_ui", "\"entity\":\"" + sound.to_string() +
+                                                        R"(","component":"ui_control","anchor_preset":"top_left")")),
+           "author the menu");
+    expect(ok(add_script(protocol, hud, "Menu")) && ok(add_script(protocol, play, "HideOnClick")), "attach the scripts");
+    expect(engine.run_game(), "the menu runs");
+    engine.step(1);
+    expect(logged(engine, "locked no") && !engine.input().mouse_locked(), "scripts unlock the cursor");
+    expect(logged(engine, "title Main menu") && logged(engine, "size refused") && logged(engine, "unknown refused") &&
+               logged(engine, "color 4 1") && logged(engine, "align center"),
+           "scripts read and write interface fields, and bad values are refused");
+    std::string error;
+    expect(engine.ui().simulate_click(scene, play, error), "click Play: " + error);
+    engine.step(2);
+    expect(logged(engine, "clicked Play") && scene.get(score)->ui.label->text == "Clicks: 1",
+           "on_ui reaches the canvas script, which updates the score label");
+    expect(!scene.get(play)->ui.control->visible, "the button's own script hears the click too");
+    expect(engine.ui().simulate_click(scene, sound, error), "click Sound: " + error);
+    engine.step(2);
+    expect(logged(engine, "toggled 1 checked") && scene.get(sound)->ui.toggle->checked, "check boxes toggle and report it");
+    expect(engine.stop_game() && scene.get(play)->ui.control->visible && scene.get(score)->ui.label->text == "Label" &&
+               !engine.input().mouse_locked(),
+           "Stop Game restores the authored interface");
+    scene.restore_state(earlier);
+}
+
 } // namespace
 
 int main() {
@@ -923,6 +1011,7 @@ int main() {
         lifecycle(engine, protocol);
         spawning(engine, protocol);
         material_parameters(engine, protocol);
+        game_interface(engine, protocol);
         compile_errors(engine, protocol);
         demo_first_person(engine, protocol);
     } catch (const std::exception& error) {

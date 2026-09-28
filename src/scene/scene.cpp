@@ -7,6 +7,7 @@
 #include <charconv>
 #include <cctype>
 #include <cmath>
+#include <deque>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
@@ -277,6 +278,7 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
                    << ",\"editor\":" << (effects[index].editor ? "true" : "false") << '}';
         output << "]}";
     } else output << "null";
+    output << ",\"ui\":" << ui_components_json(record.ui);
     output << '}';
 }
 
@@ -775,6 +777,13 @@ bool Scene::set_post_process(const Entity entity, std::optional<PostProcess> pos
     return true;
 }
 
+bool Scene::set_ui(const Entity entity, UiComponents ui) {
+    auto* record = get(entity);
+    if (!record || !valid_ui(ui)) return false;
+    record->ui = std::move(ui);
+    return true;
+}
+
 bool Scene::set_sky(const Entity entity, std::optional<Sky> sky) {
     auto* record = get(entity);
     if (!record || (sky && !valid_sky(*sky))) return false;
@@ -1115,7 +1124,8 @@ std::string Scene::serialize_json() const {
 }
 
 const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
-    static const std::vector<ComponentDescriptor> descriptors{
+    static const std::vector<ComponentDescriptor> descriptors = [] {
+      std::vector<ComponentDescriptor> list{
         {"Name", 0x01U, {{"value", ReflectedFieldType::string}}},
         {"Transform",
          0x02U,
@@ -1250,7 +1260,37 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
          {{"behaviour", ReflectedFieldType::string},
           {"enabled", ReflectedFieldType::boolean},
           {"properties", ReflectedFieldType::object_array}}},
-    };
+      };
+      // Game interface components, stored under each entity's "ui" object by key.
+      static std::deque<std::string> ui_names;
+      for (const auto& component : ui_components()) {
+          // "progress_bar" is described as UiProgressBar, like the other CamelCase names.
+          std::string name = "Ui";
+          bool upper = true;
+          for (const char character : component.key) {
+              if (character == '_') {
+                  upper = true;
+                  continue;
+              }
+              name += upper && character >= 'a' && character <= 'z' ? static_cast<char>(character - 'a' + 'A')
+                                                                     : character;
+              upper = false;
+          }
+          ComponentDescriptor descriptor{ui_names.emplace_back(std::move(name)), component.stable_id, {}};
+          for (const auto& field : component.fields) {
+              auto type = ReflectedFieldType::string;
+              if (field.type == UiFieldType::boolean) type = ReflectedFieldType::boolean;
+              else if (field.type == UiFieldType::number || field.type == UiFieldType::integer)
+                  type = ReflectedFieldType::number;
+              else if (field.type == UiFieldType::vec2 || field.type == UiFieldType::color ||
+                       field.type == UiFieldType::margins)
+                  type = ReflectedFieldType::number_array;
+              descriptor.fields.push_back({field.name, type});
+          }
+          list.push_back(std::move(descriptor));
+      }
+      return list;
+    }();
     return descriptors;
 }
 

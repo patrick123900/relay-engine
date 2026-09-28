@@ -10,6 +10,7 @@
 #include "relay/render/render_graph.hpp"
 #include "relay/render/shader_reflection.hpp"
 #include "relay/render/upload_budget.hpp"
+#include "relay/ui/ui_render.hpp"
 
 #ifdef RELAY_HAS_FIDELITYFX
 #include "vulkan_lighting.hpp"
@@ -29,6 +30,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <set>
@@ -496,6 +498,38 @@ struct VulkanWindow::Impl {
     std::array<VkDescriptorSet, frames_in_flight> tone_sets{};
     VkPipelineLayout tone_pipeline_layout{};
     VkPipeline tone_pipeline{};
+    // The game interface, drawn over the game view after tone mapping during Run Game. Texture
+    // pixels are copied inside the frame's own command buffer, so nothing waits for the device.
+    VulkanWindow::GameUiSource ui_source;
+    struct UiGpuTexture {
+        VkImage image{};
+        VkDeviceMemory memory{};
+        VkImageView view{};
+        VkDescriptorSet set{};
+        std::uint32_t width{}, height{};
+        std::uint64_t revision{};
+        std::uint64_t used{}; // The latest UI frame that drew it.
+    };
+    struct UiPushConstants {
+        std::array<float, 2> scale{};
+        std::array<float, 2> translate{};
+        std::uint32_t linear_output{};
+        std::array<std::uint32_t, 3> padding{};
+    };
+    static_assert(sizeof(UiPushConstants) == 32U);
+    std::unordered_map<std::uint64_t, UiGpuTexture> ui_textures;
+    std::array<std::vector<UiGpuTexture>, frames_in_flight> ui_retired{};
+    VkSampler ui_sampler{};
+    VkDescriptorSetLayout ui_set_layout{};
+    VkDescriptorPool ui_pool{};
+    VkPipelineLayout ui_pipeline_layout{};
+    VkPipeline ui_pipeline{};
+    std::array<VkBuffer, frames_in_flight> ui_vertex_buffers{}, ui_index_buffers{}, ui_staging_buffers{};
+    std::array<VkDeviceMemory, frames_in_flight> ui_vertex_memories{}, ui_index_memories{}, ui_staging_memories{};
+    std::array<VkDeviceSize, frames_in_flight> ui_vertex_capacities{}, ui_index_capacities{}, ui_staging_capacities{};
+    std::uint64_t ui_frame_serial{};
+    const UiDrawList* ui_list{}; // This frame's, once its data is on the GPU.
+    std::string ui_error;
     VkPipelineLayout pipeline_layout{};
     VkPipeline pipeline{};
     VkPipeline transparent_pipeline{};
@@ -598,6 +632,7 @@ struct VulkanWindow::Impl {
         acceleration_structures.reset();
 #endif
         destroy_reflection_pipelines();
+        if (device != VK_NULL_HANDLE) destroy_ui_resources();
         if (device != VK_NULL_HANDLE) {
             for (std::size_t index = 0; index < frames_in_flight; ++index) {
                 vkDestroyBuffer(device, deformed_buffers[index], nullptr);
@@ -4143,6 +4178,408 @@ void fragment() {
         return true;
     }
 
+    // Objects the interface pass keeps across swapchains: sampler, descriptor layout and pool,
+    // pipeline layout. Its pipeline follows the render pass (create_ui_pipeline).
+    bool ensure_ui_objects() {
+        if (ui_pipeline_layout != VK_NULL_HANDLE) return true;
+        VkSamplerCreateInfo sampler_info{};
+        sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sampler_info.magFilter = VK_FILTER_LINEAR;
+        sampler_info.minFilter = VK_FILTER_LINEAR;
+        sampler_info.addressModeU = sampler_info.addressModeV = sampler_info.addressModeW =
+            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        auto result = vkCreateSampler(device, &sampler_info, nullptr, &ui_sampler);
+        VkDescriptorSetLayoutBinding binding{};
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.descriptorCount = 1U;
+        binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo layout_info{};
+        layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layout_info.bindingCount = 1U;
+        layout_info.pBindings = &binding;
+        if (result == VK_SUCCESS) result = vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &ui_set_layout);
+        // One set per interface texture: glyph pages and images.
+        const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512U};
+        VkDescriptorPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        pool_info.maxSets = 512U;
+        pool_info.poolSizeCount = 1U;
+        pool_info.pPoolSizes = &pool_size;
+        if (result == VK_SUCCESS) result = vkCreateDescriptorPool(device, &pool_info, nullptr, &ui_pool);
+        VkPushConstantRange push{};
+        push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        push.size = sizeof(UiPushConstants);
+        VkPipelineLayoutCreateInfo pipeline_layout_info{};
+        pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipeline_layout_info.setLayoutCount = 1U;
+        pipeline_layout_info.pSetLayouts = &ui_set_layout;
+        pipeline_layout_info.pushConstantRangeCount = 1U;
+        pipeline_layout_info.pPushConstantRanges = &push;
+        if (result == VK_SUCCESS)
+            result = vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr, &ui_pipeline_layout);
+        if (result != VK_SUCCESS) {
+            ui_error = vk_error("interface pipeline objects", result);
+            return false;
+        }
+        return true;
+    }
+
+    // A failure leaves the game without its interface rather than failing the window.
+    bool create_ui_pipeline() {
+        if (!ensure_ui_objects()) return true;
+        std::string error;
+        const auto vertex_code = read_shader(RELAY_UI_VERTEX_PATH, error);
+        const auto fragment_code = read_shader(RELAY_UI_FRAGMENT_PATH, error);
+        if (vertex_code.empty() || fragment_code.empty()) {
+            ui_error = "interface shaders: " + error;
+            return true;
+        }
+        VkShaderModuleCreateInfo shader_info{};
+        shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        shader_info.codeSize = vertex_code.size() * sizeof(std::uint32_t);
+        shader_info.pCode = vertex_code.data();
+        VkShaderModule vertex_module{}, fragment_module{};
+        auto result = vkCreateShaderModule(device, &shader_info, nullptr, &vertex_module);
+        shader_info.codeSize = fragment_code.size() * sizeof(std::uint32_t);
+        shader_info.pCode = fragment_code.data();
+        if (result == VK_SUCCESS) result = vkCreateShaderModule(device, &shader_info, nullptr, &fragment_module);
+        const std::array stages{
+            VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0U,
+                                            VK_SHADER_STAGE_VERTEX_BIT, vertex_module, "main", nullptr},
+            VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0U,
+                                            VK_SHADER_STAGE_FRAGMENT_BIT, fragment_module, "main", nullptr}};
+        const VkVertexInputBindingDescription vertex_binding{0U, sizeof(UiVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+        const std::array attributes{
+            VkVertexInputAttributeDescription{0U, 0U, VK_FORMAT_R32G32_SFLOAT, offsetof(UiVertex, x)},
+            VkVertexInputAttributeDescription{1U, 0U, VK_FORMAT_R32G32_SFLOAT, offsetof(UiVertex, u)},
+            VkVertexInputAttributeDescription{2U, 0U, VK_FORMAT_R8G8B8A8_UNORM, offsetof(UiVertex, color)}};
+        VkPipelineVertexInputStateCreateInfo vertex_input{};
+        vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertex_input.vertexBindingDescriptionCount = 1U;
+        vertex_input.pVertexBindingDescriptions = &vertex_binding;
+        vertex_input.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());
+        vertex_input.pVertexAttributeDescriptions = attributes.data();
+        VkPipelineInputAssemblyStateCreateInfo assembly{};
+        assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo viewport{};
+        viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewport.viewportCount = 1U;
+        viewport.scissorCount = 1U;
+        VkPipelineRasterizationStateCreateInfo raster{};
+        raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        raster.polygonMode = VK_POLYGON_MODE_FILL;
+        raster.cullMode = VK_CULL_MODE_NONE;
+        raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        raster.lineWidth = 1.0F;
+        VkPipelineMultisampleStateCreateInfo multisample{};
+        multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState color_blend{};
+        color_blend.blendEnable = VK_TRUE;
+        color_blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        color_blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        color_blend.colorBlendOp = VK_BLEND_OP_ADD;
+        color_blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        color_blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        color_blend.alphaBlendOp = VK_BLEND_OP_ADD;
+        color_blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo blend{};
+        blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        blend.attachmentCount = 1U;
+        blend.pAttachments = &color_blend;
+        VkPipelineDepthStencilStateCreateInfo depth{};
+        depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        const std::array dynamic_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{};
+        dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+        dynamic.pDynamicStates = dynamic_states.data();
+        VkGraphicsPipelineCreateInfo pipeline_info{};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipeline_info.stageCount = static_cast<std::uint32_t>(stages.size());
+        pipeline_info.pStages = stages.data();
+        pipeline_info.pVertexInputState = &vertex_input;
+        pipeline_info.pInputAssemblyState = &assembly;
+        pipeline_info.pViewportState = &viewport;
+        pipeline_info.pRasterizationState = &raster;
+        pipeline_info.pMultisampleState = &multisample;
+        pipeline_info.pDepthStencilState = &depth;
+        pipeline_info.pColorBlendState = &blend;
+        pipeline_info.pDynamicState = &dynamic;
+        pipeline_info.layout = ui_pipeline_layout;
+        pipeline_info.renderPass = render_pass;
+        if (result == VK_SUCCESS)
+            result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1U, &pipeline_info, nullptr, &ui_pipeline);
+        vkDestroyShaderModule(device, fragment_module, nullptr);
+        vkDestroyShaderModule(device, vertex_module, nullptr);
+        if (result != VK_SUCCESS) ui_error = vk_error("interface pipeline", result);
+        return true;
+    }
+
+    void destroy_ui_texture(UiGpuTexture& texture) {
+        if (texture.set != VK_NULL_HANDLE) vkFreeDescriptorSets(device, ui_pool, 1U, &texture.set);
+        vkDestroyImageView(device, texture.view, nullptr);
+        vkDestroyImage(device, texture.image, nullptr);
+        vkFreeMemory(device, texture.memory, nullptr);
+        texture = {};
+    }
+
+    void destroy_ui_resources() {
+        for (auto& retired : ui_retired) {
+            for (auto& texture : retired) destroy_ui_texture(texture);
+            retired.clear();
+        }
+        for (auto& [id, texture] : ui_textures) destroy_ui_texture(texture);
+        ui_textures.clear();
+        for (std::size_t frame = 0; frame < frames_in_flight; ++frame)
+            for (const auto& [buffer, memory] : {std::pair{&ui_vertex_buffers[frame], &ui_vertex_memories[frame]},
+                                                 std::pair{&ui_index_buffers[frame], &ui_index_memories[frame]},
+                                                 std::pair{&ui_staging_buffers[frame], &ui_staging_memories[frame]}}) {
+                vkDestroyBuffer(device, *buffer, nullptr);
+                vkFreeMemory(device, *memory, nullptr);
+                *buffer = VK_NULL_HANDLE;
+                *memory = VK_NULL_HANDLE;
+            }
+        vkDestroyPipeline(device, ui_pipeline, nullptr);
+        vkDestroyPipelineLayout(device, ui_pipeline_layout, nullptr);
+        vkDestroyDescriptorPool(device, ui_pool, nullptr);
+        vkDestroyDescriptorSetLayout(device, ui_set_layout, nullptr);
+        vkDestroySampler(device, ui_sampler, nullptr);
+        ui_pipeline = VK_NULL_HANDLE;
+        ui_pipeline_layout = VK_NULL_HANDLE;
+        ui_pool = VK_NULL_HANDLE;
+        ui_set_layout = VK_NULL_HANDLE;
+        ui_sampler = VK_NULL_HANDLE;
+    }
+
+    // A host-visible buffer of at least `bytes`, grown by half again when it is too small. The
+    // frame's fence has completed, so its old buffer is free to go.
+    bool ensure_ui_buffer(VkBuffer& buffer, VkDeviceMemory& memory, VkDeviceSize& capacity, VkDeviceSize bytes,
+                          VkBufferUsageFlags usage) {
+        if (bytes <= capacity && buffer != VK_NULL_HANDLE) return true;
+        vkDestroyBuffer(device, buffer, nullptr);
+        vkFreeMemory(device, memory, nullptr);
+        buffer = VK_NULL_HANDLE;
+        memory = VK_NULL_HANDLE;
+        capacity = 0U;
+        const auto size = std::max<VkDeviceSize>(bytes + bytes / 2U, 64U * 1024U);
+        if (!create_buffer(size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                           buffer, memory))
+            return false;
+        capacity = size;
+        return true;
+    }
+
+    bool create_ui_texture(const UiTexture& source, UiGpuTexture& texture) {
+        VkImageCreateInfo image_info{};
+        image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        image_info.extent = {source.width, source.height, 1U};
+        image_info.mipLevels = 1U;
+        image_info.arrayLayers = 1U;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        auto result = vkCreateImage(device, &image_info, nullptr, &texture.image);
+        VkMemoryRequirements requirements{};
+        if (result == VK_SUCCESS) vkGetImageMemoryRequirements(device, texture.image, &requirements);
+        const auto memory_type = result == VK_SUCCESS ? find_memory_type(requirements.memoryTypeBits,
+                                                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                                                      : std::optional<std::uint32_t>{};
+        if (result == VK_SUCCESS && !memory_type) result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        VkMemoryAllocateInfo allocation{};
+        allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = memory_type.value_or(0U);
+        if (result == VK_SUCCESS) result = vkAllocateMemory(device, &allocation, nullptr, &texture.memory);
+        if (result == VK_SUCCESS) result = vkBindImageMemory(device, texture.image, texture.memory, 0U);
+        VkImageViewCreateInfo view_info{};
+        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image = texture.image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+        if (result == VK_SUCCESS) result = vkCreateImageView(device, &view_info, nullptr, &texture.view);
+        VkDescriptorSetAllocateInfo set_info{};
+        set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        set_info.descriptorPool = ui_pool;
+        set_info.descriptorSetCount = 1U;
+        set_info.pSetLayouts = &ui_set_layout;
+        if (result == VK_SUCCESS) result = vkAllocateDescriptorSets(device, &set_info, &texture.set);
+        if (result != VK_SUCCESS) {
+            ui_error = vk_error("interface texture", result);
+            destroy_ui_texture(texture);
+            return false;
+        }
+        const VkDescriptorImageInfo image{ui_sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = texture.set;
+        write.descriptorCount = 1U;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &image;
+        vkUpdateDescriptorSets(device, 1U, &write, 0U, nullptr);
+        texture.width = source.width;
+        texture.height = source.height;
+        return true;
+    }
+
+    // Before the display pass: asks the host for the interface at the view's size, copies changed
+    // textures and this frame's triangles to the GPU. The interface shows only in views through
+    // the scene's camera, never in the editor's own camera.
+    void prepare_game_ui(const VkCommandBuffer commands, const EditorViewport::Pixels& region, const Scene* scene) {
+        ui_list = nullptr;
+        for (auto& texture : ui_retired[current_frame]) destroy_ui_texture(texture);
+        ui_retired[current_frame].clear();
+        if (!scene || !ui_source || ui_pipeline == VK_NULL_HANDLE || region.width == 0U || region.height == 0U ||
+            (overlay != nullptr && overlay->view_override() != nullptr))
+            return;
+        const auto* list = ui_source(region.width, region.height);
+        if (!list || list->empty()) return;
+        ++ui_frame_serial;
+        // Pixels to copy: new textures, and ones whose revision moved on.
+        VkDeviceSize upload_bytes = 0U;
+        for (const auto& texture : list->textures) {
+            const auto found = ui_textures.find(texture->id);
+            if (found == ui_textures.end() || found->second.revision != texture->revision)
+                upload_bytes += texture->rgba.size();
+        }
+        void* staging = nullptr;
+        if (upload_bytes > 0U) {
+            if (!ensure_ui_buffer(ui_staging_buffers[current_frame], ui_staging_memories[current_frame],
+                                  ui_staging_capacities[current_frame], upload_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
+                vkMapMemory(device, ui_staging_memories[current_frame], 0U, upload_bytes, 0U, &staging) != VK_SUCCESS) {
+                ui_error = "could not stage interface textures";
+                return;
+            }
+        }
+        VkDeviceSize offset = 0U;
+        for (const auto& source : list->textures) {
+            auto& texture = ui_textures[source->id];
+            texture.used = ui_frame_serial;
+            if (texture.image != VK_NULL_HANDLE && texture.revision == source->revision) continue;
+            const bool fresh = texture.image == VK_NULL_HANDLE || texture.width != source->width ||
+                               texture.height != source->height;
+            if (fresh) {
+                if (texture.image != VK_NULL_HANDLE) ui_retired[current_frame].push_back(texture);
+                texture = {};
+                texture.used = ui_frame_serial;
+                if (!create_ui_texture(*source, texture)) continue;
+            }
+            std::memcpy(static_cast<std::uint8_t*>(staging) + offset, source->rgba.data(), source->rgba.size());
+            VkImageMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.srcAccessMask = fresh ? VkAccessFlags{0U} : VkAccessFlags{VK_ACCESS_SHADER_READ_BIT};
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.oldLayout = fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = texture.image;
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            const VkPipelineStageFlags before =
+                fresh ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            vkCmdPipelineBarrier(commands, before, VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U,
+                                 &barrier);
+            VkBufferImageCopy copy{};
+            copy.bufferOffset = offset;
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+            copy.imageExtent = {source->width, source->height, 1U};
+            vkCmdCopyBufferToImage(commands, ui_staging_buffers[current_frame], texture.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &copy);
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0U, 0U,
+                                 nullptr, 0U, nullptr, 1U, &barrier);
+            texture.revision = source->revision;
+            offset += source->rgba.size();
+        }
+        if (staging) vkUnmapMemory(device, ui_staging_memories[current_frame]);
+        // Textures no frame has drawn for ten seconds or so go.
+        for (auto it = ui_textures.begin(); it != ui_textures.end();) {
+            if (ui_frame_serial - it->second.used > 600U) {
+                ui_retired[current_frame].push_back(it->second);
+                it = ui_textures.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        const auto vertex_bytes = static_cast<VkDeviceSize>(list->vertices.size() * sizeof(UiVertex));
+        const auto index_bytes = static_cast<VkDeviceSize>(list->indices.size() * sizeof(std::uint32_t));
+        void* mapped = nullptr;
+        if (!ensure_ui_buffer(ui_vertex_buffers[current_frame], ui_vertex_memories[current_frame],
+                              ui_vertex_capacities[current_frame], vertex_bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) ||
+            !ensure_ui_buffer(ui_index_buffers[current_frame], ui_index_memories[current_frame],
+                              ui_index_capacities[current_frame], index_bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) {
+            ui_error = "could not allocate interface geometry";
+            return;
+        }
+        if (vkMapMemory(device, ui_vertex_memories[current_frame], 0U, vertex_bytes, 0U, &mapped) != VK_SUCCESS) return;
+        std::memcpy(mapped, list->vertices.data(), static_cast<std::size_t>(vertex_bytes));
+        vkUnmapMemory(device, ui_vertex_memories[current_frame]);
+        if (vkMapMemory(device, ui_index_memories[current_frame], 0U, index_bytes, 0U, &mapped) != VK_SUCCESS) return;
+        std::memcpy(mapped, list->indices.data(), static_cast<std::size_t>(index_bytes));
+        vkUnmapMemory(device, ui_index_memories[current_frame]);
+        ui_list = list;
+    }
+
+    // Inside the display pass, over the tone-mapped game view.
+    void draw_game_ui(const VkCommandBuffer commands, const EditorViewport::Pixels& region) {
+        if (!ui_list) return;
+        vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline);
+        VkViewport viewport{};
+        viewport.width = static_cast<float>(swapchain_extent.width);
+        viewport.height = static_cast<float>(swapchain_extent.height);
+        viewport.maxDepth = 1.0F;
+        vkCmdSetViewport(commands, 0U, 1U, &viewport);
+        const VkDeviceSize zero = 0U;
+        vkCmdBindVertexBuffers(commands, 0U, 1U, &ui_vertex_buffers[current_frame], &zero);
+        vkCmdBindIndexBuffer(commands, ui_index_buffers[current_frame], 0U, VK_INDEX_TYPE_UINT32);
+        UiPushConstants constants;
+        const float width = static_cast<float>(swapchain_extent.width);
+        const float height = static_cast<float>(swapchain_extent.height);
+        constants.scale = {2.0F / width, 2.0F / height};
+        constants.translate = {static_cast<float>(region.x) * 2.0F / width - 1.0F,
+                               static_cast<float>(region.y) * 2.0F / height - 1.0F};
+        constants.linear_output =
+            swapchain_format == VK_FORMAT_B8G8R8A8_SRGB || swapchain_format == VK_FORMAT_R8G8B8A8_SRGB ? 1U : 0U;
+        vkCmdPushConstants(commands, ui_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0U,
+                           sizeof(constants), &constants);
+        VkDescriptorSet bound = VK_NULL_HANDLE;
+        for (const auto& command : ui_list->commands) {
+            const auto found = ui_textures.find(ui_list->textures[command.texture]->id);
+            if (found == ui_textures.end() || found->second.set == VK_NULL_HANDLE) continue;
+            const auto left = std::clamp(static_cast<std::int64_t>(std::floor(command.clip.x0)), std::int64_t{0},
+                                         static_cast<std::int64_t>(region.width));
+            const auto top = std::clamp(static_cast<std::int64_t>(std::floor(command.clip.y0)), std::int64_t{0},
+                                        static_cast<std::int64_t>(region.height));
+            const auto right = std::clamp(static_cast<std::int64_t>(std::ceil(command.clip.x1)), left,
+                                          static_cast<std::int64_t>(region.width));
+            const auto bottom = std::clamp(static_cast<std::int64_t>(std::ceil(command.clip.y1)), top,
+                                           static_cast<std::int64_t>(region.height));
+            if (right <= left || bottom <= top) continue;
+            VkRect2D scissor{};
+            scissor.offset = {static_cast<std::int32_t>(region.x + static_cast<std::uint32_t>(left)),
+                              static_cast<std::int32_t>(region.y + static_cast<std::uint32_t>(top))};
+            scissor.extent = {static_cast<std::uint32_t>(right - left), static_cast<std::uint32_t>(bottom - top)};
+            vkCmdSetScissor(commands, 0U, 1U, &scissor);
+            if (found->second.set != bound) {
+                bound = found->second.set;
+                vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, ui_pipeline_layout, 0U, 1U, &bound,
+                                        0U, nullptr);
+            }
+            vkCmdDrawIndexed(commands, command.index_count, 1U, command.first_index, 0, 0U);
+            ++latest_draw_calls;
+        }
+    }
+
     // The global illumination composite: a fullscreen pass in the forward render pass that adds
     // indirect light, reading the G-buffer and the GI outputs.
     bool create_composite_resources() {
@@ -4344,7 +4781,7 @@ void fragment() {
                create_depth_resources() && create_hdr_resources() &&
                create_directional_shadow_resources() &&
                create_point_shadow_resources() &&
-               create_render_pass() && create_pipeline() && create_tone_resources() &&
+               create_render_pass() && create_pipeline() && create_tone_resources() && create_ui_pipeline() &&
                create_composite_resources() && create_framebuffers();
     }
 
@@ -4412,6 +4849,8 @@ void fragment() {
         pipeline = VK_NULL_HANDLE;
         vkDestroyPipeline(device, tone_pipeline, nullptr);
         tone_pipeline = VK_NULL_HANDLE;
+        vkDestroyPipeline(device, ui_pipeline, nullptr);
+        ui_pipeline = VK_NULL_HANDLE;
         vkDestroyPipeline(device, composite_pipeline, nullptr);
         composite_pipeline = VK_NULL_HANDLE;
         vkDestroyPipelineLayout(device, composite_pipeline_layout, nullptr);
@@ -6091,6 +6530,10 @@ void fragment() {
         previous_view = render_scene.camera.view.values;
         if (capture_buffer == VK_NULL_HANDLE) last_frame_time = frame_time;
         previous_projection = render_scene.camera.projection.values;
+        {
+            RELAY_PROFILE_SCOPE("Game interface");
+            prepare_game_ui(commands, region, scene);
+        }
         std::array<VkClearValue, 2> swapchain_clear{};
         swapchain_clear[0].color = clear[0].color;
         swapchain_clear[1].depthStencil = {1.0F, 0U};
@@ -6129,6 +6572,7 @@ void fragment() {
                                0U, sizeof(settings), &settings);
             vkCmdDraw(commands, 3U, 1U, 0U, 0U);
             ++latest_draw_calls;
+            draw_game_ui(commands, region);
         };
         if (overlay != nullptr && overlay_ready && capture_buffer == VK_NULL_HANDLE) {
             RELAY_PROFILE_SCOPE("Record editor UI");
@@ -6475,6 +6919,15 @@ bool VulkanWindow::poll_quit() {
             if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) impl_->resized = true;
             continue;
         }
+        if (event.type == SDL_EVENT_MOUSE_MOTION) {
+            // The game reads the pointer in its view's pixels: the editor's viewport region, or
+            // the whole window without an editor.
+            const float density = std::max(SDL_GetWindowPixelDensity(impl_->window), 1e-3F);
+            const auto region = (impl_->overlay ? impl_->overlay->scene_viewport() : EditorViewport{})
+                                    .pixels(impl_->swapchain_extent.width, impl_->swapchain_extent.height);
+            event.motion.x = event.motion.x * density - static_cast<float>(region.x);
+            event.motion.y = event.motion.y * density - static_cast<float>(region.y);
+        }
         if (auto input = sdl_input_event(event)) impl_->pending_input_events.push_back(std::move(*input));
         if (event.type == SDL_EVENT_QUIT) return true;
         // Escape closes the bare demo window, but in the editor it would throw away unsaved work
@@ -6532,6 +6985,12 @@ bool VulkanWindow::presented() const { return impl_ && impl_->last_draw_presente
 void VulkanWindow::set_render_interpolation(const RenderInterpolation* interpolation) {
     if (impl_) impl_->render_interpolation = interpolation;
 }
+
+void VulkanWindow::set_game_ui_source(GameUiSource source) {
+    if (impl_) impl_->ui_source = std::move(source);
+}
+
+std::string VulkanWindow::game_ui_error() const { return impl_ ? impl_->ui_error : std::string{}; }
 
 std::uint32_t VulkanWindow::draw_call_count() const {
     return impl_ ? impl_->latest_draw_calls : 0U;

@@ -19,8 +19,8 @@
 //     };
 //     RELAY_BEHAVIOUR(Spinner)
 //
-// Frame order: every behaviour's on_update, then animation and physics, then contact callbacks for
-// the contacts that step produced. Run Game calls on_start on every instance before the first
+// Frame order: interface events (on_ui), every behaviour's on_update, then animation and physics,
+// then contact callbacks for the contacts that step produced. Run Game calls on_start on every instance before the first
 // update; Stop Game calls on_stop and then restores the authored scene, so scripts may change the
 // scene freely during a run.
 //
@@ -57,6 +57,17 @@
 //             relay::world::instantiate("Bullet", self().world_position() + relay::Vec3{0, 1, 0});
 //     }
 //     void on_contact_begin(relay::Entity) override { self().destroy(); }
+//
+// Interface: Canvas, Control, Label, Button and the other UI nodes draw over the game's view
+// during Run Game. Scripts change them through Entity (set_text, set_visible, set_value, set_ui for
+// any field) and hear clicks, toggles and slider moves through on_ui, which reaches the control's
+// own scripts and every ancestor's, so one script on a menu can handle all of its buttons.
+// Controls react to the pointer only while the cursor is unlocked: call
+// relay::input::set_mouse_locked(false) when a menu opens and true when it closes.
+//
+//     void on_ui(const relay::ui::Event& event) override {
+//         if (event.clicked() && event.control.name() == "Resume") close_menu();
+//     }
 //
 // Hot reload: when scripts are rebuilt during Run Game, each instance is destroyed without on_stop
 // and recreated from the new code, then on_reload runs (by default it calls on_start). Member
@@ -252,6 +263,60 @@ public:
         return api().clear_material_parameter(api().context, handle_, name.data(), name.size()) != 0;
     }
 
+    // Interface fields, named "<component>.<field>" as the Inspector shows them: "label.text",
+    // "control.visible", "panel.color", "slider.value", "control.offset_min". Colors are sRGB red,
+    // green, blue and alpha from 0 to 1; vectors are two numbers; choices are their names. Changes
+    // last until Stop Game. False, with a log message, when the entity lacks the component or the
+    // value does not fit the field.
+    //
+    //     self().set_ui("panel.color", {1.0, 0.2, 0.2, 0.9});
+    //     title.set_ui("label.horizontal_align", "center");
+    bool set_ui(std::string_view field, double value) const { return set_ui(field, {value}); }
+    bool set_ui(std::string_view field, int value) const { return set_ui(field, {static_cast<double>(value)}); }
+    bool set_ui(std::string_view field, bool value) const { return set_ui(field, {value ? 1.0 : 0.0}); }
+    bool set_ui(std::string_view field, std::initializer_list<double> values) const {
+        return api().ui_set_numbers(api().context, handle_, field.data(), field.size(), values.begin(),
+                                    values.size()) != 0;
+    }
+    bool set_ui(std::string_view field, std::string_view text) const {
+        return api().ui_set_text(api().context, handle_, field.data(), field.size(), text.data(), text.size()) != 0;
+    }
+    bool set_ui(std::string_view field, const char* text) const { return set_ui(field, std::string_view{text}); }
+    // A field's numbers (booleans read 0 or 1); empty without the component or for text fields.
+    [[nodiscard]] std::vector<double> ui_numbers(std::string_view field) const {
+        double values[4];
+        const size_t count = api().ui_get_numbers(api().context, handle_, field.data(), field.size(), values, 4U);
+        return std::vector<double>(values, values + std::min<size_t>(count, 4U));
+    }
+    [[nodiscard]] std::string ui_text(std::string_view field) const {
+        std::string text(api().ui_get_text(api().context, handle_, field.data(), field.size(), nullptr, 0U), '\0');
+        if (!text.empty())
+            (void)api().ui_get_text(api().context, handle_, field.data(), field.size(), text.data(), text.size());
+        return text;
+    }
+    // Shortcuts for the fields scripts change most.
+    bool set_text(std::string_view text) const { return set_ui("label.text", text); }
+    [[nodiscard]] std::string text() const { return ui_text("label.text"); }
+    bool set_visible(bool visible) const { return set_ui("control.visible", visible); }
+    [[nodiscard]] bool visible() const { return first("control.visible") != 0.0; }
+    // A slider's or progress bar's value, kept within its range.
+    bool set_value(double value) const {
+        return set_ui(has_ui("slider.value") ? "slider.value" : "progress_bar.value", value);
+    }
+    [[nodiscard]] double value() const {
+        return has_ui("slider.value") ? first("slider.value") : first("progress_bar.value");
+    }
+    // A check box's state, or a toggle button's.
+    bool set_checked(bool checked) const {
+        return set_ui(has_ui("toggle.checked") ? "toggle.checked" : "button.pressed", checked);
+    }
+    [[nodiscard]] bool checked() const {
+        return (has_ui("toggle.checked") ? first("toggle.checked") : first("button.pressed")) != 0.0;
+    }
+    // Whether the pointer is over this button, check box or slider, or holding it down, this step.
+    [[nodiscard]] bool hovered() const { return (api().ui_state(api().context, handle_) & RELAY_UI_HOVERED) != 0; }
+    [[nodiscard]] bool held() const { return (api().ui_state(api().context, handle_) & RELAY_UI_HELD) != 0; }
+
     // Enabled colliders touching this entity's enabled collider, sorted. Each side's layer must
     // be in the other's mask.
     [[nodiscard]] std::vector<Entity> overlaps() const {
@@ -300,9 +365,35 @@ private:
     static std::vector<Entity> wrap(const std::vector<RelayEntity>& handles) {
         return {handles.begin(), handles.end()};
     }
+    bool has_ui(std::string_view field) const {
+        double value{};
+        return api().ui_get_numbers(api().context, handle_, field.data(), field.size(), &value, 1U) != 0U;
+    }
+    double first(std::string_view field) const {
+        double value{};
+        return api().ui_get_numbers(api().context, handle_, field.data(), field.size(), &value, 1U) != 0U ? value : 0.0;
+    }
 
     RelayEntity handle_{0};
 };
+
+namespace ui {
+enum class EventType {
+    clicked = RELAY_UI_CLICKED,             // Pressed and released over a button, check box or slider.
+    toggled = RELAY_UI_TOGGLED,             // A check box or toggle button flipped; value 1 on, 0 off.
+    value_changed = RELAY_UI_VALUE_CHANGED, // A slider moved; value is its new value.
+    pressed = RELAY_UI_PRESSED,
+    released = RELAY_UI_RELEASED,
+};
+struct Event {
+    EventType type{};
+    Entity control; // The button, check box or slider.
+    double value{};
+    [[nodiscard]] bool clicked() const { return type == EventType::clicked; }
+    [[nodiscard]] bool toggled() const { return type == EventType::toggled; }
+    [[nodiscard]] bool value_changed() const { return type == EventType::value_changed; }
+};
+} // namespace ui
 
 struct RayHit {
     Entity entity;
@@ -538,7 +629,7 @@ inline bool mouse_pressed(std::string_view button) {
     return api().input_control(api().context, control.data(), control.size(),
                             RELAY_INPUT_PRESSED) != 0;
 }
-// Pointer position in window pixels (z is 0).
+// Pointer position in the game view in pixels from its top-left corner (z is 0).
 inline Vec3 mouse_position() {
     RelayVec3 position{}, delta{};
     api().input_mouse(api().context, &position, &delta);
@@ -555,6 +646,10 @@ inline double mouse_wheel() {
     api().input_mouse(api().context, &position, &delta);
     return delta.z;
 }
+// Hides and locks the cursor for mouse look (true), or shows it so the player can use interface
+// controls (false), for the rest of the game. Starts as the input map's "Lock the mouse" setting.
+inline void set_mouse_locked(bool locked) { (void)api().set_mouse_locked(api().context, locked ? 1 : 0); }
+inline bool mouse_locked() { return api().mouse_locked(api().context) != 0; }
 } // namespace input
 
 class Behaviour {
@@ -579,6 +674,9 @@ public:
     virtual void on_destroy() {}
     // Runs after hot reload replaces this instance with newly built code.
     virtual void on_reload() { on_start(); }
+    // An interface event on this entity's control or a control below it: a click, a check box
+    // or toggle button flipping, a slider moving, or a press or release.
+    virtual void on_ui(const ui::Event& /*event*/) {}
 
 private:
     friend struct detail_access;
@@ -732,6 +830,15 @@ relay_script_module_v1(const RelayHostApi* host) {
                 case RELAY_CALLBACK_STOP: behaviour.on_stop(); break;
                 case RELAY_CALLBACK_RELOAD: behaviour.on_reload(); break;
                 case RELAY_CALLBACK_DESTROY: behaviour.on_destroy(); break;
+                case RELAY_CALLBACK_UI: {
+                    int type = 0;
+                    RelayEntity control = other;
+                    double value = 0.0;
+                    const auto& api = *relay::detail::host();
+                    if (api.ui_event(api.context, &type, &control, &value))
+                        behaviour.on_ui({static_cast<relay::ui::EventType>(type), relay::Entity{control}, value});
+                    break;
+                }
                 default: copy_error(error, capacity, "unknown callback"); return 0;
                 }
                 return 1;

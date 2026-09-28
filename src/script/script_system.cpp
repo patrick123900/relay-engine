@@ -991,6 +991,106 @@ struct ScriptSystem::Impl {
             if (renderer.parameters.erase(std::string(name, length)) == 0U) return 0;
             return scene.set_mesh_renderer(unpack(entity), std::move(renderer)) ? 1 : 0;
         };
+        host.ui_get_numbers = [](void* context, RelayEntity entity, const char* name, size_t length, double* values,
+                                 size_t capacity) -> size_t {
+            auto& impl = self(context);
+            const auto* record = impl.engine.scene().get(unpack(entity));
+            const auto field = ui_field({name, length});
+            if (!record || !field || !field->component->present(record->ui)) return 0U;
+            const auto numbers = ui_numbers(field->component->get(record->ui, field->index));
+            for (std::size_t index = 0; index < std::min(numbers.size(), capacity); ++index) values[index] = numbers[index];
+            return numbers.size();
+        };
+        host.ui_set_numbers = [](void* context, RelayEntity entity, const char* name, size_t length,
+                                 const double* values, size_t count) {
+            auto& impl = self(context);
+            const std::string field_name(name, length);
+            const auto field = ui_field(field_name);
+            if (!field) {
+                impl.warn("set_ui(\"" + field_name + "\"): no such interface field");
+                return 0;
+            }
+            const auto& info = field->component->fields[field->index];
+            std::optional<UiValue> value;
+            const std::vector<double> numbers(values, values + (values ? count : 0U));
+            switch (info.type) {
+            case UiFieldType::boolean:
+                if (numbers.size() == 1U) value = UiValue{numbers[0] != 0.0};
+                break;
+            case UiFieldType::number:
+            case UiFieldType::integer:
+                if (numbers.size() == 1U)
+                    value = UiValue{info.type == UiFieldType::integer ? std::round(numbers[0]) : numbers[0]};
+                break;
+            case UiFieldType::vec2:
+                if (numbers.size() == 2U) value = UiValue{Vec2{numbers[0], numbers[1]}};
+                break;
+            case UiFieldType::color:
+                if (numbers.size() == 4U) value = UiValue{UiColor{numbers[0], numbers[1], numbers[2], numbers[3]}};
+                else if (numbers.size() == 3U) value = UiValue{UiColor{numbers[0], numbers[1], numbers[2], 1.0}};
+                break;
+            case UiFieldType::margins:
+                if (numbers.size() == 4U) value = UiValue{UiMargins{numbers[0], numbers[1], numbers[2], numbers[3]}};
+                else if (numbers.size() == 1U) value = UiValue{UiMargins{numbers[0], numbers[0], numbers[0], numbers[0]}};
+                break;
+            default: break;
+            }
+            if (!value) {
+                impl.warn("set_ui(\"" + field_name + "\"): the field does not take " + std::to_string(numbers.size()) +
+                          " number(s)");
+                return 0;
+            }
+            return impl.set_ui_value(unpack(entity), *field, *value, field_name) ? 1 : 0;
+        };
+        host.ui_get_text = [](void* context, RelayEntity entity, const char* name, size_t length, char* buffer,
+                              size_t capacity) -> size_t {
+            auto& impl = self(context);
+            const auto* record = impl.engine.scene().get(unpack(entity));
+            const auto field = ui_field({name, length});
+            if (!record || !field || !field->component->present(record->ui)) return 0U;
+            const auto value = field->component->get(record->ui, field->index);
+            const auto* text = std::get_if<std::string>(&value);
+            if (!text) return 0U;
+            if (buffer) std::memcpy(buffer, text->data(), std::min(text->size(), capacity));
+            return text->size();
+        };
+        host.ui_set_text = [](void* context, RelayEntity entity, const char* name, size_t length, const char* text,
+                              size_t text_length) {
+            auto& impl = self(context);
+            const std::string field_name(name, length);
+            const auto field = ui_field(field_name);
+            if (!field) {
+                impl.warn("set_ui(\"" + field_name + "\"): no such interface field");
+                return 0;
+            }
+            const auto type = field->component->fields[field->index].type;
+            if (type != UiFieldType::text && type != UiFieldType::asset && type != UiFieldType::choice) {
+                impl.warn("set_ui(\"" + field_name + "\"): the field takes numbers, not text");
+                return 0;
+            }
+            return impl.set_ui_value(unpack(entity), *field, UiValue{std::string(text ? text : "", text ? text_length : 0U)},
+                                     field_name)
+                       ? 1
+                       : 0;
+        };
+        host.ui_state = [](void* context, RelayEntity entity) {
+            const auto pointer = self(context).engine.ui().visual_state();
+            const auto handle = unpack(entity);
+            return (pointer.hovered == handle ? RELAY_UI_HOVERED : 0) | (pointer.pressed == handle ? RELAY_UI_HELD : 0);
+        };
+        host.ui_event = [](void* context, int* type, RelayEntity* control, double* value) {
+            const auto& event = self(context).ui_event;
+            if (!event) return 0;
+            if (type) *type = static_cast<int>(event->type);
+            if (control) *control = event->control.packed();
+            if (value) *value = event->value;
+            return 1;
+        };
+        host.set_mouse_locked = [](void* context, int locked) {
+            self(context).engine.input().set_mouse_locked(locked != 0);
+            return 1;
+        };
+        host.mouse_locked = [](void* context) { return self(context).engine.input().mouse_locked() ? 1 : 0; };
         host.overlap_sphere = [](void* context, RelayVec3 center, double radius,
                                  uint32_t layer_mask, RelayEntity ignore, RelayEntity* out,
                                  size_t capacity) -> size_t {
@@ -1001,6 +1101,54 @@ struct ScriptSystem::Impl {
                                      .entities,
                                  out, capacity);
         };
+    }
+
+    struct UiFieldRef {
+        const UiComponentInfo* component;
+        std::size_t index;
+    };
+    // "label.text": a component key and one of its fields.
+    static std::optional<UiFieldRef> ui_field(std::string_view name) {
+        const auto dot = name.find('.');
+        if (dot == std::string_view::npos) return std::nullopt;
+        const auto* component = find_ui_component(name.substr(0, dot));
+        if (!component) return std::nullopt;
+        const auto index = ui_field_index(*component, name.substr(dot + 1U));
+        if (!index) return std::nullopt;
+        return UiFieldRef{component, *index};
+    }
+
+    static std::vector<double> ui_numbers(const UiValue& value) {
+        if (const auto* flag = std::get_if<bool>(&value)) return {*flag ? 1.0 : 0.0};
+        if (const auto* number = std::get_if<double>(&value)) return {*number};
+        if (const auto* vector = std::get_if<Vec2>(&value)) return {vector->x, vector->y};
+        if (const auto* color = std::get_if<UiColor>(&value)) return {color->r, color->g, color->b, color->a};
+        if (const auto* margins = std::get_if<UiMargins>(&value))
+            return {margins->left, margins->top, margins->right, margins->bottom};
+        return {};
+    }
+
+    bool set_ui_value(Entity entity, const UiFieldRef& field, const UiValue& value, const std::string& name) {
+        auto& scene = engine.scene();
+        const auto* record = scene.get(entity);
+        const auto where = "set_ui(\"" + name + "\") on " + entity.to_string();
+        if (!record || !field.component->present(record->ui)) {
+            warn(where + ": the entity has no " + std::string(field.component->name) + " component");
+            return false;
+        }
+        std::string error;
+        if (!check_ui_value(field.component->fields[field.index], value, error)) {
+            warn(where + ": " + error);
+            return false;
+        }
+        auto ui = record->ui;
+        field.component->set(ui, field.index, value);
+        normalize_ui(ui);
+        if (!valid_ui(ui, &error) || !scene.set_ui(entity, std::move(ui))) {
+            warn(where + ": " + error);
+            return false;
+        }
+        return true;
     }
 
     static size_t copy_entities(const std::vector<Entity>& entities, RelayEntity* out,
@@ -1433,6 +1581,8 @@ struct ScriptSystem::Impl {
     // Heap-allocated, so spawning during a callback never moves the instance being called.
     std::vector<std::unique_ptr<Instance>> instances;
     std::unordered_map<std::uint64_t, std::vector<Instance*>> by_entity;
+    // The interface event RELAY_CALLBACK_UI is delivering.
+    std::optional<UiEvent> ui_event;
     std::vector<Entity> pending_destroy;
     std::map<std::string, std::optional<LoadedTemplate>, std::less<>> templates;
     bool entity_limit_warned{};
@@ -1684,6 +1834,29 @@ void ScriptSystem::dispatch_contacts() {
         }
     }
     impl.contact_cursor = events.latest_sequence;
+    impl.flush_destroyed();
+}
+
+void ScriptSystem::dispatch_ui(const std::vector<UiEvent>& events) {
+    auto& impl = *impl_;
+    if (!impl.running || !impl.library || events.empty()) return;
+    impl.start_pending();
+    for (const auto& event : events) {
+        impl.ui_event = event;
+        // Events rise from the control through its ancestors, so a menu's script hears its buttons.
+        auto current = event.control;
+        for (std::size_t depth = 0; current.valid() && impl.engine.scene().contains(current) && depth < 100000U;
+             ++depth) {
+            if (const auto found = impl.by_entity.find(current.packed()); found != impl.by_entity.end()) {
+                // A copy: callbacks may spawn, which adds to the index.
+                const auto targets = found->second;
+                for (auto* instance : targets) impl.call(*instance, RELAY_CALLBACK_UI, 0.0, event.control.packed());
+            }
+            if (!impl.engine.scene().contains(current)) break;
+            current = impl.engine.scene().get(current)->parent;
+        }
+    }
+    impl.ui_event.reset();
     impl.flush_destroyed();
 }
 

@@ -272,17 +272,19 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("asset_search", {
         title: "Search project files",
-        description: "Find project files and folders anywhere below the project root whose names contain the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.",
+        description: "Find project files and folders below the project root (or one folder) whose names contain every word of the query, optionally limited to asset kinds. Hidden entries, symlinks and .relayproject files are skipped; at most 512 results.",
         inputSchema: z.object({
-            "query": z.string().max(64).default("").describe("Case-insensitive name fragment; empty matches every name"),
-            "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|material|shader|script|text|media|audio|other)$"))).max(12).optional().describe("Asset kinds to include; omitted or empty includes all")
+            "query": z.string().max(64).default("").describe("Case-insensitive words separated by spaces, all of which must appear in the name, in any order; empty matches every name"),
+            "folder": z.string().max(128).regex(new RegExp("^([A-Za-z0-9][A-Za-z0-9._ /-]*)?$")).default("").describe("Project-relative folder to search below; empty searches the whole project"),
+            "paths": z.boolean().default(false).describe("Match the words anywhere in the project-relative path instead of only the name"),
+            "kinds": z.array(z.string().regex(new RegExp("^(folder|model|scene|template|image|material|shader|script|text|media|audio|font|other)$"))).max(13).optional().describe("Asset kinds to include; omitted or empty includes all")
         }),
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["asset_search"];
         if (override)
             return override(input);
-        return invoke("assets.search", { "query": input["query"], "kinds": input["kinds"] });
+        return invoke("assets.search", { "query": input["query"], "folder": input["folder"], "paths": input["paths"], "kinds": input["kinds"] });
     });
     server.registerTool("asset_create_folder", {
         title: "Create project folder",
@@ -590,6 +592,49 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             return override(input);
         return invoke("input.simulate", { "name": input["name"], "value": input["value"], "frames": input["frames"] });
     });
+    server.registerTool("ui_layout", {
+        title: "Inspect interface layout",
+        description: "Lay out the scene's game interface for a view size (by default the game view's) and report every canvas and control: its rectangle in view pixels (the bounds of its drawn, possibly rotated, shape), its position and size in its parent's canvas units, whether it shows, its opacity, and during Run Game whether the pointer hovers or holds it, plus the latest game step's interface events (clicked, toggled, value_changed, pressed, released). Works in the editor and during Run Game.",
+        inputSchema: z.object({
+            "width": z.number().int().min(1).max(16384).optional().describe("View width in pixels; defaults to the game view's"),
+            "height": z.number().int().min(1).max(16384).optional().describe("View height in pixels; defaults to the game view's")
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["ui_layout"];
+        if (override)
+            return override(input);
+        return invoke("ui.layout", { "width": input["width"], "height": input["height"] });
+    });
+    server.registerTool("ui_render", {
+        title: "Render interface image",
+        description: "Draw the scene's game interface alone, without the 3D scene, into a PNG in the captures directory, on a checkerboard, black or transparent background. Use it to check an interface while editing, since interface nodes do not show in the editor's view; during Run Game it shows the controls as they are now. Reports fonts and images that could not be used.",
+        inputSchema: z.object({
+            "filename": z.string().regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._-]*\\.png$")).default("interface.png").describe("Safe PNG filename without directory components"),
+            "width": z.number().int().min(16).max(8192).default(1920).describe("Image width in pixels"),
+            "height": z.number().int().min(16).max(8192).default(1080).describe("Image height in pixels"),
+            "background": z.enum(["checker", "black", "transparent"]).default("checker").describe("What shows where no control draws")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["ui_render"];
+        if (override)
+            return override(input);
+        return invoke("ui.render", { "path": input["filename"], "width": input["width"], "height": input["height"], "background": input["background"] });
+    });
+    server.registerTool("ui_click", {
+        title: "Click interface control",
+        description: "Run Game only. Press and release the pointer over a button, check box or slider at its center during the next two game steps, as a player would, even while the cursor is locked. The control's scripts hear the click through on_ui; step the game (runtime.step) or let it run to deliver it, then read ui.layout's events.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["ui_click"];
+        if (override)
+            return override(input);
+        return invoke("ui.click", { "entity": input["entity"] });
+    });
     server.registerTool("video_start", {
         title: "Start Relay video",
         description: "Record real Vulkan or deterministic CPU frames to WebM with explicit frame drops.",
@@ -669,7 +714,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         inputSchema: z.object({
             "name": z.string().min(1).max(128).optional().describe("Node name; defaults to the type's name, or Entity"),
             "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity handle"),
-            "type": z.enum(["Node", "Camera", "Sky", "PostProcess", "DirectionalLight", "PointLight", "SpotLight", "RigidBody", "StaticBody", "StaticMesh", "AudioSource", "ReverbZone", "MusicPlayer"]).optional().describe("Node type to create; omitted creates a plain Node")
+            "type": z.enum(["Node", "Camera", "Sky", "PostProcess", "DirectionalLight", "PointLight", "SpotLight", "RigidBody", "StaticBody", "StaticMesh", "AudioSource", "ReverbZone", "MusicPlayer", "Canvas", "Control", "Button", "CheckBox", "Slider", "ProgressBar", "VBoxContainer", "HBoxContainer", "GridContainer", "Panel", "Label", "Image"]).optional().describe("Node type to create; omitted creates a plain Node. Interface types (Canvas, Control and its subtypes) draw during Run Game only")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
@@ -1250,6 +1295,25 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override(input);
         return invoke("scene.set_post_effect", { "entity": input["entity"], "index": input["index"], "enabled": input["enabled"], "editor": input["editor"] });
+    });
+    server.registerTool("scene_set_ui", {
+        title: "Configure interface component",
+        description: "Add, edit or remove one game interface (UI) component on a node. Interface nodes are drawn over the game's view during Run Game only, never in the editor's own view. A Canvas (ui_canvas) scales the controls below it to the screen; a Control (ui_control) places a rectangle, Godot style, by anchors (fractions of the parent control's or screen's size) plus offsets in canvas units, with a pivot for rotation and scale; widgets draw into it or react to the pointer: ui_panel, ui_label, ui_image, ui_button, ui_toggle (check box or switch), ui_slider, ui_progress_bar and ui_container (column, row or grid that places its children). values maps field names to JSON values: numbers, booleans, strings (text, project file paths, choice names), [x, y] vectors, [red, green, blue, alpha] sRGB colors from 0 to 1 and [left, top, right, bottom] margins. Omitted fields keep their values; a missing component is added with its defaults first, and a widget brings its Control. anchor_preset (ui_control) places the control by a preset before values apply, keeping its size. component.types lists every field with its type, range and choices; ui.layout and ui.render show the result. Undoable and saved with the scene.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "component": z.enum(["ui_canvas", "ui_control", "ui_panel", "ui_label", "ui_image", "ui_button", "ui_toggle", "ui_slider", "ui_progress_bar", "ui_container"]).describe("The interface component"),
+            "attached": z.boolean().default(true).describe("False removes the component (a Control only once its widgets are gone)"),
+            "values": z.record(z.string(), z.unknown()).optional().describe("Field names and new values, such as {\"text\": \"Score: 0\", \"size\": 32}"),
+            "anchorPreset": z.enum(["top_left", "top", "top_right", "left", "center", "right", "bottom_left", "bottom", "bottom_right", "full_rect", "top_wide", "bottom_wide", "left_wide", "right_wide", "vcenter_wide", "hcenter_wide"]).optional().describe("ui_control: anchor to a corner, edge, the center, or fill the parent (full_rect) or an edge (the _wide presets)"),
+            "presetMargin": z.number().finite().min(-100000).max(100000).default(0).describe("Gap between the preset's anchored edges and the control, in canvas units"),
+            "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_set_ui"];
+        if (override)
+            return override(input);
+        return invoke("scene.set_ui", { "entity": input["entity"], "component": input["component"], "attached": input["attached"], "values": input["values"], "anchor_preset": input["anchorPreset"], "preset_margin": input["presetMargin"], "gesture": input["gesture"] });
     });
     server.registerTool("component_add", {
         title: "Add component",

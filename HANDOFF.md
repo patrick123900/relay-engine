@@ -9,7 +9,7 @@ overview for visitors. Protocol details belong in [`docs/protocol.md`](docs/prot
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v49: 160 native methods. Scene v23, project v2, import manifest v3.
+- Protocol schema v50: 164 native methods. Scene v25, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
@@ -20,7 +20,9 @@ overview for visitors. Protocol details belong in [`docs/protocol.md`](docs/prot
   buses, bus effects, reverb zones, occlusion, streaming, music players and headphone output),
   a Sky node (gradient or panorama sky material, sky lighting, sun and distance fog), and custom
   shaders (a GLSL-based language for surfaces and post processing, shader materials, a Shader
-  Editor) are implemented. Preserve unrelated working-tree
+  Editor), and a game interface (Godot-style canvases, anchored controls, containers and widgets
+  drawn over the game view during Run Game only, an Interface editor panel, `on_ui` for scripts)
+  are implemented. Preserve unrelated working-tree
   edits and inspect `git diff` before changing them.
 
 ## Product intent
@@ -891,6 +893,99 @@ Phase 3:
 - Native glTF/GLB path; Assimp for OBJ/FBX/DAE; Blender-to-glTF conversion on Linux through a
   Bubblewrap sandbox. Imports are dependency-bounded, content-addressed, and recorded in a manifest.
 
+### Game interface
+
+- Data (`include/relay/scene/ui.hpp`, `src/scene/ui.cpp`): `EntityRecord::ui` (`UiComponents`)
+  holds optional `UiCanvas`, `UiControl` (the rectangle: `anchor_min`/`anchor_max` fractions of the
+  parent plus `offset_min`/`offset_max` in canvas units, Godot style; pivot, rotation, scale,
+  visible, opacity, clip_contents, mouse_filter stop/pass/ignore, sibling `order`, and container
+  hints `min_size`, `expand_x/y`, `size_x/y`), and widgets `UiPanel`, `UiLabel`, `UiImage`,
+  `UiButton`, `UiToggle`, `UiSlider`, `UiProgressBar`, `UiContainer`. Widgets need the control; a
+  canvas is never a control; at most one of button/toggle/slider/progress bar per node.
+  `ui_components()` is a reflection table (field name, type, range, choices, asset kinds, typed
+  get/set) that drives scene files (`"ui"` per entity, scene v25: an object keyed by component with
+  every field; fields left out load as defaults, unknown ones are errors), the protocol, script
+  field access and the Inspector. Colors are sRGB RGBA 0-1. `apply_ui_anchor_preset` implements
+  Godot's 16 presets keeping a size. Component ids `ui_canvas` ... `ui_container` join the catalog
+  (category UI; adding a widget adds the control; removing the control while widgets remain is
+  refused). Node types Canvas, Control > Button, CheckBox, Slider, ProgressBar, Container (>
+  VBoxContainer, HBoxContainer, GridContainer by layout), Panel, Label, Image, with styled
+  defaults; a new control's order is one past its siblings'.
+- Fonts (`src/ui/ui_font.cpp`): stb_truetype (FetchContent, pinned commit, compiled in
+  `relay_stb_truetype`); Inter Regular and Bold (OFL, `third_party/inter/`) embedded by
+  `tools/embed_binary_files.cmake`; project fonts by path, rechecked once a second. Glyphs are
+  rasterized at their on-screen pixel size (rounded) into up to eight 1024² RGBA pages (page 0 has
+  a white block for solid shapes); a full atlas is cleared between frames. Kerning from `kern`
+  only; missing characters fall back to Inter; no complex shaping.
+- Layout and drawing (`src/ui/ui_render.cpp`): `ui_sources` lists every entity with its parent
+  and UI; `UiPainter::layout` builds canvases (sorted by sort_order; controls without a canvas
+  ancestor use a screen layer at scale 1), places controls by anchors or by their container
+  (minimum sizes from text, check boxes and children), and composes affine transforms (pivot,
+  rotation, scale) plus clip rects. `draw` tessellates anti-aliased rounded rectangles (paired
+  inner/outer paths; shadows are a wide fringe), borders as rings, check marks as strokes, images
+  in six modes including nine-slice, and text quads (unrotated text snaps to pixels; outline is
+  8/16 offset passes) into a `UiDrawList` of sRGB vertices, commands per texture and clip.
+  `rasterize_ui` is the CPU twin (bilinear, top-left rule, blending in linear light).
+  `UiImageCache` decodes PNG/JPEG (64 MiB, 8192²) and reloads changed files keeping texture ids.
+- Runtime (`src/ui/ui_system.cpp`, `Engine::ui()`): each game step, after `InputState::begin_step`
+  and before scripts, `UiSystem::update` lays out for the view size (`set_view_size`, set by the
+  host each drawn frame; the engine config size headless), finds the topmost reachable control
+  under the pointer (interactive widgets take it, stop blocks, pass continues), and turns left
+  presses/releases into pressed/released/clicked/toggled/value_changed events, flipping toggles,
+  dragging sliders (step snapped) and playing click sounds flat on SFX. Presses over a stopping or
+  interactive control are consumed (`InputState::consume`: hidden from the game until released;
+  `raw_control` still sees them). The pointer only acts while `InputState::mouse_locked()` is
+  false (the map's lock_mouse unless a script overrode it for the run; cleared at Run and Stop).
+  `simulate_click` presses and releases at a control's centre over two steps even when locked.
+  Events reset at Run and Stop Game.
+- Pointer coordinates: `VulkanWindow::poll_quit` rewrites mouse motion into game-view pixels
+  (pixel density, minus the editor viewport region), so `InputState::mouse_x/y` and scripts'
+  `mouse_position` are game-view pixels.
+- Rendering (`vulkan_window.cpp`, `shaders/ui.vert/frag`): `set_game_ui_source` gives a callback
+  asked each frame with the view size; `connect_game_ui` in `main.cpp` returns the engine's draw
+  list only in Game mode and logs painter warnings. The window skips it whenever the overlay has a
+  view override (the editor camera), so the interface never shows in the editor's view. Before the
+  display pass, `prepare_game_ui` copies changed textures (per-frame staging, barriers in the
+  frame's command buffer; images retire after a frame-slot round trip; unused for 600 frames go)
+  and this frame's vertices/indices; `draw_game_ui` draws after the tone pass inside
+  `draw_tone`, so it is in presented frames and in captures, with scissors per command. Vertex
+  colors and textures are sRGB, converted to linear for an sRGB swapchain. Scene captures
+  (`--vulkan-scene-capture`) run in Game mode without scripts, so they show the authored interface.
+- Scripts: `RelayHostApi` appends `ui_get_numbers`, `ui_set_numbers`, `ui_get_text`,
+  `ui_set_text` ("component.field" names, validated like the Inspector, logged refusals),
+  `ui_state`, `ui_event`, `set_mouse_locked`, `mouse_locked`; callback `RELAY_CALLBACK_UI` (7)
+  delivered by `ScriptSystem::dispatch_ui` before `on_update`, to scripts on the control and every
+  ancestor. SDK: `Behaviour::on_ui(const ui::Event&)`, `Entity::set_ui/ui_numbers/ui_text`,
+  `set_text`, `set_visible`, `set_value`, `set_checked`, `hovered`, `held`,
+  `relay::input::set_mouse_locked`.
+- Protocol: `scene.set_ui` (component, attached, `values` object, `anchor_preset` keeping the
+  current laid-out size, `preset_margin`, gesture), `ui.layout` (rectangles in view pixels, local
+  position/size, visibility, hover/held, the latest events, pointer), `ui.render` (CPU PNG of the
+  interface alone in `captures/`, checker/black/transparent background, font/image warnings),
+  `ui.click` (Run Game). The generator gained an `object` parameter type (validated natively;
+  zod record; bridge JSON schema `additionalProperties`). `component.types` lists interface
+  fields with types, ranges, choices and defaults. `scene.create` types include the UI types.
+  Asset kind `font` (.ttf/.otf) is new.
+- Editor: the Inspector shows UI sections (generated from the table; colors with alpha, text
+  typed live as one undo step, asset pickers, choices) and replaces the Transform for canvases and
+  controls; the Control section has the anchor preset grid, position/size or margins per axis,
+  raw anchors and offsets, and order arrows. The gizmo is skipped for interface nodes. The
+  Hierarchy lists sibling controls by order. Add Node wraps a control made outside any interface
+  in a new Canvas. The **Interface** panel (index 12, Tools → Interface editor, opens beside the
+  viewport) parses `ui` from `scene.list` (`rebuild_interface_sources`), lays out with its own
+  `UiPainter` at a chosen resolution (game view size, presets, custom), draws through
+  `InterfacePreview` (`src/editor/interface_preview.cpp`: UiTexture → `ImTextureData`, colors
+  linearised; use `GetTexRef()`, since `ImTextureRef(ImTextureData*)` silently picks ImGui's legacy
+  `void*` constructor), and selects, moves and resizes controls through `scene.set_ui` with one
+  gesture per drag (Ctrl snaps to 8, arrows nudge). Controls in containers are not dragged.
+  `EditorUi::set_game_cursor_locked` is a host seam: the loop passes the engine's lock each frame,
+  and freeing the cursor warps it to the viewport centre.
+- Demo: a HUD canvas (hints, crosshair, "Balls" counter) and a hidden Tab menu (Resume button,
+  hints switch, music volume slider) run by `scripts/GameMenu.cpp`; the First Person Controller
+  stands still while a script has freed the cursor it started with locked.
+  `relay_build_demo_project --add-interface [root]` adds or replaces the HUD in an existing demo;
+  the full generator builds it too.
+
 ### Protocol and authorization
 
 - `protocol/relay.protocol.json` is the source of truth. `tools/generate_protocol.py` produces the
@@ -977,7 +1072,8 @@ Phase 3:
    with real mouse and keyboard events were exercised by the desktop play-test of the demo
    controller. Gamepad input has not been tried with hardware, and press-to-bind capture from
    real SDL events has not been checked on a desktop. Multiple gamepads are merged rather than assigned to
-   players. There is no text input or on-screen cursor API for scripts yet.
+   players. There is no text input API for scripts yet; scripts lock and free the cursor with
+   `relay::input::set_mouse_locked`, and interface controls take the pointer while it is free.
 10. Native scripts cannot be contained: a crash or endless loop in a script takes the editor down,
    and in a trusted project agent-written code runs with the user's privileges. Windows script
    loading is not implemented (builds report unsupported), and the macOS `.dylib` path has never
@@ -1047,6 +1143,17 @@ Phase 3:
    large models take a while on the worker. Only project folders and a pick's choices are listed:
    meshes of models not yet imported cannot be chosen until the model is imported (import it from
    Assets). Escape still does not close menus outside the browser.
+
+18. The game interface has engine, workflow, compiled-script and headless-editor coverage, plus
+   offscreen Vulkan captures of the demo HUD and a sample menu on RADV; it has not been used on a
+   desktop (real mouse over controls in the live editor, the Interface editor by hand, cursor
+   warping when a menu frees it). Not implemented: world-space interfaces, keyboard/gamepad focus
+   navigation, text input fields, scroll containers, rich text, interface animation (scripts
+   only), multiple pointers or touch, and OpenType shaping (GPOS kerning, right-to-left and
+   complex scripts). Translucent controls blend in linear light (lighter than design tools show).
+   Hidden controls do not draw in the Interface editor. Rotated controls resize along their
+   parent's axes in the Interface editor. Layout and draw lists are rebuilt from the scene every
+   frame and step (fine for HUD-sized interfaces; nothing is cached by revision yet).
 
 ## Next priorities
 
@@ -1174,6 +1281,19 @@ track drag; the joint, audio, music, sky and post-processing tests choose throug
 `tests/ui_snapshot.hpp` now samples each draw's own texture and encodes sRGB like the swapchain, so
 snapshots show thumbnails and the real brightness.
 
+The game interface is covered by the engine suite (reflection round trips, validation, presets,
+node types and ordering, scene v25 files, canvas scaling, anchors, a vertical box with ordering,
+expansion and placement, hit testing, container minimum sizes, CPU-rasterized panel fill, border,
+text and check box pixels, and pointer interaction: hover, click, consumption from game actions
+while held, one-step taps, toggles, slider drags, a locked cursor and simulated clicks), the
+workflow suite (`scene.set_ui` values, presets, refusals, undo, removal rules, `component.types`
+fields, `ui.layout` pixels, `ui.render`, `ui.click` during Run Game), the script suite (a menu
+script reading and writing fields, refusals logged, `on_ui` bubbling to the canvas and the button's
+own script, check boxes, cursor unlock, Stop Game restoring) and the headless editor suite
+(`interface_ui`: Add Node's automatic Canvas, the Inspector's Control and Label sections, typing
+text, anchor presets, the Interface panel, dragging as one undo step, nudging). The motion blur
+check in `relay_lighting_render_tests` hides the demo's canvas in its copy, since text never blurs.
+
 Run native suites sequentially because some fixtures share temporary import paths:
 
 ```sh
@@ -1215,6 +1335,7 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Sky and fog | `src/render/sky.cpp`, `include/relay/render/sky.hpp`, `RenderSky` in `scene_render.hpp`, `shaders/sky.frag`, Sky section in `src/editor/editor_ui.cpp` |
 | Asset Browser and reference fields | `asset_field`…`draw_asset_browser` in `src/editor/editor_ui.cpp`, `src/editor/asset_thumbnails.cpp`, `src/render/asset_thumbnail.cpp`, `src/editor/editor_widgets.cpp` (icons, checkbox, slider) |
 | Frame profiler | `src/observe/profiler.cpp`, `include/relay/observe/profiler.hpp`, Profiler panel in `src/editor/editor_ui.cpp` |
+| Game interface | `include/relay/scene/ui.hpp`, `src/scene/ui.cpp`, `src/ui/`, `include/relay/ui/`, `shaders/ui.*`, the UI pass in `src/platform/vulkan_window.cpp`, `src/editor/interface_preview.cpp`, Inspector UI sections and the Interface panel in `src/editor/editor_ui.cpp`, `third_party/inter/`, `docs/interface.md` |
 | Native tests | `tests/engine_tests.cpp`, `tests/script_tests.cpp`, `tests/editor_*tests.cpp` |
 | Bridge tests | `tools/mcp-bridge/tests/` |
 

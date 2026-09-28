@@ -1,5 +1,7 @@
 #pragma once
 
+#include "relay/scene/ui.hpp"
+
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -373,6 +375,8 @@ struct EntityRecord {
     std::optional<MusicPlayer> music_player{};
     std::optional<Sky> sky{};
     std::optional<PostProcess> post_process{};
+    // Game interface components: a canvas, or a control with its widgets.
+    UiComponents ui{};
 };
 
 // The node type shown to people and agents, derived from the components an entity has now by
@@ -429,6 +433,8 @@ public:
     [[nodiscard]] bool set_music_player(Entity entity, std::optional<MusicPlayer> player);
     [[nodiscard]] bool set_sky(Entity entity, std::optional<Sky> sky);
     [[nodiscard]] bool set_post_process(Entity entity, std::optional<PostProcess> post_process);
+    // Replaces every UI component of the node at once; valid_ui() must accept them.
+    [[nodiscard]] bool set_ui(Entity entity, UiComponents ui);
     [[nodiscard]] std::optional<Entity> active_camera() const;
     // The sky in use: the first node, in entity order, that has one.
     [[nodiscard]] std::optional<Entity> active_sky() const;

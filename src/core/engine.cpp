@@ -26,6 +26,12 @@ Engine::Engine(EngineConfig config)
     }
     // A standalone game runs from the start, so its sources start with it.
     if (mode_ == RuntimeMode::game) audio_.start_game();
+    ui_.set_view_size(config_.width, config_.height);
+    ui_.set_sound_player([this](const std::string& clip) {
+        std::string error;
+        if (audio_.play_clip(scene_, clip, AudioOneShot{}, error) == 0U)
+            logs_.write(LogLevel::warning, "Interface sound " + clip + ": " + error);
+    });
 }
 
 Engine::~Engine() {
@@ -44,6 +50,7 @@ void Engine::tick() {
     sync_input_map();
     sync_audio();
     sync_render_assets();
+    ui_.set_root(asset_root());
     if (running_ && mode_ == RuntimeMode::game && !paused_) {
         advance_one_frame();
     } else {
@@ -64,6 +71,7 @@ bool Engine::run_game() {
     input_.clear_edges();
     authored_scene_ = scene_.capture_state();
     physics_.reset();
+    ui_.reset();
     interpolation_.previous.clear();
     mode_ = RuntimeMode::game;
     paused_ = false;
@@ -86,6 +94,8 @@ bool Engine::stop_game() {
     audio_.stop_game();
     scene_.restore_state(std::move(*authored_scene_));
     physics_.reset();
+    ui_.reset();
+    input_.set_mouse_locked(std::nullopt);
     authored_scene_.reset();
     mode_ = RuntimeMode::editor;
     interpolation_.previous.clear();
@@ -386,7 +396,12 @@ void Engine::advance_one_frame() {
     elapsed_seconds_ += config_.fixed_delta_seconds;
     input_.begin_step();
     {
+        RELAY_PROFILE_SCOPE("Interface");
+        ui_.update(scene_, input_);
+    }
+    {
         RELAY_PROFILE_SCOPE("Scripts");
+        scripts_.dispatch_ui(ui_.events());
         scripts_.update(config_.fixed_delta_seconds);
     }
     advance_animations();

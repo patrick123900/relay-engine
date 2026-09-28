@@ -9,7 +9,7 @@
 
 namespace relay {
 
-inline constexpr std::uint32_t scene_file_version = 24;
+inline constexpr std::uint32_t scene_file_version = 25;
 
 struct SceneFileLoadResult {
     std::optional<SceneState> state;

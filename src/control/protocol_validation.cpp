@@ -32,6 +32,15 @@ bool validate_field(const ProtocolFieldSpec& spec, const JsonValue& scalar, std:
         error = "field '" + std::string(spec.name) + "' cannot be null";
         return false;
     }
+    if (spec.type == ProtocolValueType::object) {
+        const auto* members = scalar.object();
+        if (!members || (spec.maximum_length && members->size() > spec.maximum_length)) {
+            error = "field '" + std::string(spec.name) + "' must be an object" +
+                    (spec.maximum_length ? " of at most " + std::to_string(spec.maximum_length) + " members" : "");
+            return false;
+        }
+        return true;
+    }
     if (spec.type == ProtocolValueType::string_array || spec.type == ProtocolValueType::number_array) {
         const auto* values = scalar.array();
         if (!values || values->size() < spec.minimum_length ||

@@ -550,6 +550,106 @@ std::string ControlProtocol::handle(const std::string_view request) {
                "\",\"source\":\"" + (capture_handler_ && source != "deterministic" ? "vulkan" : "deterministic") +
                "\"}}";
     }
+    if (method == "ui.layout") {
+        auto& ui = engine_.ui();
+        const auto width = static_cast<std::uint32_t>(unsigned_field(request, "width", ui.view_width()));
+        const auto height = static_cast<std::uint32_t>(unsigned_field(request, "height", ui.view_height()));
+        const auto layout = ui.layout(engine_.scene(), width, height);
+        const auto state = ui.visual_state();
+        const bool game = engine_.status().mode == RuntimeMode::game;
+        std::ostringstream output;
+        output << response_prefix(id) << "{\"width\":" << width << ",\"height\":" << height << ",\"controls\":[";
+        const auto pair = [&](double a, double b) { output << '[' << a << ',' << b << ']'; };
+        for (std::size_t item = 0; item < layout.order.size(); ++item) {
+            const auto& node = layout.nodes[layout.order[item]];
+            const auto* record = engine_.scene().get(node.entity);
+            const auto corners = layout.corners(node);
+            double left = corners[0].x, top = corners[0].y, right = left, bottom = top;
+            for (const auto& corner : corners) {
+                left = std::min(left, corner.x);
+                top = std::min(top, corner.y);
+                right = std::max(right, corner.x);
+                bottom = std::max(bottom, corner.y);
+            }
+            output << (item ? "," : "") << "{\"entity\":\"" << node.entity.to_string() << "\",\"name\":\""
+                   << escape_json(record ? record->name : std::string{}) << "\",\"type\":\""
+                   << (record ? node_type(*record) : std::string_view{"Node"}) << "\",\"parent\":";
+            if (node.parent != UiLayoutNode::none) output << '"' << layout.nodes[node.parent].entity.to_string() << '"';
+            else output << "null";
+            output << ",\"layer\":" << node.layer << ",\"visible\":" << (node.visible ? "true" : "false")
+                   << ",\"opacity\":" << node.opacity << ",\"rect\":[" << left << ',' << top << ','
+                   << right - left << ',' << bottom - top << "],\"position\":";
+            pair(node.position.x, node.position.y);
+            output << ",\"size\":";
+            pair(node.size.x, node.size.y);
+            output << ",\"hovered\":" << (game && state.hovered == node.entity ? "true" : "false")
+                   << ",\"held\":" << (game && state.pressed == node.entity ? "true" : "false") << '}';
+        }
+        output << "],\"events\":[";
+        const auto& events = ui.events();
+        for (std::size_t item = 0; item < events.size(); ++item)
+            output << (item ? "," : "") << "{\"type\":\"" << ui_event_name(events[item].type) << "\",\"control\":\""
+                   << events[item].control.to_string() << "\",\"value\":" << events[item].value << '}';
+        output << "],\"pointer\":{\"x\":" << engine_.input().mouse_x() << ",\"y\":" << engine_.input().mouse_y()
+               << ",\"locked\":" << (engine_.input().mouse_locked() ? "true" : "false") << "}}}";
+        return output.str();
+    }
+    if (method == "ui.render") {
+        const auto path_value = string_field(request, "path");
+        const auto path = safe_capture_path(path_value.empty() ? "interface.png" : path_value);
+        if (!path || path->extension() != ".png") return error_response(id, "path must be a safe .png name without directories");
+        const auto width = static_cast<std::uint32_t>(unsigned_field(request, "width", 1920U));
+        const auto height = static_cast<std::uint32_t>(unsigned_field(request, "height", 1080U));
+        const auto background = string_field(request, "background");
+        auto& ui = engine_.ui();
+        ui.set_root(engine_.asset_root());
+        auto& painter = ui.painter();
+        const auto layout = painter.layout(ui_sources(engine_.scene()), width, height);
+        const auto list = painter.draw(layout, engine_.status().mode == RuntimeMode::game ? ui.visual_state()
+                                                                                         : UiVisualState{});
+        std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4U, 0U);
+        if (background != "transparent")
+            for (std::uint32_t y = 0; y < height; ++y)
+                for (std::uint32_t x = 0; x < width; ++x) {
+                    const auto at = (static_cast<std::size_t>(y) * width + x) * 4U;
+                    const std::uint8_t shade = background == "black" ? 0U : ((x / 16U + y / 16U) % 2U ? 58U : 44U);
+                    rgba[at] = rgba[at + 1U] = rgba[at + 2U] = shade;
+                    rgba[at + 3U] = 255U;
+                }
+        rasterize_ui(list, rgba);
+        if (background == "transparent") {
+            // Blending over transparent black darkened partly covered pixels; restore straight alpha.
+            for (std::size_t at = 0; at < rgba.size(); at += 4U) {
+                const double alpha = rgba[at + 3U] / 255.0;
+                if (alpha <= 0.0 || alpha >= 1.0) continue;
+                for (std::size_t channel = 0; channel < 3U; ++channel) {
+                    const double value = rgba[at + channel] / 255.0;
+                    const double linear = value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+                    const double straight = std::min(linear / alpha, 1.0);
+                    const double encoded = straight <= 0.0031308 ? straight * 12.92 : 1.055 * std::pow(straight, 1.0 / 2.4) - 0.055;
+                    rgba[at + channel] = static_cast<std::uint8_t>(std::lround(encoded * 255.0));
+                }
+            }
+        }
+        std::string error;
+        if (!write_frame_image(FrameView{width, height, rgba}, *path, error)) return error_response(id, error);
+        std::ostringstream output;
+        output << response_prefix(id) << "{\"path\":\"" << escape_json(path->generic_string()) << "\",\"width\":" << width
+               << ",\"height\":" << height << ",\"controls\":" << layout.nodes.size() << ",\"warnings\":[";
+        const auto warnings = painter.take_warnings();
+        for (std::size_t item = 0; item < warnings.size(); ++item)
+            output << (item ? "," : "") << '"' << escape_json(warnings[item]) << '"';
+        output << "]}}";
+        return output.str();
+    }
+    if (method == "ui.click") {
+        if (engine_.status().mode != RuntimeMode::game) return error_response(id, "ui.click works during Run Game");
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity)) return error_response(id, "invalid or stale entity");
+        std::string error;
+        if (!engine_.ui().simulate_click(engine_.scene(), *entity, error)) return error_response(id, error);
+        return response_prefix(id) + "{\"entity\":\"" + entity->to_string() + "\",\"scheduled\":true}}";
+    }
     if (method == "render.capabilities") {
         const auto capabilities = probe_vulkan_capabilities();
         std::ostringstream result;
@@ -2248,6 +2348,51 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }
+    if (method == "scene.set_ui") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        const auto component_id = string_field(request, "component");
+        const auto* component = find_ui_component(component_id);
+        if (!component || component->id != component_id) return error_response(id, "unknown interface component");
+        auto ui = engine_.scene().get(*entity)->ui;
+        std::string error;
+        const bool attached = boolean_field(request, "attached", true);
+        if (!attached) {
+            if (!component->present(ui))
+                return error_response(id, "the node has no " + std::string(component->name) + " component");
+            component->attach(ui, false);
+            if (!valid_ui(ui, &error))
+                return error_response(id, component_id == "ui_control" ? "remove the node's interface widgets before its Control"
+                                                                        : error);
+        } else {
+            if (component_id == "ui_canvas" && ui.control)
+                return error_response(id, "a Control cannot also be a Canvas; put the canvas on a parent node");
+            if (component_id != "ui_canvas" && ui.canvas)
+                return error_response(id, "a Canvas cannot also be a Control; add controls as its children");
+            if (component_id != "ui_canvas" && !ui.control) ui.control = UiControl{};
+            JsonParser parser(request);
+            const auto parsed = parser.parse();
+            const auto* values = parsed && parsed->object() ? field(*parsed->object(), "values") : nullptr;
+            if (const auto preset = optional_string_field(request, "anchor_preset")) {
+                if (component_id != "ui_control")
+                    return error_response(id, "anchor_preset applies to the ui_control component");
+                // Keep the size the control has now in the game view, even when it stretches.
+                std::optional<Vec2> size;
+                const auto layout = engine_.ui().layout(engine_.scene(), engine_.ui().view_width(), engine_.ui().view_height());
+                if (const auto* node = layout.find(*entity)) size = node->size;
+                if (!apply_ui_anchor_preset(*ui.control, *preset, size, number_field(request, "preset_margin").value_or(0.0)))
+                    return error_response(id, "unknown anchor preset");
+            }
+            if (!apply_ui_values(ui, *component, values ? *values : JsonValue{}, error)) return error_response(id, error);
+        }
+        if (!engine_.scene_history().execute(
+                std::string(attached ? "Configure " : "Remove ") + std::string(component->name) + ' ' + entity->to_string(),
+                [&](Scene& scene) { return scene.set_ui(*entity, ui); }, unsigned_field(request, "gesture", 0U)))
+            return error_response(id, "invalid interface values");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
     if (method == "component.types") {
         std::ostringstream output;
         output << response_prefix(id) << "{\"engine\":[";
@@ -2259,7 +2404,37 @@ std::string ControlProtocol::handle(const std::string_view request) {
                    << "\",\"addable\":" << (kind.addable ? "true" : "false")
                    << ",\"removable\":" << (kind.removable ? "true" : "false")
                    << ",\"multiple\":" << (kind.multiple ? "true" : "false")
-                   << ",\"description\":\"" << escape_json(kind.description) << "\"}";
+                   << ",\"description\":\"" << escape_json(kind.description) << '"';
+            // Interface components describe their fields, as scene.set_ui takes them.
+            if (const auto* ui = find_ui_component(kind.id); ui && ui->id == kind.id) {
+                static constexpr std::array<std::string_view, 9> types{
+                    "boolean", "number", "integer", "vec2", "color", "margins", "text", "asset", "choice"};
+                output << ",\"fields\":[";
+                for (std::size_t item = 0; item < ui->fields.size(); ++item) {
+                    const auto& info = ui->fields[item];
+                    output << (item ? "," : "") << "{\"name\":\"" << info.name << "\",\"type\":\""
+                           << types[static_cast<std::size_t>(info.type)] << '"';
+                    if (info.type != UiFieldType::boolean && info.type != UiFieldType::choice &&
+                        info.type != UiFieldType::asset && info.type != UiFieldType::color)
+                        output << ",\"minimum\":" << info.minimum << ",\"maximum\":" << info.maximum;
+                    const auto names = [&](const char* key, const std::vector<std::string_view>& list) {
+                        if (list.empty()) return;
+                        output << ",\"" << key << "\":[";
+                        for (std::size_t name = 0; name < list.size(); ++name)
+                            output << (name ? "," : "") << '"' << list[name] << '"';
+                        output << ']';
+                    };
+                    names("choices", info.choices);
+                    names("kinds", info.kinds);
+                    output << ",\"default\":" << ui_value_json([&] {
+                        UiComponents defaults;
+                        ui->attach(defaults, true);
+                        return ui->get(defaults, item);
+                    }()) << ",\"description\":\"" << escape_json(info.description) << "\"}";
+                }
+                output << ']';
+            }
+            output << '}';
         }
         output << "],\"behaviours\":";
         append_behaviours(output, engine_.scripts().status().behaviours);

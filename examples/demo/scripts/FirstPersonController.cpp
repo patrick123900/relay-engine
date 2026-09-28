@@ -14,6 +14,9 @@
 // look with a gamepad, jump and sprint, and fire shoots. The mouse looks around while the game has
 // input; turn on "Lock the mouse cursor" there so the cursor stays inside the window.
 //
+// While a menu frees the cursor (relay::input::set_mouse_locked(false) from another script), the
+// player stands still and neither looks nor shoots.
+//
 // Shooting spawns the ball_template project template just in front of the camera and launches it
 // where the camera looks. The demo's Ball template sits on collider layer 2, which the player's
 // collider mask leaves out, so balls never knock into the player who shot them.
@@ -40,12 +43,19 @@ public:
             return;
         }
         camera.make_active_camera();
+        started_locked = relay::input::mouse_locked();
         const auto rotation = camera.rotation();
         pitch = rotation.x;
         yaw = rotation.y;
     }
 
     void on_update(double dt) override {
+        if (started_locked && !relay::input::mouse_locked()) {
+            // A menu has the cursor: stop walking, keeping any fall.
+            auto velocity = self().velocity();
+            self().set_velocity({0.0, velocity.y, 0.0});
+            return;
+        }
         look(dt);
         move();
         if (relay::input::pressed("fire")) shoot();
@@ -126,6 +136,7 @@ private:
     unsigned shots = 0;
 
     relay::Entity camera;
+    bool started_locked = false;
     double yaw = 0.0;
     double pitch = 0.0;
 };

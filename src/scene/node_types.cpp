@@ -28,7 +28,86 @@ bool matches(const std::string_view id, const EntityRecord& record) {
     if (id == "ReverbZone") return record.reverb_zone.has_value();
     if (id == "MusicPlayer") return record.music_player.has_value();
     if (id == "PostProcess") return record.post_process.has_value();
+    const auto& ui = record.ui;
+    const auto container = [&](UiContainer::Layout layout) {
+        return ui.container && ui.container->layout == layout;
+    };
+    if (id == "Canvas") return ui.canvas.has_value();
+    if (id == "Control") return ui.control.has_value();
+    if (id == "Button") return ui.button.has_value();
+    if (id == "CheckBox") return ui.toggle.has_value();
+    if (id == "Slider") return ui.slider.has_value();
+    if (id == "ProgressBar") return ui.progress_bar.has_value();
+    if (id == "Container") return ui.container.has_value();
+    if (id == "VBoxContainer") return container(UiContainer::Layout::vertical);
+    if (id == "HBoxContainer") return container(UiContainer::Layout::horizontal);
+    if (id == "GridContainer") return container(UiContainer::Layout::grid);
+    if (id == "Panel") return ui.panel.has_value();
+    if (id == "Label") return ui.label.has_value();
+    if (id == "Image") return ui.image.has_value();
     return false;
+}
+
+// Interface types: a size centered in the parent, and a look that reads on any game.
+void contribute_ui(const std::string_view id, UiComponents& ui) {
+    const auto centered = [&](double width, double height) {
+        (void)apply_ui_anchor_preset(*ui.control, "center", Vec2{width, height});
+    };
+    const auto text = [&](std::string value, UiLabel::Align horizontal) {
+        ui.label = UiLabel{};
+        ui.label->text = std::move(value);
+        ui.label->horizontal_align = horizontal;
+    };
+    if (id == "Canvas") {
+        ui.canvas = UiCanvas{};
+    } else if (id == "Control") {
+        // A plain control usually groups others, so it fills its parent.
+        ui.control = UiControl{};
+        (void)apply_ui_anchor_preset(*ui.control, "full_rect");
+    } else if (id == "Button") {
+        centered(220.0, 56.0);
+        ui.control->mouse_filter = UiControl::MouseFilter::stop;
+        ui.panel = UiPanel{};
+        ui.panel->color = {0.13, 0.14, 0.17, 0.95};
+        ui.panel->corner_radius = 10.0;
+        ui.button = UiButton{};
+        text("Button", UiLabel::Align::center);
+        ui.label->size = 22.0;
+    } else if (id == "CheckBox") {
+        centered(240.0, 40.0);
+        ui.control->mouse_filter = UiControl::MouseFilter::stop;
+        ui.toggle = UiToggle{};
+        text("Check box", UiLabel::Align::start);
+        ui.label->size = 22.0;
+    } else if (id == "Slider") {
+        centered(260.0, 32.0);
+        ui.control->mouse_filter = UiControl::MouseFilter::stop;
+        ui.slider = UiSlider{};
+    } else if (id == "ProgressBar") {
+        centered(280.0, 24.0);
+        ui.panel = UiPanel{};
+        ui.panel->color = {0.06, 0.07, 0.09, 0.8};
+        ui.panel->corner_radius = 12.0;
+        ui.progress_bar = UiProgressBar{};
+    } else if (id == "VBoxContainer" || id == "HBoxContainer" || id == "GridContainer") {
+        centered(320.0, 240.0);
+        ui.container = UiContainer{};
+        ui.container->layout = id == "VBoxContainer"   ? UiContainer::Layout::vertical
+                               : id == "HBoxContainer" ? UiContainer::Layout::horizontal
+                                                       : UiContainer::Layout::grid;
+    } else if (id == "Panel") {
+        centered(360.0, 240.0);
+        ui.control->mouse_filter = UiControl::MouseFilter::stop;
+        ui.panel = UiPanel{};
+    } else if (id == "Label") {
+        centered(240.0, 48.0);
+        ui.control->mouse_filter = UiControl::MouseFilter::ignore;
+        text("Label", UiLabel::Align::start);
+    } else if (id == "Image") {
+        centered(128.0, 128.0);
+        ui.control->mouse_filter = UiControl::MouseFilter::ignore;
+        ui.image = UiImage{};
+    }
 }
 
 // Adds the components one type contributes, with the defaults a new node of that type gets.
@@ -71,6 +150,8 @@ void contribute(const std::string_view id, EntityRecord& record, const bool came
         record.music_player = MusicPlayer{};
     } else if (id == "PostProcess") {
         record.post_process = PostProcess{};
+    } else {
+        contribute_ui(id, record.ui);
     }
 }
 
@@ -121,6 +202,33 @@ const std::vector<NodeTypeInfo>& node_types() {
          "Full-screen effects on the lit scene, such as color grading, vignettes or outlines, from "
          "post_process shaders.",
          {"post_process"}, true},
+        {"Canvas", "Canvas", "Node",
+         "A layer for the game's interface, drawn over the game's view during Run Game only. It "
+         "scales the controls below it to fit the screen.",
+         {"ui_canvas"}, true},
+        {"Control", "Control", "Node",
+         "A rectangle of the game's interface, placed by anchors on its parent control or the "
+         "screen. Groups other controls.",
+         {"ui_control"}, true},
+        // Interactive controls first: a button's panel and label must not make it a Panel.
+        {"Button", "Button", "Control", "A clickable button with a label. Scripts hear clicks through on_ui.",
+         {"ui_button", "ui_panel", "ui_label"}, true},
+        {"CheckBox", "Check Box", "Control", "A check box or switch that flips on click, with a label.",
+         {"ui_toggle", "ui_label"}, true},
+        {"Slider", "Slider", "Control", "A value chosen by dragging a handle along a track.",
+         {"ui_slider"}, true},
+        {"ProgressBar", "Progress Bar", "Control", "A bar filled to a value, for health, loading or timers.",
+         {"ui_progress_bar", "ui_panel"}, true},
+        {"Container", "Container", "Control", "Arranges its child controls. Choose a column, row or grid.",
+         {"ui_container"}, false},
+        {"VBoxContainer", "Vertical Box", "Container", "Stacks its child controls in a column.", {}, true},
+        {"HBoxContainer", "Horizontal Box", "Container", "Lines its child controls up in a row.", {}, true},
+        {"GridContainer", "Grid", "Container", "Arranges its child controls in rows of equal columns.", {},
+         true},
+        {"Panel", "Panel", "Control", "A filled, rounded rectangle, such as a window or a HUD backdrop.",
+         {"ui_panel"}, true},
+        {"Label", "Label", "Control", "Text on the screen.", {"ui_label"}, true},
+        {"Image", "Image", "Control", "A picture from a PNG or JPEG file.", {"ui_image"}, true},
     };
     return types;
 }
@@ -179,9 +287,29 @@ bool apply_node_type(Scene& scene, const Entity entity, const std::string_view i
         !scene.set_reverb_zone(entity, record.reverb_zone) ||
         !scene.set_music_player(entity, record.music_player) ||
         !scene.set_sky(entity, record.sky) ||
-        !scene.set_post_process(entity, record.post_process)) {
+        !scene.set_post_process(entity, record.post_process) || !scene.set_ui(entity, record.ui)) {
         error = "could not give the node its components";
         return false;
+    }
+    // A new control goes in front of its siblings.
+    if (record.ui.control) {
+        const auto parent = scene.get(entity)->parent;
+        std::int32_t order = 0;
+        bool sibling = false;
+        for (const auto other : scene.entities()) {
+            const auto* candidate = scene.get(other);
+            if (other == entity || candidate->parent != parent || !candidate->ui.control) continue;
+            order = sibling ? std::max(order, candidate->ui.control->order) : candidate->ui.control->order;
+            sibling = true;
+        }
+        if (sibling && order < 1000000) {
+            auto ui = scene.get(entity)->ui;
+            ui.control->order = order + 1;
+            if (!scene.set_ui(entity, std::move(ui))) {
+                error = "could not order the control";
+                return false;
+            }
+        }
     }
     // A new sky's sun comes from above and to one side rather than along the horizon.
     if (record.sky) {

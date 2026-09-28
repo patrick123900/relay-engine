@@ -1052,7 +1052,7 @@ void first_person_migration() {
         text.replace(at, from.size(), to);
     };
     replace("\"version\":" + std::to_string(relay::scene_file_version), "\"version\":15");
-    replace("\"scripts\":[],\"joint\":null,\"audio_source\":null,\"audio_listener\":null,\"reverb_zone\":null,\"music_player\":null,\"sky\":null,\"post_process\":null}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
+    replace("\"scripts\":[],\"joint\":null,\"audio_source\":null,\"audio_listener\":null,\"reverb_zone\":null,\"music_player\":null,\"sky\":null,\"post_process\":null,\"ui\":null}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
                                "\"sprint_speed\":8,\"jump_speed\":4,\"mouse_sensitivity\":0.2,"
                                "\"stick_look_speed\":120,\"invert_y\":true,\"ground_distance\":1.1,"
                                "\"camera\":\"Eyes\"}}");
@@ -2601,6 +2601,82 @@ void fragment() {
     std::cout << "Shader graph tests passed\n";
 }
 
+// The game interface through the protocol: node types, scene.set_ui with undo, component field
+// descriptions, layout, a CPU render and clicks during Run Game.
+void game_interface() {
+    relay::Engine engine(relay::EngineConfig{.editor_mode = true});
+    relay::ControlProtocol protocol(engine);
+    const auto created = [&](const std::string& name, const std::string& type, const std::string& parent = {}) {
+        const auto result = request(protocol, "scene.create",
+                                    "\"name\":\"" + name + "\",\"type\":\"" + type + "\"" +
+                                        (parent.empty() ? "" : ",\"parent\":\"" + parent + "\""));
+        return *relay::field(*result.object(), "entity")->string();
+    };
+    const auto hud = created("HUD", "Canvas");
+    const auto score = created("Score", "Label", hud);
+    const auto play = created("Play", "Button", hud);
+    const auto record = [&](const std::string& handle) { return engine.scene().get(*relay::Entity::parse(handle)); };
+    check(record(score)->ui.label && record(play)->ui.button && record(play)->ui.panel, "UI node types through scene.create");
+    const auto list = request(protocol, "scene.list");
+    check(relay::json_stringify(list).find("\"type\":\"Button\"") != std::string::npos, "scene.list reports the Button type");
+
+    (void)request(protocol, "scene.set_ui", "\"entity\":\"" + score + R"(","component":"ui_label","values":{"text":"Score: 0","size":36,"horizontal_align":"right","color":[1,0.8,0.2,1]})");
+    check(record(score)->ui.label->text == "Score: 0" && record(score)->ui.label->size == 36.0 &&
+              record(score)->ui.label->horizontal_align == relay::UiLabel::Align::end,
+          "scene.set_ui changes label fields");
+    (void)request(protocol, "scene.set_ui", "\"entity\":\"" + score + R"(","component":"ui_control","anchor_preset":"top_right","preset_margin":24)");
+    const auto& control = *record(score)->ui.control;
+    check(control.anchor_min.x == 1.0 && control.anchor_min.y == 0.0 && control.offset_max.x == -24.0 &&
+              std::abs((control.offset_max.x - control.offset_min.x) - 240.0) < 1e-9,
+          "anchor presets keep the control's size");
+    const auto refused = request(protocol, "scene.set_ui", "\"entity\":\"" + score + R"(","component":"ui_label","values":{"size":-3})", false);
+    check(relay::json_stringify(refused).find("size must be from") != std::string::npos, "out-of-range values are refused");
+    (void)request(protocol, "scene.set_ui", "\"entity\":\"" + score + R"(","component":"ui_label","values":{"text":"Undo me"})");
+    (void)request(protocol, "scene.undo");
+    check(record(score)->ui.label->text == "Score: 0", "interface edits undo");
+    (void)request(protocol, "scene.set_ui", "\"entity\":\"" + hud + R"(","component":"ui_panel")", false);
+    (void)request(protocol, "scene.set_ui", "\"entity\":\"" + play + R"(","component":"ui_control","attached":false)", false);
+    (void)request(protocol, "scene.set_ui", "\"entity\":\"" + play + R"(","component":"ui_panel","attached":false)");
+    check(!record(play)->ui.panel && record(play)->ui.button, "widgets can be removed one at a time");
+    (void)request(protocol, "scene.undo");
+
+    const auto types = relay::json_stringify(request(protocol, "component.types"));
+    check(types.find("\"id\":\"ui_label\"") != std::string::npos &&
+              types.find("\"name\":\"horizontal_align\",\"type\":\"choice\"") != std::string::npos &&
+              types.find("\"choices\":[\"left\",\"center\",\"right\"]") != std::string::npos,
+          "component.types describes interface fields");
+
+    const auto layout = request(protocol, "ui.layout", "\"width\":1280,\"height\":720");
+    const auto* controls = relay::field(*layout.object(), "controls")->array();
+    check(controls && controls->size() == 3U, "ui.layout lists the canvas and its controls");
+    for (const auto& item : *controls) {
+        if (*relay::field(*item.object(), "entity")->string() != score) continue;
+        const auto& rect = *relay::field(*item.object(), "rect")->array();
+        // 1280x720 is two thirds of the 1920x1080 reference: 24 units in is 16 pixels in.
+        check(std::abs(*rect[0].number() + *rect[2].number() - (1280.0 - 16.0)) < 0.01, "ui.layout rectangles are in view pixels");
+    }
+
+    std::filesystem::create_directories("captures");
+    const auto render = request(protocol, "ui.render", R"("path":"hud.png","width":640,"height":360,"background":"transparent")");
+    check(std::filesystem::exists("captures/hud.png") && *relay::field(*render.object(), "controls")->number() == 3.0,
+          "ui.render writes a PNG of the interface");
+    (void)request(protocol, "ui.click", "\"entity\":\"" + play + '"', false);
+
+    (void)request(protocol, "runtime.play");
+    (void)request(protocol, "scene.set_ui", "\"entity\":\"" + score + R"(","component":"ui_label","values":{"text":"x"})", false);
+    (void)request(protocol, "ui.click", "\"entity\":\"" + play + '"');
+    (void)request(protocol, "runtime.step", "\"frames\":1");
+    (void)request(protocol, "runtime.step", "\"frames\":1");
+    const auto after = request(protocol, "ui.layout");
+    bool clicked = false;
+    for (const auto& event : *relay::field(*after.object(), "events")->array())
+        clicked = clicked || (*relay::field(*event.object(), "type")->string() == "clicked" &&
+                              *relay::field(*event.object(), "control")->string() == play);
+    check(clicked, "ui.click clicks a button during Run Game");
+    (void)request(protocol, "ui.click", "\"entity\":\"" + score + '"', false);
+    (void)request(protocol, "runtime.stop");
+}
+
 int main() {
     const auto original = std::filesystem::current_path();
     const auto temporary = std::filesystem::temp_directory_path() /
@@ -2630,6 +2706,7 @@ int main() {
         shader_language();
         shader_materials();
         shader_graphs();
+        game_interface();
         std::cout << "Background editor workflow tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -1004,6 +1004,22 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                 return result;
             }
         }
+        if (result.source_version >= 26U) {
+            const auto* value = field(*entity_object, "particle_emitter");
+            if (!value) {
+                result.error = "version 26 entity requires particle_emitter";
+                return result;
+            }
+            if (!value->is_null()) {
+                ParticleEmitter emitter;
+                std::string particle_error;
+                if (!read_particle_emitter(*value, emitter, particle_error)) {
+                    result.error = "invalid particle_emitter: " + particle_error;
+                    return result;
+                }
+                slot.record.particle_emitter = std::move(emitter);
+            }
+        }
         ++result.entity_count;
     }
 

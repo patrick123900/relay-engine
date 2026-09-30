@@ -51,12 +51,17 @@ void Engine::tick() {
     sync_audio();
     sync_render_assets();
     ui_.set_root(asset_root());
+    particles_.set_root(asset_root());
     if (running_ && mode_ == RuntimeMode::game && !paused_) {
         advance_one_frame();
     } else {
-        // Keeps editor previews and paused voices following their sources' settings.
-        RELAY_PROFILE_SCOPE("Audio");
-        audio_.update(scene_, mode_ == RuntimeMode::game, 0.0);
+        {
+            // Keeps editor previews and paused voices following their sources' settings.
+            RELAY_PROFILE_SCOPE("Audio");
+            audio_.update(scene_, mode_ == RuntimeMode::game, 0.0);
+        }
+        // The editor previews every emitter at the game's step rate; a paused game holds still.
+        if (running_ && mode_ == RuntimeMode::editor) particles_.update(scene_, config_.fixed_delta_seconds, false);
     }
 }
 
@@ -72,6 +77,7 @@ bool Engine::run_game() {
     authored_scene_ = scene_.capture_state();
     physics_.reset();
     ui_.reset();
+    particles_.reset();
     interpolation_.previous.clear();
     mode_ = RuntimeMode::game;
     paused_ = false;
@@ -95,6 +101,7 @@ bool Engine::stop_game() {
     scene_.restore_state(std::move(*authored_scene_));
     physics_.reset();
     ui_.reset();
+    particles_.reset();
     input_.set_mouse_locked(std::nullopt);
     authored_scene_.reset();
     mode_ = RuntimeMode::editor;
@@ -381,6 +388,11 @@ bool Engine::set_audio_settings(AudioSettings settings, std::string& error) {
     return true;
 }
 
+const ParticleRenderList& Engine::particle_render_list(const ParticleView& view, const double alpha) {
+    const bool moving = running_ && !paused_;
+    return particles_.render_list(view, moving ? alpha : 1.0);
+}
+
 const RenderInterpolation* Engine::render_interpolation(const double alpha) {
     if (mode_ != RuntimeMode::game || paused_ || interpolation_.previous.empty())
         return nullptr;
@@ -413,6 +425,11 @@ void Engine::advance_one_frame() {
         RELAY_PROFILE_SCOPE("Script contact callbacks");
         scripts_.dispatch_contacts();
     }
+    particles_.set_root(asset_root());
+    particles_.update(scene_, config_.fixed_delta_seconds, true,
+                      [this](const Vec3 origin, const Vec3 direction, const double distance) {
+                          return physics_.raycast(scene_, origin, direction, distance);
+                      });
     {
         RELAY_PROFILE_SCOPE("Audio");
         sync_audio();

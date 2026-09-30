@@ -1052,7 +1052,7 @@ void first_person_migration() {
         text.replace(at, from.size(), to);
     };
     replace("\"version\":" + std::to_string(relay::scene_file_version), "\"version\":15");
-    replace("\"scripts\":[],\"joint\":null,\"audio_source\":null,\"audio_listener\":null,\"reverb_zone\":null,\"music_player\":null,\"sky\":null,\"post_process\":null,\"ui\":null}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
+    replace("\"scripts\":[],\"joint\":null,\"audio_source\":null,\"audio_listener\":null,\"reverb_zone\":null,\"music_player\":null,\"sky\":null,\"post_process\":null,\"particle_emitter\":null,\"ui\":null}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
                                "\"sprint_speed\":8,\"jump_speed\":4,\"mouse_sensitivity\":0.2,"
                                "\"stick_look_speed\":120,\"invert_y\":true,\"ground_distance\":1.1,"
                                "\"camera\":\"Eyes\"}}");
@@ -2677,6 +2677,115 @@ void game_interface() {
     (void)request(protocol, "runtime.stop");
 }
 
+// scene.set_particle_emitter, particles.status and particles.control, in the editor and the game.
+void particles() {
+    relay::Engine engine(relay::EngineConfig{.editor_mode = true});
+    relay::ControlProtocol protocol(engine);
+    const auto* kind = relay::find_component_kind("particle_emitter");
+    check(kind && kind->addable && kind->removable && kind->category == "Effects",
+          "the particle emitter is an addable effects component");
+    const auto created = request(protocol, "scene.create", "\"type\":\"ParticleEmitter\"");
+    const auto handle = *relay::field(*created.object(), "entity")->string();
+    const auto emitter = *relay::Entity::parse(handle);
+    const auto node = "\"entity\":\"" + handle + "\"";
+    const auto settings = [&] { return *engine.scene().get(emitter)->particle_emitter; };
+    check(engine.scene().get(emitter)->name == "Particle Emitter" && settings() == relay::ParticleEmitter{} &&
+              relay::json_stringify(request(protocol, "scene.list")).find("\"type\":\"ParticleEmitter\"") != std::string::npos,
+          "scene.create makes a Particle Emitter node");
+
+    (void)request(protocol, "scene.set_particle_emitter",
+                  node + R"(,"values":{"rate":80,"shape":"sphere","speed":[1,4],"color":[1,0.5,0,1],)"
+                         R"("size_over_lifetime":[[0,0],[0.2,1],[1,0]],"bursts":[{"time":0.5,"count":25}],)"
+                         R"("blend":"additive","collision":"plane"})");
+    check(settings().rate == 80.0 && settings().shape == relay::ParticleEmitter::Shape::sphere &&
+              settings().speed.max == 4.0 && settings().size_over_lifetime.keys.size() == 3U &&
+              settings().bursts.size() == 1U && settings().bursts.front().count == 25 &&
+              settings().bursts.front().cycles == 1 && settings().blend == relay::ParticleEmitter::Blend::additive,
+          "scene.set_particle_emitter changes the named fields");
+    const auto refused = request(protocol, "scene.set_particle_emitter", node + R"(,"values":{"lifetime":[5,1]})", false);
+    check(relay::json_stringify(refused).find("min must not be more than max") != std::string::npos && settings().rate == 80.0,
+          "bad values are refused with a reason and change nothing");
+    (void)request(protocol, "scene.set_particle_emitter", node + R"(,"values":{"rate":5})");
+    (void)request(protocol, "scene.undo");
+    check(settings().rate == 80.0, "emitter edits undo");
+    const auto first = request(protocol, "scene.set_particle_emitter", node + R"(,"values":{"rate":81},"gesture":7)");
+    (void)request(protocol, "scene.set_particle_emitter", node + R"(,"values":{"rate":82},"gesture":7)");
+    (void)request(protocol, "scene.undo");
+    check(settings().rate == 80.0, "one drag's updates undo together");
+    (void)first;
+
+    {
+        const auto types = request(protocol, "component.types");
+        std::map<std::string, std::string> described;
+        for (const auto& item : *relay::field(*types.object(), "engine")->array())
+            if (*relay::field(*item.object(), "id")->string() == "particle_emitter")
+                for (const auto& entry : *relay::field(*item.object(), "fields")->array())
+                    described[*relay::field(*entry.object(), "name")->string()] =
+                        *relay::field(*entry.object(), "type")->string() + '/' +
+                        *relay::field(*entry.object(), "group")->string();
+        check(described.size() == relay::particle_fields().size() && described["shape"] == "choice/shape" &&
+                  described["color_over_lifetime"] == "gradient/lifetime" && described["lifetime"] == "range/particle",
+              "component.types describes the emitter's fields");
+    }
+
+    // The editor previews the emitter as the engine ticks.
+    for (int step = 0; step < 30; ++step) engine.tick();
+    auto status = request(protocol, "particles.status", node);
+    const auto emitter_status = [&](const relay::JsonValue& value) {
+        return relay::field(*value.object(), "emitters")->array()->front().object();
+    };
+    check(*relay::field(*status.object(), "mode")->string() == "editor" &&
+              *relay::field(*emitter_status(status), "particles")->number() > 0.0 &&
+              *relay::field(*emitter_status(status), "playing")->boolean(),
+          "particles.status reports the editor preview");
+    status = request(protocol, "particles.control", node + R"(,"action":"clear")");
+    check(*relay::field(*emitter_status(status), "particles")->number() == 0.0 &&
+              !*relay::field(*emitter_status(status), "playing")->boolean(),
+          "particles.control clear stops the emitter and removes its particles");
+    status = request(protocol, "particles.control", node + R"(,"action":"emit","count":12)");
+    check(*relay::field(*status.object(), "emitted")->number() == 12.0 &&
+              *relay::field(*emitter_status(status), "particles")->number() == 12.0,
+          "particles.control emit adds particles at once");
+    (void)request(protocol, "particles.control", node + R"(,"action":"pause")");
+    const auto paused = engine.particles().status(emitter)->particles;
+    for (int step = 0; step < 10; ++step) engine.tick();
+    check(engine.particles().status(emitter)->paused && engine.particles().status(emitter)->particles == paused,
+          "a paused emitter holds still");
+    (void)request(protocol, "particles.control", node + R"(,"action":"restart")");
+    check(engine.particles().status(emitter)->playing && !engine.particles().status(emitter)->paused,
+          "restart plays it again from the start");
+    const auto plain = *relay::field(*request(protocol, "scene.create").object(), "entity")->string();
+    (void)request(protocol, "particles.control", "\"entity\":\"" + plain + R"(","action":"play")", false);
+    (void)request(protocol, "particles.status", "\"entity\":\"" + plain + '"', false);
+
+    // Saved with the scene.
+    std::filesystem::create_directories("scenes");
+    (void)request(protocol, "scene.save", "\"filename\":\"particles.relay.json\"");
+    (void)request(protocol, "scene.set_particle_emitter", node + ",\"attached\":false");
+    check(!engine.scene().get(emitter)->particle_emitter, "attached false removes the emitter");
+    (void)request(protocol, "scene.load", "\"filename\":\"particles.relay.json\"");
+    relay::Entity loaded{};
+    for (const auto entity : engine.scene().entities())
+        if (engine.scene().get(entity)->particle_emitter) loaded = entity;
+    check(loaded.valid() && engine.scene().get(loaded)->particle_emitter->rate == 80.0, "emitters save and load");
+
+    // During Run Game emitters follow play_on_start and the protocol; scene edits wait.
+    (void)request(protocol, "scene.set_particle_emitter",
+                  "\"entity\":\"" + loaded.to_string() + R"(","values":{"play_on_start":false,"collision":"none"})");
+    (void)request(protocol, "runtime.play");
+    (void)request(protocol, "runtime.step", "\"frames\":30");
+    check(!engine.particles().status(loaded) || engine.particles().status(loaded)->particles == 0U,
+          "an emitter that waits for a script does not start with the game");
+    (void)request(protocol, "scene.set_particle_emitter", "\"entity\":\"" + loaded.to_string() + R"(","values":{"rate":1})", false);
+    (void)request(protocol, "particles.control", "\"entity\":\"" + loaded.to_string() + R"(","action":"play")");
+    (void)request(protocol, "runtime.step", "\"frames\":30");
+    check(engine.particles().status(loaded)->particles > 0U &&
+              *relay::field(*request(protocol, "particles.status").object(), "mode")->string() == "game",
+          "particles.control plays an emitter during the game");
+    (void)request(protocol, "runtime.stop");
+    check(engine.particles().particle_count() == 0U, "Stop Game clears the game's particles");
+}
+
 int main() {
     const auto original = std::filesystem::current_path();
     const auto temporary = std::filesystem::temp_directory_path() /
@@ -2707,6 +2816,7 @@ int main() {
         shader_materials();
         shader_graphs();
         game_interface();
+        particles();
         std::cout << "Background editor workflow tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

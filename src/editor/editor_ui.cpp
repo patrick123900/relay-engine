@@ -721,6 +721,16 @@ struct EditorUi::Impl {
     std::set<ImGuiID> color_gestures;
     JsonValue audio_settings;
     JsonValue audio_status;
+    // particles.status for the selected emitter, while one is selected.
+    JsonValue particle_status;
+    // A curve key or gradient key being dragged in the Particle emitter section.
+    struct ParticleKeyDrag {
+        std::string key;
+        std::size_t index{};
+        double top{1.0}; // The curve's value range, held while dragging.
+    };
+    std::optional<ParticleKeyDrag> particle_key_drag;
+    std::map<std::string, std::size_t, std::less<>> particle_gradient_selected;
     std::map<std::string, JsonValue, std::less<>> audio_clip_info;
     std::array<char, 65> new_bus_name{};
     std::string bus_rename_target;
@@ -927,6 +937,16 @@ struct EditorUi::Impl {
                 graphics_status = std::move(*settings);
         }
         refresh_audio_status();
+        refresh_particle_status();
+    }
+
+    void refresh_particle_status() {
+        const auto* entity = selection.empty() ? nullptr : find_entity(selection);
+        if (!entity || !component(*entity, "particle_emitter")) {
+            particle_status = JsonValue{};
+            return;
+        }
+        if (auto status = call("particles.status", entity_field(selection), false)) particle_status = std::move(*status);
     }
 
     void refresh_sky_files() {
@@ -3382,6 +3402,103 @@ struct EditorUi::Impl {
         viewport_draw_list->PopClipRect();
     }
 
+    // The selected emitter's shape, in its node's space: where particles are born and which way
+    // they start out.
+    template <class Line>
+    void draw_emitter_shape(const JsonValue::Object& values, const EditorMatrix& world, const Line& line_world) const {
+        ParticleEmitter emitter;
+        std::string error;
+        if (!read_particle_emitter(JsonValue{values}, emitter, error)) return;
+        const auto shape = editor_multiply(world, editor_compose(emitter.shape_offset, emitter.shape_rotation, {1, 1, 1}));
+        const auto at = [&](double x, double y, double z) {
+            return Vec3{shape[0] * x + shape[4] * y + shape[8] * z + shape[12],
+                        shape[1] * x + shape[5] * y + shape[9] * z + shape[13],
+                        shape[2] * x + shape[6] * y + shape[10] * z + shape[14]};
+        };
+        constexpr ImU32 color = IM_COL32(255, 150, 92, 225);
+        constexpr ImU32 faint = IM_COL32(255, 150, 92, 110);
+        constexpr double pi = 3.14159265358979323846;
+        const double r = emitter.radius;
+        const double arc = std::clamp(emitter.arc, 0.0, 360.0) * pi / 180.0;
+        // An arc about the shape's Y axis at height y, and one standing in the XY or ZY plane.
+        const auto ring = [&](double radius, double y, double sweep, ImU32 tint) {
+            constexpr int segments = 48;
+            for (int step = 0; step < segments; ++step) {
+                const double a0 = sweep * step / segments, a1 = sweep * (step + 1) / segments;
+                line_world(at(radius * std::cos(a0), y, radius * std::sin(a0)),
+                           at(radius * std::cos(a1), y, radius * std::sin(a1)), tint, 1.5F);
+            }
+        };
+        const auto upright = [&](double radius, bool across, double from, double to) {
+            constexpr int segments = 32;
+            for (int step = 0; step < segments; ++step) {
+                const double a0 = from + (to - from) * step / segments, a1 = from + (to - from) * (step + 1) / segments;
+                const auto point = [&](double a) {
+                    return across ? at(0.0, radius * std::sin(a), radius * std::cos(a))
+                                  : at(radius * std::cos(a), radius * std::sin(a), 0.0);
+                };
+                line_world(point(a0), point(a1), color, 1.5F);
+            }
+        };
+        const auto arrow = [&](Vec3 from, Vec3 to) { line_world(from, to, faint, 1.2F); };
+        switch (emitter.shape) {
+        case ParticleEmitter::Shape::point: {
+            constexpr double size = 0.1;
+            line_world(at(-size, 0, 0), at(size, 0, 0), color, 1.5F);
+            line_world(at(0, -size, 0), at(0, size, 0), color, 1.5F);
+            line_world(at(0, 0, -size), at(0, 0, size), color, 1.5F);
+            break;
+        }
+        case ParticleEmitter::Shape::sphere:
+            ring(r, 0.0, arc, color);
+            upright(r, false, 0.0, 2.0 * pi);
+            upright(r, true, 0.0, 2.0 * pi);
+            break;
+        case ParticleEmitter::Shape::hemisphere:
+            ring(r, 0.0, arc, color);
+            upright(r, false, 0.0, pi);
+            upright(r, true, 0.0, pi);
+            break;
+        case ParticleEmitter::Shape::cone: {
+            // The base, and where particles leaving its rim at the cone's angle are a metre up.
+            const double height = std::max(1.0, r);
+            const double top = r + std::tan(std::clamp(emitter.angle, 0.0, 89.0) * pi / 180.0) * height;
+            ring(r, 0.0, arc, color);
+            ring(top, height, arc, faint);
+            for (int side = 0; side < 4; ++side) {
+                const double a = arc * side / (arc >= 2.0 * pi - 1e-6 ? 4.0 : 3.0);
+                line_world(at(r * std::cos(a), 0, r * std::sin(a)), at(top * std::cos(a), height, top * std::sin(a)),
+                           faint, 1.2F);
+            }
+            break;
+        }
+        case ParticleEmitter::Shape::box: {
+            const Vec3 half{emitter.box_size.x * 0.5, emitter.box_size.y * 0.5, emitter.box_size.z * 0.5};
+            for (unsigned corner = 0; corner < 8U; ++corner)
+                for (unsigned axis = 0; axis < 3U; ++axis) {
+                    const unsigned other = corner ^ (1U << axis);
+                    if (corner > other) continue;
+                    const auto point = [&](unsigned c) {
+                        return at(c & 1U ? half.x : -half.x, c & 2U ? half.y : -half.y, c & 4U ? half.z : -half.z);
+                    };
+                    line_world(point(corner), point(other), color, 1.5F);
+                }
+            arrow(at(0, half.y, 0), at(0, half.y + 0.5, 0));
+            break;
+        }
+        case ParticleEmitter::Shape::circle:
+            ring(r, 0.0, arc, color);
+            break;
+        case ParticleEmitter::Shape::edge:
+            line_world(at(-r, 0, 0), at(r, 0, 0), color, 1.5F);
+            for (const double x : {-r, 0.0, r}) arrow(at(x, 0, 0), at(x, 0.3, 0));
+            break;
+        }
+        if (emitter.shape != ParticleEmitter::Shape::box && emitter.shape != ParticleEmitter::Shape::edge &&
+            emitter.shape != ParticleEmitter::Shape::point)
+            arrow(at(0, 0, 0), at(0, std::max(0.5, r), 0));
+    }
+
     void draw_scene_nodes() {
         node_markers.clear();
         if (!camera_enabled || !viewport_visible || !viewport_draw_list ||
@@ -3429,7 +3546,8 @@ struct EditorUi::Impl {
             if (drawn >= 2048U) break;
             const auto* camera = component(*entity, "camera");
             const auto* light = component(*entity, "light");
-            if (!camera && !light) continue;
+            const auto* particles = component(*entity, "particle_emitter");
+            if (!camera && !light && !particles) continue;
             ++drawn;
             const auto handle = string_or(*entity, "entity");
             const auto name = string_or(*entity, "name", handle);
@@ -3456,6 +3574,7 @@ struct EditorUi::Impl {
                 for (unsigned corner = 0; corner < 4; ++corner)
                     line_world(corners[corner], corners[corner + 4U], color, 1.5F);
             }
+            if (particles && selected) draw_emitter_shape(*particles, world, line_world);
             if (!node_icons_enabled) continue;
             const auto camera_space = eye_point(origin);
             const auto center = project(camera_space);
@@ -3514,6 +3633,21 @@ struct EditorUi::Impl {
             if (light) {
                 const int type = static_cast<int>(number_or(*light, "type", 1));
                 draw_icon({center->x + (camera ? 23.0F : 0.0F), center->y}, false, type);
+            }
+            if (particles) {
+                // Sparkles: a round badge with three dots of different sizes.
+                const ImVec2 at{center->x + ((camera ? 23.0F : 0.0F) + (light ? 23.0F : 0.0F)), center->y};
+                constexpr float radius = 11.0F;
+                constexpr ImU32 color = IM_COL32(255, 150, 92, 255);
+                viewport_draw_list->AddCircleFilled(at, radius, IM_COL32(19, 25, 34, 225), 16);
+                viewport_draw_list->AddCircle(at, radius, selected ? IM_COL32(255, 194, 67, 255) : color, 16,
+                                              selected ? 2.0F : 1.2F);
+                viewport_draw_list->AddCircleFilled(ImVec2(at.x - 3.5F, at.y + 2.5F), 3.0F, color, 12);
+                viewport_draw_list->AddCircleFilled(ImVec2(at.x + 3.5F, at.y - 1.0F), 2.0F, color, 10);
+                viewport_draw_list->AddCircleFilled(ImVec2(at.x - 0.5F, at.y - 5.0F), 1.4F, color, 8);
+                node_markers.push_back({handle, "Particle emitter: " + name, at, static_cast<float>(-camera_space.z), radius});
+                if (headless) headless_items["node:" + handle + ":particles"] = {at.x - radius, at.y - radius,
+                                                                               at.x + radius, at.y + radius};
             }
         }
         viewport_draw_list->PopClipRect();
@@ -5581,6 +5715,554 @@ struct EditorUi::Impl {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Turns the panorama about the vertical axis");
     }
 
+    // A particle field's value as the entity JSON holds it, or the emitter's default.
+    static ParticleValue particle_json_value(const std::size_t index, const JsonValue::Object& values) {
+        std::string error;
+        if (const auto* value = field(values, particle_fields()[index].name))
+            if (auto parsed = particle_value_from_json(particle_fields()[index], *value, error)) return *parsed;
+        return particle_value(ParticleEmitter{}, index);
+    }
+
+    void set_particle_values(const std::string& values, const std::string& success) {
+        mutate("scene.set_particle_emitter", entity_field(selection) + ",\"values\":{" + values + '}', success);
+    }
+
+    // Fields that do nothing with the emitter's other settings stay out of the way.
+    static bool particle_field_shown(const std::string_view name, const ParticleEmitter& e) {
+        using Shape = ParticleEmitter::Shape;
+        const auto shape = e.shape;
+        if (name == "radius") return shape != Shape::point && shape != Shape::box;
+        if (name == "radius_thickness") return shape != Shape::point && shape != Shape::edge;
+        if (name == "angle") return shape == Shape::cone;
+        if (name == "arc") return shape == Shape::sphere || shape == Shape::hemisphere || shape == Shape::cone ||
+                                  shape == Shape::circle;
+        if (name == "box_size") return shape == Shape::box;
+        if (name == "prewarm") return e.looping;
+        if (name == "plane_height") return e.collision == ParticleEmitter::Collision::plane;
+        if (name == "bounce" || name == "friction" || name == "lifetime_loss" || name == "collision_radius")
+            return e.collision != ParticleEmitter::Collision::none;
+        if (name == "noise_frequency" || name == "noise_scroll") return e.noise_strength > 0.0;
+        if (name == "stretch_speed" || name == "stretch_length")
+            return e.alignment == ParticleEmitter::Alignment::stretched;
+        if (name == "builtin_texture") return e.texture.empty();
+        if (name == "color_alt") return e.random_color;
+        const bool sheet = e.sheet_columns * e.sheet_rows > 1;
+        if (name == "sheet_mode" || name == "sheet_random_start" || name == "sheet_blend") return sheet;
+        if (name == "sheet_fps") return sheet && e.sheet_mode == ParticleEmitter::SheetMode::fps;
+        if (name == "sheet_cycles") return sheet && e.sheet_mode == ParticleEmitter::SheetMode::over_lifetime;
+        if (name == "sub_emitter_trigger" || name == "sub_emitter_count" || name == "sub_emitter_inherit")
+            return !e.sub_emitter.empty();
+        return true;
+    }
+
+    static ImU32 particle_color_u32(const UiColor& color, const double alpha_scale = 1.0) {
+        const auto channel = [](double value) { return static_cast<int>(std::clamp(value, 0.0, 1.0) * 255.0 + 0.5); };
+        return IM_COL32(channel(color.r), channel(color.g), channel(color.b), channel(color.a * alpha_scale));
+    }
+
+    void draw_checkerboard(ImDrawList* list, const ImVec2 low, const ImVec2 high, const float cell) const {
+        list->AddRectFilled(low, high, IM_COL32(200, 200, 200, 255));
+        for (float y = low.y; y < high.y; y += cell)
+            for (float x = low.x + (static_cast<int>((y - low.y) / cell) % 2 == 0 ? 0.0F : cell); x < high.x; x += cell * 2.0F)
+                list->AddRectFilled(ImVec2(x, y), ImVec2(std::min(x + cell, high.x), std::min(y + cell, high.y)),
+                                    IM_COL32(150, 150, 150, 255));
+    }
+
+    // A curve over a particle's life: drag keys, double-click to add one, right-click one to remove
+    // it, or right-click the graph for presets. One drag is one undo step.
+    bool particle_curve_edit(const char* label, ParticleCurve& curve, const double maximum, const std::string& key) {
+        const auto& palette = editor_palette();
+        ImGui::PushID(key.c_str());
+        inspector_field_label(label);
+        const float width = std::max(ImGui::CalcItemWidth(), 80.0F * ui_scale);
+        const float height = 58.0F * ui_scale;
+        const auto low = ImGui::GetCursorScreenPos();
+        const ImVec2 high(low.x + width, low.y + height);
+        ImGui::InvisibleButton("##curve", ImVec2(width, height));
+        note_item(key);
+        const bool hovered = ImGui::IsItemHovered();
+        const bool dragging = particle_key_drag && particle_key_drag->key == key;
+        double top = 1.0;
+        for (const auto& item : curve.keys) top = std::max(top, item.value);
+        top = std::min(maximum, top <= 1.0 ? 1.0 : std::ceil(top * 1.25));
+        if (dragging) top = particle_key_drag->top;
+        const float pad = 5.0F * ui_scale;
+        const auto to_screen = [&](double time, double value) {
+            return ImVec2(low.x + pad + static_cast<float>(time) * (width - pad * 2.0F),
+                          high.y - pad - static_cast<float>(value / top) * (height - pad * 2.0F));
+        };
+        const auto from_screen = [&](ImVec2 point) {
+            const double time = std::clamp((point.x - low.x - pad) / (width - pad * 2.0F), 0.0F, 1.0F);
+            const double value = std::clamp(static_cast<double>((high.y - pad - point.y) / (height - pad * 2.0F)) * top,
+                                            0.0, maximum);
+            return std::pair{time, value};
+        };
+        auto* list = ImGui::GetWindowDrawList();
+        list->AddRectFilled(low, high, palette.input, ImGui::GetStyle().FrameRounding);
+        for (int line = 1; line < 4; ++line) {
+            const float x = low.x + pad + (width - pad * 2.0F) * static_cast<float>(line) / 4.0F;
+            list->AddLine(ImVec2(x, low.y + pad), ImVec2(x, high.y - pad), palette.border_soft);
+        }
+        const auto baseline = to_screen(0.0, 1.0).y;
+        if (top > 1.0) list->AddLine(ImVec2(low.x + pad, baseline), ImVec2(high.x - pad, baseline), palette.border_soft);
+        // The curve, sampled across the graph.
+        ImVec2 previous{};
+        for (int step = 0; step <= 48; ++step) {
+            const double time = step / 48.0;
+            const auto point = to_screen(time, curve.sample(time));
+            if (step > 0) list->AddLine(previous, point, curve.keys.empty() ? palette.text_faint : palette.accent, 2.0F * ui_scale);
+            previous = point;
+        }
+        char text[32];
+        std::snprintf(text, sizeof text, "%g", top);
+        list->AddText(ImVec2(high.x - pad - ImGui::CalcTextSize(text).x, low.y + 1.0F), palette.text_faint, text);
+        const auto mouse = ImGui::GetIO().MousePos;
+        std::optional<std::size_t> near;
+        for (std::size_t index = 0; index < curve.keys.size(); ++index) {
+            const auto point = to_screen(curve.keys[index].time, curve.keys[index].value);
+            const float dx = point.x - mouse.x, dy = point.y - mouse.y;
+            if (hovered && dx * dx + dy * dy < 49.0F * ui_scale * ui_scale) near = index;
+        }
+        for (std::size_t index = 0; index < curve.keys.size(); ++index) {
+            const auto point = to_screen(curve.keys[index].time, curve.keys[index].value);
+            const bool lit = near == index || (dragging && particle_key_drag->index == index);
+            list->AddCircleFilled(point, (lit ? 5.0F : 4.0F) * ui_scale, lit ? palette.text : palette.accent_hovered);
+        }
+        bool changed = false;
+        if (ImGui::IsItemActivated() && near) {
+            particle_key_drag = ParticleKeyDrag{key, *near, top};
+            inspector_gesture = ++gesture_serial;
+        }
+        if (dragging && ImGui::IsItemActive() && particle_key_drag->index < curve.keys.size() &&
+            (ImGui::GetIO().MouseDelta.x != 0.0F || ImGui::GetIO().MouseDelta.y != 0.0F)) {
+            const auto index = particle_key_drag->index;
+            auto [time, value] = from_screen(mouse);
+            // Keys keep their order; the ends stay at the ends.
+            const double earliest = index == 0U ? 0.0 : curve.keys[index - 1U].time;
+            const double latest = index + 1U == curve.keys.size() ? 1.0 : curve.keys[index + 1U].time;
+            curve.keys[index] = {std::clamp(time, earliest, latest), value};
+            pending_gesture = inspector_gesture;
+            changed = true;
+        }
+        if (dragging && !ImGui::IsItemActive()) particle_key_drag.reset();
+        if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !near &&
+            curve.keys.size() < maximum_particle_curve_keys) {
+            if (curve.keys.empty()) curve.keys = {{0.0, 1.0}, {1.0, 1.0}};
+            const auto [time, value] = from_screen(mouse);
+            curve.keys.push_back({time, value});
+            std::stable_sort(curve.keys.begin(), curve.keys.end(), [](const auto& a, const auto& b) { return a.time < b.time; });
+            if (curve.keys.size() > maximum_particle_curve_keys) curve.keys.resize(maximum_particle_curve_keys);
+            changed = true;
+        }
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && near) {
+            curve.keys.erase(curve.keys.begin() + static_cast<std::ptrdiff_t>(*near));
+            changed = true;
+        } else if (ImGui::BeginPopupContextItem("##curve_presets")) {
+            const auto preset = [&](const char* name, std::vector<ParticleCurveKey> keys) {
+                if (ImGui::MenuItem(name)) {
+                    curve.keys = std::move(keys);
+                    changed = true;
+                }
+            };
+            preset("Constant", {});
+            preset("Grow", {{0.0, 0.0}, {1.0, 1.0}});
+            preset("Shrink", {{0.0, 1.0}, {1.0, 0.0}});
+            preset("Grow, then shrink", {{0.0, 0.0}, {0.2, 1.0}, {1.0, 0.0}});
+            preset("Pop in", {{0.0, 0.0}, {0.1, 1.0}, {1.0, 1.0}});
+            ImGui::EndPopup();
+        }
+        if (hovered && !particle_key_drag)
+            ImGui::SetTooltip("%s\nDouble-click to add a key, drag keys, right-click a key to remove it,\n"
+                              "or right-click the graph for presets. Left is birth, right is death.",
+                              curve.keys.empty() ? "1 throughout" : "");
+        ImGui::PopID();
+        return changed;
+    }
+
+    // A gradient over a particle's life: click a key to edit its color below, drag it along,
+    // double-click the bar to add one, right-click one to remove it, or right-click for presets.
+    bool particle_gradient_edit(const char* label, ParticleGradient& gradient, const std::string& key) {
+        const auto& palette = editor_palette();
+        ImGui::PushID(key.c_str());
+        inspector_field_label(label);
+        const float width = std::max(ImGui::CalcItemWidth(), 80.0F * ui_scale);
+        const float bar = 18.0F * ui_scale, marker = 9.0F * ui_scale;
+        const auto low = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##gradient", ImVec2(width, bar + marker));
+        note_item(key);
+        const bool hovered = ImGui::IsItemHovered();
+        auto* list = ImGui::GetWindowDrawList();
+        const ImVec2 bar_high(low.x + width, low.y + bar);
+        draw_checkerboard(list, low, bar_high, 5.0F * ui_scale);
+        constexpr int slices = 48;
+        for (int slice = 0; slice < slices; ++slice) {
+            const float x0 = low.x + width * static_cast<float>(slice) / slices;
+            const float x1 = low.x + width * static_cast<float>(slice + 1) / slices;
+            const auto a = gradient.sample(static_cast<double>(slice) / slices);
+            const auto b = gradient.sample(static_cast<double>(slice + 1) / slices);
+            list->AddRectFilledMultiColor(ImVec2(x0, low.y), ImVec2(x1, bar_high.y), particle_color_u32(a),
+                                          particle_color_u32(b), particle_color_u32(b), particle_color_u32(a));
+        }
+        list->AddRect(low, bar_high, palette.border);
+        auto& selected = particle_gradient_selected[selection + ':' + key];
+        const auto mouse = ImGui::GetIO().MousePos;
+        const auto marker_x = [&](double time) { return low.x + static_cast<float>(time) * width; };
+        std::optional<std::size_t> near;
+        for (std::size_t index = 0; index < gradient.keys.size(); ++index)
+            if (hovered && std::abs(marker_x(gradient.keys[index].time) - mouse.x) < 6.0F * ui_scale) near = index;
+        for (std::size_t index = 0; index < gradient.keys.size(); ++index) {
+            const float x = marker_x(gradient.keys[index].time);
+            const ImVec2 tip(x, bar_high.y), left(x - marker * 0.6F, bar_high.y + marker), right(x + marker * 0.6F, bar_high.y + marker);
+            auto color = gradient.keys[index].color;
+            color.a = 1.0;
+            list->AddTriangleFilled(tip, right, left, particle_color_u32(color));
+            list->AddTriangle(tip, right, left, index == selected ? palette.accent_hovered : palette.text_dim,
+                              (index == selected ? 2.0F : 1.0F) * ui_scale);
+        }
+        bool changed = false;
+        const bool dragging = particle_key_drag && particle_key_drag->key == key;
+        if (ImGui::IsItemActivated() && near) {
+            selected = *near;
+            particle_key_drag = ParticleKeyDrag{key, *near, 1.0};
+            inspector_gesture = ++gesture_serial;
+        }
+        if (dragging && ImGui::IsItemActive() && particle_key_drag->index < gradient.keys.size() &&
+            ImGui::GetIO().MouseDelta.x != 0.0F) {
+            const auto index = particle_key_drag->index;
+            const double time = std::clamp(static_cast<double>((mouse.x - low.x) / width), 0.0, 1.0);
+            const double earliest = index == 0U ? 0.0 : gradient.keys[index - 1U].time;
+            const double latest = index + 1U == gradient.keys.size() ? 1.0 : gradient.keys[index + 1U].time;
+            gradient.keys[index].time = std::clamp(time, earliest, latest);
+            pending_gesture = inspector_gesture;
+            changed = true;
+        }
+        if (dragging && !ImGui::IsItemActive()) particle_key_drag.reset();
+        if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !near &&
+            gradient.keys.size() < maximum_particle_curve_keys) {
+            if (gradient.keys.empty()) gradient.keys = {{0.0, {}}, {1.0, {}}};
+            const double time = std::clamp(static_cast<double>((mouse.x - low.x) / width), 0.0, 1.0);
+            gradient.keys.push_back({time, gradient.sample(time)});
+            std::stable_sort(gradient.keys.begin(), gradient.keys.end(), [](const auto& a, const auto& b) { return a.time < b.time; });
+            if (gradient.keys.size() > maximum_particle_curve_keys) gradient.keys.resize(maximum_particle_curve_keys);
+            for (std::size_t index = 0; index < gradient.keys.size(); ++index)
+                if (gradient.keys[index].time == time) selected = index;
+            changed = true;
+        }
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && near) {
+            gradient.keys.erase(gradient.keys.begin() + static_cast<std::ptrdiff_t>(*near));
+            changed = true;
+        } else if (ImGui::BeginPopupContextItem("##gradient_presets")) {
+            const auto preset = [&](const char* name, std::vector<ParticleGradientKey> keys) {
+                if (ImGui::MenuItem(name)) {
+                    gradient.keys = std::move(keys);
+                    selected = 0U;
+                    changed = true;
+                }
+            };
+            preset("White", {});
+            preset("Fade out", {{0.0, {1, 1, 1, 1}}, {1.0, {1, 1, 1, 0}}});
+            preset("Fade in and out", {{0.0, {1, 1, 1, 0}}, {0.2, {1, 1, 1, 1}}, {0.7, {1, 1, 1, 1}}, {1.0, {1, 1, 1, 0}}});
+            preset("Fire", {{0.0, {1, 0.95, 0.7, 0}}, {0.1, {1, 0.85, 0.4, 1}}, {0.5, {1, 0.4, 0.08, 0.8}},
+                            {1.0, {0.35, 0.05, 0.02, 0}}});
+            preset("Smoke", {{0.0, {1, 1, 1, 0}}, {0.25, {1, 1, 1, 0.6}}, {1.0, {1, 1, 1, 0}}});
+            ImGui::EndPopup();
+        }
+        if (hovered && !particle_key_drag)
+            ImGui::SetTooltip("Multiplies each particle's color and alpha from birth (left) to death (right).\n"
+                              "Click a key to edit it, drag it along, double-click to add one, right-click\n"
+                              "a key to remove it, or right-click the bar for presets.");
+        // The selected key's color and time.
+        if (selected < gradient.keys.size()) {
+            auto& chosen = gradient.keys[selected];
+            ImGui::PushID(static_cast<int>(selected));
+            if (ui_color_edit("Key color", chosen.color)) changed = true;
+            double time = chosen.time;
+            if (drag_scalar("Key time", time, 0.005F, "%.2f")) {
+                const double earliest = selected == 0U ? 0.0 : gradient.keys[selected - 1U].time;
+                const double latest = selected + 1U == gradient.keys.size() ? 1.0 : gradient.keys[selected + 1U].time;
+                chosen.time = std::clamp(time, earliest, latest);
+                changed = true;
+            }
+            ImGui::PopID();
+        }
+        ImGui::PopID();
+        return changed;
+    }
+
+    bool particle_bursts_edit(std::vector<ParticleBurst>& bursts, const std::string& key) {
+        const auto& palette = editor_palette();
+        bool changed = false;
+        ImGui::PushID(key.c_str());
+        ImGui::TextColored(editor_color(palette.text_dim), "Bursts");
+        if (!bursts.empty() &&
+            ImGui::BeginTable("##bursts", 6, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerH)) {
+            for (const char* heading : {"Time", "Count", "Cycles", "Interval", "Chance"}) ImGui::TableSetupColumn(heading);
+            ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
+            ImGui::TableHeadersRow();
+            std::optional<std::size_t> removed;
+            for (std::size_t index = 0; index < bursts.size(); ++index) {
+                auto& burst = bursts[index];
+                ImGui::PushID(static_cast<int>(index));
+                ImGui::TableNextRow();
+                const auto cell = [&](const char* id, double& value, float speed, const char* format, double low, double high) {
+                    ImGui::TableNextColumn();
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (drag_scalar(id, value, speed, format)) {
+                        value = std::clamp(value, low, high);
+                        changed = true;
+                    }
+                };
+                double count = burst.count, cycles = burst.cycles;
+                cell("##time", burst.time, 0.01F, "%.2f s", 0.0, 3600.0);
+                cell("##count", count, 0.5F, "%.0f", 0.0, maximum_particles_per_emitter);
+                cell("##cycles", cycles, 0.1F, cycles == 0.0 ? "all" : "%.0f", 0.0, 10000.0);
+                cell("##interval", burst.interval, 0.01F, "%.2f s", 0.01, 3600.0);
+                cell("##chance", burst.probability, 0.005F, "%.2f", 0.0, 1.0);
+                burst.count = static_cast<std::int32_t>(std::lround(count));
+                burst.cycles = static_cast<std::int32_t>(std::lround(cycles));
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton("x")) removed = index;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove this burst");
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+            if (removed) {
+                bursts.erase(bursts.begin() + static_cast<std::ptrdiff_t>(*removed));
+                changed = true;
+            }
+        }
+        ImGui::BeginDisabled(bursts.size() >= maximum_particle_bursts);
+        if (ImGui::Button("+ Add burst")) {
+            ParticleBurst burst;
+            if (!bursts.empty()) burst.time = std::min(3600.0, bursts.back().time + 0.5);
+            bursts.push_back(burst);
+            changed = true;
+        }
+        ImGui::EndDisabled();
+        note_item(key + ":add");
+        if (bursts.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(editor_color(palette.text_faint), "Groups of particles at set times");
+        }
+        ImGui::PopID();
+        return changed;
+    }
+
+    // One emitter field, drawn from the reflection table.
+    void draw_particle_field(const std::size_t index, const JsonValue::Object& values, const JsonValue::Object& entity) {
+        const auto& info = particle_fields()[index];
+        const std::string name(info.name);
+        const auto key = "inspector:particle_emitter:" + name;
+        const auto label = field_display_name(name);
+        auto value = particle_json_value(index, values);
+        const auto send = [&](const ParticleValue& next) {
+            std::string error;
+            if (!check_particle_value(info, next, error)) return;
+            set_particle_values('"' + name + "\":" + particle_value_json(next), "Particle emitter " + label + " changed");
+        };
+        const double range = info.maximum - info.minimum;
+        const float speed = info.type == ParticleFieldType::integer ? 0.2F
+                            : range <= 1.0                           ? 0.005F
+                            : range <= 20.0                          ? 0.02F
+                            : range <= 400.0                         ? 0.1F
+                                                                     : 0.5F;
+        const char* format = info.type == ParticleFieldType::integer ? "%.0f" : range <= 1.0 ? "%.3f" : "%.2f";
+        switch (info.type) {
+        case ParticleFieldType::boolean: {
+            bool flag = std::get<bool>(value);
+            if (inspector_checkbox(label.c_str(), &flag)) send(flag);
+            break;
+        }
+        case ParticleFieldType::number:
+        case ParticleFieldType::integer: {
+            double number = std::get<double>(value);
+            if (drag_scalar(label.c_str(), number, speed, format)) {
+                number = std::clamp(number, info.minimum, info.maximum);
+                if (info.type == ParticleFieldType::integer) number = std::round(number);
+                send(number);
+            }
+            break;
+        }
+        case ParticleFieldType::vec3: {
+            const auto vector = std::get<Vec3>(value);
+            std::array<double, 3> numbers{vector.x, vector.y, vector.z};
+            if (drag_numbers(label.c_str(), {"X", "Y", "Z"}, numbers.data(), speed, format)) {
+                for (auto& number : numbers) number = std::clamp(number, info.minimum, info.maximum);
+                send(Vec3{numbers[0], numbers[1], numbers[2]});
+            }
+            break;
+        }
+        case ParticleFieldType::range: {
+            const auto pair = std::get<ParticleRange>(value);
+            std::array<double, 2> numbers{pair.min, pair.max};
+            if (const auto mask = drag_numbers(label.c_str(), {"Min", "Max"}, numbers.data(), speed, format)) {
+                for (auto& number : numbers) number = std::clamp(number, info.minimum, info.maximum);
+                // Dragging one end past the other carries it along.
+                if (numbers[0] > numbers[1]) (mask & 1U ? numbers[1] : numbers[0]) = mask & 1U ? numbers[0] : numbers[1];
+                send(ParticleRange{numbers[0], numbers[1]});
+            }
+            break;
+        }
+        case ParticleFieldType::color: {
+            auto color = std::get<UiColor>(value);
+            if (ui_color_edit(label.c_str(), color)) send(color);
+            break;
+        }
+        case ParticleFieldType::choice: {
+            const auto& current = std::get<std::string>(value);
+            if (inspector_begin_combo(label.c_str(), choice_label(current).c_str())) {
+                for (const auto choice : info.choices) {
+                    const bool chosen = choice == current;
+                    if (ImGui::Selectable(choice_label(choice).c_str(), chosen) && !chosen) send(std::string(choice));
+                    note_item(key + ':' + std::string(choice));
+                    if (chosen) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            break;
+        }
+        case ParticleFieldType::asset: {
+            const auto path = std::get<std::string>(value);
+            const auto handle = selection;
+            asset_field(
+                label.c_str(), path, key,
+                [=, this] {
+                    AssetPick pick;
+                    pick.key = key;
+                    pick.title = "Choose a particle texture";
+                    pick.current = path;
+                    pick.kinds = {"image"};
+                    pick.accepts = [](const std::string& file) { return valid_ui_asset_path(file, {"image"}); };
+                    pick.what = "a PNG or JPEG image";
+                    pick.choices.push_back({"", "Built-in", AssetIcon::other, "", "", std::nullopt});
+                    pick.choose = [this, handle, name](const std::string& chosen) {
+                        mutate("scene.set_particle_emitter",
+                               entity_field(handle) + ",\"values\":{\"" + name + "\":\"" + json_escape(chosen) + "\"}",
+                               chosen.empty() ? "Particle texture cleared" : "Particle texture chosen");
+                    };
+                    return pick;
+                },
+                "Built-in", AssetIcon::image);
+            break;
+        }
+        case ParticleFieldType::text: {
+            // The sub emitter: one of this node's emitters_below with an emitter of its own.
+            const auto& current = std::get<std::string>(value);
+            std::vector<std::string> emitters_below;
+            for (const auto* other : entities)
+                if (string_or(*other, "parent") == selection && component(*other, "particle_emitter"))
+                    emitters_below.push_back(string_or(*other, "name"));
+            const bool missing = !current.empty() && std::find(emitters_below.begin(), emitters_below.end(), current) == emitters_below.end();
+            const auto shown = current.empty() ? std::string("None") : missing ? current + " (missing)" : current;
+            if (inspector_begin_combo(label.c_str(), shown.c_str())) {
+                if (ImGui::Selectable("None", current.empty()) && !current.empty()) send(std::string{});
+                for (const auto& child : emitters_below)
+                    if (ImGui::Selectable(child.c_str(), child == current) && child != current) send(child);
+                if (emitters_below.empty()) ImGui::TextDisabled("Add a child Particle Emitter first");
+                ImGui::EndCombo();
+            }
+            break;
+        }
+        case ParticleFieldType::curve: {
+            auto curve = std::get<ParticleCurve>(value);
+            if (particle_curve_edit(label.c_str(), curve, info.maximum, key)) send(curve);
+            break;
+        }
+        case ParticleFieldType::gradient: {
+            auto gradient = std::get<ParticleGradient>(value);
+            if (particle_gradient_edit(label.c_str(), gradient, key)) send(gradient);
+            break;
+        }
+        case ParticleFieldType::bursts: {
+            auto bursts = std::get<std::vector<ParticleBurst>>(value);
+            if (particle_bursts_edit(bursts, key)) send(bursts);
+            break;
+        }
+        }
+        if (info.type != ParticleFieldType::curve && info.type != ParticleFieldType::gradient &&
+            info.type != ParticleFieldType::bursts && info.type != ParticleFieldType::asset)
+            note_item(key);
+        if (!info.description.empty() && info.type != ParticleFieldType::curve &&
+            info.type != ParticleFieldType::gradient && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("%s", std::string(info.description).c_str());
+        (void)entity;
+    }
+
+    void draw_particle_emitter_section(const JsonValue::Object& entity) {
+        const auto* values = component(entity, "particle_emitter");
+        if (!values || !component_header("Particle emitter", "particle_emitter")) return;
+        const auto& palette = editor_palette();
+        // The emitter as stored, to decide which fields apply.
+        ParticleEmitter emitter;
+        {
+            std::string error;
+            (void)read_particle_emitter(JsonValue{*values}, emitter, error);
+        }
+        // Preview controls: in the editor every emitter plays, so the effect shows as it is tuned.
+        const auto* status_object = particle_status.object();
+        const JsonValue::Object* status = nullptr;
+        if (const auto* list = status_object ? field(*status_object, "emitters") : nullptr; list && list->array())
+            for (const auto& item : *list->array())
+                if (const auto* object = item.object(); object && string_or(*object, "entity") == selection) status = object;
+        const bool game = status_object && string_or(*status_object, "mode") == "game";
+        const bool paused = status && boolean_or(*status, "paused", false);
+        const bool playing = status && boolean_or(*status, "playing", false);
+        const auto control = [&](const char* action, const char* message) {
+            if (call("particles.control", entity_field(selection) + ",\"action\":\"" + action + '"')) set_status(message, false);
+            refresh_particle_status();
+        };
+        const float button = 78.0F * ui_scale;
+        if (ImGui::Button(paused ? "Resume" : playing ? "Pause" : "Play", ImVec2(button, 0.0F))) {
+            if (paused) control("resume", "Particles resumed");
+            else if (playing) control("pause", "Particles paused");
+            else control("play", "Particles playing");
+        }
+        note_item("inspector:particles:play");
+        ImGui::SameLine();
+        if (ImGui::Button("Restart", ImVec2(button, 0.0F))) control("restart", "Particles restarted");
+        note_item("inspector:particles:restart");
+        ImGui::SameLine();
+        if (ImGui::Button("Stop", ImVec2(button, 0.0F))) control("stop", "Particles stopped");
+        note_item("inspector:particles:stop");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stop emitting; the particles alive finish their lives");
+        ImGui::SameLine();
+        if (ImGui::Button("Burst", ImVec2(button * 0.8F, 0.0F))) {
+            if (call("particles.control", entity_field(selection) + ",\"action\":\"emit\",\"count\":30"))
+                set_status("30 particles emitted", false);
+            refresh_particle_status();
+        }
+        note_item("inspector:particles:burst");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Emit 30 particles now, from the shape");
+        if (status) {
+            const auto count = static_cast<long long>(number_or(*status, "particles", 0.0));
+            ImGui::TextColored(editor_color(palette.text_dim), "%lld particle%s  ·  %.1f s%s%s", count,
+                               count == 1 ? "" : "s", number_or(*status, "time", 0.0),
+                               boolean_or(*status, "sub_emitter", false) ? "  ·  sub emitter" : "",
+                               game ? "" : "  ·  editor preview");
+        }
+        note_item("inspector:particles:status");
+        static constexpr std::array<std::pair<std::string_view, const char*>, 10> groups{{
+            {"emitter", "Emitter"}, {"emission", "Emission"}, {"shape", "Shape"}, {"particle", "Start"},
+            {"motion", "Motion"}, {"lifetime", "Over lifetime"}, {"collision", "Collision"},
+            {"sheet", "Flipbook"}, {"renderer", "Renderer"}, {"sub_emitter", "Sub emitter"}}};
+        const auto& fields = particle_fields();
+        for (const auto& [group, title] : groups) {
+            const bool open_by_default = group == "emitter" || group == "emission" || group == "shape" ||
+                                         group == "particle" || group == "lifetime" || group == "renderer";
+            ImGui::PushID(title);
+            const bool open = ImGui::TreeNodeEx(title, ImGuiTreeNodeFlags_SpanAvailWidth |
+                                                           (open_by_default ? ImGuiTreeNodeFlags_DefaultOpen : 0));
+            note_item(std::string("inspector:particles:group:") + std::string(group));
+            if (open) {
+                for (std::size_t index = 0; index < fields.size(); ++index)
+                    if (fields[index].group == group && particle_field_shown(fields[index].name, emitter))
+                        draw_particle_field(index, *values, entity);
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+    }
+
     void draw_reverb_zone_section(const JsonValue::Object& entity) {
         const auto* zone = component(entity, "reverb_zone");
         if (!zone || !component_header("Reverb zone", "reverb_zone")) return;
@@ -7075,6 +7757,7 @@ struct EditorUi::Impl {
         section("audio_listener", [&] { draw_audio_listener_section(); });
         section("reverb_zone", [&] { draw_reverb_zone_section(*entity); });
         section("music_player", [&] { draw_music_player_section(*entity); });
+        section("particle_emitter", [&] { draw_particle_emitter_section(*entity); });
         if (const auto* scripts = field(*entity, "scripts"); scripts && scripts->array() &&
             !scripts->array()->empty())
             draw_script_sections(*entity);
@@ -7664,7 +8347,8 @@ struct EditorUi::Impl {
                              ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y * 2.0F;
         if (ImGui::BeginChild("##component_categories", ImVec2(150.0F * ui_scale, -footer),
                               ImGuiChildFlags_Borders)) {
-            for (const std::string category : {"All", "Rendering", "Physics", "Animation", "Scripts"}) {
+            for (const std::string category :
+                 {"All", "Rendering", "Effects", "Physics", "Audio", "UI", "Animation", "Scripts"}) {
                 const auto count = std::count_if(items.begin(), items.end(), [&](const Item& item) {
                     return category == "All" || item.category == category;
                 });

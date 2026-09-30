@@ -9,7 +9,7 @@ overview for visitors. Protocol details belong in [`docs/protocol.md`](docs/prot
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v50: 164 native methods. Scene v25, project v2, import manifest v3.
+- Protocol schema v51: 167 native methods. Scene v26, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
@@ -21,8 +21,10 @@ overview for visitors. Protocol details belong in [`docs/protocol.md`](docs/prot
   a Sky node (gradient or panorama sky material, sky lighting, sun and distance fog), and custom
   shaders (a GLSL-based language for surfaces and post processing, shader materials, a Shader
   Editor), and a game interface (Godot-style canvases, anchored controls, containers and widgets
-  drawn over the game view during Run Game only, an Interface editor panel, `on_ui` for scripts)
-  are implemented. Preserve unrelated working-tree
+  drawn over the game view during Run Game only, an Interface editor panel, `on_ui` for scripts),
+  and particle emitters (a ParticleEmitter node: shapes, rate, distance and burst emission, forces,
+  turbulence, plane and world collisions, sub emitters, curves, gradients and flipbooks, drawn as
+  sorted, soft, optionally lit sprites and previewed live in the editor) are implemented. Preserve unrelated working-tree
   edits and inspect `git diff` before changing them.
 
 ## Product intent
@@ -314,7 +316,7 @@ without blocking simultaneous human editing.
   cannot be removed. A camera added to a scene without an active camera becomes active.
 - Node types are a tree in `src/scene/node_types.cpp`: Node > Model, PhysicsBody
   (> RigidBody, StaticBody), Camera, Sky, Light (> DirectionalLight, PointLight, SpotLight),
-  StaticMesh, AudioSource, ReverbZone, MusicPlayer, PostProcess. Each type
+  StaticMesh, AudioSource, ReverbZone, MusicPlayer, PostProcess, ParticleEmitter. Each type
   adds components to its parent's; `apply_node_type` applies them root first when
   `scene.create` receives a `type`. Light, PhysicsBody and Model are not creatable (Model comes
   from import). `node_type()` walks down the tree taking the first child whose own additions the
@@ -986,6 +988,82 @@ Phase 3:
   `relay_build_demo_project --add-interface [root]` adds or replaces the HUD in an existing demo;
   the full generator builds it too.
 
+### Particles
+
+- Data (`include/relay/scene/particles.hpp`, `src/scene/particles.cpp`): `EntityRecord::particle_emitter`
+  (`ParticleEmitter`, scene v26 key `particle_emitter`, stable id 0x1f, component id
+  `particle_emitter` in category Effects, creatable node type `ParticleEmitter` before Canvas).
+  About 70 fields in groups (emitter, emission, shape, particle, motion, collision, lifetime, sheet,
+  renderer, sub_emitter), each described once in `particle_fields()` (name, `ParticleFieldType`,
+  group, range, choices, description) with typed accessors, like `ui_components()`: scene files
+  (every field; left out loads as default, unknown is an error), `scene.set_particle_emitter`
+  `values`, `component.types` (type, group, range, choices, default), script field access and the
+  Inspector all go through it. Value types add `ParticleRange` ([min, max] or one number),
+  `ParticleCurve` ([[time, value]], empty is 1, linear, sorted on read), `ParticleGradient`
+  ([[time, r, g, b, a]] sRGB, empty is white) and bursts ({time, count, cycles 0 = all cycle,
+  interval, probability}); curves and gradients hold at most 8 keys, bursts at most 8.
+  `color_alt` is used only with `random_color` (a white default mixed in washed out every color).
+- Simulation (`include/relay/particles/particle_system.hpp`, `src/particles/particle_system.cpp`,
+  `Engine::particles()`): per emitter state keyed by entity (first-seen order), copying the
+  component every update so edits apply live. `Engine::tick` in Editor mode calls
+  `update(scene, step, false)` (every non-sub emitter previews; one-shots replay 1 s after they
+  finish unless stopped by hand); game steps call it with `game` true after contact callbacks, with
+  `PhysicsWorld::raycast` for world collisions. Run Game and Stop Game `reset()`. Emission: rate over
+  the step's slice of the clock (carry kept, a 1e-9 nudge so whole counts are not lost), bursts by
+  whole cycle index (a float cycle index once stalled on 1.4 s cycles), rate over distance along the
+  node's path; new particles are placed between the previous and current world transform and live
+  only their share of the birth step, so streams from moving nodes stay even. PCG32 seeded from the
+  seed (or the node index for 0) and play count; Perlin turbulence as a displacement velocity.
+  Forces act in world space (turned into local space for local emitters), drag is exponential.
+  Plane and world collisions reflect with bounce/friction and lifetime loss; with more colliding
+  particles than 4096 rays per step each is tested every `stride` steps along the path since.
+  Sub emitters: a named direct child with an emitter; it never emits by itself and spawns its count
+  from its own shape at death/collision/birth events, processed after all emitters. Destroyed
+  nodes' particles finish during the game (orphans, at most 60 s) and vanish in the editor. Caps:
+  100,000 per emitter, 1,000,000 total (oldest of the largest trimmed). Prewarm simulates the last
+  min(duration, lifetime max, 30 s) of a cycle at 30 Hz.
+- Draw list: `render_list(scene, view, alpha)` builds world-space `ParticleSprite`s (64 bytes,
+  std430) per `ParticleBatch` (texture, blend, alignment, lit, soft distance, flipbook, local axes),
+  positions blended between steps by `alpha` (`Engine::particle_render_list` passes 1 while paused),
+  sizes and colors from the life curves (colors linear times `emission`), sorted within the batch
+  (distance, oldest, youngest) and batches far to near. Textures: `UiImageCache` for project files
+  (warnings once each), `builtin_particle_texture` for seven textures drawn in code (128²).
+- Vulkan (`vulkan_window.cpp`, `shaders/particle.vert/frag`): `VulkanWindow::set_particle_source`
+  (called in every view with the camera position and forward; `connect_particles` in `main.cpp`,
+  with the live loop's step fraction). `prepare_particles` runs before the forward pass: sRGB
+  textures with CPU mip chains (alpha-weighted linear box filter) through a per-frame staging
+  buffer, a per-frame sprite storage buffer and frame UBO (view-projection, its inverse, camera
+  axes from the view matrix rows, extent). `draw_particles` draws after transparent geometry and
+  before post processing: set 0 scene bindings, set 1 the composite set (depth for soft particles;
+  `update_composite_descriptors` now also runs for particles), set 2 frame/sprites, set 3 the
+  texture; six vertices per instance with `firstInstance` as the batch offset; push constants carry
+  alignment, local axes, flipbook, soft distance, blend and lit. One premultiplied blend state
+  serves alpha (covering), additive (alpha 0) and premultiplied textures; depth test on, no depth
+  writes. Lit particles use `direct_lighting` and `ambient_diffuse` with a sphere normal across the
+  sprite; all fog like transparent surfaces (additive fades out). `--vulkan-scene-capture` steps
+  particles once per captured frame.
+- Protocol: `scene.set_particle_emitter` (values, attached, gesture), `particles.status`
+  (read-only; mode, total and per emitter playing/paused/sub/orphan/particles/time/cycle),
+  `particles.control` (play, restart, stop, clear, pause, resume, emit with count; works in the
+  editor and during the game, not undoable). Scripts: `RelayHostApi` appends `particles_play`,
+  `_stop`, `_pause`, `_emit`, `_count`, `_playing`, `_get_numbers`, `_set_numbers`, `_set_text`;
+  SDK `Entity::play_particles`, `stop_particles`, `pause_particles`, `emit_particles`,
+  `particle_count`, `particles_playing`, `set_particles`, `particle_numbers`.
+- Editor: the Particle emitter Inspector section (Pause/Resume, Restart, Stop, Burst and a status
+  line from `particles.status`, polled with the other refreshes; tree groups, the first ones open;
+  fields hidden when irrelevant via `particle_field_shown`; a curve editor, a gradient editor with a
+  selected key's color and time, a bursts table, sub emitter picker of named children, texture
+  asset field), a selected emitter's shape outline and an orange sparkle marker in
+  `draw_scene_nodes`. Add Component's categories gained Effects, Audio and UI (the last two were
+  missing from its list).
+- Demo: `relay_build_demo_project --add-particles [root]` (also part of the full build) adds a
+  Campfire at (-3.4, 0, 3.9) under the warm fill light (stones, crossed logs, glowing coals,
+  alpha-blended HDR flames, stretched additive embers, lit smoke drifting on the wind), a Fireworks
+  launcher at (7, 0.25, -6) (a rocket every 1.4 s bursting through the `Burst` sub emitter) and a
+  gold `Trail` (rate over distance) under the Ball template. Additive flames washed out over the
+  bright ground in daylight, hence alpha blending with emission 3.5; thin spark sprites vanish at
+  20 m, hence star sprites for the burst.
+
 ### Protocol and authorization
 
 - `protocol/relay.protocol.json` is the source of truth. `tools/generate_protocol.py` produces the
@@ -1155,6 +1233,15 @@ Phase 3:
    parent's axes in the Interface editor. Layout and draw lists are rebuilt from the scene every
    frame and step (fine for HUD-sized interfaces; nothing is cached by revision yet).
 
+19. Particles have engine, workflow, compiled-script and headless-editor coverage and offscreen
+   Vulkan checks on RADV; the Inspector section and live editor preview have not been used on a
+   desktop. Particles simulate on the CPU; they are drawn after all transparent meshes (no
+   interleaving), cast no shadows, write no motion vectors (motion blur smears them with what is
+   behind), and are not in GI or ray traced reflections. Editor previews do not collide with the
+   world. There are no ribbons or trails, mesh particles, GPU simulation, attractors, per-burst
+   colors or particle lights, and emitter transforms are not interpolated between steps for
+   local-space particles. The demo effects were tuned from offscreen captures only.
+
 ## Next priorities
 
 0. A desktop listening pass for audio, to tune the demo's levels, occlusion strength, zone
@@ -1281,6 +1368,22 @@ track drag; the joint, audio, music, sky and post-processing tests choose throug
 `tests/ui_snapshot.hpp` now samples each draw's own texture and encodes sRGB like the swapchain, so
 snapshots show thumbnails and the real brightness.
 
+Particles are covered by the engine suite (every field's JSON round trip, refusals, curves and
+gradients, scene v26 files, the node type and component, rate, max particles, bursts including
+1.4 s cycles stepped at 60 Hz, one-shots, sphere/box/shell/cone shapes, gravity, plane collisions
+and lifetime loss, world and local space, rate over distance, death sub emitters, editor preview
+versus play_on_start, play/emit/stop/clear, prewarm, seeds, the draw list's order, curves and
+brightness, built-in textures, and the engine's preview, Run Game reset, orphans and Stop Game),
+the workflow suite (`scene.set_particle_emitter`, refusals, undo and gestures, `component.types`
+fields, `particles.status` and `particles.control` in the editor and the game, save and load), the
+script suite (a compiled script playing, bursting, retuning and stopping an emitter, refusals,
+Stop Game restoring it), the headless editor suite (`particles_ui`: shape fields, a Rate drag as
+one undo step, curve and gradient keys, Add burst, Stop, Burst, Restart; a
+`particle-inspector.png` snapshot) and `relay_lighting_render_tests` (additive, alpha and lit
+particles in front of the demo camera, compared with the same view without them). With the demo's
+committed player position the whole script suite, including the play-test that throws trailed
+balls, passes with the demo's particle effects.
+
 The game interface is covered by the engine suite (reflection round trips, validation, presets,
 node types and ordering, scene v25 files, canvas scaling, anchors, a vertical box with ordering,
 expansion and placement, hit testing, container minimum sizes, CPU-rasterized panel fill, border,
@@ -1335,6 +1438,7 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Sky and fog | `src/render/sky.cpp`, `include/relay/render/sky.hpp`, `RenderSky` in `scene_render.hpp`, `shaders/sky.frag`, Sky section in `src/editor/editor_ui.cpp` |
 | Asset Browser and reference fields | `asset_field`…`draw_asset_browser` in `src/editor/editor_ui.cpp`, `src/editor/asset_thumbnails.cpp`, `src/render/asset_thumbnail.cpp`, `src/editor/editor_widgets.cpp` (icons, checkbox, slider) |
 | Frame profiler | `src/observe/profiler.cpp`, `include/relay/observe/profiler.hpp`, Profiler panel in `src/editor/editor_ui.cpp` |
+| Particles | `include/relay/scene/particles.hpp`, `src/scene/particles.cpp`, `src/particles/`, `include/relay/particles/`, `shaders/particle.*`, the particle pass in `src/platform/vulkan_window.cpp`, the Particle emitter section in `src/editor/editor_ui.cpp`, `docs/particles.md` |
 | Game interface | `include/relay/scene/ui.hpp`, `src/scene/ui.cpp`, `src/ui/`, `include/relay/ui/`, `shaders/ui.*`, the UI pass in `src/platform/vulkan_window.cpp`, `src/editor/interface_preview.cpp`, Inspector UI sections and the Interface panel in `src/editor/editor_ui.cpp`, `third_party/inter/`, `docs/interface.md` |
 | Native tests | `tests/engine_tests.cpp`, `tests/script_tests.cpp`, `tests/editor_*tests.cpp` |
 | Bridge tests | `tools/mcp-bridge/tests/` |

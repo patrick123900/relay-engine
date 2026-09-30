@@ -952,6 +952,41 @@ std::string ControlProtocol::handle(const std::string_view request) {
     if (method == "audio.status") {
         return response_prefix(id) + engine_.audio().status_json(engine_.scene()) + '}';
     }
+    if (method == "particles.status") {
+        std::optional<Entity> only;
+        if (const auto text = optional_string_field(request, "entity")) {
+            only = Entity::parse(*text);
+            if (!only || !engine_.scene().contains(*only)) return error_response(id, "invalid or stale entity");
+            const auto* record = engine_.scene().get(*only);
+            if (!record->particle_emitter) return error_response(id, "the node has no particle emitter");
+        }
+        return response_prefix(id) + engine_.particles().status_json(engine_.scene(), only) + '}';
+    }
+    if (method == "particles.control") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity)) return error_response(id, "invalid or stale entity");
+        if (!engine_.scene().get(*entity)->particle_emitter)
+            return error_response(id, "the node has no particle emitter");
+        auto& particles = engine_.particles();
+        const auto action = string_field(request, "action");
+        std::size_t born = 0;
+        if (action == "play") (void)particles.play(engine_.scene(), *entity);
+        else if (action == "restart") (void)particles.play(engine_.scene(), *entity, true);
+        else if (action == "stop" || action == "clear") {
+            if (!particles.status(*entity)) (void)particles.play(engine_.scene(), *entity);
+            (void)particles.stop(*entity, action == "clear");
+        } else if (action == "pause" || action == "resume") {
+            if (!particles.status(*entity)) (void)particles.play(engine_.scene(), *entity);
+            (void)particles.set_paused(*entity, action == "pause");
+        } else if (action == "emit") {
+            born = particles.emit(engine_.scene(), *entity, static_cast<std::size_t>(unsigned_field(request, "count", 10U)));
+        } else {
+            return error_response(id, "unknown particle action");
+        }
+        std::string reply = particles.status_json(engine_.scene(), *entity);
+        if (action == "emit") reply.insert(1, "\"emitted\":" + std::to_string(born) + ',');
+        return response_prefix(id) + reply + '}';
+    }
     if (method == "audio.play") {
         const auto entity = Entity::parse(string_field(request, "entity"));
         if (!entity || !engine_.scene().contains(*entity))
@@ -2348,6 +2383,29 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }
+    if (method == "scene.set_particle_emitter") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        std::optional<ParticleEmitter> emitter;
+        const bool attached = boolean_field(request, "attached", true);
+        if (attached) {
+            emitter = engine_.scene().get(*entity)->particle_emitter.value_or(ParticleEmitter{});
+            JsonParser parser(request);
+            const auto parsed = parser.parse();
+            const auto* values = parsed && parsed->object() ? field(*parsed->object(), "values") : nullptr;
+            std::string error;
+            if (values && !apply_particle_values(*emitter, *values, error)) return error_response(id, error);
+        }
+        if (!engine_.scene_history().execute(
+                std::string(attached ? "Configure particle emitter " : "Remove particle emitter ") +
+                    entity->to_string(),
+                [&](Scene& scene) { return scene.set_particle_emitter(*entity, emitter); },
+                unsigned_field(request, "gesture", 0U)))
+            return error_response(id, "invalid particle emitter values");
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
     if (method == "scene.set_ui") {
         const auto entity = Entity::parse(string_field(request, "entity"));
         if (!entity || !engine_.scene().contains(*entity))
@@ -2431,6 +2489,33 @@ std::string ControlProtocol::handle(const std::string_view request) {
                         ui->attach(defaults, true);
                         return ui->get(defaults, item);
                     }()) << ",\"description\":\"" << escape_json(info.description) << "\"}";
+                }
+                output << ']';
+            }
+            // So does the particle emitter, as scene.set_particle_emitter takes them.
+            if (kind.id == "particle_emitter") {
+                static constexpr std::array<std::string_view, 12> types{
+                    "boolean", "number", "integer", "vec3",  "range",    "color",
+                    "choice",  "asset",  "text",    "curve", "gradient", "bursts"};
+                const ParticleEmitter defaults;
+                const auto& fields = particle_fields();
+                output << ",\"fields\":[";
+                for (std::size_t item = 0; item < fields.size(); ++item) {
+                    const auto& info = fields[item];
+                    output << (item ? "," : "") << "{\"name\":\"" << info.name << "\",\"type\":\""
+                           << types[static_cast<std::size_t>(info.type)] << "\",\"group\":\"" << info.group << '"';
+                    if (info.type != ParticleFieldType::boolean && info.type != ParticleFieldType::choice &&
+                        info.type != ParticleFieldType::asset && info.type != ParticleFieldType::color &&
+                        info.type != ParticleFieldType::gradient)
+                        output << ",\"minimum\":" << info.minimum << ",\"maximum\":" << info.maximum;
+                    if (!info.choices.empty()) {
+                        output << ",\"choices\":[";
+                        for (std::size_t name = 0; name < info.choices.size(); ++name)
+                            output << (name ? "," : "") << '"' << info.choices[name] << '"';
+                        output << ']';
+                    }
+                    output << ",\"default\":" << particle_value_json(particle_value(defaults, item))
+                           << ",\"description\":\"" << escape_json(info.description) << "\"}";
                 }
                 output << ']';
             }

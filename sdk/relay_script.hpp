@@ -317,6 +317,58 @@ public:
     [[nodiscard]] bool hovered() const { return (api().ui_state(api().context, handle_) & RELAY_UI_HOVERED) != 0; }
     [[nodiscard]] bool held() const { return (api().ui_state(api().context, handle_) & RELAY_UI_HELD) != 0; }
 
+    // The entity's particle emitter. play_particles starts its cycle (restart also clears the
+    // particles alive); stop_particles ends emission, letting the particles finish unless `clear`;
+    // emit_particles adds a burst now, from the emitter's shape, and returns how many were born.
+    //
+    //     explosion.emit_particles(80);
+    //     self().stop_particles();
+    bool play_particles(bool restart = false) const {
+        return api().particles_play(api().context, handle_, restart ? 1 : 0) != 0;
+    }
+    bool stop_particles(bool clear = false) const {
+        return api().particles_stop(api().context, handle_, clear ? 1 : 0) != 0;
+    }
+    bool pause_particles(bool paused = true) const {
+        return api().particles_pause(api().context, handle_, paused ? 1 : 0) != 0;
+    }
+    size_t emit_particles(size_t count) const { return api().particles_emit(api().context, handle_, count); }
+    [[nodiscard]] size_t particle_count() const { return api().particles_count(api().context, handle_); }
+    [[nodiscard]] bool particles_playing() const { return api().particles_playing(api().context, handle_) != 0; }
+    // Emitter fields by the names the Inspector shows: "rate", "gravity", "color" (sRGB red, green,
+    // blue, alpha), "speed" and other ranges (min, max), "acceleration" and other vectors, and
+    // choices or paths as text. Changes last until Stop Game.
+    //
+    //     torch.set_particles("rate", 80.0);
+    //     torch.set_particles("color", {1.0, 0.4, 0.1, 1.0});
+    //     torch.set_particles("blend", "additive");
+    bool set_particles(std::string_view field, double value) const { return set_particles(field, {value}); }
+    bool set_particles(std::string_view field, int value) const {
+        return set_particles(field, {static_cast<double>(value)});
+    }
+    bool set_particles(std::string_view field, bool value) const { return set_particles(field, {value ? 1.0 : 0.0}); }
+    bool set_particles(std::string_view field, Vec3 value) const {
+        return set_particles(field, {value.x, value.y, value.z});
+    }
+    bool set_particles(std::string_view field, std::initializer_list<double> values) const {
+        return api().particles_set_numbers(api().context, handle_, field.data(), field.size(), values.begin(),
+                                           values.size()) != 0;
+    }
+    bool set_particles(std::string_view field, std::string_view text) const {
+        return api().particles_set_text(api().context, handle_, field.data(), field.size(), text.data(),
+                                        text.size()) != 0;
+    }
+    bool set_particles(std::string_view field, const char* text) const {
+        return set_particles(field, std::string_view{text});
+    }
+    // A field's numbers (booleans read 0 or 1); empty without an emitter or for text fields.
+    [[nodiscard]] std::vector<double> particle_numbers(std::string_view field) const {
+        double values[4];
+        const size_t count =
+            api().particles_get_numbers(api().context, handle_, field.data(), field.size(), values, 4U);
+        return std::vector<double>(values, values + std::min<size_t>(count, 4U));
+    }
+
     // Enabled colliders touching this entity's enabled collider, sorted. Each side's layer must
     // be in the other's mask.
     [[nodiscard]] std::vector<Entity> overlaps() const {

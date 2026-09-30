@@ -985,6 +985,71 @@ void game_interface(relay::Engine& engine, relay::ControlProtocol& protocol) {
     scene.restore_state(earlier);
 }
 
+const char* sparks_source = R"(#include "relay_script.hpp"
+
+// Starts a waiting emitter, bursts from it, retunes it, and stops it after half a second.
+class Sparks : public relay::Behaviour {
+public:
+    void on_start() override {
+        const bool played = self().play_particles();
+        relay::world::log(std::string("played ") + (played && self().particles_playing() ? "yes" : "no"));
+        relay::world::log("burst " + std::to_string(self().emit_particles(12)));
+        self().set_particles("rate", 120.0);
+        self().set_particles("speed", {1.0, 2.0});
+        self().set_particles("color", {1.0, 0.5, 0.0, 1.0});
+        self().set_particles("blend", "additive");
+        if (!self().set_particles("rate", -3.0)) relay::world::log("negative refused");
+        if (!self().set_particles("sparkle", 1.0)) relay::world::log("unknown refused");
+        if (!self().set_particles("speed", {1.0, 2.0, 3.0})) relay::world::log("count refused");
+        const auto speed = self().particle_numbers("speed");
+        relay::world::log("speed " + std::to_string(speed.size()) + " " + std::to_string(static_cast<int>(speed[1])));
+    }
+    void on_update(double delta) override {
+        elapsed += delta;
+        if (!stopped && elapsed >= 0.5) {
+            stopped = true;
+            relay::world::log("alive " + std::string(self().particle_count() > 12 ? "many" : "few"));
+            self().stop_particles();
+            relay::world::log(std::string("stopped ") + (self().particles_playing() ? "no" : "yes"));
+        }
+    }
+private:
+    double elapsed = 0.0;
+    bool stopped = false;
+};
+RELAY_BEHAVIOUR(Sparks)
+)";
+
+void particle_scripts(relay::Engine& engine, relay::ControlProtocol& protocol) {
+    expect(ok(write_script(protocol, "sparks.cpp", sparks_source)) && ok(request(protocol, "scripts.build")) &&
+               wait_for_build(engine, protocol).find("\"state\":\"ready\"") != std::string::npos,
+           "the particle script builds");
+    auto& scene = engine.scene();
+    const auto earlier = scene.capture_state();
+    expect(ok(request(protocol, "scene.clear")), "start the particle scene empty");
+    const auto emitter = entity_from(request(protocol, "scene.create", "\"type\":\"ParticleEmitter\""));
+    expect(ok(request(protocol, "scene.set_particle_emitter",
+                      "\"entity\":\"" + emitter.to_string() + R"(","values":{"play_on_start":false,"lifetime":[5,5]})")) &&
+               ok(add_script(protocol, emitter, "Sparks")),
+           "a waiting emitter with the sparks script");
+    expect(engine.run_game(), "the particle scene runs");
+    engine.step(40);
+    const auto& settings = *scene.get(emitter)->particle_emitter;
+    expect(logged(engine, "played yes") && logged(engine, "burst 12") && logged(engine, "negative refused") &&
+               logged(engine, "unknown refused") && logged(engine, "count refused") && logged(engine, "speed 2 2"),
+           "scripts play, burst and retune emitters, and bad fields and values are refused");
+    expect(settings.rate == 120.0 && settings.blend == relay::ParticleEmitter::Blend::additive &&
+               settings.color.g == 0.5 && logged(engine, "alive many") && logged(engine, "stopped yes"),
+           "the script's settings take effect and stop ends emission");
+    const auto alive = engine.particles().status(emitter)->particles;
+    engine.step(10);
+    expect(alive > 12U && engine.particles().status(emitter)->particles == alive,
+           "stopped emitters keep their living particles");
+    expect(engine.stop_game() && scene.get(emitter)->particle_emitter->rate == relay::ParticleEmitter{}.rate,
+           "Stop Game restores the authored emitter");
+    scene.restore_state(earlier);
+}
+
 } // namespace
 
 int main() {
@@ -1012,6 +1077,7 @@ int main() {
         spawning(engine, protocol);
         material_parameters(engine, protocol);
         game_interface(engine, protocol);
+        particle_scripts(engine, protocol);
         compile_errors(engine, protocol);
         demo_first_person(engine, protocol);
     } catch (const std::exception& error) {

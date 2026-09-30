@@ -27,7 +27,7 @@ edits the same project alongside it.
   profiler, mixer and shader graph editor, built with SDL3 and Dear ImGui.
 - **Agents built in** — an embedded chat workspace with sign-in, attachments, inline renders and
   permission controls; agents frame, capture and review the viewport as they work.
-- **One typed API** — 164 versioned native methods for scenes, assets, rendering, capture and
+- **One typed API** — 167 versioned native methods for scenes, assets, rendering, capture and
   authorization, generated for C++, TypeScript and an MCP bridge.
 - **Rendering** — Vulkan HDR pipeline with PBR materials, cascaded and punctual shadows, sky, sun
   and fog, and AMD FidelityFX global illumination and ray traced reflections.
@@ -38,6 +38,8 @@ edits the same project alongside it.
 - **Game interface** — Godot-style canvases, anchored controls and containers: labels, images,
   buttons, check boxes, sliders and progress bars, laid out and drawn in an Interface editor and
   shown over the game while it runs.
+- **Particles** — emitters with shapes, bursts, forces, turbulence, collisions, sub emitters,
+  flipbooks, curves and gradients, lit and soft particles, previewed live in the editor.
 - **Audio** — spatial sources, mixer buses and effects, reverb zones, occlusion, streaming music
   and a headphone mode.
 - **Assets** — glTF/GLB, OBJ, FBX, DAE and sandboxed Blender import with animation, skinning and

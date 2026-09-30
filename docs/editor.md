@@ -249,6 +249,19 @@ copy one of Relay's ready-made effects into the project (each effect can be kept
 editor's view). The demo has three hovering plasma orbs, bloom and motion blur for the player's
 camera. See the [shader guide](shaders.md).
 
+## Particles
+
+A **Particle Emitter** node (Add Node → Particle Emitter, or the **Particle emitter** component
+under **Effects**) emits sprites for sparks, smoke, fire, dust, rain, magic and explosions. Emitters
+play in the editor, so you see the effect as you tune it; the Inspector's **Pause**, **Restart**,
+**Stop** and **Burst** buttons control the preview. Settings are grouped: the emitter's cycle and
+space, emission rate and bursts, the shape it emits from (outlined in the viewport when selected),
+each particle's start values, motion (gravity, wind, drag, turbulence), size and color over its life
+(edited as a curve and a gradient), collisions, flipbook textures, how it draws (additive or alpha,
+billboard or stretched, brightness, lit, soft edges), and a sub emitter fired where particles die.
+The demo has a campfire, fireworks and trails behind the balls you throw. See the
+[particle guide](particles.md).
+
 ## Game interface
 
 Interface nodes (Add Node → **Canvas**, then Label, Button, Panel, Image, Check Box, Slider,
@@ -271,7 +284,8 @@ a camera at eye height, and the project's `scripts/FirstPersonController.cpp` fo
 and gamepad look, walking, sprinting, jumping and shooting balls where you look. For sound, bodies
 thump as they land or are hit, louder the harder the hit; the spinning torus hums, so walking
 around it pans and fades the sound; and the glowing button just ahead and to the right plays the
-next note of a scale when you look at it and press **E** (or shoot it). The joints playground
+next note of a scale when you look at it and press **E** (or shoot it). A campfire to the front left burns with flames, rising embers and lit smoke,
+fireworks go up to the right, and every ball you throw leaves a glowing trail. The joints playground
 sits in a hall reverb zone, and crates between you and a sound muffle it. A generated soundtrack
 plays throughout; the blue pad to the left of the start moves it to the next track on the next bar,
 the tone button ducks it under each note, and every shot has its own sound. A HUD shows control

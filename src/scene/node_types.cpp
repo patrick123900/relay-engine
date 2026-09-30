@@ -28,6 +28,7 @@ bool matches(const std::string_view id, const EntityRecord& record) {
     if (id == "ReverbZone") return record.reverb_zone.has_value();
     if (id == "MusicPlayer") return record.music_player.has_value();
     if (id == "PostProcess") return record.post_process.has_value();
+    if (id == "ParticleEmitter") return record.particle_emitter.has_value();
     const auto& ui = record.ui;
     const auto container = [&](UiContainer::Layout layout) {
         return ui.container && ui.container->layout == layout;
@@ -150,6 +151,8 @@ void contribute(const std::string_view id, EntityRecord& record, const bool came
         record.music_player = MusicPlayer{};
     } else if (id == "PostProcess") {
         record.post_process = PostProcess{};
+    } else if (id == "ParticleEmitter") {
+        record.particle_emitter = ParticleEmitter{};
     } else {
         contribute_ui(id, record.ui);
     }
@@ -202,6 +205,10 @@ const std::vector<NodeTypeInfo>& node_types() {
          "Full-screen effects on the lit scene, such as color grading, vignettes or outlines, from "
          "post_process shaders.",
          {"post_process"}, true},
+        {"ParticleEmitter", "Particle Emitter", "Node",
+         "Emits particles for sparks, smoke, fire, dust, rain and magic effects. Plays in the editor "
+         "too, so you see the effect as you tune it.",
+         {"particle_emitter"}, true},
         {"Canvas", "Canvas", "Node",
          "A layer for the game's interface, drawn over the game's view during Run Game only. It "
          "scales the controls below it to fit the screen.",
@@ -287,7 +294,8 @@ bool apply_node_type(Scene& scene, const Entity entity, const std::string_view i
         !scene.set_reverb_zone(entity, record.reverb_zone) ||
         !scene.set_music_player(entity, record.music_player) ||
         !scene.set_sky(entity, record.sky) ||
-        !scene.set_post_process(entity, record.post_process) || !scene.set_ui(entity, record.ui)) {
+        !scene.set_post_process(entity, record.post_process) ||
+        !scene.set_particle_emitter(entity, record.particle_emitter) || !scene.set_ui(entity, record.ui)) {
         error = "could not give the node its components";
         return false;
     }

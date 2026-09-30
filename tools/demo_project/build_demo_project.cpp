@@ -5,7 +5,8 @@
 // GameMenu.cpp) are project source and are left as they are.
 //
 // `relay_build_demo_project --add-interface [root]` instead adds (or replaces) only the showcase's
-// game interface in an existing demo, keeping everything else in its scene.
+// game interface in an existing demo, keeping everything else in its scene, and
+// `--add-particles [root]` its particle effects and the Ball template's trail.
 
 #include "relay/control/control_protocol.hpp"
 #include "relay/core/engine.hpp"
@@ -89,6 +90,9 @@ struct Builder {
     }
     void sound(const std::string& entity, const std::string& fields) {
         call("scene.set_audio_source", "\"entity\":" + text(entity) + ',' + fields);
+    }
+    void particles(const std::string& entity, const std::string& values) {
+        call("scene.set_particle_emitter", "\"entity\":" + text(entity) + ",\"values\":{" + values + '}');
     }
     void script(const std::string& entity, const std::string& behaviour) {
         call("component.add", "\"entity\":" + text(entity) +
@@ -178,6 +182,90 @@ void add_interface(Builder& demo) {
     demo.script(hud, "GameMenu");
 }
 
+// Particle effects: a campfire under the warm fill light (glowing coals, flames, rising embers and
+// lit smoke drifting on the wind) and a fireworks launcher to the right, in front of the joints
+// playground, whose rockets burst through a sub emitter. Emitters play in the editor too, as they are tuned.
+void add_particles(Builder& demo) {
+    const auto emitter = [&](const std::string& name, const std::string& parent) {
+        const auto result = demo.call("scene.create", "\"name\":" + Builder::text(name) +
+                                                          ",\"type\":\"ParticleEmitter\",\"parent\":" + Builder::text(parent));
+        return *relay::field(*result.object(), "entity")->string();
+    };
+    const auto campfire = demo.create("Campfire");
+    demo.transform(campfire, {-3.4, 0, 3.9});
+    for (int stone = 0; stone < 8; ++stone) {
+        const double angle = stone * pi / 4.0 + 0.2;
+        demo.mesh_entity("Stone " + std::to_string(stone + 1), campfire, "Sphere", "Ground",
+                         {0.42 * std::cos(angle), 0.05, 0.42 * std::sin(angle)}, {0, stone * 37.0, 0},
+                         {0.2, 0.13, 0.17});
+    }
+    // Three logs crossed over the coals, each lying on its side.
+    for (int log = 0; log < 3; ++log)
+        demo.mesh_entity("Log " + std::to_string(log + 1), campfire, "Cylinder", "Rubber",
+                         {0, 0.06 + log * 0.05, 0}, {88, log * 60.0 + 15.0, 0}, {0.08, 0.66, 0.08});
+    demo.mesh_entity("Coals", campfire, "Sphere", "Glow", {0, 0.02, 0}, {}, {0.34, 0.06, 0.34});
+    const auto flames = emitter("Flames", campfire);
+    demo.transform(flames, {0, 0.08, 0});
+    demo.particles(flames, "\"prewarm\":true,\"max_particles\":300,\"rate\":80,\"shape\":\"cone\",\"radius\":0.2,"
+                           "\"angle\":6,\"lifetime\":[0.5,0.85],\"speed\":[0.8,1.3],\"size\":[0.3,0.5],"
+                           "\"rotation\":[0,360],\"angular_velocity\":[-70,70],\"gravity\":-0.15,"
+                           "\"noise_strength\":0.45,\"noise_frequency\":1.6,\"noise_scroll\":1.2,"
+                           "\"size_over_lifetime\":[[0,0.5],[0.25,1],[1,0.25]],"
+                           "\"color\":[1,0.62,0.2,1],\"random_color\":true,\"color_alt\":[1,0.36,0.08,1],"
+                           "\"color_over_lifetime\":[[0,1,0.9,0.6,0],[0.1,1,0.85,0.45,1],[0.5,1,0.45,0.12,0.8],"
+                           "[1,0.6,0.1,0.02,0]],\"builtin_texture\":\"smoke\",\"emission\":3.5,"
+                           "\"soft_distance\":0.15,\"seed\":11");
+    const auto embers = emitter("Embers", campfire);
+    demo.transform(embers, {0, 0.15, 0});
+    demo.particles(embers, "\"prewarm\":true,\"rate\":10,\"shape\":\"sphere\",\"radius\":0.15,\"lifetime\":[1.4,2.6],"
+                           "\"speed\":[0.3,0.8],\"direction_randomness\":0.3,\"size\":[0.018,0.032],"
+                           "\"gravity\":-0.12,\"drag\":0.4,\"noise_strength\":0.9,\"noise_frequency\":0.9,"
+                           "\"noise_scroll\":0.6,\"velocity\":[0,0.6,0],\"acceleration\":[0.25,0,0],"
+                           "\"color\":[1,0.62,0.22,1],\"color_over_lifetime\":[[0,1,1,1,1],[0.7,1,0.6,0.4,1],[1,1,0.3,0.1,0]],"
+                           "\"builtin_texture\":\"spark\",\"alignment\":\"stretched\",\"stretch_speed\":0.05,"
+                           "\"stretch_length\":1.5,\"blend\":\"additive\",\"emission\":5,\"soft_distance\":0,\"seed\":12");
+    const auto smoke = emitter("Smoke", campfire);
+    demo.transform(smoke, {0, 0.75, 0});
+    demo.particles(smoke, "\"prewarm\":true,\"rate\":9,\"shape\":\"cone\",\"radius\":0.12,\"angle\":10,"
+                          "\"lifetime\":[3.5,5],\"speed\":[0.45,0.7],\"size\":[0.3,0.45],\"rotation\":[0,360],"
+                          "\"angular_velocity\":[-18,18],\"acceleration\":[0.12,0.05,-0.04],\"drag\":0.15,"
+                          "\"noise_strength\":0.2,\"noise_frequency\":0.4,"
+                          "\"size_over_lifetime\":[[0,0.6],[1,3.2]],\"color\":[0.36,0.32,0.29,0.8],"
+                          "\"color_over_lifetime\":[[0,1,1,1,0],[0.15,1,1,1,0.85],[0.6,1,1,1,0.55],[1,1,1,1,0]],"
+                          "\"builtin_texture\":\"smoke\",\"lit\":true,\"soft_distance\":0.4,\"seed\":13");
+
+    // Fireworks: one rocket every 1.4 s streaks up and bursts into colored sparks where it dies.
+    const auto launcher = demo.mesh_entity("Fireworks launcher", {}, "Cylinder", "Brick", {7, 0.25, -6}, {},
+                                           {0.18, 0.5, 0.18});
+    const auto rockets = emitter("Fireworks", launcher);
+    demo.transform(rockets, {0, 0.6, 0});
+    demo.particles(rockets, "\"rate\":0,\"duration\":1.4,\"bursts\":[{\"time\":0,\"count\":1}],\"shape\":\"cone\","
+                            "\"radius\":0,\"angle\":8,\"lifetime\":[1.1,1.35],\"speed\":[10,12],\"gravity\":0.45,"
+                            "\"size\":[0.16,0.16],\"color\":[1,0.85,0.6,1],\"builtin_texture\":\"spark\","
+                            "\"alignment\":\"stretched\",\"stretch_speed\":0.06,\"blend\":\"additive\",\"emission\":5,"
+                            "\"simulation_space\":\"world\",\"soft_distance\":0,\"sub_emitter\":\"Burst\","
+                            "\"sub_emitter_count\":160,\"sub_emitter_inherit\":0.15,\"seed\":21");
+    const auto burst = emitter("Burst", rockets);
+    demo.particles(burst, "\"play_on_start\":false,\"rate\":0,\"shape\":\"point\",\"max_particles\":1200,"
+                          "\"lifetime\":[1.3,2],\"speed\":[6,9],\"gravity\":0.3,\"drag\":1.3,"
+                          "\"size\":[0.35,0.5],\"size_over_lifetime\":[[0,1],[1,0.4]],\"random_color\":true,\"color\":[1,0.22,0.1,1],"
+                          "\"color_alt\":[0.25,0.55,1,1],\"color_over_lifetime\":[[0,1,1,1,1],[0.6,1,1,1,0.9],[1,1,1,1,0]],"
+                          "\"builtin_texture\":\"star\",\"blend\":\"additive\",\"emission\":3,\"soft_distance\":0,"
+                          "\"seed\":22");
+}
+
+// A glowing gold trail behind the ball, emitted as it moves and left in the world.
+void add_ball_trail(Builder& demo, const std::string& ball) {
+    const auto result = demo.call("scene.create", "\"name\":\"Trail\",\"type\":\"ParticleEmitter\",\"parent\":" +
+                                                      Builder::text(ball));
+    const auto trail = *relay::field(*result.object(), "entity")->string();
+    demo.particles(trail, "\"rate\":0,\"rate_over_distance\":14,\"shape\":\"sphere\",\"radius\":0.3,"
+                          "\"lifetime\":[0.35,0.55],\"speed\":[0,0.2],\"size\":[0.1,0.16],"
+                          "\"size_over_lifetime\":[[0,1],[1,0]],\"color\":[1,0.78,0.34,1],"
+                          "\"color_over_lifetime\":[[0,1,1,1,0.9],[1,1,0.6,0.2,0]],\"blend\":\"additive\","
+                          "\"emission\":2.5,\"soft_distance\":0,\"max_particles\":200");
+}
+
 std::string string_of(const relay::JsonValue::Object& object, const char* key) {
     const auto* value = relay::field(object, key);
     return value && value->string() ? *value->string() : std::string{};
@@ -193,6 +281,52 @@ std::vector<std::string> strings(const relay::JsonValue& result, const char* key
         for (const auto& value : *list->array())
             if (value.string()) values.push_back(*value.string());
     return values;
+}
+
+// Finds the demo's primitive meshes and materials in the asset registry. Importers may reorder,
+// drop or add materials, so assets are identified by their contents: meshes by index count,
+// materials by base colour. `imported`, when given, limits the search to one import's assets.
+bool resolve_primitives(Builder& demo, const relay::JsonValue& imported) {
+    const bool limited = imported.object() != nullptr;
+    const auto ids = limited ? strings(imported, "meshes") : std::vector<std::string>{};
+    const auto material_ids = limited ? strings(imported, "materials") : std::vector<std::string>{};
+    const std::vector<std::pair<std::string, double>> mesh_indices{
+        {"Cube", 36}, {"Sphere", 4800}, {"Capsule", 5040}, {"Cylinder", 720}, {"Plane", 6},
+        {"Torus", 6912}};
+    const std::vector<std::pair<std::string, std::array<double, 4>>> material_colors{
+        {"Ground", {0.46, 0.48, 0.5, 1}}, {"Brick", {0.78, 0.2, 0.14, 1}},
+        {"Ocean", {0.12, 0.38, 0.86, 1}}, {"Mint", {0.28, 0.82, 0.58, 1}},
+        {"Gold", {1.0, 0.77, 0.34, 1}}, {"Chrome", {0.95, 0.95, 0.96, 1}},
+        {"Copper", {0.95, 0.62, 0.52, 1}}, {"Rubber", {0.05, 0.05, 0.06, 1}},
+        {"Glass", {0.62, 0.82, 1.0, 0.32}}, {"Glow", {1.0, 0.55, 0.18, 1}}};
+    const auto registry = demo.call("render.assets");
+    for (const auto& value : *relay::field(*registry.object(), "meshes")->array()) {
+        const auto& mesh = *value.object();
+        const auto name = string_of(mesh, "name");
+        if (limited && std::find(ids.begin(), ids.end(), name) == ids.end()) continue;
+        for (const auto& [label, count] : mesh_indices)
+            if (number_of(mesh, "indices") == count) demo.meshes[label] = name;
+    }
+    for (const auto& value : *relay::field(*registry.object(), "materials")->array()) {
+        const auto& material = *value.object();
+        const auto name = string_of(material, "name");
+        const auto* color = relay::field(material, "color");
+        if ((limited && std::find(material_ids.begin(), material_ids.end(), name) == material_ids.end()) ||
+            !color || !color->array() || color->array()->size() != 4) continue;
+        for (const auto& [label, expected] : material_colors) {
+            bool same = true;
+            for (std::size_t channel = 0; channel < 4; ++channel)
+                same &= std::abs(*(*color->array())[channel].number() - expected[channel]) < 1e-3;
+            if (same) demo.materials[label] = name;
+        }
+    }
+    if (demo.meshes.size() != mesh_indices.size() || demo.materials.size() != material_colors.size()) {
+        std::cerr << "primitives.glb resolved " << demo.meshes.size() << " of " << mesh_indices.size()
+                  << " meshes and " << demo.materials.size() << " of " << material_colors.size()
+                  << " materials\n";
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -212,9 +346,39 @@ int add_interface_only(const std::filesystem::path& root) {
     return 0;
 }
 
+// Adds the particle effects to an existing demo's startup scene, replacing older ones, and gives
+// the Ball template its trail.
+int add_particles_only(const std::filesystem::path& root) {
+    Builder demo;
+    const auto project_file = (root / "demo.relayproject").generic_string();
+    demo.call("project.open", "\"filename\":" + Builder::text(project_file));
+    if (!resolve_primitives(demo, {})) return 1;
+    const auto listed = demo.call("scene.list");
+    for (const auto& value : *relay::field(*listed.object(), "entities")->array())
+        if (const auto& entity = *value.object();
+            (string_of(entity, "name") == "Campfire" || string_of(entity, "name") == "Fireworks launcher") &&
+            relay::field(entity, "parent")->is_null())
+            demo.call("scene.destroy", "\"entity\":" + Builder::text(string_of(entity, "entity")));
+    add_particles(demo);
+    demo.call("scene.save", "\"filename\":\"showcase.relay.json\"");
+    // The Ball template, placed away from the scene, given a fresh trail and saved again.
+    const auto placed = demo.call("templates.instantiate", "\"template\":\"project:Ball\"");
+    const auto ball = *relay::field(*placed.object(), "entity")->string();
+    const auto after = demo.call("scene.list");
+    for (const auto& value : *relay::field(*after.object(), "entities")->array())
+        if (const auto& entity = *value.object(); string_of(entity, "name") == "Trail" && string_of(entity, "parent") == ball)
+            demo.call("scene.destroy", "\"entity\":" + Builder::text(string_of(entity, "entity")));
+    add_ball_trail(demo, ball);
+    demo.call("templates.save", "\"entity\":" + Builder::text(ball) + ",\"name\":\"Ball\",\"replace\":true");
+    std::cout << "Added the particle effects to " << project_file << " and a trail to the Ball template\n";
+    return 0;
+}
+
 int main(const int argument_count, char** arguments) {
     if (argument_count > 1 && std::string_view(arguments[1]) == "--add-interface")
         return add_interface_only(argument_count > 2 ? arguments[2] : "examples/demo");
+    if (argument_count > 1 && std::string_view(arguments[1]) == "--add-particles")
+        return add_particles_only(argument_count > 2 ? arguments[2] : "examples/demo");
     const std::filesystem::path root = argument_count > 1 ? arguments[1] : "examples/demo";
     const auto project_file = (root / "demo.relayproject").generic_string();
     // Start from a clean project, keeping the generated models.
@@ -230,46 +394,7 @@ int main(const int argument_count, char** arguments) {
                                     ",\"name\":\"Relay Demo\"");
     const auto imported = demo.call("assets.import_model",
                                     "\"filename\":\"models/primitives.glb\",\"instantiate\":false");
-    // Importers may reorder, drop or add materials, so assets are identified by their contents:
-    // meshes by index count, materials by base colour.
-    const auto ids = strings(imported, "meshes");
-    const auto material_ids = strings(imported, "materials");
-    const std::vector<std::pair<std::string, double>> mesh_indices{
-        {"Cube", 36}, {"Sphere", 4800}, {"Capsule", 5040}, {"Cylinder", 720}, {"Plane", 6},
-        {"Torus", 6912}};
-    const std::vector<std::pair<std::string, std::array<double, 4>>> material_colors{
-        {"Ground", {0.46, 0.48, 0.5, 1}}, {"Brick", {0.78, 0.2, 0.14, 1}},
-        {"Ocean", {0.12, 0.38, 0.86, 1}}, {"Mint", {0.28, 0.82, 0.58, 1}},
-        {"Gold", {1.0, 0.77, 0.34, 1}}, {"Chrome", {0.95, 0.95, 0.96, 1}},
-        {"Copper", {0.95, 0.62, 0.52, 1}}, {"Rubber", {0.05, 0.05, 0.06, 1}},
-        {"Glass", {0.62, 0.82, 1.0, 0.32}}, {"Glow", {1.0, 0.55, 0.18, 1}}};
-    const auto registry = demo.call("render.assets");
-    for (const auto& value : *relay::field(*registry.object(), "meshes")->array()) {
-        const auto& mesh = *value.object();
-        const auto name = string_of(mesh, "name");
-        if (std::find(ids.begin(), ids.end(), name) == ids.end()) continue;
-        for (const auto& [label, count] : mesh_indices)
-            if (number_of(mesh, "indices") == count) demo.meshes[label] = name;
-    }
-    for (const auto& value : *relay::field(*registry.object(), "materials")->array()) {
-        const auto& material = *value.object();
-        const auto name = string_of(material, "name");
-        const auto* color = relay::field(material, "color");
-        if (std::find(material_ids.begin(), material_ids.end(), name) == material_ids.end() ||
-            !color || !color->array() || color->array()->size() != 4) continue;
-        for (const auto& [label, expected] : material_colors) {
-            bool same = true;
-            for (std::size_t channel = 0; channel < 4; ++channel)
-                same &= std::abs(*(*color->array())[channel].number() - expected[channel]) < 1e-3;
-            if (same) demo.materials[label] = name;
-        }
-    }
-    if (demo.meshes.size() != mesh_indices.size() || demo.materials.size() != material_colors.size()) {
-        std::cerr << "primitives.glb resolved " << demo.meshes.size() << " of " << mesh_indices.size()
-                  << " meshes and " << demo.materials.size() << " of " << material_colors.size()
-                  << " materials\n";
-        return 1;
-    }
+    if (!resolve_primitives(demo, imported)) return 1;
 
     // Lighting: a shadowed sun, a warm point fill and a cool spot over the material row.
     const auto lighting = demo.create("Lighting");
@@ -495,6 +620,7 @@ int main(const int argument_count, char** arguments) {
     demo.transform(player, {0, 1, 8});
     demo.call("scene.set_camera", "\"entity\":" + Builder::text(player_camera) + ",\"active\":true");
     add_interface(demo);
+    add_particles(demo);
 
     demo.call("scene.save", "\"filename\":\"showcase.relay.json\"");
     demo.call("project.add_scene", "\"scene_file\":\"showcase.relay.json\"");
@@ -509,6 +635,7 @@ int main(const int argument_count, char** arguments) {
     demo.body(ball, 0.5, 0.5, 0.4);
     demo.call("component.add", ball_field + ",\"component\":\"script\",\"behaviour\":\"Projectile\"");
     demo.impact(ball, 1.5, -4.0);
+    add_ball_trail(demo, ball);
     demo.call("templates.save", ball_field + ",\"name\":\"Ball\",\"replace\":true");
     demo.call("scene.destroy", ball_field);
 

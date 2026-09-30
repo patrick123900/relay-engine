@@ -1853,6 +1853,111 @@ void sky_ui() {
     std::cout << "Headless sky UI tests passed\n";
 }
 
+// The Particle emitter section: preview controls, fields shown for the chosen shape, the curve,
+// gradient and burst editors, and drags that are one undo step each.
+void particles_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/particles/project.relayproject","name":"Particles"})")
+              .find("\"ok\":true") != std::string::npos, "create particle project");
+    const auto created = protocol.handle(R"({"id":2,"method":"scene.create","type":"ParticleEmitter"})");
+    const auto start = created.find("\"entity\":\"") + 10U;
+    const auto emitter = *relay::Entity::parse(created.substr(start, created.find('"', start) - start));
+    auto& scene = engine.scene();
+    const auto settings = [&] { return *scene.get(emitter)->particle_emitter; };
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize particle editor without windows");
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + emitter.to_string()));
+    for (int step = 0; step < 30; ++step) engine.tick();
+    frame(ui, 3);
+    check(ui.headless_item_rect("inspector:component:particle_emitter") &&
+              ui.headless_item_rect("inspector:particles:play") &&
+              ui.headless_item_rect("inspector:particle_emitter:rate") &&
+              ui.headless_item_rect("inspector:particle_emitter:angle") &&
+              !ui.headless_item_rect("inspector:particle_emitter:box_size"),
+          "a Particle Emitter node shows its section, with the cone's fields and not the box's");
+    check(engine.particles().status(emitter) && engine.particles().status(emitter)->particles > 0U,
+          "the editor previews the emitter as the engine ticks");
+
+    // Collapsing the Emitter group brings the shape into view.
+    click_center(ui, *ui.headless_item_rect("inspector:particles:group:emitter"));
+    frame(ui, 2);
+    click_center(ui, *ui.headless_item_rect("inspector:particle_emitter:shape"));
+    click_center(ui, *ui.headless_item_rect("inspector:particle_emitter:shape:box"));
+    frame(ui, 3);
+    check(settings().shape == relay::ParticleEmitter::Shape::box &&
+              ui.headless_item_rect("inspector:particle_emitter:box_size") &&
+              !ui.headless_item_rect("inspector:particle_emitter:angle"),
+          "choosing a box shows its size in place of the cone's angle");
+
+    const auto history = [&] { return protocol.handle(R"({"id":3,"method":"scene.history"})"); };
+    const auto undo_steps = [&] {
+        const auto text = history();
+        std::size_t count = 0;
+        for (auto at = text.find("Configure particle emitter"); at != std::string::npos;
+             at = text.find("Configure particle emitter", at + 1U))
+            ++count;
+        return count;
+    };
+    const auto before = undo_steps();
+    {
+        const auto rect = *ui.headless_item_rect("inspector:particle_emitter:rate");
+        const float y = (rect[1] + rect[3]) / 2.0F;
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(rect[0] + 10.0F, y);
+        frame(ui);
+        io.AddMouseButtonEvent(0, true);
+        frame(ui);
+        for (int step = 1; step <= 4; ++step) {
+            io.AddMousePosEvent(rect[0] + 10.0F + 20.0F * static_cast<float>(step), y);
+            frame(ui);
+        }
+        io.AddMouseButtonEvent(0, false);
+        frame(ui, 3);
+    }
+    check(settings().rate > relay::ParticleEmitter{}.rate && undo_steps() == before + 1U,
+          "dragging Rate raises it as one undo step");
+
+    // Collapse the upper groups so the life curves come into view.
+    for (const char* group : {"emission", "shape", "particle"}) {
+        click_center(ui, *ui.headless_item_rect(std::string("inspector:particles:group:") + group));
+        frame(ui, 2);
+    }
+    const auto curve = ui.headless_item_rect("inspector:particle_emitter:size_over_lifetime");
+    check(curve.has_value(), "the size curve is shown");
+    double_click(ui, *curve);
+    check(settings().size_over_lifetime.keys.size() == 3U,
+          "double-clicking the size curve adds a key between two constant ends");
+    const auto gradient = ui.headless_item_rect("inspector:particle_emitter:color_over_lifetime");
+    check(gradient.has_value(), "the color gradient is shown");
+    double_click(ui, *gradient);
+    check(settings().color_over_lifetime.keys.size() == 3U && ui.headless_item_rect("inspector:particle_emitter:color_over_lifetime"),
+          "double-clicking the gradient adds a key");
+    click_center(ui, *ui.headless_item_rect("inspector:particles:group:emission"));
+    frame(ui, 3);
+    click_center(ui, *ui.headless_item_rect("inspector:particle_emitter:bursts:add"));
+    frame(ui, 3);
+    check(settings().bursts.size() == 1U && settings().bursts.front().count == 30,
+          "+ Add burst adds a burst of 30");
+
+    click_center(ui, *ui.headless_item_rect("inspector:particles:stop"));
+    frame(ui, 2);
+    check(!engine.particles().status(emitter)->playing, "Stop ends the preview's emission");
+    click_center(ui, *ui.headless_item_rect("inspector:particles:burst"));
+    check(engine.particles().status(emitter)->particles >= 30U, "Burst emits particles now");
+    click_center(ui, *ui.headless_item_rect("inspector:particles:restart"));
+    check(engine.particles().status(emitter)->playing, "Restart plays the emitter again");
+    for (int step = 0; step < 10; ++step) engine.tick();
+    frame(ui, 40);
+    if (const char* directory = std::getenv("RELAY_UI_SNAPSHOT_DIR"))
+        (void)relay_test::write_ui_snapshot(std::filesystem::path(directory) / "particle-inspector.png");
+    std::cout << "Headless particle UI tests passed\n";
+}
+
 // The Shader Editor previews typing, saves with Ctrl+S and shows errors; the Inspector edits a
 // mesh's shader material and a Post Process node's effects.
 void shader_ui() {
@@ -2523,6 +2628,7 @@ int main() {
         fresh(mixer_ui);
         fresh(music_ui);
         fresh(sky_ui);
+        fresh(particles_ui);
         fresh(shader_ui);
         fresh(asset_browser_ui);
         fresh(interface_ui);

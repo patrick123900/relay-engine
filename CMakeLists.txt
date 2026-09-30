@@ -124,6 +124,7 @@ add_library(relay_engine
     src/observe/performance.cpp
     src/observe/profiler.cpp
     src/observe/trace.cpp
+    src/particles/particle_system.cpp
     src/render/software_renderer.cpp
     src/render/asset_manifest.cpp
     src/render/asset_thumbnail.cpp
@@ -153,6 +154,7 @@ add_library(relay_engine
     src/scene/scene_history.cpp
     src/scene/scene_io.cpp
     src/scene/ui.cpp
+    src/scene/particles.cpp
     src/script/script_system.cpp
     src/ui/ui_font.cpp
     src/ui/ui_render.cpp
@@ -387,6 +389,20 @@ if(RELAY_ENABLE_SDL)
                         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bindings.glsl"
                 VERBATIM
             )
+            foreach(stage vert frag)
+                set(RELAY_PARTICLE_${stage} "${RELAY_SHADER_OUTPUT_DIR}/particle.${stage}.spv")
+                add_custom_command(
+                    OUTPUT "${RELAY_PARTICLE_${stage}}"
+                    COMMAND "${CMAKE_COMMAND}" -E make_directory "${RELAY_SHADER_OUTPUT_DIR}"
+                    COMMAND "${RELAY_GLSLC}" -fshader-stage=${stage}
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/particle.${stage}"
+                            -o "${RELAY_PARTICLE_${stage}}"
+                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/particle.${stage}"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/surface_lighting.glsl"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bindings.glsl"
+                    VERBATIM
+                )
+            endforeach()
             # Ray traced reflections; ray queries need SPIR-V 1.4, so these target Vulkan 1.3.
             foreach(shader reflection_trace reflection_arguments)
                 set(RELAY_${shader}_SHADER "${RELAY_SHADER_OUTPUT_DIR}/${shader}.comp.spv")
@@ -410,7 +426,8 @@ if(RELAY_ENABLE_SDL)
                               "${RELAY_SHADER_OUTPUT_DIR}/ui.vert.spv" "${RELAY_SHADER_OUTPUT_DIR}/ui.frag.spv"
                               "${RELAY_SHADOW_VERTEX}" "${RELAY_SHADOW_FRAGMENT}"
                               "${RELAY_GRID_vert}" "${RELAY_GRID_frag}"
-                              "${RELAY_SELECTION_vert}" "${RELAY_SELECTION_frag}")
+                              "${RELAY_SELECTION_vert}" "${RELAY_SELECTION_frag}"
+                              "${RELAY_PARTICLE_vert}" "${RELAY_PARTICLE_frag}")
             add_dependencies(relay_demo relay_shaders)
             target_sources(relay_demo PRIVATE src/platform/vulkan_window.cpp)
             find_program(RELAY_GLSLANG_VALIDATOR glslangValidator)
@@ -444,6 +461,8 @@ if(RELAY_ENABLE_SDL)
                 RELAY_SELECTION_FRAGMENT_PATH="${RELAY_SELECTION_frag}"
                 RELAY_GI_COMPOSITE_FRAGMENT_PATH="${RELAY_GI_COMPOSITE_FRAGMENT}"
                 RELAY_SKY_FRAGMENT_PATH="${RELAY_SKY_FRAGMENT}"
+                RELAY_PARTICLE_VERTEX_PATH="${RELAY_PARTICLE_vert}"
+                RELAY_PARTICLE_FRAGMENT_PATH="${RELAY_PARTICLE_frag}"
                 RELAY_REFLECTION_TRACE_PATH="${RELAY_reflection_trace_SHADER}"
                 RELAY_REFLECTION_ARGUMENTS_PATH="${RELAY_reflection_arguments_SHADER}"
             )

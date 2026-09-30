@@ -944,7 +944,7 @@ export function registerGeneratedTools(
       inputSchema: z.object({
         "name": z.string().min(1).max(128).optional().describe("Node name; defaults to the type's name, or Entity"),
         "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("Optional parent entity handle"),
-        "type": z.enum(["Node", "Camera", "Sky", "PostProcess", "DirectionalLight", "PointLight", "SpotLight", "RigidBody", "StaticBody", "StaticMesh", "AudioSource", "ReverbZone", "MusicPlayer", "Canvas", "Control", "Button", "CheckBox", "Slider", "ProgressBar", "VBoxContainer", "HBoxContainer", "GridContainer", "Panel", "Label", "Image"]).optional().describe("Node type to create; omitted creates a plain Node. Interface types (Canvas, Control and its subtypes) draw during Run Game only")
+        "type": z.enum(["Node", "Camera", "Sky", "PostProcess", "ParticleEmitter", "DirectionalLight", "PointLight", "SpotLight", "RigidBody", "StaticBody", "StaticMesh", "AudioSource", "ReverbZone", "MusicPlayer", "Canvas", "Control", "Button", "CheckBox", "Slider", "ProgressBar", "VBoxContainer", "HBoxContainer", "GridContainer", "Panel", "Label", "Image"]).optional().describe("Node type to create; omitted creates a plain Node. Interface types (Canvas, Control and its subtypes) draw during Run Game only")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
     },
@@ -1661,6 +1661,26 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "scene_set_particle_emitter",
+    {
+      title: "Configure particle emitter",
+      description: "Add, edit or remove a node's particle emitter, for sparks, smoke, fire, dust, rain, magic, trails and explosions. values maps field names to JSON values: numbers, booleans, strings (choice names, a texture path, a sub emitter's child name), [x, y, z] vectors, [min, max] ranges picked at random per particle (or one number for both), [red, green, blue, alpha] sRGB colors from 0 to 1, curves as [[time, value], ...] and gradients as [[time, red, green, blue, alpha], ...] over each particle's life (time 0 at birth, 1 at death; no keys is 1 or white throughout), and bursts as [{\"time\", \"count\", \"cycles\", \"interval\", \"probability\"}]. The groups: emitter (play_on_start, looping, duration, prewarm, start_delay, max_particles, simulation_space world or local, simulation_speed, seed), emission (rate per second, rate_over_distance, bursts), shape (point, sphere, hemisphere, cone, box, circle or edge along +Y of the node, with radius, radius_thickness, angle, arc, box_size, shape_offset, shape_rotation, direction_randomness, spherize), particle (lifetime, speed, size, aspect, rotation, angular_velocity, color, and random_color with color_alt for a random mix per particle, inherit_velocity), motion (gravity as a multiple of 9.81 m/s\u00b2, acceleration, velocity, drag, speed_over_lifetime, noise_strength, noise_frequency, noise_scroll), collision (none, plane at plane_height, or world colliders during Run Game, with bounce, friction, lifetime_loss, collision_radius), lifetime (size_over_lifetime, color_over_lifetime), sheet (flipbook columns, rows, mode, fps, cycles, random start, blend), renderer (texture or builtin_texture soft_dot, dot, ring, star, smoke, spark or square; blend alpha, additive or premultiplied; alignment billboard, stretched, horizontal, vertical or local; stretch_speed, stretch_length, emission brightness above 1 for glow, lit, soft_distance, sort) and sub_emitter (a child node's name, fired on death, collision or birth, with a count and inherited velocity). Omitted fields keep their values; a missing emitter is added with its defaults first. component.types lists every field with its type, range and choices. Undoable and saved with the scene; emitters preview in the editor, so check the look with a viewport capture.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "attached": z.boolean().default(true).describe("False removes the emitter"),
+        "values": z.record(z.string(), z.unknown()).optional().describe("Field names and new values, such as {\"rate\": 50, \"color_over_lifetime\": [[0, 1, 0.8, 0.3, 1], [1, 1, 0.2, 0, 0]]}"),
+        "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_set_particle_emitter"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.set_particle_emitter", {"entity": input["entity"], "attached": input["attached"], "values": input["values"], "gesture": input["gesture"]});
+      },
+  );
+
+  server.registerTool(
     "scene_set_ui",
     {
       title: "Configure interface component",
@@ -1690,7 +1710,7 @@ export function registerGeneratedTools(
       description: "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-        "component": z.enum(["mesh_renderer", "camera", "light", "sky", "post_process", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script"]),
+        "component": z.enum(["mesh_renderer", "camera", "light", "sky", "post_process", "particle_emitter", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script"]),
         "behaviour": z.string().max(128).regex(new RegExp("^[A-Za-z_][A-Za-z0-9_]*$")).optional().describe("Behaviour class name; required for script")
       }),
       annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
@@ -1709,7 +1729,7 @@ export function registerGeneratedTools(
       description: "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
-        "component": z.enum(["mesh_renderer", "camera", "light", "sky", "post_process", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script"]),
+        "component": z.enum(["mesh_renderer", "camera", "light", "sky", "post_process", "particle_emitter", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script"]),
         "index": z.number().int().min(0).max(31).optional().describe("Which script component, from zero")
       }),
       annotations: {readOnlyHint:false,destructiveHint:true,openWorldHint:false},
@@ -2558,6 +2578,42 @@ export function registerGeneratedTools(
         const override = overrides["audio_remove_bus"];
         if (override) return override(input as JsonObject);
         return invoke("audio.remove_bus", {"name": input["name"]});
+      },
+  );
+
+  server.registerTool(
+    "particles_status",
+    {
+      title: "Inspect particles",
+      description: "Report every particle emitter the simulation knows (or one): whether it is playing, paused, a sub emitter or finishing after its node went, how many particles are alive, and its time and cycle. In the editor every emitter previews; during Run Game emitters follow play_on_start, scripts and particles.control.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")).optional().describe("One emitter; omitted lists all")
+      }),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["particles_status"];
+        if (override) return override(input as JsonObject);
+        return invoke("particles.status", {"entity": input["entity"]});
+      },
+  );
+
+  server.registerTool(
+    "particles_control",
+    {
+      title: "Control a particle emitter",
+      description: "Play, restart, stop, clear, pause, resume or emit a burst from a node's particle emitter, in the editor preview or during Run Game. stop lets the living particles finish while clear removes them; emit adds count particles now from the emitter's shape. Not undoable: particles are not scene data.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "action": z.enum(["play", "restart", "stop", "clear", "pause", "resume", "emit"]),
+        "count": z.number().int().min(1).max(100000).default(10).describe("For emit: particles to add")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["particles_control"];
+        if (override) return override(input as JsonObject);
+        return invoke("particles.control", {"entity": input["entity"], "action": input["action"], "count": input["count"]});
       },
   );
 

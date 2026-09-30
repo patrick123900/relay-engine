@@ -278,6 +278,8 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
                    << ",\"editor\":" << (effects[index].editor ? "true" : "false") << '}';
         output << "]}";
     } else output << "null";
+    output << ",\"particle_emitter\":"
+           << (record.particle_emitter ? particle_emitter_json(*record.particle_emitter) : std::string("null"));
     output << ",\"ui\":" << ui_components_json(record.ui);
     output << '}';
 }
@@ -791,6 +793,13 @@ bool Scene::set_sky(const Entity entity, std::optional<Sky> sky) {
     return true;
 }
 
+bool Scene::set_particle_emitter(const Entity entity, std::optional<ParticleEmitter> emitter) {
+    auto* record = get(entity);
+    if (!record || (emitter && !valid_particle_emitter(*emitter))) return false;
+    record->particle_emitter = std::move(emitter);
+    return true;
+}
+
 bool Scene::set_music_player(const Entity entity, std::optional<MusicPlayer> player) {
     auto* record = get(entity);
     if (!record || (player && !valid_music_player(*player))) return false;
@@ -1256,11 +1265,28 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
           {"fog_start_color", ReflectedFieldType::vec3},
           {"fog_end_color", ReflectedFieldType::vec3}}},
         {"PostProcess", 0x14U, {{"effects", ReflectedFieldType::object_array}}},
+        {"ParticleEmitter", particle_emitter_stable_id, {}},
         {"Scripts", 0x0cU,
          {{"behaviour", ReflectedFieldType::string},
           {"enabled", ReflectedFieldType::boolean},
           {"properties", ReflectedFieldType::object_array}}},
       };
+      // The particle emitter's fields, from its reflection table.
+      for (auto& descriptor : list) {
+          if (descriptor.stable_id != particle_emitter_stable_id) continue;
+          for (const auto& field : particle_fields()) {
+              auto type = ReflectedFieldType::number_array;
+              if (field.type == ParticleFieldType::boolean) type = ReflectedFieldType::boolean;
+              else if (field.type == ParticleFieldType::number || field.type == ParticleFieldType::integer)
+                  type = ReflectedFieldType::number;
+              else if (field.type == ParticleFieldType::choice || field.type == ParticleFieldType::asset ||
+                       field.type == ParticleFieldType::text)
+                  type = ReflectedFieldType::string;
+              else if (field.type == ParticleFieldType::bursts)
+                  type = ReflectedFieldType::object_array;
+              descriptor.fields.push_back({field.name, type});
+          }
+      }
       // Game interface components, stored under each entity's "ui" object by key.
       static std::deque<std::string> ui_names;
       for (const auto& component : ui_components()) {

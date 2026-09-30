@@ -147,6 +147,18 @@ void connect_game_ui(relay::VulkanWindow& window, relay::Engine& engine) {
     });
 }
 
+// Draws the scene's particles in every view. `alpha`, when given, is the share of a game step
+// since the latest one, so particles move smoothly between steps; texture files the particles
+// could not use are reported in the log.
+void connect_particles(relay::VulkanWindow& window, relay::Engine& engine, const double* alpha = nullptr) {
+    window.set_particle_source([&engine, alpha](const relay::ParticleView& view) -> const relay::ParticleRenderList* {
+        const auto& list = engine.particle_render_list(view, alpha ? *alpha : 1.0);
+        for (auto& warning : engine.particles().take_warnings())
+            engine.logs().write(relay::LogLevel::warning, "Particles: " + warning);
+        return &list;
+    });
+}
+
 int run_windowed() {
     relay::Engine engine(windowed_config());
     relay::VulkanWindow window("Relay Engine — Vulkan First Light", 1280, 720, engine.assets());
@@ -156,6 +168,7 @@ int run_windowed() {
     }
     std::cout << "Rendering with Vulkan on " << window.device_name() << '\n';
     connect_game_ui(window, engine);
+    connect_particles(window, engine);
 
     using namespace std::chrono_literals;
     while (engine.status().running && !window.poll_quit()) {
@@ -240,10 +253,14 @@ int run_vulkan_scene_capture(const std::string& project, const std::string& outp
         return 1;
     }
     connect_game_ui(window, engine);
+    connect_particles(window, engine);
     for (unsigned frame = 0; frame < frames; ++frame) {
         (void)window.poll_quit();
         apply_graphics_settings(window, engine);
         engine.sync_render_assets();
+        // Particles play as they would in the game, one step per frame, from the same seeds.
+        engine.particles().set_root(engine.asset_root());
+        engine.particles().update(engine.scene(), 1.0 / 60.0, true);
         if (!window.draw(engine.scene(), static_cast<double>(frame) / 60.0)) {
             std::cerr << window.error() << '\n';
             return 1;
@@ -411,6 +428,8 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
         return 1;
     }
     connect_game_ui(window, engine);
+    double particle_alpha = 1.0;
+    connect_particles(window, engine, &particle_alpha);
     engine.set_gpu_capture_source([&](relay::Engine::FrameReceiver receiver, std::string& error) {
         return window.readback_async(engine.scene(), engine.status().elapsed_seconds, std::move(receiver), error);
     }, [&] { window.flush_readbacks(); });
@@ -548,6 +567,7 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
                                                              shader_clock_start).count());
         // Frames between game steps blend the last two steps by the time since the latest one.
         window.set_render_interpolation(engine.render_interpolation(unsimulated_seconds / step));
+        particle_alpha = unsimulated_seconds / step;
         {
             RELAY_PROFILE_SCOPE("Render");
             if (!window.draw(engine.scene(), engine.status().elapsed_seconds)) {

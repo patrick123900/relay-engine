@@ -7,6 +7,7 @@
 #include "relay/observe/capture.hpp"
 #include "relay/observe/performance.hpp"
 #include "relay/observe/trace.hpp"
+#include "relay/particles/particle_system.hpp"
 #include "relay/physics/collision.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/render/renderer.hpp"
@@ -109,6 +110,12 @@ public:
     // list hosts draw over the game's view.
     [[nodiscard]] UiSystem& ui() { return ui_; }
     [[nodiscard]] const UiSystem& ui() const { return ui_; }
+    // Particle emitters: simulated in every game step, and previewed in the editor by tick().
+    [[nodiscard]] ParticleSystem& particles() { return particles_; }
+    [[nodiscard]] const ParticleSystem& particles() const { return particles_; }
+    // The particles to draw for a view. Between game steps positions blend by `alpha`, the share
+    // of a step since the latest one; paused games and captures draw the exact state.
+    [[nodiscard]] const ParticleRenderList& particle_render_list(const ParticleView& view, double alpha = 1.0);
     // The open project's mixer buses, or the defaults without a project or saved settings.
     [[nodiscard]] AudioSettings audio_settings() const;
     // Validates and saves mixer buses in the open project; the mixer follows immediately.
@@ -186,6 +193,7 @@ private:
     void sync_audio();
     AudioSystem audio_;
     UiSystem ui_;
+    ParticleSystem particles_;
     SkyMaterialCache sky_materials_;
     ShaderLibrary shaders_;
     std::string previewed_material_;

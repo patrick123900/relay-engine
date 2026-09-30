@@ -192,7 +192,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scene_inspect{{
 constexpr std::array<ProtocolFieldSpec, 3> fields_scene_create{{
     {"name", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 128U, "", ""},
     {"parent", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "Node|Camera|Sky|PostProcess|DirectionalLight|PointLight|SpotLight|RigidBody|StaticBody|StaticMesh|AudioSource|ReverbZone|MusicPlayer|Canvas|Control|Button|CheckBox|Slider|ProgressBar|VBoxContainer|HBoxContainer|GridContainer|Panel|Label|Image"},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "Node|Camera|Sky|PostProcess|ParticleEmitter|DirectionalLight|PointLight|SpotLight|RigidBody|StaticBody|StaticMesh|AudioSource|ReverbZone|MusicPlayer|Canvas|Control|Button|CheckBox|Slider|ProgressBar|VBoxContainer|HBoxContainer|GridContainer|Panel|Label|Image"},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_scene_destroy{{
@@ -461,6 +461,13 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_post_effect{{
     {"editor", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_particle_emitter{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"values", ProtocolValueType::object, false, false, false, false, 0, 0, 0U, 96U, "", ""},
+    {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 7> fields_scene_set_ui{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "ui_canvas|ui_control|ui_panel|ui_label|ui_image|ui_button|ui_toggle|ui_slider|ui_progress_bar|ui_container"},
@@ -473,13 +480,13 @@ constexpr std::array<ProtocolFieldSpec, 7> fields_scene_set_ui{{
 
 constexpr std::array<ProtocolFieldSpec, 3> fields_component_add{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|sky|post_process|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script"},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|sky|post_process|particle_emitter|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script"},
     {"behaviour", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 3> fields_component_remove{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
-    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|sky|post_process|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script"},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|sky|post_process|particle_emitter|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script"},
     {"index", ProtocolValueType::integer, false, false, true, true, 0, 31, 0U, 0U, "", ""},
 }};
 
@@ -732,6 +739,16 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_audio_remove_bus{{
     {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 1> fields_particles_status{{
+    {"entity", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 3> fields_particles_control{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"action", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "play|restart|stop|clear|pause|resume|emit"},
+    {"count", ProtocolValueType::integer, false, false, true, true, 1, 100000, 0U, 0U, "", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 1> fields_audio_play{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
 }};
@@ -808,7 +825,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_audio_set_spatialization{{
     {"mode", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "stereo|binaural"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 164> methods{{
+constexpr std::array<ProtocolMethodSpec, 167> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -900,6 +917,7 @@ constexpr std::array<ProtocolMethodSpec, 164> methods{{
     {"scene.set_sky", "scene_set_sky", "Configure sky", "Add, edit or remove a sky: what is drawn behind everything, the ambient light it gives the scene, and linear distance fog. The first node with a sky is the one in use; its directional light, if any, is the sun, aimed by turning the node. The sky is a gradient from horizon_color (at the horizon and below) to zenith_color (straight up), unless material names a sky material (.relay-material, see assets.set_sky_material), which draws its panorama instead. Colors are linear RGB triples from 0 to 1000. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_sky},
     {"scene.set_post_process", "scene_set_post_process", "Configure post processing", "Add, change or remove post processing: an ordered list of post_process materials (full-screen effects from post_process shaders) applied to the lit scene before tone mapping, in every view. The first node with post processing is used. Effects that stay in a replaced list keep their settings; new ones start on and show in the editor's view too. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_post_process},
     {"scene.set_post_effect", "scene_set_post_effect", "Configure post effect", "Turn one post-processing effect on or off by its position in the list, without removing it, and choose whether it also shows in the editor's own view (off for effects meant for the game camera, such as motion blur). Undoable.", false, false, false, false, false, fields_scene_set_post_effect},
+    {"scene.set_particle_emitter", "scene_set_particle_emitter", "Configure particle emitter", "Add, edit or remove a node's particle emitter, for sparks, smoke, fire, dust, rain, magic, trails and explosions. values maps field names to JSON values: numbers, booleans, strings (choice names, a texture path, a sub emitter's child name), [x, y, z] vectors, [min, max] ranges picked at random per particle (or one number for both), [red, green, blue, alpha] sRGB colors from 0 to 1, curves as [[time, value], ...] and gradients as [[time, red, green, blue, alpha], ...] over each particle's life (time 0 at birth, 1 at death; no keys is 1 or white throughout), and bursts as [{\"time\", \"count\", \"cycles\", \"interval\", \"probability\"}]. The groups: emitter (play_on_start, looping, duration, prewarm, start_delay, max_particles, simulation_space world or local, simulation_speed, seed), emission (rate per second, rate_over_distance, bursts), shape (point, sphere, hemisphere, cone, box, circle or edge along +Y of the node, with radius, radius_thickness, angle, arc, box_size, shape_offset, shape_rotation, direction_randomness, spherize), particle (lifetime, speed, size, aspect, rotation, angular_velocity, color, and random_color with color_alt for a random mix per particle, inherit_velocity), motion (gravity as a multiple of 9.81 m/s\u00b2, acceleration, velocity, drag, speed_over_lifetime, noise_strength, noise_frequency, noise_scroll), collision (none, plane at plane_height, or world colliders during Run Game, with bounce, friction, lifetime_loss, collision_radius), lifetime (size_over_lifetime, color_over_lifetime), sheet (flipbook columns, rows, mode, fps, cycles, random start, blend), renderer (texture or builtin_texture soft_dot, dot, ring, star, smoke, spark or square; blend alpha, additive or premultiplied; alignment billboard, stretched, horizontal, vertical or local; stretch_speed, stretch_length, emission brightness above 1 for glow, lit, soft_distance, sort) and sub_emitter (a child node's name, fired on death, collision or birth, with a count and inherited velocity). Omitted fields keep their values; a missing emitter is added with its defaults first. component.types lists every field with its type, range and choices. Undoable and saved with the scene; emitters preview in the editor, so check the look with a viewport capture.", false, false, false, false, false, fields_scene_set_particle_emitter},
     {"scene.set_ui", "scene_set_ui", "Configure interface component", "Add, edit or remove one game interface (UI) component on a node. Interface nodes are drawn over the game's view during Run Game only, never in the editor's own view. A Canvas (ui_canvas) scales the controls below it to the screen; a Control (ui_control) places a rectangle, Godot style, by anchors (fractions of the parent control's or screen's size) plus offsets in canvas units, with a pivot for rotation and scale; widgets draw into it or react to the pointer: ui_panel, ui_label, ui_image, ui_button, ui_toggle (check box or switch), ui_slider, ui_progress_bar and ui_container (column, row or grid that places its children). values maps field names to JSON values: numbers, booleans, strings (text, project file paths, choice names), [x, y] vectors, [red, green, blue, alpha] sRGB colors from 0 to 1 and [left, top, right, bottom] margins. Omitted fields keep their values; a missing component is added with its defaults first, and a widget brings its Control. anchor_preset (ui_control) places the control by a preset before values apply, keeping its size. component.types lists every field with its type, range and choices; ui.layout and ui.render show the result. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_ui},
     {"component.add", "component_add", "Add component", "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.", false, false, false, false, false, fields_component_add},
     {"component.remove", "component_remove", "Remove component", "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.", false, true, false, false, false, fields_component_remove},
@@ -963,6 +981,8 @@ constexpr std::array<ProtocolMethodSpec, 164> methods{{
     {"audio.settings", "audio_settings", "Read mixer buses", "Read the project's mixer buses (settings.audio in the .relayproject): name, parent, volume in dB, mute and solo, with the defaults.", true, false, false, false, false, no_fields},
     {"audio.set_bus", "audio_set_bus", "Create or change a mixer bus", "Create a bus, or change one's name, parent, volume, mute or solo, and save the mixer in the open project. A new bus defaults to Master as its parent. While any bus is soloed only soloed buses, their parents and their children are heard. Renaming keeps children attached; sources naming the old bus fall back to Master until they are changed.", false, false, false, false, false, fields_audio_set_bus},
     {"audio.remove_bus", "audio_remove_bus", "Remove a mixer bus", "Remove a bus other than Master and save the mixer; its children move to its parent and sources routed to it play into Master.", false, true, false, false, false, fields_audio_remove_bus},
+    {"particles.status", "particles_status", "Inspect particles", "Report every particle emitter the simulation knows (or one): whether it is playing, paused, a sub emitter or finishing after its node went, how many particles are alive, and its time and cycle. In the editor every emitter previews; during Run Game emitters follow play_on_start, scripts and particles.control.", true, false, false, false, false, fields_particles_status},
+    {"particles.control", "particles_control", "Control a particle emitter", "Play, restart, stop, clear, pause, resume or emit a burst from a node's particle emitter, in the editor preview or during Run Game. stop lets the living particles finish while clear removes them; emit adds count particles now from the emitter's shape. Not undoable: particles are not scene data.", false, false, false, false, false, fields_particles_control},
     {"audio.play", "audio_play", "Play an audio source", "Start or restart a node's audio source. During Run Game it plays as authored; in the editor it plays as a flat preview.", false, false, false, false, false, fields_audio_play},
     {"audio.stop", "audio_stop", "Stop audio", "Stop a node's audio source, a one-shot by the handle audio.play_clip returned, or every playing sound when neither is given.", false, false, false, false, false, fields_audio_stop},
     {"audio.clip", "audio_clip", "Inspect a sound file", "Decode a project sound file and report its duration, sample rate, channels and frames, with optional min/max peak pairs across it for drawing a waveform.", true, false, false, false, false, fields_audio_clip},

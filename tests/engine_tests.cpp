@@ -5,6 +5,7 @@
 #include "relay/editor/editor_state.hpp"
 #include "relay/editor/editor_viewport.hpp"
 #include "relay/core/engine.hpp"
+#include "relay/particles/particle_system.hpp"
 #include "relay/observe/profiler.hpp"
 #include "relay/physics/collision.hpp"
 #include "relay/render/scene_render.hpp"
@@ -506,8 +507,431 @@ void test_game_interface() {
     }
 }
 
+// Particle emitters: the reflected fields, scene files, and the simulation's emission, shapes,
+// forces, collisions, spaces, sub emitters, determinism and draw list.
+void test_particles() {
+    using relay::ParticleEmitter;
+    // Every field round-trips through JSON, and bad values are refused with the field's name.
+    ParticleEmitter custom;
+    custom.rate = 42.5;
+    custom.shape = ParticleEmitter::Shape::box;
+    custom.box_size = {2.0, 0.5, 3.0};
+    custom.lifetime = {0.5, 1.5};
+    custom.color = {1.0, 0.5, 0.25, 0.75};
+    custom.size_over_lifetime.keys = {{0.0, 0.0}, {0.3, 2.0}, {1.0, 0.5}};
+    custom.color_over_lifetime.keys = {{0.0, {1, 1, 1, 0}}, {1.0, {1, 0, 0, 1}}};
+    custom.bursts = {{0.25, 12, 3, 0.1, 0.5}};
+    custom.blend = ParticleEmitter::Blend::additive;
+    custom.texture = "sprites/flame.png";
+    custom.sub_emitter = "Sparks";
+    {
+        const auto text = relay::particle_emitter_json(custom);
+        relay::JsonParser parser(text);
+        const auto parsed = parser.parse();
+        ParticleEmitter read;
+        std::string error;
+        expect(parsed && relay::read_particle_emitter(*parsed, read, error) && read == custom,
+               "particle emitters round-trip every field through JSON: " + error + parser.error());
+    }
+    const auto apply = [](ParticleEmitter& emitter, const std::string& json, std::string& error) {
+        relay::JsonParser parser(json);
+        const auto parsed = parser.parse();
+        return parsed && relay::apply_particle_values(emitter, *parsed, error);
+    };
+    {
+        ParticleEmitter emitter;
+        std::string error;
+        expect(apply(emitter, R"({"rate":5,"speed":3,"size_over_lifetime":[[1,0],[0,1]]})", error) && emitter.rate == 5.0 &&
+                   emitter.speed.min == 3.0 && emitter.speed.max == 3.0 &&
+                   emitter.size_over_lifetime.keys.front().time == 0.0,
+               "one number fills a range and curve keys are put in time order: " + error);
+        expect(!apply(emitter, R"({"lifetime":[3,1]})", error) && error.find("lifetime") != std::string::npos,
+               "a range whose min is above its max is refused");
+        expect(!apply(emitter, R"({"shape":"torus"})", error) && error.find("shape") != std::string::npos,
+               "an unknown choice is refused");
+        expect(!apply(emitter, R"({"sparkle":1})", error), "an unknown field is refused");
+        expect(!apply(emitter, R"({"rate":-1})", error) && emitter.rate == 5.0,
+               "an out-of-range value is refused and changes nothing");
+        expect(!apply(emitter, R"({"bursts":[{"time":0,"count":1.5}]})", error), "burst counts are whole numbers");
+    }
+    {
+        relay::ParticleCurve curve;
+        expect(curve.sample(0.4) == 1.0, "a curve without keys is 1 throughout");
+        curve.keys = {{0.0, 0.0}, {0.5, 2.0}, {1.0, 1.0}};
+        expect(std::abs(curve.sample(0.25) - 1.0) < 1e-12 && std::abs(curve.sample(0.75) - 1.5) < 1e-12 &&
+                   curve.sample(2.0) == 1.0,
+               "curves blend straight between keys and hold past the ends");
+        relay::ParticleGradient gradient;
+        gradient.keys = {{0.0, {0, 0, 0, 0}}, {1.0, {1, 1, 1, 1}}};
+        expect(std::abs(gradient.sample(0.5).r - 0.5) < 1e-12 && std::abs(gradient.sample(0.5).a - 0.5) < 1e-12,
+               "gradients blend colors and alpha");
+    }
+
+    // Scene files, components and node types.
+    {
+        relay::Scene scene;
+        const auto node = scene.create("Fire");
+        std::string error;
+        expect(relay::apply_node_type(scene, node, "ParticleEmitter", error) && scene.get(node)->particle_emitter &&
+                   relay::node_type(*scene.get(node)) == "ParticleEmitter",
+               "the ParticleEmitter node type creates an emitter node: " + error);
+        expect(scene.set_particle_emitter(node, custom), "an emitter can be set on a node");
+        auto broken = custom;
+        broken.max_particles = 0;
+        expect(!scene.set_particle_emitter(node, broken), "an invalid emitter is refused by the scene");
+        const std::filesystem::path path = "particles-test.relay.json";
+        expect(relay::save_scene_file_atomic(scene, path, error), "save a scene with an emitter");
+        const auto loaded = relay::load_scene_file(path);
+        expect(loaded && loaded.source_version == relay::scene_file_version &&
+                   loaded.state->slots[node.index].record.particle_emitter == custom,
+               "scene files keep particle emitters: " + loaded.error);
+        std::filesystem::remove(path);
+        expect(relay::has_component(*scene.get(node), "particle_emitter") &&
+                   relay::remove_component(scene, node, "particle_emitter", 0, error) && !scene.get(node)->particle_emitter,
+               "the particle_emitter component can be removed");
+    }
+
+    // The simulation.
+    const double step = 1.0 / 60.0;
+    const auto run = [&](relay::ParticleSystem& system, const relay::Scene& scene, int steps, bool game = true) {
+        for (int index = 0; index < steps; ++index) system.update(scene, step, game);
+    };
+    const auto count = [](const relay::ParticleSystem& system, relay::Entity entity) {
+        const auto status = system.status(entity);
+        return status ? status->particles : std::size_t{0};
+    };
+    ParticleEmitter still;
+    still.speed = {0.0, 0.0};
+    still.lifetime = {10.0, 10.0};
+    still.shape = ParticleEmitter::Shape::point;
+    {
+        relay::Scene scene;
+        const auto node = scene.create("Emitter");
+        auto emitter = still;
+        emitter.rate = 50.0;
+        (void)scene.set_particle_emitter(node, emitter);
+        relay::ParticleSystem system;
+        run(system, scene, 60);
+        expect(count(system, node) == 50U, "a rate of 50 per second emits 50 particles in a second (" +
+                                               std::to_string(count(system, node)) + ")");
+        emitter.max_particles = 20;
+        (void)scene.set_particle_emitter(node, emitter);
+        system.reset();
+        run(system, scene, 60);
+        expect(count(system, node) == 20U, "max_particles caps the living particles");
+    }
+    {
+        relay::Scene scene;
+        const auto node = scene.create("Bursts");
+        auto emitter = still;
+        emitter.rate = 0.0;
+        emitter.bursts = {{0.5, 20, 2, 0.25, 1.0}};
+        (void)scene.set_particle_emitter(node, emitter);
+        relay::ParticleSystem system;
+        run(system, scene, 25);
+        expect(count(system, node) == 0U, "nothing is emitted before a burst's time");
+        run(system, scene, 10);
+        expect(count(system, node) == 20U, "a burst emits its count at its time");
+        run(system, scene, 15);
+        expect(count(system, node) == 40U, "a two-cycle burst repeats after its interval");
+        // Steps that end exactly on cycle boundaries: one burst a cycle, and no stall.
+        emitter.duration = 1.4;
+        emitter.lifetime = {100.0, 100.0};
+        emitter.bursts = {{0.0, 1, 1, 0.5, 1.0}};
+        (void)scene.set_particle_emitter(node, emitter);
+        system.reset();
+        run(system, scene, 600);
+        expect(count(system, node) == 8U && system.status(node)->cycle == 7U,
+               "a looping burst fires once each cycle (" + std::to_string(count(system, node)) + ")");
+    }
+    {
+        relay::Scene scene;
+        const auto node = scene.create("One shot");
+        auto emitter = still;
+        emitter.looping = false;
+        emitter.duration = 0.5;
+        emitter.rate = 20.0;
+        emitter.lifetime = {0.25, 0.25};
+        (void)scene.set_particle_emitter(node, emitter);
+        relay::ParticleSystem system;
+        run(system, scene, 20);
+        expect(system.status(node)->playing, "a one-shot emitter plays through its duration");
+        run(system, scene, 15);
+        expect(!system.status(node)->playing, "a one-shot emitter stops after its duration");
+        run(system, scene, 30);
+        expect(count(system, node) == 0U, "and its particles die at the end of their lives");
+    }
+    {
+        // Shapes: particles are born inside them.
+        relay::Scene scene;
+        const auto node = scene.create("Shapes");
+        auto emitter = still;
+        emitter.rate = 600.0;
+        emitter.shape = ParticleEmitter::Shape::sphere;
+        emitter.radius = 2.0;
+        (void)scene.set_particle_emitter(node, emitter);
+        relay::ParticleSystem system;
+        run(system, scene, 10);
+        bool inside = true, spread = false;
+        for (const auto& sprite : system.render_list({}).sprites) {
+            const double distance = std::sqrt(sprite.position[0] * sprite.position[0] + sprite.position[1] * sprite.position[1] +
+                                              sprite.position[2] * sprite.position[2]);
+            inside = inside && distance <= 2.0 + 1e-4;
+            spread = spread || distance > 1.5;
+        }
+        expect(inside && spread, "a sphere emits throughout its volume and nowhere outside it");
+        emitter.shape = ParticleEmitter::Shape::box;
+        emitter.box_size = {4.0, 1.0, 2.0};
+        (void)scene.set_particle_emitter(node, emitter);
+        system.reset();
+        run(system, scene, 10);
+        inside = true;
+        for (const auto& sprite : system.render_list({}).sprites)
+            inside = inside && std::abs(sprite.position[0]) <= 2.0001F && std::abs(sprite.position[1]) <= 0.5001F &&
+                     std::abs(sprite.position[2]) <= 1.0001F;
+        expect(inside, "a box emits inside its size");
+        emitter.shape = ParticleEmitter::Shape::sphere;
+        emitter.radius_thickness = 0.0;
+        (void)scene.set_particle_emitter(node, emitter);
+        system.reset();
+        run(system, scene, 10);
+        bool shell = true;
+        for (const auto& sprite : system.render_list({}).sprites) {
+            const double distance = std::sqrt(sprite.position[0] * sprite.position[0] + sprite.position[1] * sprite.position[1] +
+                                              sprite.position[2] * sprite.position[2]);
+            shell = shell && std::abs(distance - 2.0) < 1e-3;
+        }
+        expect(shell, "a radius thickness of 0 emits from the surface only");
+        // A narrow point cone sends everything up within its angle.
+        emitter.shape = ParticleEmitter::Shape::cone;
+        emitter.radius = 0.0;
+        emitter.angle = 10.0;
+        emitter.speed = {1.0, 1.0};
+        (void)scene.set_particle_emitter(node, emitter);
+        system.reset();
+        run(system, scene, 30);
+        bool within = true;
+        for (const auto& sprite : system.render_list({}).sprites) {
+            const double distance = std::sqrt(sprite.position[0] * sprite.position[0] + sprite.position[1] * sprite.position[1] +
+                                              sprite.position[2] * sprite.position[2]);
+            if (distance > 1e-3) within = within && sprite.position[1] / distance >= std::cos(10.0 * 3.14159265358979 / 180.0) - 1e-4;
+        }
+        expect(within, "a cone sends particles out within its angle");
+    }
+    {
+        // Gravity, and a floor plane that stops the fall.
+        relay::Scene scene;
+        const auto node = scene.create("Falling");
+        auto emitter = still;
+        emitter.rate = 0.0;
+        emitter.gravity = 1.0;
+        emitter.bursts = {{0.0, 1, 1, 0.5, 1.0}};
+        (void)scene.set_particle_emitter(node, emitter);
+        (void)scene.set_transform(node, relay::Transform{{0.0, 10.0, 0.0}, {}, {1, 1, 1}});
+        relay::ParticleSystem system;
+        run(system, scene, 60);
+        const auto fallen = system.render_list({}).sprites.front().position[1];
+        expect(std::abs(fallen - (10.0 - 0.5 * 9.81)) < 0.15, "gravity pulls particles down about 4.9 m in a second (" +
+                                                                  std::to_string(fallen) + ")");
+        emitter.collision = ParticleEmitter::Collision::plane;
+        emitter.plane_height = 8.0;
+        emitter.collision_radius = 0.0;
+        emitter.bounce = 0.0;
+        (void)scene.set_particle_emitter(node, emitter);
+        system.reset();
+        run(system, scene, 90);
+        const auto landed = system.render_list({}).sprites.front().position[1];
+        expect(std::abs(landed - 8.0) < 1e-4, "a collision plane stops falling particles at its height");
+        emitter.lifetime_loss = 1.0;
+        (void)scene.set_particle_emitter(node, emitter);
+        system.reset();
+        run(system, scene, 90);
+        expect(count(system, node) == 0U, "a lifetime loss of 1 kills particles when they hit");
+    }
+    {
+        // World space leaves particles behind as the node moves; local space carries them.
+        relay::Scene scene;
+        const auto world = scene.create("World");
+        const auto local = scene.create("Local");
+        auto emitter = still;
+        emitter.rate = 0.0;
+        emitter.bursts = {{0.0, 5, 1, 0.5, 1.0}};
+        (void)scene.set_particle_emitter(world, emitter);
+        emitter.simulation_space = ParticleEmitter::Space::local;
+        (void)scene.set_particle_emitter(local, emitter);
+        relay::ParticleSystem system;
+        run(system, scene, 2);
+        for (const auto node : {world, local}) (void)scene.set_transform(node, relay::Transform{{5.0, 0.0, 0.0}, {}, {1, 1, 1}});
+        run(system, scene, 2);
+        const auto& list = system.render_list({});
+        float world_x = -1.0F, local_x = -1.0F;
+        for (const auto& batch : list.batches)
+            (batch.entity == world ? world_x : local_x) = list.sprites[batch.first].position[0];
+        expect(std::abs(world_x) < 1e-4 && std::abs(local_x - 5.0F) < 1e-4,
+               "world-space particles stay put when their node moves and local ones go with it");
+    }
+    {
+        // Trails: particles per metre moved, spread along the path.
+        relay::Scene scene;
+        const auto node = scene.create("Trail");
+        auto emitter = still;
+        emitter.rate = 0.0;
+        emitter.rate_over_distance = 5.0;
+        (void)scene.set_particle_emitter(node, emitter);
+        relay::ParticleSystem system;
+        run(system, scene, 1);
+        for (int metre = 1; metre <= 10; ++metre) {
+            (void)scene.set_transform(node, relay::Transform{{static_cast<double>(metre), 0.0, 0.0}, {}, {1, 1, 1}});
+            run(system, scene, 1);
+        }
+        float lowest = 100.0F, highest = -100.0F;
+        for (const auto& sprite : system.render_list({}).sprites) {
+            lowest = std::min(lowest, sprite.position[0]);
+            highest = std::max(highest, sprite.position[0]);
+        }
+        expect(count(system, node) == 50U && lowest < 0.5F && highest > 9.5F,
+               "rate over distance emits per metre moved, along the whole path (" + std::to_string(count(system, node)) + ")");
+    }
+    {
+        // Sub emitters fire where their parent's particles die.
+        relay::Scene scene;
+        const auto rocket = scene.create("Rocket");
+        const auto sparks = scene.create("Sparks", rocket);
+        auto parent = still;
+        parent.rate = 0.0;
+        parent.lifetime = {0.1, 0.1};
+        parent.bursts = {{0.0, 5, 1, 0.5, 1.0}};
+        parent.sub_emitter = "Sparks";
+        parent.sub_emitter_count = 3;
+        auto child = still;
+        child.rate = 100.0; // A sub emitter never emits on its own.
+        (void)scene.set_particle_emitter(rocket, parent);
+        (void)scene.set_particle_emitter(sparks, child);
+        relay::ParticleSystem system;
+        run(system, scene, 20);
+        expect(count(system, rocket) == 0U && count(system, sparks) == 15U && system.status(sparks)->sub_emitter,
+               "a death sub emitter emits its count where each particle died (" + std::to_string(count(system, sparks)) + ")");
+    }
+    {
+        // The editor previews every emitter; the game waits for play_on_start or a script.
+        relay::Scene scene;
+        const auto node = scene.create("Waiting");
+        auto emitter = still;
+        emitter.play_on_start = false;
+        emitter.rate = 30.0;
+        (void)scene.set_particle_emitter(node, emitter);
+        relay::ParticleSystem preview, game;
+        run(preview, scene, 30, false);
+        run(game, scene, 30, true);
+        expect(count(preview, node) > 0U && count(game, node) == 0U,
+               "emitters preview in the editor even when they wait for a script in the game");
+        expect(game.play(scene, node), "play starts a waiting emitter");
+        run(game, scene, 30);
+        expect(count(game, node) == 15U, "a started emitter emits at its rate " + std::to_string(count(game, node)));
+        expect(game.emit(scene, node, 7) == 7U && count(game, node) == 22U, "emit adds particles at once");
+        expect(game.stop(node) && !game.status(node)->playing, "stop ends emission");
+        run(game, scene, 30);
+        expect(count(game, node) == 22U, "stopped emitters keep their particles until they die");
+        expect(game.stop(node, true) && count(game, node) == 0U, "stop with clear removes them");
+        emitter.play_on_start = true;
+        emitter.prewarm = true;
+        emitter.duration = 2.0;
+        (void)scene.set_particle_emitter(node, emitter);
+        game.reset();
+        run(game, scene, 1);
+        expect(count(game, node) > 50U, "a prewarmed looping emitter starts full");
+    }
+    {
+        // The same seed gives the same particles; another seed gives others.
+        relay::Scene scene;
+        const auto node = scene.create("Seeded");
+        ParticleEmitter emitter;
+        emitter.seed = 7;
+        emitter.noise_strength = 1.0;
+        (void)scene.set_particle_emitter(node, emitter);
+        relay::ParticleSystem first, second;
+        run(first, scene, 90);
+        run(second, scene, 90);
+        const auto a = first.render_list({}).sprites;
+        const auto b = second.render_list({}).sprites;
+        bool same = !a.empty() && a.size() == b.size();
+        for (std::size_t index = 0; same && index < a.size(); ++index) same = a[index].position == b[index].position;
+        expect(same, "particles are deterministic for a seed");
+        emitter.seed = 8;
+        (void)scene.set_particle_emitter(node, emitter);
+        relay::ParticleSystem third;
+        run(third, scene, 90);
+        const auto c = third.render_list({}).sprites;
+        expect(!c.empty() && c.front().position != a.front().position, "another seed gives other particles");
+    }
+    {
+        // The draw list: far particles first, life curves and brightness applied.
+        relay::Scene scene;
+        const auto node = scene.create("Drawn");
+        auto emitter = still;
+        emitter.rate = 0.0;
+        emitter.shape = ParticleEmitter::Shape::edge;
+        emitter.radius = 5.0;
+        emitter.size = {1.0, 1.0};
+        emitter.lifetime = {2.0, 2.0};
+        emitter.size_over_lifetime.keys = {{0.0, 1.0}, {1.0, 0.0}};
+        emitter.color_over_lifetime.keys = {{0.0, {1, 1, 1, 1}}, {1.0, {1, 1, 1, 0}}};
+        emitter.emission = 4.0;
+        emitter.bursts = {{0.0, 40, 1, 0.5, 1.0}};
+        (void)scene.set_particle_emitter(node, emitter);
+        relay::ParticleSystem system;
+        run(system, scene, 60);
+        relay::ParticleView view;
+        view.camera_position = {20.0, 0.0, 0.0};
+        view.camera_forward = {-1.0, 0.0, 0.0};
+        const auto& list = system.render_list(view);
+        bool ordered = true;
+        for (std::size_t index = 1; index < list.sprites.size(); ++index)
+            ordered = ordered && list.sprites[index - 1U].position[0] <= list.sprites[index].position[0] + 1e-6F;
+        const auto& sprite = list.sprites.front();
+        expect(list.batches.size() == 1U && list.batches.front().count == 40U && ordered,
+               "sprites are drawn farthest from the camera first");
+        expect(std::abs(sprite.width - 0.5F) < 0.02F && std::abs(sprite.color[3] - 0.5F) < 0.02F &&
+                   std::abs(sprite.color[0] - 4.0F) < 1e-3F && std::abs(sprite.age - 0.5F) < 0.02F,
+               "size and color follow their curves over life, and brightness scales the color");
+        expect(list.batches.front().texture == relay::builtin_particle_texture(ParticleEmitter::Builtin::soft_dot),
+               "emitters without a texture draw the built-in soft dot");
+    }
+    for (int builtin = 0; builtin < 7; ++builtin) {
+        const auto texture = relay::builtin_particle_texture(static_cast<ParticleEmitter::Builtin>(builtin));
+        std::size_t covered = 0;
+        for (std::size_t index = 3; texture && index < texture->rgba.size(); index += 4U) covered += texture->rgba[index] > 0U;
+        expect(texture && texture->width == 128U && covered > 200U && covered < 128U * 128U + 1U,
+               "built-in particle texture " + std::to_string(builtin) + " is drawn");
+    }
+    {
+        // The engine previews in the editor, resets for the game and runs particles in game steps.
+        relay::EngineConfig config;
+        config.editor_mode = true;
+        relay::Engine engine(config);
+        const auto node = engine.scene().create("Engine emitter");
+        auto emitter = still;
+        emitter.rate = 60.0;
+        (void)engine.scene().set_particle_emitter(node, emitter);
+        for (int index = 0; index < 30; ++index) engine.tick();
+        expect(count(engine.particles(), node) == 30U, "the engine previews emitters as it ticks in the editor " + std::to_string(count(engine.particles(), node)));
+        expect(engine.run_game(), "run the particle game");
+        expect(engine.particles().particle_count() == 0U, "Run Game starts particles afresh");
+        engine.step(30);
+        expect(count(engine.particles(), node) == 30U, "game steps advance emitters");
+        (void)engine.scene().destroy(node);
+        engine.step(1);
+        expect(engine.particles().status(node) && engine.particles().status(node)->orphan &&
+                   count(engine.particles(), node) == 30U,
+               "a destroyed emitter's particles finish their lives during the game");
+        expect(engine.stop_game() && engine.particles().particle_count() == 0U, "Stop Game clears particles");
+    }
+    std::cout << "Particle tests passed\n";
+}
+
 int main() {
     test_game_interface();
+    test_particles();
     {
         relay::Camera camera;
         camera.field_of_view_y_degrees = 90.0;
@@ -2508,7 +2932,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 50U && relay::protocol_methods().size() == 164U,
+    expect(relay::protocol_schema_version == 51U && relay::protocol_methods().size() == 167U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");

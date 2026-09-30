@@ -12,6 +12,8 @@ namespace relay {
 
 class AssetRegistry;
 class EditorOverlay;
+struct ParticleRenderList;
+struct ParticleView;
 struct RenderInterpolation;
 class Scene;
 struct UiDrawList;
@@ -52,6 +54,13 @@ public:
     void set_game_ui_source(GameUiSource source);
     // Why the interface pass could not be set up, if it could not.
     [[nodiscard]] std::string game_ui_error() const;
+    // The particles to draw, asked for each frame that draws a scene, in every view (the editor's
+    // camera too), with where the view is so the list can be sorted. Return null to draw none. The
+    // list must stay valid until the next call.
+    using ParticleSource = std::function<const ParticleRenderList*(const ParticleView& view)>;
+    void set_particle_source(ParticleSource source);
+    // Why the particle pass could not be set up, if it could not.
+    [[nodiscard]] std::string particle_error() const;
     [[nodiscard]] std::uint32_t draw_call_count() const;
     [[nodiscard]] std::uint32_t render_resource_count() const;
     [[nodiscard]] std::string render_graph_json() const;

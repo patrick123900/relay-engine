@@ -1091,6 +1091,102 @@ struct ScriptSystem::Impl {
             return 1;
         };
         host.mouse_locked = [](void* context) { return self(context).engine.input().mouse_locked() ? 1 : 0; };
+        host.particles_play = [](void* context, RelayEntity entity, int restart) {
+            auto& owner = self(context).engine;
+            return owner.particles().play(owner.scene(), unpack(entity), restart != 0) ? 1 : 0;
+        };
+        host.particles_stop = [](void* context, RelayEntity entity, int clear) {
+            auto& owner = self(context).engine;
+            if (!owner.scene().contains(unpack(entity)) || !owner.scene().get(unpack(entity))->particle_emitter)
+                return 0;
+            if (!owner.particles().status(unpack(entity))) (void)owner.particles().play(owner.scene(), unpack(entity));
+            return owner.particles().stop(unpack(entity), clear != 0) ? 1 : 0;
+        };
+        host.particles_pause = [](void* context, RelayEntity entity, int paused) {
+            return self(context).engine.particles().set_paused(unpack(entity), paused != 0) ? 1 : 0;
+        };
+        host.particles_emit = [](void* context, RelayEntity entity, size_t count) -> size_t {
+            auto& owner = self(context).engine;
+            return owner.particles().emit(owner.scene(), unpack(entity), count);
+        };
+        host.particles_count = [](void* context, RelayEntity entity) -> size_t {
+            const auto status = self(context).engine.particles().status(unpack(entity));
+            return status ? status->particles : 0U;
+        };
+        host.particles_playing = [](void* context, RelayEntity entity) {
+            const auto status = self(context).engine.particles().status(unpack(entity));
+            return status && status->playing ? 1 : 0;
+        };
+        host.particles_get_numbers = [](void* context, RelayEntity entity, const char* name, size_t length,
+                                        double* values, size_t capacity) -> size_t {
+            const auto* record = self(context).engine.scene().get(unpack(entity));
+            const auto index = particle_field_index({name, length});
+            if (!record || !record->particle_emitter || !index) return 0U;
+            const auto numbers = particle_numbers(particle_value(*record->particle_emitter, *index));
+            for (std::size_t item = 0; item < std::min(numbers.size(), capacity); ++item) values[item] = numbers[item];
+            return numbers.size();
+        };
+        host.particles_set_numbers = [](void* context, RelayEntity entity, const char* name, size_t length,
+                                        const double* values, size_t count) {
+            auto& impl = self(context);
+            const std::string field_name(name, length);
+            const auto index = particle_field_index(field_name);
+            const std::string where = "set_particles(\"" + field_name + "\")";
+            if (!index) {
+                impl.warn(where + ": particle emitters have no such field");
+                return 0;
+            }
+            const auto& info = particle_fields()[*index];
+            const std::vector<double> numbers(values, values + (values ? count : 0U));
+            std::optional<ParticleValue> value;
+            switch (info.type) {
+            case ParticleFieldType::boolean:
+                if (numbers.size() == 1U) value = ParticleValue{numbers[0] != 0.0};
+                break;
+            case ParticleFieldType::number:
+            case ParticleFieldType::integer:
+                if (numbers.size() == 1U)
+                    value = ParticleValue{info.type == ParticleFieldType::integer ? std::round(numbers[0]) : numbers[0]};
+                break;
+            case ParticleFieldType::vec3:
+                if (numbers.size() == 3U) value = ParticleValue{Vec3{numbers[0], numbers[1], numbers[2]}};
+                break;
+            case ParticleFieldType::range:
+                if (numbers.size() == 2U) value = ParticleValue{ParticleRange{numbers[0], numbers[1]}};
+                else if (numbers.size() == 1U) value = ParticleValue{ParticleRange{numbers[0], numbers[0]}};
+                break;
+            case ParticleFieldType::color:
+                if (numbers.size() == 4U) value = ParticleValue{UiColor{numbers[0], numbers[1], numbers[2], numbers[3]}};
+                else if (numbers.size() == 3U) value = ParticleValue{UiColor{numbers[0], numbers[1], numbers[2], 1.0}};
+                break;
+            default: break;
+            }
+            if (!value) {
+                impl.warn(where + ": the field does not take " + std::to_string(numbers.size()) + " number(s)");
+                return 0;
+            }
+            return impl.set_particle_value(unpack(entity), *index, *value, where) ? 1 : 0;
+        };
+        host.particles_set_text = [](void* context, RelayEntity entity, const char* name, size_t length,
+                                     const char* text, size_t text_length) {
+            auto& impl = self(context);
+            const std::string field_name(name, length);
+            const auto index = particle_field_index(field_name);
+            const std::string where = "set_particles(\"" + field_name + "\")";
+            if (!index) {
+                impl.warn(where + ": particle emitters have no such field");
+                return 0;
+            }
+            const auto type = particle_fields()[*index].type;
+            if (type != ParticleFieldType::choice && type != ParticleFieldType::asset && type != ParticleFieldType::text) {
+                impl.warn(where + ": the field takes numbers, not text");
+                return 0;
+            }
+            return impl.set_particle_value(unpack(entity), *index,
+                                           ParticleValue{std::string(text ? text : "", text ? text_length : 0U)}, where)
+                       ? 1
+                       : 0;
+        };
         host.overlap_sphere = [](void* context, RelayVec3 center, double radius,
                                  uint32_t layer_mask, RelayEntity ignore, RelayEntity* out,
                                  size_t capacity) -> size_t {
@@ -1126,6 +1222,37 @@ struct ScriptSystem::Impl {
         if (const auto* margins = std::get_if<UiMargins>(&value))
             return {margins->left, margins->top, margins->right, margins->bottom};
         return {};
+    }
+
+    // Numbers of a particle field's value, as scripts read them; none for text and lists.
+    static std::vector<double> particle_numbers(const ParticleValue& value) {
+        if (const auto* flag = std::get_if<bool>(&value)) return {*flag ? 1.0 : 0.0};
+        if (const auto* number = std::get_if<double>(&value)) return {*number};
+        if (const auto* vector = std::get_if<Vec3>(&value)) return {vector->x, vector->y, vector->z};
+        if (const auto* range = std::get_if<ParticleRange>(&value)) return {range->min, range->max};
+        if (const auto* color = std::get_if<UiColor>(&value)) return {color->r, color->g, color->b, color->a};
+        return {};
+    }
+
+    bool set_particle_value(Entity entity, std::size_t index, const ParticleValue& value, const std::string& where) {
+        auto& scene = engine.scene();
+        const auto* record = scene.get(entity);
+        if (!record || !record->particle_emitter) {
+            warn(where + " on " + entity.to_string() + ": the entity has no particle emitter");
+            return false;
+        }
+        std::string error;
+        if (!check_particle_value(particle_fields()[index], value, error)) {
+            warn(where + ": " + error);
+            return false;
+        }
+        auto emitter = *record->particle_emitter;
+        relay::set_particle_value(emitter, index, value);
+        if (!valid_particle_emitter(emitter, &error)) {
+            warn(where + ": " + error);
+            return false;
+        }
+        return scene.set_particle_emitter(entity, std::move(emitter));
     }
 
     bool set_ui_value(Entity entity, const UiFieldRef& field, const UiValue& value, const std::string& name) {

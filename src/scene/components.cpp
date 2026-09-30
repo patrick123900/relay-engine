@@ -22,6 +22,10 @@ const std::vector<ComponentKind>& engine_components() {
         {"post_process", "Post process", "Rendering", true, true, false,
          "Full-screen effects from post_process shaders, such as color grading or outlines, "
          "applied in order to every view. The first node with post processing is used."},
+        {"particle_emitter", "Particle emitter", "Effects", true, true, false,
+         "Emits particles for sparks, smoke, fire, dust, rain and magic: a shape, a rate and "
+         "bursts, forces, turbulence and collisions, and size, color and flipbook over each "
+         "particle's life."},
         {"collider", "Collider", "Physics", true, true, false,
          "A box, sphere, capsule, convex hull or triangle mesh shape for collisions, overlaps "
          "and raycasts."},
@@ -93,6 +97,7 @@ bool has_component(const EntityRecord& record, const std::string_view id) {
     if (id == "music_player") return record.music_player.has_value();
     if (id == "sky") return record.sky.has_value();
     if (id == "post_process") return record.post_process.has_value();
+    if (id == "particle_emitter") return record.particle_emitter.has_value();
     if (id == "animator") return record.animator.has_value();
     if (id == "script") return !record.scripts.empty();
     if (const auto* ui = find_ui_component(id); ui && ui->id == id) return ui->present(record.ui);
@@ -161,6 +166,8 @@ bool add_component(Scene& scene, const Entity entity, const std::string_view id,
         added = scene.set_sky(entity, Sky{});
     } else if (id == "post_process") {
         added = scene.set_post_process(entity, PostProcess{});
+    } else if (id == "particle_emitter") {
+        added = scene.set_particle_emitter(entity, ParticleEmitter{});
     } else if (id == "keyframes") {
         TransformAnimation animation;
         animation.keys.push_back({0.0, record->transform});
@@ -221,6 +228,7 @@ bool remove_component(Scene& scene, const Entity entity, const std::string_view 
     if (id == "music_player") return scene.set_music_player(entity, std::nullopt);
     if (id == "sky") return scene.set_sky(entity, std::nullopt);
     if (id == "post_process") return scene.set_post_process(entity, std::nullopt);
+    if (id == "particle_emitter") return scene.set_particle_emitter(entity, std::nullopt);
     auto scripts = record->scripts;
     scripts.erase(scripts.begin() + static_cast<std::ptrdiff_t>(index));
     return scene.set_scripts(entity, std::move(scripts));

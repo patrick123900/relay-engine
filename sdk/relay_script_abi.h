@@ -214,6 +214,27 @@ typedef struct RelayHostApi {
      * map's lock_mouse. Controls react to the pointer only while it is unlocked. */
     int (*set_mouse_locked)(void* context, int locked);
     int (*mouse_locked)(void* context);
+    /* Particle emitters. play starts the emitter's cycle (restart 1 also clears its particles);
+     * stop ends emission, letting living particles finish unless `clear` is 1; emit adds `count`
+     * particles now and returns how many were born. All return 0 without an emitter. */
+    int (*particles_play)(void* context, RelayEntity entity, int restart);
+    int (*particles_stop)(void* context, RelayEntity entity, int clear);
+    int (*particles_pause)(void* context, RelayEntity entity, int paused);
+    size_t (*particles_emit)(void* context, RelayEntity entity, size_t count);
+    /* Living particles, and whether the emitter is emitting. */
+    size_t (*particles_count)(void* context, RelayEntity entity);
+    int (*particles_playing)(void* context, RelayEntity entity);
+    /* Emitter fields by the names scene.set_particle_emitter uses, such as "rate", "color" or
+     * "gravity". Booleans are 0 or 1, ranges two numbers (min, max), vectors three and colors four
+     * (sRGB red, green, blue, alpha); choices and paths are text. Setting checks the value like the
+     * Inspector does, returning 0 and logging why when it does not fit. Changes last until Stop
+     * Game. Curves, gradients and bursts are edited in the scene, not from scripts. */
+    size_t (*particles_get_numbers)(void* context, RelayEntity entity, const char* field, size_t length,
+                                    double* values, size_t capacity);
+    int (*particles_set_numbers)(void* context, RelayEntity entity, const char* field, size_t length,
+                                 const double* values, size_t count);
+    int (*particles_set_text)(void* context, RelayEntity entity, const char* field, size_t length,
+                              const char* text, size_t text_length);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

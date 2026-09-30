@@ -6,8 +6,9 @@ is untouched. The test skips (and passes) when offscreen Vulkan or the lighting 
 unavailable. It checks that each effect reports itself active, that turning both off still
 renders the scene, and that each effect changes the image where it should. A copy of the demo
 with a Sky node then checks the gradient sky, fog and a sky material's panorama, and another the
-custom surface shaders and post processing. Finally the demo's motion blur must blur a camera that
-turns between frames and leave a still one sharp.
+custom surface shaders and post processing. The demo's motion blur must blur a camera that
+turns between frames and leave a still one sharp. Finally particles in front of the camera must
+glow additively, cover alpha-blended and rise as the capture steps.
 """
 
 import json
@@ -344,6 +345,77 @@ def motion_blur_checks(binary: str, folder: pathlib.Path) -> list:
     return [] if turning < still * 0.5 else [f"a turning camera should blur the view ({still} -> {turning} sharp edges)"]
 
 
+def particle_checks(binary: str, folder: pathlib.Path) -> list:
+    """Particles in front of the demo's camera: a glowing additive sprite in the middle of the view,
+    an opaque alpha-blended one to its left, and a stream of lit smoke that must have been simulated
+    through the capture's frames. Each is checked by the pixels it covers."""
+    project = folder / "particle-demo"
+    shutil.copytree(ROOT / "examples" / "demo", project, ignore=shutil.ignore_patterns(".relay-cache"))
+    hide_interface(project)
+    path = project / "scenes" / "showcase.relay.json"
+    document = json.loads(path.read_text())
+    entities = document["scene"]["entities"]
+    for entity in entities:
+        entity.setdefault("particle_emitter", None)
+        # Only these particles, and no post effects spreading them.
+        entity["particle_emitter"] = None
+        if entity.get("post_process") is not None:
+            entity["post_process"] = None
+    camera = next(entity for entity in entities if entity.get("camera") and entity["camera"]["active"])
+    generations = document["scene"]["allocator"]["slot_generations"]
+
+    def add(name: str, position: list, emitter: dict) -> None:
+        node = {key: None for key in entities[0]}
+        node.update(entity=f"{len(generations)}:1", name=name, scripts=[], parent=camera["entity"],
+                    particle_emitter=emitter,
+                    transform={"position": dict(zip("xyz", position)), "rotation_degrees": {"x": 0, "y": 0, "z": 0},
+                               "scale": {"x": 1, "y": 1, "z": 1}})
+        generations.append(1)
+        entities.append(node)
+
+    one = {"rate": 0, "bursts": [{"time": 0, "count": 1}], "shape": "point", "speed": 0, "lifetime": 100,
+           "soft_distance": 0}
+    add("Glow", [0, 0, -1.2], dict(one, size=0.4, color=[1, 0.1, 0.05, 1], blend="additive", emission=6,
+                                 builtin_texture="square"))
+    add("Blue", [-0.45, 0, -1.2], dict(one, size=0.2, color=[0.05, 0.2, 1, 1], builtin_texture="square"))
+    # Rises from below the view to its lower right: nothing shows there unless the steps ran.
+    add("Smoke", [0.6, -1.0, -1.2], {"rate": 40, "shape": "point", "speed": 0.5, "direction_randomness": 0,
+                                   "spherize": 0, "angle": 0, "lifetime": 3, "size": 0.12, "lit": True,
+                                   "color": [0.9, 0.9, 0.9, 1], "builtin_texture": "square", "soft_distance": 0})
+    document["version"] = max(document["version"], 26)
+    path.write_text(json.dumps(document))
+    result, status = render(binary, folder / "particles.png", True, True, folder, "particle-demo/demo.relayproject")
+    if result.returncode != 0 or status is None:
+        return [f"particle render failed: {result.stderr.strip()[-400:]}"]
+    # The same view without the emitters, for what lies behind them.
+    for entity in entities:
+        entity["particle_emitter"] = None
+    path.write_text(json.dumps(document))
+    result, status = render(binary, folder / "no-particles.png", True, True, folder, "particle-demo/demo.relayproject")
+    if result.returncode != 0 or status is None:
+        return [f"render without particles failed: {result.stderr.strip()[-400:]}"]
+    image, plain = read_png(folder / "particles.png"), read_png(folder / "no-particles.png")
+    width, height = image[0], image[1]
+    pixel = lambda picture, x, y: tuple(picture[3][y][x * picture[2] + c] for c in range(3))
+    # 1.2 m in front of a camera with a 75 degree view, the half width is about 1.2 m.
+    half_width = 1.2 * 0.7673 * width / height
+    centre = (width // 2, height // 2)
+    glow, behind_glow = pixel(image, *centre), pixel(plain, *centre)
+    blue = pixel(image, int(width * (0.5 - 0.45 / half_width / 2.0)), height // 2)
+    smoke_x = int(width * (0.5 + 0.6 / half_width / 2.0))
+    smoke_change = max(sum(abs(a - b) for a, b in zip(pixel(image, smoke_x, y), pixel(plain, smoke_x, y)))
+                       for y in range(height // 2, height - 10, 4))
+    print(f"additive glow {glow} over {behind_glow}, alpha sprite {blue}, lit smoke changes the view by {smoke_change}")
+    failures = []
+    if not (glow[0] >= min(behind_glow[0] + 30, 250) and glow[0] - glow[1] > behind_glow[0] - behind_glow[1] + 30):
+        failures.append(f"the additive particle should add red light in the middle of the view: {behind_glow} -> {glow}")
+    if not (blue[2] > 150 and blue[0] < 90 and blue[2] > blue[1]):
+        failures.append(f"the alpha-blended particle should cover its spot in blue, not {blue}")
+    if smoke_change < 60:
+        failures.append(f"the lit smoke stream should rise into view as the capture steps (change {smoke_change})")
+    return failures
+
+
 def main() -> int:
     binary = sys.argv[1]
     with tempfile.TemporaryDirectory(prefix="relay-lighting-") as directory:
@@ -389,6 +461,8 @@ def main() -> int:
             failures += material_preview_checks(binary, folder)
         if not failures:
             failures += motion_blur_checks(binary, folder)
+        if not failures:
+            failures += particle_checks(binary, folder)
         for failure in failures:
             print("FAIL:", failure)
         if failures:

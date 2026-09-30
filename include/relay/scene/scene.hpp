@@ -1,6 +1,8 @@
 #pragma once
 
+#include "relay/scene/particles.hpp"
 #include "relay/scene/ui.hpp"
+#include "relay/scene/vec3.hpp"
 
 #include <compare>
 #include <cstddef>
@@ -24,14 +26,6 @@ struct Entity {
     [[nodiscard]] static std::optional<Entity> parse(std::string_view value);
 
     auto operator<=>(const Entity&) const = default;
-};
-
-struct Vec3 {
-    double x{0.0};
-    double y{0.0};
-    double z{0.0};
-
-    auto operator<=>(const Vec3&) const = default;
 };
 
 struct Transform {
@@ -375,6 +369,7 @@ struct EntityRecord {
     std::optional<MusicPlayer> music_player{};
     std::optional<Sky> sky{};
     std::optional<PostProcess> post_process{};
+    std::optional<ParticleEmitter> particle_emitter{};
     // Game interface components: a canvas, or a control with its widgets.
     UiComponents ui{};
 };
@@ -433,6 +428,8 @@ public:
     [[nodiscard]] bool set_music_player(Entity entity, std::optional<MusicPlayer> player);
     [[nodiscard]] bool set_sky(Entity entity, std::optional<Sky> sky);
     [[nodiscard]] bool set_post_process(Entity entity, std::optional<PostProcess> post_process);
+    // valid_particle_emitter() must accept the emitter.
+    [[nodiscard]] bool set_particle_emitter(Entity entity, std::optional<ParticleEmitter> emitter);
     // Replaces every UI component of the node at once; valid_ui() must accept them.
     [[nodiscard]] bool set_ui(Entity entity, UiComponents ui);
     [[nodiscard]] std::optional<Entity> active_camera() const;

@@ -255,6 +255,33 @@ button that plays the next note of a scale and ducks the music under it),
 `scripts/MusicSwitch.cpp` (a pad that moves the soundtrack on at the next bar) and the shot sound in
 `scripts/FirstPersonController.cpp` are complete examples. `scripts/GameMenu.cpp` runs the showcase's HUD and pause menu.
 
+## Particles
+
+A node's **Particle emitter** is authored in the editor; scripts start, stop and retune it during
+the game:
+
+```cpp
+void on_contact_begin(relay::Entity) override {
+    sparks.emit_particles(40);            // A burst from the emitter's shape, where it is now.
+}
+void on_start() override {
+    sparks = self().child("Sparks");
+    self().play_particles();              // Start a waiting emitter (Play on start off).
+}
+```
+
+- `entity.play_particles(restart)` starts the emitter's cycle; `restart` also clears its particles.
+- `entity.stop_particles(clear)` stops emitting and lets the living particles finish, or removes
+  them with `clear`; `entity.pause_particles(paused)` freezes them.
+- `entity.emit_particles(count)` adds particles now and returns how many were born (Max particles
+  can limit it). `entity.particle_count()` and `entity.particles_playing()` report its state.
+- `entity.set_particles(field, value)` sets any emitter field by the name the protocol uses:
+  numbers, booleans, `relay::Vec3` vectors, `{min, max}` ranges, `{r, g, b, a}` sRGB colors and
+  choice names or texture paths as text. `entity.particle_numbers(field)` reads one back. Values
+  that do not fit are refused and logged; changes last until Stop Game.
+
+See the [particle guide](particles.md) for every field.
+
 ## Trust
 
 Scripts are native code. They run inside the editor with your full user permissions, like any

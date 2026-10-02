@@ -18,6 +18,7 @@
 #include "relay/scene/project.hpp"
 #include "relay/scene/scene_io.hpp"
 #include "relay/scene/templates.hpp"
+#include "relay/ui/ui_render.hpp"
 #include "relay/scene/scene_edit.hpp"
 
 #include <algorithm>
@@ -625,6 +626,122 @@ relay::Entity created_entity(const relay::JsonValue& result) {
     return *relay::Entity::parse(*relay::field(*result.object(), "entity")->string());
 }
 
+// Switched-off components do nothing while the game runs.
+void disabled_components_in_game() {
+    relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+    relay::ControlProtocol protocol(engine);
+    (void)request(protocol, "project.create",
+                  "\"filename\":\"projects/switches/project.relayproject\",\"name\":\"Switches\"");
+    auto& scene = engine.scene();
+    const auto body = [&](const char* name, const double height) {
+        const auto node = scene.create(name);
+        const auto field = "\"entity\":\"" + node.to_string() + '"';
+        request(protocol, "scene.set_transform", field + ",\"py\":" + std::to_string(height));
+        request(protocol, "component.add", field + ",\"component\":\"collider\"");
+        request(protocol, "component.add", field + ",\"component\":\"physics_body\"");
+        return node;
+    };
+    const auto falling = body("Falling", 20.0);
+    const auto held = body("Held", 20.0);
+    request(protocol, "component.set_enabled",
+            "\"entity\":\"" + held.to_string() + "\",\"component\":\"physics_body\",\"enabled\":false");
+    request(protocol, "runtime.play");
+    engine.step(30);
+    check(scene.get(falling)->transform.position.y < 19.0, "an enabled dynamic body falls");
+    check(scene.get(held)->transform.position.y == 20.0, "a body switched off stays where it is");
+    request(protocol, "runtime.stop");
+
+    // Interface widgets switched off are left out of the layout, as if removed.
+    const auto menu = scene.create("Menu");
+    const auto menu_field = "\"entity\":\"" + menu.to_string() + '"';
+    request(protocol, "scene.set_ui", menu_field + ",\"component\":\"ui_canvas\"");
+    const auto panel = scene.create("Panel", menu);
+    const auto panel_field = "\"entity\":\"" + panel.to_string() + '"';
+    request(protocol, "scene.set_ui", panel_field + ",\"component\":\"ui_panel\"");
+    relay::UiPainter painter;
+    check(painter.layout(relay::ui_sources(scene), 640, 360).find(panel) != nullptr, "an interface panel is laid out");
+    request(protocol, "component.set_enabled", panel_field + ",\"component\":\"ui_panel\",\"enabled\":true");
+    request(protocol, "component.set_enabled", panel_field + ",\"component\":\"ui_control\",\"enabled\":false");
+    check(painter.layout(relay::ui_sources(scene), 640, 360).find(panel) == nullptr,
+          "a Control switched off takes the whole widget out of the layout");
+    request(protocol, "component.set_enabled", panel_field + ",\"component\":\"ui_control\",\"enabled\":true");
+    check(painter.layout(relay::ui_sources(scene), 640, 360).find(panel) != nullptr,
+          "switching it back on restores it");
+}
+
+// Every component except the Transform can be switched off and on without losing its settings.
+void component_switches() {
+    relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+    relay::ControlProtocol protocol(engine);
+    auto& scene = engine.scene();
+    const auto node = scene.create("Switched");
+    const auto field = "\"entity\":\"" + node.to_string() + '"';
+    const auto set = [&](const std::string& id, const bool enabled, const bool ok = true,
+                         const std::string& extra = {}) {
+        request(protocol, "component.set_enabled",
+                field + ",\"component\":\"" + id + "\",\"enabled\":" + (enabled ? "true" : "false") + extra,
+                ok);
+    };
+    for (const std::string id : {"mesh_renderer", "camera", "light", "collider", "physics_body", "keyframes"})
+        request(protocol, "component.add", field + ",\"component\":\"" + id + '"');
+    request(protocol, "component.add", field + ",\"component\":\"script\",\"behaviour\":\"First\"");
+    const auto rendered = [&] {
+        const auto output = relay::build_render_scene(scene, engine.assets(), 1.0F);
+        return std::pair{output.instances.size(), output.lights.size()};
+    };
+    check(rendered().second == 1U && scene.active_camera() == node, "components start switched on");
+    const auto instances = rendered().first;
+
+    set("transform", false, false);
+    set("animator", false, false);
+    set("sky", false, false); // Absent components cannot be switched.
+
+    set("mesh_renderer", false);
+    check(scene.get(node)->mesh_renderer && rendered().first + 1U == instances,
+          "a disabled mesh renderer stays on the node but is not drawn");
+    set("light", false);
+    check(rendered().second == 0U, "a disabled light does not light the scene");
+    set("camera", false);
+    check(!scene.active_camera(), "a disabled camera is never the active camera");
+    set("collider", false);
+    check(!scene.get(node)->collider->enabled, "a collider keeps its own enabled flag");
+    set("script", false, true, ",\"index\":0");
+    check(!scene.get(node)->scripts[0].enabled, "a script keeps its own enabled flag");
+    set("script", false, false, ",\"index\":5");
+    check(relay::component_enabled(*scene.get(node), "keyframes") &&
+              !relay::component_enabled(*scene.get(node), "light") &&
+              relay::component_enabled(*scene.get(node), "physics_body"),
+          "component_enabled reads each component's switch");
+
+    const auto inspected = request(protocol, "scene.inspect", field);
+    const auto* wrapped = relay::field(*inspected.object(), "entity");
+    const auto* disabled = relay::field(wrapped && wrapped->object() ? *wrapped->object() : *inspected.object(),
+                                        "disabled_components");
+    check(disabled && disabled->array() && disabled->array()->size() == 3U,
+          "scene.inspect lists switched-off components, except those with their own flag");
+
+    // Saved, loaded, copied and undone with the node.
+    std::string error;
+    check(relay::save_scene_file_atomic(scene, "switches.relay.json", error), "save switched scene");
+    const auto loaded = relay::load_scene_file("switches.relay.json");
+    check(loaded && loaded.state->slots[node.index].record.disabled_components ==
+                        scene.get(node)->disabled_components,
+          "switched-off components survive saving and loading");
+    const auto copy = scene.duplicate(node);
+    check(scene.get(copy)->disabled_components == scene.get(node)->disabled_components,
+          "a duplicate keeps its components switched off");
+    set("light", true);
+    check(rendered().second == 1U, "enabling a component restores it (the duplicate's light stays off)");
+    request(protocol, "scene.undo");
+    check(!relay::component_enabled(*scene.get(node), "light") && rendered().second == 0U,
+          "switching a component is undoable");
+
+    // Removing and re-adding starts switched on.
+    request(protocol, "component.remove", field + ",\"component\":\"light\"");
+    request(protocol, "component.add", field + ",\"component\":\"light\"");
+    check(relay::component_enabled(*scene.get(node), "light"), "a re-added component starts enabled");
+}
+
 void components_and_templates() {
     relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
     relay::ControlProtocol protocol(engine);
@@ -1052,7 +1169,7 @@ void first_person_migration() {
         text.replace(at, from.size(), to);
     };
     replace("\"version\":" + std::to_string(relay::scene_file_version), "\"version\":15");
-    replace("\"scripts\":[],\"joint\":null,\"audio_source\":null,\"audio_listener\":null,\"reverb_zone\":null,\"music_player\":null,\"sky\":null,\"post_process\":null,\"particle_emitter\":null,\"ui\":null}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
+    replace("\"scripts\":[],\"joint\":null,\"audio_source\":null,\"audio_listener\":null,\"reverb_zone\":null,\"music_player\":null,\"sky\":null,\"post_process\":null,\"particle_emitter\":null,\"ui\":null,\"disabled_components\":[]}", "\"scripts\":[],\"first_person_controller\":{\"walk_speed\":5,"
                                "\"sprint_speed\":8,\"jump_speed\":4,\"mouse_sensitivity\":0.2,"
                                "\"stick_look_speed\":120,\"invert_y\":true,\"ground_distance\":1.1,"
                                "\"camera\":\"Eyes\"}}");
@@ -2803,6 +2920,8 @@ int main() {
         asset_files();
         demo_project();
         components_and_templates();
+        component_switches();
+        disabled_components_in_game();
         input_mapping();
         graphics_settings();
         demo_first_person_template();

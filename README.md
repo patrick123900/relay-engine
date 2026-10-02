@@ -27,7 +27,7 @@ edits the same project alongside it.
   profiler, mixer and shader graph editor, built with SDL3 and Dear ImGui.
 - **Agents built in** — an embedded chat workspace with sign-in, attachments, inline renders and
   permission controls; agents frame, capture and review the viewport as they work.
-- **One typed API** — 167 versioned native methods for scenes, assets, rendering, capture and
+- **One typed API** — 168 versioned native methods for scenes, assets, rendering, capture and
   authorization, generated for C++, TypeScript and an MCP bridge.
 - **Rendering** — Vulkan HDR pipeline with PBR materials, cascaded and punctual shadows, sky, sun
   and fog, and AMD FidelityFX global illumination and ray traced reflections.

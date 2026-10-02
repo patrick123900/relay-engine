@@ -2526,7 +2526,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
         output << "}}";
         return output.str();
     }
-    if (method == "component.add" || method == "component.remove" || method == "scene.set_script" ||
+    if (method == "component.add" || method == "component.remove" || method == "component.set_enabled" ||
+        method == "scene.set_script" ||
         method == "scene.set_script_property") {
         const auto entity = Entity::parse(string_field(request, "entity"));
         if (!entity || !engine_.scene().contains(*entity))
@@ -2543,6 +2544,12 @@ std::string ControlProtocol::handle(const std::string_view request) {
                     entity->to_string();
             change = [&](Scene& scene) {
                 return add_component(scene, *entity, component, behaviour, error);
+            };
+        } else if (method == "component.set_enabled") {
+            const auto enabled = boolean_field(request, "enabled", true);
+            label = std::string{enabled ? "Enable " : "Disable "} + component + " on " + entity->to_string();
+            change = [&, enabled](Scene& scene) {
+                return set_component_enabled(scene, *entity, component, index, enabled, error);
             };
         } else if (method == "component.remove") {
             label = "Remove " + component + " from " + entity->to_string();

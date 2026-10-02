@@ -468,7 +468,8 @@ class WorldResolver {
             }
         }
         if (record != nullptr && record->transform_animation &&
-            !record->transform_animation->keys.empty()) {
+            !record->transform_animation->keys.empty() &&
+            !component_disabled(*record, ComponentFlag::keyframes)) {
             const auto& animation = *record->transform_animation;
             const auto time = previous != nullptr && previous->has_animation
                                   ? blended_time(previous->animation_time, animation.time_seconds,
@@ -808,7 +809,8 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
                 output.post_effects.push_back(std::move(material));
         }
     if (output.sky.visible)
-        if (const auto& sun = scene.get(output.sky.entity)->light;
+        if (const auto* sun = active_component(*scene.get(output.sky.entity), scene.get(output.sky.entity)->light,
+                                               ComponentFlag::light);
             sun && sun->type == Light::Type::directional && sun->intensity > 0.0) {
             const auto shining = normalized(transform_point(resolve_world(output.sky.entity), {0, 0, -1}, true));
             output.sky.sun = true;
@@ -816,7 +818,8 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
             output.sky.sun_radiance = to_color(sun->color, sun->intensity);
         }
     for (const auto entity : entities)
-        if (const auto& light = scene.get(entity)->light) {
+        if (const auto* light = active_component(*scene.get(entity), scene.get(entity)->light,
+                                                 ComponentFlag::light)) {
             const auto world = resolve_world(entity);
             output.lights.push_back({*light, transform_point(world, {}),
                                      normalized(transform_point(world, {0, 0, -1}, true))});
@@ -963,7 +966,8 @@ RenderScene build_render_scene(const Scene& scene, const AssetRegistry& assets,
     output.instances.reserve(entities.size());
     for (const auto entity : entities) {
         const auto* record = scene.get(entity);
-        if (record == nullptr || !record->mesh_renderer.has_value()) {
+        if (record == nullptr || !record->mesh_renderer.has_value() ||
+            component_disabled(*record, ComponentFlag::mesh_renderer)) {
             continue;
         }
         const auto model = resolve_world(entity);

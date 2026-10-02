@@ -72,6 +72,9 @@ struct UiSourceNode {
     Entity entity;
     Entity parent;
     const UiComponents* ui{}; // Null for nodes without UI; must outlive the layout.
+    // Set when some of the node's widgets are switched off: `ui` then points at this copy without
+    // them, and layouts built from the node keep it alive.
+    std::shared_ptr<const UiComponents> owned;
 };
 [[nodiscard]] std::vector<UiSourceNode> ui_sources(const Scene& scene);
 
@@ -98,6 +101,7 @@ struct UiLayout {
     std::vector<UiLayoutNode> nodes;
     std::vector<std::size_t> order; // Back to front: canvases by sort order, then depth first.
     std::unordered_map<std::uint64_t, std::size_t> by_entity;
+    std::vector<std::shared_ptr<const UiComponents>> keep_alive; // Owners of nodes' filtered components.
     [[nodiscard]] const UiLayoutNode* find(Entity entity) const;
     // The node's rectangle's four corners in view pixels, clockwise from its top-left.
     [[nodiscard]] std::array<Vec2, 4> corners(const UiLayoutNode& node) const;

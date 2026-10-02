@@ -1,3 +1,4 @@
+#include "relay/scene/components.hpp"
 #include "relay/scene/scene_io.hpp"
 
 #include "relay/core/json.hpp"
@@ -1018,6 +1019,21 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                     return result;
                 }
                 slot.record.particle_emitter = std::move(emitter);
+            }
+        }
+        if (result.source_version >= 27U) {
+            const auto* value = field(*entity_object, "disabled_components");
+            if (!value || !value->array()) {
+                result.error = "version 27 entity requires disabled_components";
+                return result;
+            }
+            for (const auto& item : *value->array()) {
+                const auto flag = item.string() ? component_flag(*item.string()) : std::nullopt;
+                if (!flag || !has_component(slot.record, *item.string())) {
+                    result.error = "invalid disabled_components entry";
+                    return result;
+                }
+                slot.record.disabled_components |= static_cast<std::uint32_t>(*flag);
             }
         }
         ++result.entity_count;

@@ -118,12 +118,12 @@ void UiSystem::update(Scene& scene, InputState& input) {
 
     const auto* held = pressed_.valid() ? layout.find(pressed_) : nullptr;
     auto* record = pressed_.valid() ? scene.get(pressed_) : nullptr;
-    if (pressed_.valid() && (!held || !record || !held->visible || !interactive(record->ui))) {
+    if (pressed_.valid() && (!held || !record || !held->visible || !interactive(*held->ui))) {
         pressed_ = {};
         held = nullptr;
         record = nullptr;
     }
-    if (record && record->ui.slider && pointer_on) {
+    if (record && held->ui->slider && pointer_on) {
         auto& slider = *record->ui.slider;
         const double value = slider_value(*held, slider, pointer);
         if (value != slider.value) {
@@ -137,7 +137,8 @@ void UiSystem::update(Scene& scene, InputState& input) {
         emit(UiEvent::Type::released, control, 0.0);
         if (over && over->entity == control) {
             std::string sound;
-            if (ui.button) {
+            const auto& shown = *held->ui;
+            if (shown.button) {
                 auto& button = *ui.button;
                 if (button.toggle) {
                     button.pressed = !button.pressed;
@@ -145,13 +146,13 @@ void UiSystem::update(Scene& scene, InputState& input) {
                 }
                 emit(UiEvent::Type::clicked, control, button.pressed ? 1.0 : 0.0);
                 sound = button.click_sound;
-            } else if (ui.toggle) {
+            } else if (shown.toggle) {
                 auto& toggle = *ui.toggle;
                 toggle.checked = !toggle.checked;
                 emit(UiEvent::Type::toggled, control, toggle.checked ? 1.0 : 0.0);
                 emit(UiEvent::Type::clicked, control, toggle.checked ? 1.0 : 0.0);
                 sound = toggle.click_sound;
-            } else if (ui.slider) {
+            } else if (shown.slider) {
                 emit(UiEvent::Type::clicked, control, ui.slider->value);
             }
             if (!sound.empty() && sound_) sound_(sound);

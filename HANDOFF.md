@@ -9,7 +9,7 @@ overview for visitors. Protocol details belong in [`docs/protocol.md`](docs/prot
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v51: 167 native methods. Scene v26, project v2, import manifest v3.
+- Protocol schema v52: 168 native methods. Scene v27, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
@@ -314,6 +314,21 @@ without blocking simultaneous human editing.
   category, addable, removable, multiple) and the add/remove rules shared by protocol and editor.
   The Transform and imported model animation (`animator`, which model-node children depend on)
   cannot be removed. A camera added to a scene without an active camera becomes active.
+  Every component except the Transform and model animation can be switched off (Unity's header
+  checkbox) without removing it: `component.set_enabled` (undoable). Colliders, joints and
+  scripts keep their own `enabled` field; every other kind is a bit of `ComponentFlag` in
+  `EntityRecord::disabled_components`, saved in scene v27 as an entity `disabled_components` id
+  list (present components only; a Scene setter clears the bit when its component goes, so a
+  re-added component starts on). `component_enabled` / `set_component_enabled` /
+  `component_flag` live in `components.cpp`, and `active_component` / `component_disabled` in
+  `scene.hpp` are what systems test. A disabled camera, sky or post process is skipped by
+  `active_camera`/`active_sky`/`active_post_process`; the renderer skips disabled mesh renderers
+  and lights; audio ignores disabled sources, listeners, reverb zones and music players (a disabled
+  one stops); a disabled particle emitter is treated like a removed one (live particles finish);
+  a disabled physics body leaves the node static (collider only) and disabled keyframes stop
+  driving the transform everywhere it is sampled; disabled interface widgets are filtered out in
+  `ui_sources` (a filtered copy kept alive by the layout). Scripts cannot toggle components yet
+  (`component_fields.cpp` has no `<component>.enabled` for the flag-based kinds).
 - Node types are a tree in `src/scene/node_types.cpp`: Node > Model, PhysicsBody
   (> RigidBody, StaticBody), Camera, Sky, Light (> DirectionalLight, PointLight, SpotLight),
   StaticMesh, AudioSource, ReverbZone, MusicPlayer, PostProcess, ParticleEmitter. Each type
@@ -356,8 +371,9 @@ without blocking simultaneous human editing.
   paste's "<name> Copy". There is no live prefab link or override tracking. `templates.list`
   reports each template's root node type (`node_type()` of the saved root), its engine component
   ids and its script behaviours.
-- The Inspector draws only present components, with a close button and Remove context item on
-  removable headers, and script components as "<Behaviour> (Script)" sections with typed property
+- The Inspector draws only present components, with an enable checkbox (`component_header`: a
+  text-free `editor_checkbox` just left of the close button, drawn over the header with
+  `SetNextItemAllowOverlap`), a close button and Remove context item on removable headers, and script components as "<Behaviour> (Script)" sections with typed property
   editors and per-property Reset. **+ Add Component** opens a modal window: category list,
   component list (present ones disabled and tagged "Added"), description of the selection,
   search, "New C++ script..." (creates the file and attaches it), Add/Enter and double-click.

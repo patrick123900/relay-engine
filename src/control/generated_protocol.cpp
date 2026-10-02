@@ -490,6 +490,13 @@ constexpr std::array<ProtocolFieldSpec, 3> fields_component_remove{{
     {"index", ProtocolValueType::integer, false, false, true, true, 0, 31, 0U, 0U, "", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 4> fields_component_set_enabled{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"component", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "mesh_renderer|camera|light|sky|post_process|particle_emitter|collider|physics_body|joint|audio_source|audio_listener|reverb_zone|music_player|keyframes|script|ui_canvas|ui_control|ui_panel|ui_label|ui_image|ui_button|ui_toggle|ui_slider|ui_progress_bar|ui_container"},
+    {"enabled", ProtocolValueType::boolean, true, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"index", ProtocolValueType::integer, false, false, true, true, 0, 31, 0U, 0U, "", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_script{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"index", ProtocolValueType::integer, true, false, true, true, 0, 31, 0U, 0U, "", ""},
@@ -825,7 +832,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_audio_set_spatialization{{
     {"mode", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "stereo|binaural"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 167> methods{{
+constexpr std::array<ProtocolMethodSpec, 168> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -921,6 +928,7 @@ constexpr std::array<ProtocolMethodSpec, 167> methods{{
     {"scene.set_ui", "scene_set_ui", "Configure interface component", "Add, edit or remove one game interface (UI) component on a node. Interface nodes are drawn over the game's view during Run Game only, never in the editor's own view. A Canvas (ui_canvas) scales the controls below it to the screen; a Control (ui_control) places a rectangle, Godot style, by anchors (fractions of the parent control's or screen's size) plus offsets in canvas units, with a pivot for rotation and scale; widgets draw into it or react to the pointer: ui_panel, ui_label, ui_image, ui_button, ui_toggle (check box or switch), ui_slider, ui_progress_bar and ui_container (column, row or grid that places its children). values maps field names to JSON values: numbers, booleans, strings (text, project file paths, choice names), [x, y] vectors, [red, green, blue, alpha] sRGB colors from 0 to 1 and [left, top, right, bottom] margins. Omitted fields keep their values; a missing component is added with its defaults first, and a widget brings its Control. anchor_preset (ui_control) places the control by a preset before values apply, keeping its size. component.types lists every field with its type, range and choices; ui.layout and ui.render show the result. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_ui},
     {"component.add", "component_add", "Add component", "Add an engine component with editor defaults, or append a script component running a behaviour, as one undoable transaction. Configure it afterwards with the component's own method, such as scene.set_camera or scene.set_script_property.", false, false, false, false, false, fields_component_add},
     {"component.remove", "component_remove", "Remove component", "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.", false, true, false, false, false, fields_component_remove},
+    {"component.set_enabled", "component_set_enabled", "Enable or disable component", "Switch one component on or off without removing it or losing its settings, like the checkbox on a Unity component, as one undoable transaction. A disabled component stays on the node and in the scene file but does nothing: a disabled mesh renderer is not drawn, a disabled camera or sky is never the one in use, a disabled collider, physics body, joint, script, light, audio source, music player, reverb zone, particle emitter, keyframe animation or interface component is ignored during Run Game and in the editor view. The Transform and imported model animation cannot be disabled.", false, false, false, false, false, fields_component_set_enabled},
     {"scene.set_script", "scene_set_script", "Configure script component", "Change the behaviour or enabled state of one of a node's script components, as an undoable transaction.", false, false, false, false, false, fields_scene_set_script},
     {"scene.set_script_property", "scene_set_script_property", "Set script property", "Store a value for a behaviour property on one script component, or reset it to the code default. Send exactly one of number, boolean, text or vector unless resetting.", false, false, false, false, false, fields_scene_set_script_property},
     {"nodes.types", "nodes_types", "List node types", "List the node type tree. Each type adds components to its parent's; creatable types can be passed to scene.create. A node's reported type is the deepest type whose components it has.", true, false, false, false, false, no_fields},

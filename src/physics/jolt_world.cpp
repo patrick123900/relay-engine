@@ -210,6 +210,16 @@ Vec3 cross(Vec3 a, Vec3 b) {
 }
 double dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
+// Keyframes with at least one key and switched on drive the node's transform.
+bool keyframes_play(const EntityRecord& record) {
+    return record.transform_animation && !record.transform_animation->keys.empty() &&
+           !component_disabled(record, ComponentFlag::keyframes);
+}
+
+const PhysicsBody* enabled_body(const EntityRecord& record) {
+    return active_component(record, record.physics_body, ComponentFlag::physics_body);
+}
+
 std::optional<WorldTransform> world_transform(const Scene& scene, Entity entity) {
     std::array<Entity, 4096> chain{};
     std::size_t count{};
@@ -221,8 +231,7 @@ std::optional<WorldTransform> world_transform(const Scene& scene, Entity entity)
     WorldTransform world;
     while (count) {
         const auto* record = scene.get(chain[--count]);
-        const auto transform = record->transform_animation &&
-                                       !record->transform_animation->keys.empty()
+        const auto transform = keyframes_play(*record)
             ? sample_transform_animation(*record->transform_animation, record->transform)
             : record->transform;
         const Vec3 translated = transform_direction(world.axes, transform.position);
@@ -267,9 +276,8 @@ std::optional<JPH::ShapeRefC> shape_from_box(const CollisionDebugBox& box,
 }
 
 bool dynamic_body(const EntityRecord& record) {
-    return record.physics_body &&
-           record.physics_body->type == PhysicsBody::Type::dynamic &&
-           (!record.transform_animation || record.transform_animation->keys.empty());
+    const auto* body = enabled_body(record);
+    return body && body->type == PhysicsBody::Type::dynamic && !keyframes_play(record);
 }
 
 std::optional<JPH::ShapeRefC> shape_from_round(const BoxCollider& collider,
@@ -653,7 +661,8 @@ public:
         std::optional<CollisionDebugBox> geometry;
         if (!mesh_based) geometry = detail::collider_geometry(scene, entity);
         const bool has_collider = geometry || mesh_based;
-        if (!has_collider && (!record->physics_body || queries_only)) return;
+        const auto* body = enabled_body(*record);
+        if (!has_collider && (!body || queries_only)) return;
         const auto transform = world_transform(scene, entity);
         if (!transform) return;
         JPH::ShapeRefC shape;
@@ -679,8 +688,7 @@ public:
             shape = new JPH::SphereShape(0.1f);
         }
         const bool dynamic = !queries_only && dynamic_body(*record);
-        const bool animated = record->transform_animation &&
-                              !record->transform_animation->keys.empty();
+        const bool animated = keyframes_play(*record);
         const auto motion = dynamic ? JPH::EMotionType::Dynamic :
                             animated && !queries_only ? JPH::EMotionType::Kinematic :
                             JPH::EMotionType::Static;
@@ -689,19 +697,19 @@ public:
         JPH::BodyCreationSettings settings(shape.GetPtr(), to_jolt_position(transform->position),
                                             transform->rotation, motion, layer);
         settings.mUserData = entity.packed();
-        if (record->physics_body) {
-            settings.mGravityFactor = static_cast<float>(record->physics_body->gravity_scale);
-            settings.mRestitution = static_cast<float>(record->physics_body->restitution);
-            settings.mFriction = static_cast<float>(record->physics_body->friction);
-            settings.mLinearDamping = static_cast<float>(record->physics_body->linear_damping);
-            settings.mAngularDamping = static_cast<float>(record->physics_body->angular_damping);
+        if (body) {
+            settings.mGravityFactor = static_cast<float>(body->gravity_scale);
+            settings.mRestitution = static_cast<float>(body->restitution);
+            settings.mFriction = static_cast<float>(body->friction);
+            settings.mLinearDamping = static_cast<float>(body->linear_damping);
+            settings.mAngularDamping = static_cast<float>(body->angular_damping);
             if (dynamic) {
                 settings.mOverrideMassProperties =
                     JPH::EOverrideMassProperties::CalculateInertia;
                 settings.mMassPropertiesOverride.mMass =
-                    static_cast<float>(record->physics_body->mass);
+                    static_cast<float>(body->mass);
                 settings.mMotionQuality = JPH::EMotionQuality::LinearCast;
-                if (record->physics_body->lock_rotation)
+                if (body->lock_rotation)
                     settings.mAllowedDOFs = JPH::EAllowedDOFs::TranslationX |
                                             JPH::EAllowedDOFs::TranslationY |
                                             JPH::EAllowedDOFs::TranslationZ;
@@ -723,8 +731,7 @@ public:
         auto& api = system_.GetBodyInterface();
         for (const auto& [entity, id] : bodies_) {
             const auto* record = scene.get(entity);
-            if (!record || !record->transform_animation ||
-                record->transform_animation->keys.empty()) continue;
+            if (!record || !keyframes_play(*record)) continue;
             const auto pose = world_transform(scene, entity);
             if (!pose) continue;
             api.MoveKinematic(id,

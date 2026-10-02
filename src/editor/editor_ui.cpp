@@ -1,4 +1,5 @@
 #include "relay/editor/editor_ui.hpp"
+#include "relay/scene/components.hpp"
 #include "relay/editor/chat_media.hpp"
 #include "relay/audio/audio_settings.hpp"
 
@@ -259,6 +260,7 @@ struct EditorUi::Impl {
 
     std::map<ImGuiID, EditorScalarDraft> drafts;
     bool drawing_inspector{};
+    const JsonValue::Object* inspected_entity{}; // The node the Inspector is drawing, for its headers.
 
     // How a field's name reads in the label column: any "##id" dropped, underscores as spaces and a
     // capital first letter, so script and shader names like wave_height read "Wave height".
@@ -5120,10 +5122,6 @@ struct EditorUi::Impl {
             }
             ImGui::EndCombo();
         }
-        auto enabled = boolean_or(*collider, "enabled", true);
-        if (inspector_checkbox("Enabled##collider", &enabled))
-            mutate("scene.set_collider", entity_request +
-                   ",\"enabled\":" + (enabled ? "true" : "false"), "Collider updated");
         auto center = editor_vector(*collider, "center", {0, 0, 0});
         if (const auto mask = drag_vector3("Center", center, 0.05F, 84.0F * ui_scale))
             mutate("scene.set_collider", entity_request +
@@ -6411,9 +6409,6 @@ struct EditorUi::Impl {
             }
             ImGui::EndCombo();
         }
-        bool enabled = boolean_or(*joint, "enabled", true);
-        if (inspector_checkbox("Enabled##joint", &enabled))
-            set(std::string{",\"enabled\":"} + (enabled ? "true" : "false"), "Joint updated");
 
         // The partner: any other node with a physics body or collider, or the world.
         const auto connected = string_or(*joint, "connected");
@@ -6530,7 +6525,7 @@ struct EditorUi::Impl {
             ImGui::TextColored(warning, "Add a physics body or collider to this node.");
         else if (!dynamic(&entity) && !dynamic(partner))
             ImGui::TextColored(warning, "One of the joined bodies must be dynamic.");
-        if (!enabled)
+        if (!boolean_or(*joint, "enabled", true))
             ImGui::TextDisabled("Removing the connected node disables its joints.");
     }
 
@@ -6554,14 +6549,60 @@ struct EditorUi::Impl {
         return nullptr;
     }
 
-    // A removable component's header carries a close button and a Remove context item; closing
-    // it removes the component through the protocol like any other edit.
+    // Whether the inspected node's component is switched on: colliders, joints and scripts carry
+    // their own flag, every other component is listed in `disabled_components` when it is off.
+    bool inspected_component_enabled(const std::string& id, const std::size_t index) const {
+        if (inspected_entity == nullptr) return true;
+        if (id == "script") {
+            const auto* scripts = field(*inspected_entity, "scripts");
+            if (!scripts || !scripts->array() || index >= scripts->array()->size()) return true;
+            const auto* script = (*scripts->array())[index].object();
+            return script == nullptr || boolean_or(*script, "enabled", true);
+        }
+        if (id == "collider" || id == "joint") {
+            const auto* values = component(*inspected_entity, id.c_str());
+            return values == nullptr || boolean_or(*values, "enabled", true);
+        }
+        const auto* disabled = field(*inspected_entity, "disabled_components");
+        if (disabled && disabled->array())
+            for (const auto& item : *disabled->array())
+                if (item.string() && *item.string() == id) return false;
+        return true;
+    }
+
+    // A removable component's header carries an enable checkbox, as in Unity, then a close button
+    // and a Remove context item; closing it removes the component through the protocol like any
+    // other edit, and the checkbox switches it off or on without losing its settings.
     bool component_header(const char* label, const std::string& id, const std::size_t index = 0,
                           const bool removable = true) {
         bool keep = true;
+        const bool switchable = removable && inspected_entity != nullptr && can_disable_component(id);
+        if (switchable) ImGui::SetNextItemAllowOverlap();
         const bool open = ImGui::CollapsingHeader(label, removable ? &keep : nullptr,
                                                   ImGuiTreeNodeFlags_DefaultOpen);
-        note_item("inspector:component:" + id + (id == "script" ? ":" + std::to_string(index) : ""));
+        const auto key = "inspector:component:" + id + (id == "script" ? ":" + std::to_string(index) : "");
+        note_item(key);
+        if (switchable) {
+            const ImVec2 low = ImGui::GetItemRectMin();
+            const ImVec2 high = ImGui::GetItemRectMax();
+            const ImGuiStyle& style = ImGui::GetStyle();
+            const float box = std::round(std::min(ImGui::GetFrameHeight(), ImGui::GetFontSize() * 0.86F));
+            // Just left of the close button, which ends one frame padding inside the header.
+            const float x = high.x - style.FramePadding.x - ImGui::GetFontSize() - style.ItemInnerSpacing.x - box;
+            const ImVec2 resume = ImGui::GetCursorScreenPos();
+            ImGui::SetCursorScreenPos(ImVec2(x, low.y));
+            bool enabled = inspected_component_enabled(id, index);
+            if (editor_checkbox("##component_enabled", &enabled)) {
+                mutate("component.set_enabled",
+                       entity_field(selection) + ",\"component\":\"" + id + "\",\"enabled\":" +
+                           (enabled ? "true" : "false") +
+                           (id == "script" ? ",\"index\":" + std::to_string(index) : ""),
+                       enabled ? "Component enabled" : "Component disabled");
+            }
+            note_item(key + ":enabled");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(enabled ? "Disable this component" : "Enable this component");
+            ImGui::SetCursorScreenPos(resume);
+        }
         if (removable && ImGui::BeginPopupContextItem()) {
             if (ImGui::MenuItem("Remove component")) keep = false;
             ImGui::EndPopup();
@@ -6687,10 +6728,6 @@ struct EditorUi::Impl {
                 continue;
             }
             const auto script_request = entity_field(selection) + ",\"index\":" + std::to_string(index);
-            bool enabled = boolean_or(*script, "enabled", true);
-            if (inspector_checkbox("Enabled", &enabled))
-                mutate("scene.set_script", script_request + ",\"enabled\":" + (enabled ? "true" : "false"),
-                       enabled ? "Script enabled" : "Script disabled");
             const auto* info = behaviour_info(behaviour);
             const auto* declared = info ? field(*info, "properties") : nullptr;
             const auto* stored_list = field(*script, "properties");
@@ -7386,10 +7423,29 @@ struct EditorUi::Impl {
             const UiComponents* ui = nullptr;
             if (const auto* value = field(*entities[index], "ui"); value && value->object()) {
                 std::string error;
-                if (read_ui_components(*value, interface_components[index], error) && !interface_components[index].empty())
-                    ui = &interface_components[index];
+                if (read_ui_components(*value, interface_components[index], error)) {
+                    // Widgets switched off with their component checkbox are not drawn.
+                    auto& parsed = interface_components[index];
+                    const auto* off = field(*entities[index], "disabled_components");
+                    if (off && off->array())
+                        for (const auto& item : *off->array()) {
+                            if (!item.string()) continue;
+                            const auto& name = *item.string();
+                            if (name == "ui_canvas") parsed.canvas.reset();
+                            else if (name == "ui_control") parsed.control.reset();
+                            else if (name == "ui_panel") parsed.panel.reset();
+                            else if (name == "ui_label") parsed.label.reset();
+                            else if (name == "ui_image") parsed.image.reset();
+                            else if (name == "ui_button") parsed.button.reset();
+                            else if (name == "ui_toggle") parsed.toggle.reset();
+                            else if (name == "ui_slider") parsed.slider.reset();
+                            else if (name == "ui_progress_bar") parsed.progress_bar.reset();
+                            else if (name == "ui_container") parsed.container.reset();
+                        }
+                    if (!parsed.empty()) ui = &parsed;
+                }
             }
-            interface_sources.push_back({*entity, parent, ui});
+            interface_sources.push_back({*entity, parent, ui, nullptr});
         }
     }
 
@@ -7705,6 +7761,7 @@ struct EditorUi::Impl {
             return;
         }
         drawing_inspector = true;
+        inspected_entity = entity;
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                             ImVec2(8.0F * ui_scale, 6.0F * ui_scale));
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
@@ -7764,6 +7821,7 @@ struct EditorUi::Impl {
         draw_add_component();
         ImGui::PopStyleColor(6);
         ImGui::PopStyleVar(2);
+        inspected_entity = nullptr;
         drawing_inspector = false;
     }
 

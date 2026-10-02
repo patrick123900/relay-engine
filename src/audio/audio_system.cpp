@@ -46,7 +46,8 @@ std::optional<EditorMatrix> world_matrix(const Scene& scene, const Entity entity
     for (auto item = chain.rbegin(); item != chain.rend(); ++item) {
         const auto* record = *item;
         const auto transform =
-            record->transform_animation && !record->transform_animation->keys.empty()
+            record->transform_animation && !record->transform_animation->keys.empty() &&
+                    !component_disabled(*record, ComponentFlag::keyframes)
                 ? sample_transform_animation(*record->transform_animation, record->transform)
                 : record->transform;
         world = editor_multiply(world, editor_compose(transform.position,
@@ -91,7 +92,7 @@ std::uint64_t seconds_to_frames(const double seconds) {
 
 double reverb_zone_weight(const Scene& scene, const Entity zone_entity, const Vec3 point) {
     const auto* record = scene.get(zone_entity);
-    if (!record || !record->reverb_zone) return 0.0;
+    if (!record || !record->reverb_zone || component_disabled(*record, ComponentFlag::reverb_zone)) return 0.0;
     const auto& zone = *record->reverb_zone;
     const auto world = world_matrix(scene, zone_entity);
     if (!world) return 0.0;
@@ -250,7 +251,8 @@ void AudioSystem::set_paused(const bool paused) { paused_ = paused; }
 void AudioSystem::find_listener(const Scene& scene, const double delta_seconds) {
     Listener listener;
     for (const auto entity : scene.entities()) {
-        if (scene.get(entity)->audio_listener) {
+        if (active_component(*scene.get(entity), scene.get(entity)->audio_listener,
+                             ComponentFlag::audio_listener)) {
             listener.entity = entity;
             break;
         }
@@ -399,6 +401,10 @@ bool AudioSystem::start_source(const Scene& scene, const Entity entity, const bo
     const auto* record = scene.get(entity);
     if (!record || !record->audio_source) {
         error = "the node has no audio source";
+        return false;
+    }
+    if (component_disabled(*record, ComponentFlag::audio_source)) {
+        error = "the audio source is disabled";
         return false;
     }
     const auto& source = *record->audio_source;
@@ -558,6 +564,10 @@ bool AudioSystem::change_track(const Scene& scene, const Entity entity, int trac
         error = "the node has no music player";
         return false;
     }
+    if (component_disabled(*record, ComponentFlag::music_player)) {
+        error = "the music player is disabled";
+        return false;
+    }
     const auto& player = *record->music_player;
     if (player.tracks.empty()) {
         error = "the music player has no tracks";
@@ -677,7 +687,7 @@ void AudioSystem::update_music(const Scene& scene, const double delta_seconds) {
     (void)delta_seconds;
     for (auto item = music_.begin(); item != music_.end();) {
         const auto* record = scene.get(item->first);
-        if (record && record->music_player) {
+        if (record && record->music_player && !component_disabled(*record, ComponentFlag::music_player)) {
             ++item;
             continue;
         }
@@ -688,7 +698,8 @@ void AudioSystem::update_music(const Scene& scene, const double delta_seconds) {
         item = music_.erase(item);
     }
     for (const auto entity : scene.entities()) {
-        const auto& player = scene.get(entity)->music_player;
+        const auto* player = active_component(*scene.get(entity), scene.get(entity)->music_player,
+                                              ComponentFlag::music_player);
         if (!player || player->tracks.empty()) continue;
         auto& state = music_[entity];
         std::string ignored;
@@ -817,7 +828,8 @@ void AudioSystem::update_zones(const Scene& scene, const bool game) {
             if (const auto position = playback_position(scene, playback)) sounds.push_back(*position);
     std::vector<Entity> relevant;
     for (const auto entity : scene.entities()) {
-        if (!scene.get(entity)->reverb_zone) continue;
+        if (!active_component(*scene.get(entity), scene.get(entity)->reverb_zone, ComponentFlag::reverb_zone))
+            continue;
         const double heard = reverb_zone_weight(scene, entity, listener_.position);
         if (heard > 0.0) listener_zones_.emplace_back(entity, heard);
         const bool near = heard > 0.0 || std::any_of(sounds.begin(), sounds.end(), [&](const Vec3 point) {
@@ -862,8 +874,8 @@ void AudioSystem::update_occlusion(const Scene& scene, const double delta_second
     for (auto& [handle, playback] : playbacks_) {
         const AudioSource* source = playback.kind == Kind::one_shot ? &playback.settings : nullptr;
         if (playback.kind == Kind::source)
-            if (const auto* record = scene.get(playback.entity); record && record->audio_source)
-                source = &*record->audio_source;
+            if (const auto* record = scene.get(playback.entity))
+                source = active_component(*record, record->audio_source, ComponentFlag::audio_source);
         if (!playback.game || !source || !source->spatial || !source->occlusion) {
             playback.occlusion_target = 0.0;
             continue;
@@ -928,7 +940,8 @@ void AudioSystem::update(const Scene& scene, const bool game, const double delta
         update_occlusion(scene, delta_seconds, raycast);
     if (running && !paused_) {
         for (const auto entity : scene.entities()) {
-            const auto& source = scene.get(entity)->audio_source;
+            const auto* source = active_component(*scene.get(entity), scene.get(entity)->audio_source,
+                                                  ComponentFlag::audio_source);
             if (!source || !source->play_on_start || started_.contains(entity)) continue;
             started_.insert(entity);
             std::string ignored;
@@ -944,12 +957,14 @@ void AudioSystem::update(const Scene& scene, const bool game, const double delta
             bool keep = mixer_.active(playback.voice) && (!playback.game || game);
             const AudioSource* source = nullptr;
             if (playback.kind == Kind::source) {
-                keep = keep && record && record->audio_source && record->audio_source->clip == playback.clip;
-                if (keep) source = &*record->audio_source;
+                source = record ? active_component(*record, record->audio_source, ComponentFlag::audio_source)
+                                : nullptr;
+                keep = keep && source && source->clip == playback.clip;
             } else if (playback.kind == Kind::one_shot) {
                 source = &playback.settings;
             } else {
-                keep = keep && record && record->music_player;
+                keep = keep && record && record->music_player &&
+                       !component_disabled(*record, ComponentFlag::music_player);
             }
             if (!keep) {
                 mixer_.stop(playback.voice);
@@ -1091,11 +1106,13 @@ std::string AudioSystem::debug_shapes_json(const Scene& scene) {
     std::string zones, sources;
     for (const auto entity : scene.entities()) {
         const auto* record = scene.get(entity);
-        if (!record->reverb_zone && !(record->audio_source && record->audio_source->spatial)) continue;
+        const auto* zone_shape = active_component(*record, record->reverb_zone, ComponentFlag::reverb_zone);
+        const auto* placed = active_component(*record, record->audio_source, ComponentFlag::audio_source);
+        if (!zone_shape && !(placed && placed->spatial)) continue;
         const auto world = world_matrix(scene, entity);
         if (!world) continue;
         const auto center = matrix_column(*world, 3);
-        if (const auto& zone = record->reverb_zone) {
+        if (const auto* zone = zone_shape) {
             if (!zones.empty()) zones += ',';
             zones += "{\"entity\":\"" + entity.to_string() + "\",\"shape\":\"" +
                      std::string(reverb_shape_name(zone->shape)) + "\",\"center\":";
@@ -1113,7 +1130,7 @@ std::string AudioSystem::debug_shapes_json(const Scene& scene) {
             zones += "],\"radius\":" + number_json(zone->radius * scale) +
                      ",\"fade\":" + number_json(zone->fade) + '}';
         }
-        if (const auto& source = record->audio_source; source && source->spatial) {
+        if (const auto* source = placed; source && source->spatial) {
             if (!sources.empty()) sources += ',';
             sources += "{\"entity\":\"" + entity.to_string() + "\",\"center\":";
             append_vec3(sources, center);

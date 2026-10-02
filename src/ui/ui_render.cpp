@@ -109,7 +109,41 @@ std::vector<UiSourceNode> ui_sources(const Scene& scene) {
     std::vector<UiSourceNode> sources;
     for (const auto entity : scene.entities()) {
         const auto* record = scene.get(entity);
-        sources.push_back({entity, record->parent, record->ui.empty() ? nullptr : &record->ui});
+        if (record->ui.empty()) {
+            sources.push_back({entity, record->parent, nullptr, nullptr});
+            continue;
+        }
+        // Widgets switched off with their component checkbox are left out, as if removed.
+        constexpr auto ui_flags = static_cast<std::uint32_t>(ComponentFlag::ui_canvas) |
+                                  static_cast<std::uint32_t>(ComponentFlag::ui_control) |
+                                  static_cast<std::uint32_t>(ComponentFlag::ui_panel) |
+                                  static_cast<std::uint32_t>(ComponentFlag::ui_label) |
+                                  static_cast<std::uint32_t>(ComponentFlag::ui_image) |
+                                  static_cast<std::uint32_t>(ComponentFlag::ui_button) |
+                                  static_cast<std::uint32_t>(ComponentFlag::ui_toggle) |
+                                  static_cast<std::uint32_t>(ComponentFlag::ui_slider) |
+                                  static_cast<std::uint32_t>(ComponentFlag::ui_progress_bar) |
+                                  static_cast<std::uint32_t>(ComponentFlag::ui_container);
+        if ((record->disabled_components & ui_flags) == 0U) {
+            sources.push_back({entity, record->parent, &record->ui, nullptr});
+            continue;
+        }
+        auto copy = std::make_shared<UiComponents>(record->ui);
+        const auto drop = [&](auto& component, const ComponentFlag flag) {
+            if (component_disabled(*record, flag)) component.reset();
+        };
+        drop(copy->canvas, ComponentFlag::ui_canvas);
+        drop(copy->control, ComponentFlag::ui_control);
+        drop(copy->panel, ComponentFlag::ui_panel);
+        drop(copy->label, ComponentFlag::ui_label);
+        drop(copy->image, ComponentFlag::ui_image);
+        drop(copy->button, ComponentFlag::ui_button);
+        drop(copy->toggle, ComponentFlag::ui_toggle);
+        drop(copy->slider, ComponentFlag::ui_slider);
+        drop(copy->progress_bar, ComponentFlag::ui_progress_bar);
+        drop(copy->container, ComponentFlag::ui_container);
+        const auto* pointer = copy->empty() ? nullptr : copy.get();
+        sources.push_back({entity, record->parent, pointer, pointer ? std::move(copy) : nullptr});
     }
     return sources;
 }
@@ -459,6 +493,7 @@ struct UiPainter::Build {
             source_of.emplace(sources[index].entity.packed(), index);
             const auto* ui = sources[index].ui;
             if (!ui || (!ui->canvas && !ui->control)) continue;
+            if (sources[index].owned) out.keep_alive.push_back(sources[index].owned);
             out.by_entity.emplace(sources[index].entity.packed(), out.nodes.size());
             UiLayoutNode node;
             node.entity = sources[index].entity;

@@ -1742,6 +1742,26 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "component_set_enabled",
+    {
+      title: "Enable or disable component",
+      description: "Switch one component on or off without removing it or losing its settings, like the checkbox on a Unity component, as one undoable transaction. A disabled component stays on the node and in the scene file but does nothing: a disabled mesh renderer is not drawn, a disabled camera or sky is never the one in use, a disabled collider, physics body, joint, script, light, audio source, music player, reverb zone, particle emitter, keyframe animation or interface component is ignored during Run Game and in the editor view. The Transform and imported model animation cannot be disabled.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "component": z.enum(["mesh_renderer", "camera", "light", "sky", "post_process", "particle_emitter", "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone", "music_player", "keyframes", "script", "ui_canvas", "ui_control", "ui_panel", "ui_label", "ui_image", "ui_button", "ui_toggle", "ui_slider", "ui_progress_bar", "ui_container"]),
+        "enabled": z.boolean(),
+        "index": z.number().int().min(0).max(31).optional().describe("Which script component, from zero")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["component_set_enabled"];
+        if (override) return override(input as JsonObject);
+        return invoke("component.set_enabled", {"entity": input["entity"], "component": input["component"], "enabled": input["enabled"], "index": input["index"]});
+      },
+  );
+
+  server.registerTool(
     "scene_set_script",
     {
       title: "Configure script component",

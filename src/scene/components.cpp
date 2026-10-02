@@ -215,7 +215,7 @@ bool remove_component(Scene& scene, const Entity entity, const std::string_view 
         }
         return scene.set_ui(entity, std::move(components));
     }
-        if (id == "mesh_renderer") return scene.set_mesh_renderer(entity, std::nullopt);
+    if (id == "mesh_renderer") return scene.set_mesh_renderer(entity, std::nullopt);
     if (id == "camera") return scene.set_camera(entity, std::nullopt);
     if (id == "light") return scene.set_light(entity, std::nullopt);
     if (id == "collider") return scene.set_collider(entity, std::nullopt);
@@ -232,6 +232,89 @@ bool remove_component(Scene& scene, const Entity entity, const std::string_view 
     auto scripts = record->scripts;
     scripts.erase(scripts.begin() + static_cast<std::ptrdiff_t>(index));
     return scene.set_scripts(entity, std::move(scripts));
+}
+
+std::optional<ComponentFlag> component_flag(const std::string_view id) {
+    struct Entry {
+        std::string_view id;
+        ComponentFlag flag;
+    };
+    static constexpr Entry entries[]{
+        {"camera", ComponentFlag::camera},
+        {"mesh_renderer", ComponentFlag::mesh_renderer},
+        {"light", ComponentFlag::light},
+        {"sky", ComponentFlag::sky},
+        {"post_process", ComponentFlag::post_process},
+        {"particle_emitter", ComponentFlag::particle_emitter},
+        {"physics_body", ComponentFlag::physics_body},
+        {"audio_source", ComponentFlag::audio_source},
+        {"audio_listener", ComponentFlag::audio_listener},
+        {"reverb_zone", ComponentFlag::reverb_zone},
+        {"music_player", ComponentFlag::music_player},
+        {"keyframes", ComponentFlag::keyframes},
+        {"ui_canvas", ComponentFlag::ui_canvas},
+        {"ui_control", ComponentFlag::ui_control},
+        {"ui_panel", ComponentFlag::ui_panel},
+        {"ui_label", ComponentFlag::ui_label},
+        {"ui_image", ComponentFlag::ui_image},
+        {"ui_button", ComponentFlag::ui_button},
+        {"ui_toggle", ComponentFlag::ui_toggle},
+        {"ui_slider", ComponentFlag::ui_slider},
+        {"ui_progress_bar", ComponentFlag::ui_progress_bar},
+        {"ui_container", ComponentFlag::ui_container},
+    };
+    for (const auto& entry : entries)
+        if (entry.id == id) return entry.flag;
+    return std::nullopt;
+}
+
+bool can_disable_component(const std::string_view id) {
+    return component_flag(id).has_value() || id == "collider" || id == "joint" || id == "script";
+}
+
+bool component_enabled(const EntityRecord& record, const std::string_view id, const std::size_t index) {
+    if (id == "collider") return record.collider && record.collider->enabled;
+    if (id == "joint") return record.joint && record.joint->enabled;
+    if (id == "script") return index < record.scripts.size() && record.scripts[index].enabled;
+    if (const auto flag = component_flag(id)) return has_component(record, id) && !component_disabled(record, *flag);
+    return has_component(record, id);
+}
+
+bool set_component_enabled(Scene& scene, const Entity entity, const std::string_view id,
+                           const std::size_t index, const bool enabled, std::string& error) {
+    auto* record = scene.get(entity);
+    if (!record) {
+        error = "invalid or stale entity";
+        return false;
+    }
+    if (!can_disable_component(id)) {
+        error = id == "transform" ? "the Transform cannot be disabled"
+                                  : "unknown or non-switchable component";
+        return false;
+    }
+    if (!has_component(*record, id) || (id == "script" && index >= record->scripts.size())) {
+        error = "the node has no such component";
+        return false;
+    }
+    if (id == "collider") {
+        auto collider = *record->collider;
+        collider.enabled = enabled;
+        return scene.set_collider(entity, std::move(collider));
+    }
+    if (id == "joint") {
+        auto joint = *record->joint;
+        joint.enabled = enabled;
+        return scene.set_joint(entity, std::move(joint));
+    }
+    if (id == "script") {
+        auto scripts = record->scripts;
+        scripts[index].enabled = enabled;
+        return scene.set_scripts(entity, std::move(scripts));
+    }
+    const auto bit = static_cast<std::uint32_t>(*component_flag(id));
+    if (enabled) record->disabled_components &= ~bit;
+    else record->disabled_components |= bit;
+    return true;
 }
 
 } // namespace relay

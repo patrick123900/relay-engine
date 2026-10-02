@@ -1409,7 +1409,8 @@ struct ScriptSystem::Impl {
         for (std::size_t depth = 0; current.valid() && depth < 4096U; ++depth) {
             const auto* record = scene.get(current);
             if (!record) return std::nullopt;
-            const auto local = record->transform_animation && !record->transform_animation->keys.empty()
+            const auto local = record->transform_animation && !record->transform_animation->keys.empty() &&
+                                       !component_disabled(*record, ComponentFlag::keyframes)
                 ? sample_transform_animation(*record->transform_animation, record->transform)
                 : record->transform;
             world = editor_multiply(editor_compose(local.position, local.rotation_degrees, local.scale), world);

@@ -467,7 +467,8 @@ void Engine::advance_animations() {
     RELAY_PROFILE_SCOPE("Animation");
     for (const auto entity : scene_.entities()) {
         auto *record = scene_.get(entity);
-        if (record->transform_animation && record->transform_animation->playing) {
+        if (record->transform_animation && record->transform_animation->playing &&
+            !component_disabled(*record, ComponentFlag::keyframes)) {
             auto& animation = *record->transform_animation;
             animation.time_seconds += config_.fixed_delta_seconds * animation.speed;
             if (animation.loop) {

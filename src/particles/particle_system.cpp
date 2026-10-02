@@ -86,7 +86,8 @@ std::optional<Affine> world_of(const Scene& scene, const Entity entity) {
     Affine world;
     for (auto item = chain.rbegin(); item != chain.rend(); ++item) {
         const auto* record = *item;
-        const auto transform = record->transform_animation && !record->transform_animation->keys.empty()
+        const auto transform = record->transform_animation && !record->transform_animation->keys.empty() &&
+                                       !component_disabled(*record, ComponentFlag::keyframes)
                                    ? sample_transform_animation(*record->transform_animation, record->transform)
                                    : record->transform;
         world = multiply(world, compose(transform.position, transform.rotation_degrees, transform.scale));
@@ -656,11 +657,13 @@ void ParticleSystem::update(const Scene& scene, const double delta_seconds, cons
     const auto entities = scene.entities();
     for (const auto entity : entities) {
         const auto* record = scene.get(entity);
-        if (!record->particle_emitter || record->particle_emitter->sub_emitter.empty()) continue;
+        const auto* emitter = active_component(*record, record->particle_emitter, ComponentFlag::particle_emitter);
+        if (!emitter || emitter->sub_emitter.empty()) continue;
         for (const auto child : entities) {
             const auto* candidate = scene.get(child);
-            if (child != entity && candidate->parent == entity && candidate->particle_emitter &&
-                candidate->name == record->particle_emitter->sub_emitter) {
+            if (child != entity && candidate->parent == entity &&
+                active_component(*candidate, candidate->particle_emitter, ComponentFlag::particle_emitter) &&
+                candidate->name == emitter->sub_emitter) {
                 sub_of[entity.packed()] = child.packed();
                 subs.insert(child.packed());
                 break;
@@ -668,7 +671,9 @@ void ParticleSystem::update(const Scene& scene, const double delta_seconds, cons
         }
     }
     for (const auto entity : entities) {
-        if (!scene.get(entity)->particle_emitter) continue;
+        // A switched-off emitter is treated like a removed one: its live particles finish in place.
+        if (!active_component(*scene.get(entity), scene.get(entity)->particle_emitter,
+                              ComponentFlag::particle_emitter)) continue;
         const auto existing = states_.find(entity.packed());
         const bool fresh = existing == states_.end() || existing->second->orphan;
         auto* state = state_for(scene, entity);

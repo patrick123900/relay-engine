@@ -1,4 +1,5 @@
 #include "relay/scene/scene.hpp"
+#include "relay/scene/components.hpp"
 #include "relay/scene/scene_io.hpp"
 #include "relay/audio/audio_clip.hpp"
 #include "relay/audio/audio_settings.hpp"
@@ -281,7 +282,15 @@ void append_entity(std::ostringstream& output, const Entity entity, const Entity
     output << ",\"particle_emitter\":"
            << (record.particle_emitter ? particle_emitter_json(*record.particle_emitter) : std::string("null"));
     output << ",\"ui\":" << ui_components_json(record.ui);
-    output << '}';
+    output << ",\"disabled_components\":[";
+    bool first_disabled = true;
+    for (const auto& kind : engine_components()) {
+        const auto flag = component_flag(kind.id);
+        if (!flag || !component_disabled(record, *flag) || !has_component(record, kind.id)) continue;
+        output << (first_disabled ? "" : ",") << '"' << kind.id << '"';
+        first_disabled = false;
+    }
+    output << "]}";
 }
 
 std::string_view field_type_name(const ReflectedFieldType type) {
@@ -439,6 +448,7 @@ bool Scene::set_camera(const Entity entity, std::optional<Camera> camera) {
         }
     }
     record->camera = camera;
+    if (!record->camera) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::camera);
     return true;
 }
 
@@ -470,6 +480,7 @@ bool Scene::set_mesh_renderer(const Entity entity, std::optional<MeshRenderer> r
         for (const auto& [name, values] : renderer->parameters)
             if (!valid_renderer_parameter(name, values)) return false;
     record->mesh_renderer = std::move(renderer);
+    if (!record->mesh_renderer) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::mesh_renderer);
     return true;
 }
 
@@ -511,6 +522,7 @@ bool Scene::set_transform_animation(const Entity entity,
         }
     }
     record->transform_animation = std::move(animation);
+    if (!record->transform_animation) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::keyframes);
     return true;
 }
 
@@ -560,6 +572,7 @@ bool Scene::set_light(const Entity entity, std::optional<Light> light) {
             return false;
     }
     record->light = std::move(light);
+    if (!record->light) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::light);
     return true;
 }
 
@@ -598,6 +611,7 @@ bool Scene::set_physics_body(const Entity entity, std::optional<PhysicsBody> bod
                  !std::isfinite(body->angular_damping) || body->angular_damping < 0.0 ||
                  body->angular_damping > 100.0)) return false;
     record->physics_body = std::move(body);
+    if (!record->physics_body) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::physics_body);
     return true;
 }
 
@@ -776,6 +790,7 @@ bool Scene::set_post_process(const Entity entity, std::optional<PostProcess> pos
     auto* record = get(entity);
     if (!record || (post_process && !valid_post_process(*post_process))) return false;
     record->post_process = std::move(post_process);
+    if (!record->post_process) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::post_process);
     return true;
 }
 
@@ -783,6 +798,19 @@ bool Scene::set_ui(const Entity entity, UiComponents ui) {
     auto* record = get(entity);
     if (!record || !valid_ui(ui)) return false;
     record->ui = std::move(ui);
+    const auto clear = [&](const bool present, const ComponentFlag flag) {
+        if (!present) record->disabled_components &= ~static_cast<std::uint32_t>(flag);
+    };
+    clear(record->ui.canvas.has_value(), ComponentFlag::ui_canvas);
+    clear(record->ui.control.has_value(), ComponentFlag::ui_control);
+    clear(record->ui.panel.has_value(), ComponentFlag::ui_panel);
+    clear(record->ui.label.has_value(), ComponentFlag::ui_label);
+    clear(record->ui.image.has_value(), ComponentFlag::ui_image);
+    clear(record->ui.button.has_value(), ComponentFlag::ui_button);
+    clear(record->ui.toggle.has_value(), ComponentFlag::ui_toggle);
+    clear(record->ui.slider.has_value(), ComponentFlag::ui_slider);
+    clear(record->ui.progress_bar.has_value(), ComponentFlag::ui_progress_bar);
+    clear(record->ui.container.has_value(), ComponentFlag::ui_container);
     return true;
 }
 
@@ -790,6 +818,7 @@ bool Scene::set_sky(const Entity entity, std::optional<Sky> sky) {
     auto* record = get(entity);
     if (!record || (sky && !valid_sky(*sky))) return false;
     record->sky = std::move(sky);
+    if (!record->sky) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::sky);
     return true;
 }
 
@@ -797,6 +826,7 @@ bool Scene::set_particle_emitter(const Entity entity, std::optional<ParticleEmit
     auto* record = get(entity);
     if (!record || (emitter && !valid_particle_emitter(*emitter))) return false;
     record->particle_emitter = std::move(emitter);
+    if (!record->particle_emitter) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::particle_emitter);
     return true;
 }
 
@@ -804,6 +834,7 @@ bool Scene::set_music_player(const Entity entity, std::optional<MusicPlayer> pla
     auto* record = get(entity);
     if (!record || (player && !valid_music_player(*player))) return false;
     record->music_player = std::move(player);
+    if (!record->music_player) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::music_player);
     return true;
 }
 
@@ -874,6 +905,7 @@ bool Scene::set_reverb_zone(const Entity entity, std::optional<ReverbZone> zone)
     auto* record = get(entity);
     if (!record || (zone && !valid_reverb_zone(*zone))) return false;
     record->reverb_zone = std::move(zone);
+    if (!record->reverb_zone) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::reverb_zone);
     return true;
 }
 
@@ -881,6 +913,7 @@ bool Scene::set_audio_source(const Entity entity, std::optional<AudioSource> sou
     auto* record = get(entity);
     if (!record || (source && !valid_audio_source(*source))) return false;
     record->audio_source = std::move(source);
+    if (!record->audio_source) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::audio_source);
     return true;
 }
 
@@ -888,6 +921,7 @@ bool Scene::set_audio_listener(const Entity entity, std::optional<AudioListener>
     auto* record = get(entity);
     if (!record) return false;
     record->audio_listener = listener;
+    if (!record->audio_listener) record->disabled_components &= ~static_cast<std::uint32_t>(ComponentFlag::audio_listener);
     return true;
 }
 
@@ -1005,7 +1039,8 @@ Entity Scene::duplicate(const Entity source) {
 std::optional<Entity> Scene::active_camera() const {
     for (std::uint32_t index = 0; index < slots_.size(); ++index) {
         const auto& slot = slots_[index];
-        if (slot.alive && slot.record.camera.has_value() && slot.record.camera->active) {
+        if (slot.alive && slot.record.camera.has_value() && slot.record.camera->active &&
+            !component_disabled(slot.record, ComponentFlag::camera)) {
             return Entity{index, slot.generation};
         }
     }
@@ -1015,7 +1050,8 @@ std::optional<Entity> Scene::active_camera() const {
 std::optional<Entity> Scene::active_post_process() const {
     for (std::uint32_t index = 0; index < slots_.size(); ++index) {
         const auto& slot = slots_[index];
-        if (slot.alive && slot.record.post_process) return Entity{index, slot.generation};
+        if (slot.alive && slot.record.post_process &&
+            !component_disabled(slot.record, ComponentFlag::post_process)) return Entity{index, slot.generation};
     }
     return std::nullopt;
 }
@@ -1023,7 +1059,7 @@ std::optional<Entity> Scene::active_post_process() const {
 std::optional<Entity> Scene::active_sky() const {
     for (std::uint32_t index = 0; index < slots_.size(); ++index) {
         const auto& slot = slots_[index];
-        if (slot.alive && slot.record.sky) return Entity{index, slot.generation};
+        if (slot.alive && slot.record.sky && !component_disabled(slot.record, ComponentFlag::sky)) return Entity{index, slot.generation};
     }
     return std::nullopt;
 }

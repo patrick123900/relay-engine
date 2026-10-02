@@ -3,6 +3,7 @@
 #include "relay/scene/scene.hpp"
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -33,5 +34,16 @@ struct ComponentKind {
 // Removes one component; `index` selects among script components.
 [[nodiscard]] bool remove_component(Scene& scene, Entity entity, std::string_view id,
                                     std::size_t index, std::string& error);
+
+// The flag bit that switches a component off, for every kind that has one. Colliders, joints and
+// scripts keep their own `enabled` field; the Transform and model animation cannot be switched.
+[[nodiscard]] std::optional<ComponentFlag> component_flag(std::string_view id);
+[[nodiscard]] bool can_disable_component(std::string_view id);
+// Whether the component is present and switched on; `index` selects among script components.
+[[nodiscard]] bool component_enabled(const EntityRecord& record, std::string_view id,
+                                     std::size_t index = 0);
+// Switches a present component on or off as one scene change, leaving its settings alone.
+[[nodiscard]] bool set_component_enabled(Scene& scene, Entity entity, std::string_view id,
+                                         std::size_t index, bool enabled, std::string& error);
 
 } // namespace relay

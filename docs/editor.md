@@ -14,8 +14,11 @@ arrangement, and `RELAY_EDITOR_LAYOUT_PATH` points the editor at another file.
 ## Nodes, components and templates
 
 A node is a Transform plus the components you give it. The **Inspector** shows only the
-components a node has; remove one with the **×** on its header (or right-click → **Remove
-component**). **+ Add Component** at the bottom opens the Add Component window: categories on the
+components a node has; switch one off, like Unity, with the checkbox on its header, left of the
+**×**, and on again without losing its settings (a disabled mesh renderer is not drawn, a disabled
+camera is never the active one, a disabled collider, body, joint, script, light, audio source,
+emitter, keyframe animation or interface widget is ignored). The Transform and Model animation have
+no checkbox. Remove one with the **×** on its header (or right-click → **Remove component**). **+ Add Component** at the bottom opens the Add Component window: categories on the
 left, engine components and your script behaviours on the right, a description of the selection,
 and search. The Transform cannot be removed.
 

@@ -349,6 +349,35 @@ struct ComponentDescriptor {
     std::vector<ReflectedField> fields;
 };
 
+// Components that can be switched off without removing them, like the checkbox on a Unity
+// component. Colliders, joints and scripts carry their own `enabled` flag instead. A node's
+// switched-off components are a bit set in `EntityRecord::disabled_components`; the bit means
+// nothing while the component is absent.
+enum class ComponentFlag : std::uint32_t {
+    camera = 1U << 0,
+    mesh_renderer = 1U << 1,
+    light = 1U << 2,
+    sky = 1U << 3,
+    post_process = 1U << 4,
+    particle_emitter = 1U << 5,
+    physics_body = 1U << 6,
+    audio_source = 1U << 7,
+    audio_listener = 1U << 8,
+    reverb_zone = 1U << 9,
+    music_player = 1U << 10,
+    keyframes = 1U << 11,
+    ui_canvas = 1U << 12,
+    ui_control = 1U << 13,
+    ui_panel = 1U << 14,
+    ui_label = 1U << 15,
+    ui_image = 1U << 16,
+    ui_button = 1U << 17,
+    ui_toggle = 1U << 18,
+    ui_slider = 1U << 19,
+    ui_progress_bar = 1U << 20,
+    ui_container = 1U << 21,
+};
+
 struct EntityRecord {
     std::string name;
     Transform transform;
@@ -372,7 +401,21 @@ struct EntityRecord {
     std::optional<ParticleEmitter> particle_emitter{};
     // Game interface components: a canvas, or a control with its widgets.
     UiComponents ui{};
+    // Bits of `ComponentFlag` for components that are present but switched off.
+    std::uint32_t disabled_components{};
 };
+
+[[nodiscard]] constexpr bool component_disabled(const EntityRecord& record,
+                                                const ComponentFlag flag) noexcept {
+    return (record.disabled_components & static_cast<std::uint32_t>(flag)) != 0U;
+}
+// Present and switched on: what the simulation, renderer and audio act on.
+template <typename Component>
+[[nodiscard]] constexpr const Component* active_component(const EntityRecord& record,
+                                                          const std::optional<Component>& component,
+                                                          const ComponentFlag flag) noexcept {
+    return component && !component_disabled(record, flag) ? &*component : nullptr;
+}
 
 // The node type shown to people and agents, derived from the components an entity has now by
 // walking the node type tree (see node_types.hpp). Scripts do not affect it.

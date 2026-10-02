@@ -115,7 +115,8 @@ std::optional<Affine> affine_for(const Scene& scene, const Entity entity) {
     for (auto node = ancestors.rbegin(); node != ancestors.rend(); ++node) {
         const auto& source = **node;
         const auto transform = source.transform_animation &&
-                                       !source.transform_animation->keys.empty()
+                                       !source.transform_animation->keys.empty() &&
+                                       !component_disabled(source, ComponentFlag::keyframes)
                                    ? sample_transform_animation(*source.transform_animation,
                                                                 source.transform)
                                    : source.transform;

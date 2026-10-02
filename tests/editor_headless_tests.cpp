@@ -1021,6 +1021,17 @@ void components_ui() {
     check(engine.scene().get(node)->light.has_value(), "choosing a component and Add adds it");
     check(ui.headless_item_rect("inspector:component:light").has_value(),
           "an added component gets its Inspector section");
+    // Each removable header has an enable checkbox beside its close button.
+    check(ui.headless_item_rect("inspector:component:light:enabled").has_value(),
+          "a component header has an enable checkbox");
+    click_center(ui, *ui.headless_item_rect("inspector:component:light:enabled"));
+    frame(ui, 3);
+    check(engine.scene().get(node)->light.has_value() && relay::component_disabled(*engine.scene().get(node), relay::ComponentFlag::light),
+          "clicking the header checkbox switches the component off, keeping it");
+    click_center(ui, *ui.headless_item_rect("inspector:component:light:enabled"));
+    frame(ui, 3);
+    check(!relay::component_disabled(*engine.scene().get(node), relay::ComponentFlag::light),
+          "clicking it again switches the component back on");
     click_center(ui, *ui.headless_item_rect("inspector:add_component"));
     frame(ui, 2);
     // A present component is drawn disabled, so neither clicking it nor Add does anything.

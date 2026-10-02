@@ -27,6 +27,17 @@ typedef struct RelayRayHit {
     RelayVec3 normal;
 } RelayRayHit;
 
+/* A convex shape for casts and overlaps. Capsules stand along their local Y axis. */
+enum RelayShapeType { RELAY_SHAPE_SPHERE = 0, RELAY_SHAPE_BOX = 1, RELAY_SHAPE_CAPSULE = 2 };
+
+typedef struct RelayShape {
+    int type;
+    double radius;          /* Sphere and capsule. */
+    double half_height;     /* Capsule: half its cylinder, excluding the round ends; 0 is a sphere. */
+    RelayVec3 half_extents; /* Box. */
+    RelayVec3 rotation;     /* Euler degrees, as transforms use. */
+} RelayShape;
+
 enum RelayLogLevel { RELAY_LOG_INFO = 1, RELAY_LOG_WARNING = 2, RELAY_LOG_ERROR = 3 };
 
 enum RelayCallback {
@@ -235,6 +246,42 @@ typedef struct RelayHostApi {
                                  const double* values, size_t count);
     int (*particles_set_text)(void* context, RelayEntity entity, const char* field, size_t length,
                               const char* text, size_t text_length);
+    /* Moves the entity under `parent` (0 for the top level). With `keep_world` 1 it keeps its
+     * place, turn and size in the world; with 0 it keeps its local transform. Refuses cycles. */
+    int (*set_parent)(void* context, RelayEntity entity, RelayEntity parent, int keep_world);
+    /* Engine components by id, as component.add names them: "collider", "physics_body", "light",
+     * "ui_label" and so on. Adding uses the editor's defaults; scripts use add_script and
+     * remove_script instead. Changes last until Stop Game. */
+    int (*has_component)(void* context, RelayEntity entity, const char* id, size_t length);
+    int (*add_component)(void* context, RelayEntity entity, const char* id, size_t length);
+    int (*remove_component)(void* context, RelayEntity entity, const char* id, size_t length);
+    /* Attaches a behaviour; its instance starts before its first update. */
+    int (*add_script)(void* context, RelayEntity entity, const char* behaviour, size_t length);
+    /* Removes the entity's first script component running `behaviour` once the current
+     * callbacks finish, after its on_destroy. */
+    int (*remove_script)(void* context, RelayEntity entity, const char* behaviour, size_t length);
+    /* Component fields named "<component>.<field>", such as "collider.radius", "light.color" or
+     * "physics_body.type". Booleans, numbers and vectors are numbers; text and choices are text.
+     * Setting checks the value like the scene does and returns 0, logging why, when it does not
+     * fit. */
+    size_t (*component_get_numbers)(void* context, RelayEntity entity, const char* field, size_t length,
+                                    double* values, size_t capacity);
+    int (*component_set_numbers)(void* context, RelayEntity entity, const char* field, size_t length,
+                                 const double* values, size_t count);
+    /* Copies up to `capacity` bytes and returns the text's full length. */
+    size_t (*component_get_text)(void* context, RelayEntity entity, const char* field, size_t length,
+                                 char* buffer, size_t capacity);
+    int (*component_set_text)(void* context, RelayEntity entity, const char* field, size_t length,
+                              const char* text, size_t text_length);
+    /* Connects the entity's joint to `other`'s body, or to the world with 0. */
+    int (*joint_connect)(void* context, RelayEntity entity, RelayEntity other);
+    /* Sweeps `shape` from `origin` along `direction` against the running physics world. `hit`
+     * gets the distance the shape's centre travelled, the contact point and the surface normal. */
+    int (*shape_cast)(void* context, const RelayShape* shape, RelayVec3 origin, RelayVec3 direction,
+                      double maximum_distance, uint32_t layer_mask, RelayEntity ignore, RelayRayHit* hit);
+    /* Enabled colliders on `layer_mask` layers overlapping `shape` centred at `center`. */
+    size_t (*overlap_shape)(void* context, const RelayShape* shape, RelayVec3 center, uint32_t layer_mask,
+                            RelayEntity ignore, RelayEntity* out, size_t capacity);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

@@ -111,10 +111,10 @@ clicks, toggles and slider moves from the game interface, on the script's own co
 control below it; see the [interface guide](interface.md). Scripts can find a child node by
 name (`self().child("Camera")`) or list them all (`children()`), make a camera the one the game
 renders through (`camera.make_active_camera()`, restored by Stop Game), read and set local
-transforms, read world positions, set velocities, apply impulses, raycast and test overlaps
-against the live physics world, find entities by name, spawn and destroy entities, and log to the
-editor, read and drive joints, play sounds and music and adjust the mixer. The header documents
-each call.
+transforms, read world positions, set velocities, apply impulses, raycast, shape cast and test
+overlaps against the live physics world, find entities by name, spawn and destroy entities, move
+them between parents, add, remove and configure their components, log to the editor, read and
+drive joints, play sounds and music and adjust the mixer. The header documents each call.
 
 Each frame delivers the step's interface events (`on_ui`), runs every `on_update`, then animation
 and physics, then the contact callbacks for that step. Stop Game calls `on_stop` and restores the authored scene, so scripts can change the scene
@@ -154,9 +154,61 @@ void on_contact_begin(relay::Entity) override { self().destroy(); }
 - Stop Game removes everything the run spawned and restores everything it destroyed. A scene holds
   at most 100000 entities; spawning beyond that fails with a warning.
 
+## Components and parents
+
+Scripts can change what a node is made of while the game runs, the way the Inspector does before
+it:
+
+```cpp
+void on_start() override {
+    auto crate = relay::world::create("Crate");
+    crate.set_position({0, 3, 0});
+    crate.add_component("collider");
+    crate.set_field("collider.half_extents", relay::Vec3{0.5, 0.5, 0.5});
+    crate.add_component("physics_body");
+    crate.set_field("physics_body.mass", 20.0);
+}
+void on_contact_begin(relay::Entity other) override {
+    if (other.name() == "Player") self().set_parent(other); // Carried along, keeping its place.
+}
+```
+
+- `has_component`, `add_component` and `remove_component` take the component ids the Add
+  Component window uses: `collider`, `physics_body`, `joint`, `light`, `camera`, `mesh_renderer`,
+  `audio_source`, `particle_emitter`, `keyframes`, `ui_label` and so on. Added components start
+  with the editor's defaults.
+- `add_script("Behaviour")` attaches a behaviour; it starts before its first update.
+  `remove_script("Behaviour")` removes the first script component running it once the current
+  callbacks finish, after its `on_destroy`, so a behaviour can remove itself.
+- `set_field("<component>.<field>", value)` changes one field, named as the scene stores it:
+  `collider.radius`, `collider.layer`, `collider.mask`, `physics_body.type` (`"static"` or
+  `"dynamic"`), `physics_body.mass`, `light.color`, `light.intensity`, `camera.field_of_view_y_degrees`,
+  `mesh_renderer.material`, `joint.limit_max`, `audio_source.volume_db`, `keyframes.playing` and the
+  rest of the camera, renderer, light, collider, physics body, joint, audio source and keyframe
+  fields. `field_numbers` and `field_text` read them back. Interface controls use `set_ui` and
+  particle emitters `set_particles`. A value the Inspector would refuse is refused with a log
+  message.
+- `connect_joint(other)` joins the node's joint to another node's body, or to the world with an
+  empty `Entity`.
+- `set_parent(parent)` moves a node under another (or to the top level with an empty `Entity`),
+  keeping where it is in the world; `set_parent(parent, false)` keeps its local transform instead,
+  so it jumps to the same place relative to the new parent. Moving a node under itself or its
+  descendants is refused.
+- Collider, physics body and joint changes, rescaling and reparenting rebuild the physics bodies
+  involved at once. Moving bodies keep their velocity, and a contact that still touches does not
+  end or begin again. Joints on a rebuilt body are recreated where the bodies are now, so a hinge's
+  angle and a slider's travel count from there.
+- Stop Game restores every authored component, field and parent.
+
 ## Scene queries
 
 - `relay::world::raycast(origin, direction, distance)` returns the nearest hit.
+- `relay::world::shape_cast(shape, origin, direction, distance)` sweeps a `relay::Shape::sphere`,
+  `box` or `capsule` and returns the first collider it touches: how far its centre travelled, the
+  contact point and the surface normal. `sphere_cast` is the common case. Shapes that start
+  touching a collider hit it at distance zero, so pass your own entity as `ignore` when casting
+  from inside it. Use them for ground checks, melee swings and cover tests that a thin ray misses.
+- `relay::world::overlap(shape, center)` lists the colliders overlapping a box, sphere or capsule.
 - `entity.overlaps()` lists the enabled colliders touching the entity's own enabled collider,
   including ones resting against it (within Jolt's 2 cm contact distance). Each side's layer must
   be in the other's mask.
@@ -323,9 +375,6 @@ The compiler is the one Relay was built with. Set `RELAY_SCRIPT_COMPILER` to use
 - A crash (bad pointer, abort) or an endless loop in a script takes the editor down with it. This
   is the cost of native speed.
 - Register behaviours with unqualified class names.
-- Collider shapes keep the scale they had when Run Game started, even if a script rescales the
-  entity.
-- Scripts cannot yet add or remove components, or change an entity's parent.
 - Scripts are verified on Linux. The macOS path (`.dylib`, `dlopen`) exists but is untested, and
   Windows reports scripts as unsupported for now.
 

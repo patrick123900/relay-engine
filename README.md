@@ -33,8 +33,9 @@ edits the same project alongside it.
   and fog, and AMD FidelityFX global illumination and ray traced reflections.
 - **Shaders** — surface and post-processing shaders edited as node graphs, saved as readable
   GLSL-based code, with materials, per-object values and ready-made effects.
-- **Gameplay** — components, node types and templates, native C++ scripts with hot reload, input
-  mapping, Jolt physics with joints, and a playable first person demo.
+- **Gameplay** — components, node types and templates, native C++ scripts with hot reload that
+  spawn, reparent and reconfigure nodes and shape cast, input mapping, Jolt physics with joints,
+  and a playable first person demo.
 - **Game interface** — Godot-style canvases, anchored controls and containers: labels, images,
   buttons, check boxes, sliders and progress bars, laid out and drawn in an Interface editor and
   shown over the game while it runs.

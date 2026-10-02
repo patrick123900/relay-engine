@@ -1050,6 +1050,221 @@ void particle_scripts(relay::Engine& engine, relay::ControlProtocol& protocol) {
     scene.restore_state(earlier);
 }
 
+const char* builder_source = R"(#include "relay_script.hpp"
+#include <cmath>
+
+namespace {
+std::string yes(bool value, const char* on, const char* off) { return value ? on : off; }
+std::string centi(double value) { return std::to_string(std::lround(value * 100.0)); }
+std::string cast_text(const std::optional<relay::RayHit>& hit) {
+    return hit ? hit->entity.name() + " " + centi(hit->distance) + " normal " + centi(hit->normal.y) : "missed";
+}
+} // namespace
+
+class Builder : public relay::Behaviour {
+public:
+    void on_start() override {
+        using relay::world::log;
+        // A crate made from nothing: a node, a collider and a dynamic body.
+        crate = relay::world::create("Built");
+        crate.set_position({0, 3, 0});
+        const bool built = crate.add_component("collider") &&
+                           crate.set_field("collider.half_extents", relay::Vec3{0.5, 0.5, 0.5}) &&
+                           crate.add_component("physics_body") && crate.set_field("physics_body.mass", 20.0);
+        log("built " + yes(built, "yes", "no") + " mass " + centi(crate.field_numbers("physics_body.mass")[0]) +
+            " type " + crate.field_text("physics_body.type") + " has " +
+            yes(crate.has_component("physics_body"), "body", "nothing"));
+        log("twice " + yes(crate.add_component("collider"), "accepted", "refused"));
+        log("negative mass " + yes(crate.set_field("physics_body.mass", -1.0), "accepted", "refused"));
+        log("bad choice " + yes(crate.set_field("physics_body.type", "floating"), "accepted", "refused"));
+        log("wrong count " + yes(crate.set_field("collider.center", 1.0), "accepted", "refused"));
+        log("unknown field " + yes(crate.set_field("collider.colour", 1.0), "accepted", "refused"));
+        log("ui field " + yes(crate.set_field("ui_label.text", "hi"), "accepted", "refused"));
+        log("script component " + yes(crate.add_component("script"), "accepted", "refused"));
+        const bool masked = crate.set_field("collider.mask", 0xFFFFFFFDu);
+        log("mask " + yes(masked, "set", "refused") + " " +
+            std::to_string(static_cast<std::uint32_t>(crate.field_numbers("collider.mask")[0])));
+
+        // Shape casts beside the crate; the floor's top is at y = 0.
+        log("sphere cast " + cast_text(relay::world::sphere_cast({5, 4, 0}, 0.5, {0, -2, 0}, 10.0)));
+        log("box cast " + cast_text(relay::world::shape_cast(relay::Shape::box({1, 0.25, 1}, {0, 45, 0}),
+                                                               {5, 2, 0}, {0, -1, 0}, 10.0)));
+        log("short cast " + cast_text(relay::world::sphere_cast({5, 4, 0}, 0.5, {0, -1, 0}, 1.0)));
+        log("inside cast " + cast_text(relay::world::sphere_cast({5, 0, 0}, 0.5, {1, 0, 0}, 1.0)));
+        log("ignored cast " + cast_text(relay::world::sphere_cast({5, 4, 0}, 0.5, {0, -1, 0}, 10.0, 0xffffffffu,
+                                                                  relay::world::find("Floor"))));
+        log("masked cast " + cast_text(relay::world::sphere_cast({5, 4, 0}, 0.5, {0, -1, 0}, 10.0, 2u)));
+        log("capsule overlaps " +
+            std::to_string(relay::world::overlap(relay::Shape::capsule(0.25, 1.0), {5, 0.1, 0}).size()));
+        log("bad shape " + cast_text(relay::world::sphere_cast({0, 4, 0}, -1.0, {0, -1, 0}, 10.0)));
+
+        // Scripts come and go while the game runs.
+        log("add script " + yes(self().add_script("Counter"), "yes", "no"));
+        log("add unknown " + yes(self().add_script("Nobody"), "yes", "no"));
+
+        // Reparenting keeps the world pose by default.
+        const auto holder = relay::world::find("Holder");
+        const auto item = relay::world::find("Item");
+        const bool moved = item.set_parent(holder);
+        const auto world = item.world_position();
+        const auto local = item.position();
+        log("reparented " + yes(moved, "yes", "no") + " world " + centi(world.x) + " " + centi(world.y) + " " +
+            centi(world.z) + " scale " + centi(item.scale().x) + " local " + centi(local.x) + " " +
+            centi(local.y) + " " + centi(local.z));
+        log("cycle " + yes(holder.set_parent(item), "accepted", "refused"));
+        // Keeping the local transform instead moves it with the new parent (here, none).
+        item.set_parent({}, false);
+        const auto top = item.world_position();
+        log("top level " + centi(top.x) + " " + centi(top.y) + " " + centi(top.z) + " parent " +
+            yes(static_cast<bool>(item.parent()), "some", "none"));
+    }
+    void on_update(double) override {
+        ++frames;
+        if (frames == 90) {
+            relay::world::log("crate rests at " + centi(crate.world_position().y));
+            crate.set_scale({2, 2, 2}); // Its collider grows with it.
+        }
+        if (frames == 150) {
+            relay::world::log("grown crate rests at " + centi(crate.world_position().y));
+            relay::world::log("body removed " + yes(crate.remove_component("physics_body"), "yes", "no"));
+        }
+    }
+private:
+    relay::Entity crate;
+    int frames = 0;
+};
+RELAY_BEHAVIOUR(Builder)
+
+class Counter : public relay::Behaviour {
+public:
+    void on_start() override { relay::world::log("counter started"); }
+    void on_update(double) override {
+        if (++updates != 5) return;
+        const bool first = self().remove_script("Counter");
+        const bool again = self().remove_script("Counter");
+        relay::world::log("counter removal " + yes(first, "queued", "refused") + " again " +
+                          yes(again, "queued", "refused"));
+    }
+    void on_destroy() override { relay::world::log("counter removed after " + std::to_string(updates)); }
+private:
+    int updates = 0;
+};
+RELAY_BEHAVIOUR(Counter)
+
+class Resting : public relay::Behaviour {
+public:
+    void on_contact_begin(relay::Entity other) override { relay::world::log("resting begin " + other.name()); }
+    void on_contact_end(relay::Entity other) override { relay::world::log("resting end " + other.name()); }
+    void on_update(double) override {
+        // Before it sleeps: sleeping bodies end their contacts.
+        if (++frames == 10)
+            relay::world::log("resting retuned " + yes(self().set_field("physics_body.friction", 0.8), "yes", "no"));
+    }
+private:
+    int frames = 0;
+};
+RELAY_BEHAVIOUR(Resting)
+)";
+
+// Scripts add, remove and configure components, move nodes between parents, and sweep shapes
+// through the physics world; bodies rebuilt by those changes keep their contacts.
+void component_scripts(relay::Engine& engine, relay::ControlProtocol& protocol) {
+    expect(ok(write_script(protocol, "builder.cpp", builder_source)) && ok(request(protocol, "scripts.build")),
+           "the builder script is written");
+    const auto status = wait_for_build(engine, protocol);
+    expect(status.find("\"state\":\"ready\"") != std::string::npos,
+           "the builder script compiles: " + status.substr(0, 600));
+    auto& scene = engine.scene();
+    const auto earlier = scene.capture_state();
+    expect(ok(request(protocol, "scene.clear")), "start the builder scene empty");
+    const auto floor = scene.create("Floor");
+    (void)scene.set_transform(floor, {{0, -0.5, 0}, {}, {1, 1, 1}});
+    relay::BoxCollider ground;
+    ground.half_extents = {50, 0.5, 50};
+    (void)scene.set_collider(floor, ground);
+    const auto holder = scene.create("Holder");
+    (void)scene.set_transform(holder, {{10, 0, 0}, {0, 90, 0}, {2, 2, 2}});
+    const auto item = scene.create("Item");
+    (void)scene.set_transform(item, {{10, 0, 5}, {}, {1, 1, 1}});
+    const auto resting = scene.create("Resting");
+    (void)scene.set_transform(resting, {{-5, 0.5, 0}, {}, {1, 1, 1}});
+    relay::BoxCollider box;
+    box.half_extents = {0.5, 0.5, 0.5};
+    (void)scene.set_collider(resting, box);
+    (void)scene.set_physics_body(resting, relay::PhysicsBody{});
+    const auto builder = scene.create("Builder");
+    expect(ok(add_script(protocol, resting, "Resting")) && ok(add_script(protocol, builder, "Builder")),
+           "attach the builder scripts");
+    const auto authored = scene.entities().size();
+
+    expect(engine.run_game(), "the builder scene runs");
+    expect(logged(engine, "built yes mass 2000 type dynamic has body"), "scripts add and configure components");
+    expect(logged(engine, "twice refused") && logged(engine, "negative mass refused") &&
+               logged(engine, "bad choice refused") && logged(engine, "wrong count refused") &&
+               logged(engine, "unknown field refused") && logged(engine, "ui field refused") &&
+               logged(engine, "interface fields are set with set_ui") && logged(engine, "script component refused") &&
+               logged(engine, "physics_body.type is one of static, dynamic"),
+           "bad components and field values are refused with reasons");
+    expect(logged(engine, "mask set 4294967293"), "collider masks take unsigned values");
+    expect(logged(engine, "sphere cast Floor 350 normal 100") && logged(engine, "box cast Floor 175 normal 100") &&
+               logged(engine, "short cast missed") && logged(engine, "inside cast Floor 0") &&
+               logged(engine, "ignored cast missed") && logged(engine, "masked cast missed") &&
+               logged(engine, "capsule overlaps 1") && logged(engine, "bad shape missed") &&
+               logged(engine, "shape_cast: invalid shape cast"),
+           "shape casts and overlaps find the floor, respect distance, ignore and masks, and refuse bad shapes");
+    expect(logged(engine, "add script yes") && logged(engine, "add unknown no") &&
+               logged(engine, "the scripts define no such behaviour"),
+           "scripts attach defined behaviours only");
+    std::string reparented;
+    for (const auto& entry : engine.logs().read_after(0))
+        if (entry.message.find("reparented ") != std::string::npos) reparented = entry.message;
+    expect(reparented.find("reparented yes world 1000 0 500 scale 50") != std::string::npos,
+           "set_parent keeps the world pose under a turned, scaled parent: " + reparented);
+    expect(logged(engine, "cycle refused"), "set_parent refuses cycles");
+    const auto local_at = reparented.find(" local ");
+    const auto local_text = local_at == std::string::npos ? std::string{} : reparented.substr(local_at + 7U);
+    expect(!local_text.empty() && logged(engine, "top level " + local_text + " parent none"),
+           "set_parent can keep the local transform instead: " + local_text);
+
+    engine.step(10);
+    expect(logged(engine, "counter started") && logged(engine, "counter removal queued again refused") &&
+               logged(engine, "counter removed after 5") && scene.get(builder)->scripts.size() == 1U &&
+               request(protocol, "scripts.status").find("\"instances\":2") != std::string::npos,
+           "an added script runs, and removing itself calls on_destroy and drops the component");
+    engine.step(10); // Frame 20: the retuned body is still awake.
+    expect(logged(engine, "resting retuned yes") && count_logged(engine, "resting begin Floor") == 1U &&
+               !logged(engine, "resting end"),
+           "retuning a resting body rebuilds it without ending or restarting its contact");
+    engine.step(70); // Frame 90.
+    relay::Entity built{};
+    for (const auto entity : scene.entities())
+        if (scene.get(entity)->name == "Built") built = entity;
+    // Heights in centimetres, as the builder logs them. Jolt lets resting bodies sink up to its
+    // 2 cm penetration slop.
+    const auto height = [&](const std::string& text) {
+        long value = -1;
+        for (const auto& entry : engine.logs().read_after(0))
+            if (const auto at = entry.message.find(text); at != std::string::npos)
+                value = std::atol(entry.message.c_str() + at + text.size());
+        return value;
+    };
+    const auto landed = height("] crate rests at ");
+    expect(built.valid() && landed >= 47 && landed <= 50,
+           "the built crate falls and lands on the floor: " + std::to_string(landed));
+    engine.step(60); // Frame 150.
+    const auto grown = height("grown crate rests at ");
+    expect(grown >= 97 && grown <= 100, "a script's scale change rebuilds the collider: " + std::to_string(grown));
+    expect(logged(engine, "body removed yes") && !engine.physics().velocity(scene, built), "a removed body stops simulating");
+    const auto settled = scene.get(built)->transform.position;
+    engine.step(10);
+    expect(scene.get(built)->transform.position == settled, "a node without a body stays put");
+
+    expect(engine.stop_game() && scene.entities().size() == authored && !scene.get(item)->parent.valid() &&
+               scene.get(item)->transform.position.z == 5.0 && scene.get(builder)->scripts.size() == 1U,
+           "Stop Game restores components, parents and scripts");
+    scene.restore_state(earlier);
+}
+
 } // namespace
 
 int main() {
@@ -1078,6 +1293,7 @@ int main() {
         material_parameters(engine, protocol);
         game_interface(engine, protocol);
         particle_scripts(engine, protocol);
+        component_scripts(engine, protocol);
         compile_errors(engine, protocol);
         demo_first_person(engine, protocol);
     } catch (const std::exception& error) {

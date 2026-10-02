@@ -58,6 +58,15 @@ struct CollisionDebugBoxes {
     std::vector<CollisionDebugJoint> joints; // At most 4096.
 };
 
+// A convex shape for game queries, placed in world space by the query.
+struct CollisionShape {
+    enum class Type : std::uint8_t { sphere, box, capsule } type{Type::sphere};
+    double radius{0.5};              // Sphere and capsule.
+    double half_height{0.5};         // Capsule cylinder along its local Y, excluding the round ends.
+    Vec3 half_extents{0.5, 0.5, 0.5}; // Box.
+    Vec3 rotation_degrees{};         // Euler degrees, as transforms use.
+};
+
 struct ContactEvent {
     std::uint64_t sequence{};
     Entity first{};
@@ -109,6 +118,11 @@ public:
     void add_bodies(const Scene& scene, Entity root);
     // Entities destroyed during the game: removes their bodies and ends their contacts.
     void remove_missing_bodies(const Scene& scene);
+    // Game-time component, scale or parent changes: rebuilds the bodies of `root` (and its
+    // descendants when asked) from the scene. Dynamic bodies keep their velocities, and contacts
+    // that still touch after the next step neither end nor begin again. Joints on or to a rebuilt
+    // body are recreated from the current poses, so hinge angles and slider travel count from here.
+    void rebuild_bodies(const Scene& scene, Entity root, bool descendants);
     // Enabled colliders overlapping or resting against (within Jolt's 2 cm speculative contact
     // distance) this entity's collider in the running world, filtered by both colliders' layers
     // and masks as collision_overlaps does.
@@ -119,6 +133,17 @@ public:
                                                    std::uint32_t layer_mask = 0xffffffffU,
                                                    Entity ignore = {},
                                                    std::size_t maximum = 1024U);
+    // Enabled colliders on `layer_mask` layers overlapping `shape` centred at `center`.
+    [[nodiscard]] CollisionOverlaps overlap_shape(const Scene& scene, const CollisionShape& shape,
+                                                  Vec3 center, std::uint32_t layer_mask = 0xffffffffU,
+                                                  Entity ignore = {}, std::size_t maximum = 1024U);
+    // Sweeps `shape` from `origin` along `direction` and reports the first enabled collider on
+    // `layer_mask` layers it touches: the distance its centre travelled, the contact point and the
+    // hit surface's normal. A shape that starts touching a collider hits it at distance zero.
+    [[nodiscard]] CollisionRaycast shape_cast(const Scene& scene, const CollisionShape& shape,
+                                              Vec3 origin, Vec3 direction, double maximum_distance,
+                                              std::uint32_t layer_mask = 0xffffffffU,
+                                              Entity ignore = {});
     // The entity's active joint: a hinge's angle in degrees, a slider's travel in metres from its
     // start, or a distance joint's current length. Nothing without an active hinge, slider or
     // distance joint.

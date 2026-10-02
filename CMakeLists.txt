@@ -145,6 +145,7 @@ add_library(relay_engine
     src/render/vulkan_device.cpp
     src/scene/scene.cpp
     src/scene/components.cpp
+    src/scene/component_fields.cpp
     src/scene/templates.cpp
     src/scene/node_types.cpp
     src/scene/project.cpp

@@ -13,6 +13,7 @@
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyFilter.h>
 #include <Jolt/Physics/Body/BodyLock.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
@@ -21,6 +22,7 @@
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
 #include <Jolt/Physics/Collision/CollideShape.h>
 #include <Jolt/Physics/Collision/RayCast.h>
+#include <Jolt/Physics/Collision/ShapeCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Constraints/DistanceConstraint.h>
 #include <Jolt/Physics/Constraints/FixedConstraint.h>
@@ -112,6 +114,9 @@ public:
     std::vector<ContactEvent> pending;
     // Bodies joined without collide_connected; each pair ordered with std::minmax.
     std::multiset<std::pair<Entity, Entity>> joined;
+    // Touching pairs whose body was rebuilt: the next step either finds them again, which is no
+    // new contact, or ends them.
+    std::set<std::pair<Entity, Entity>> held;
     JPH::ValidateResult OnContactValidate(const JPH::Body& first, const JPH::Body& second,
                                            JPH::RVec3Arg,
                                            const JPH::CollideShapeResult&) override {
@@ -134,7 +139,8 @@ public:
         const auto second_entity = from_user_data(second.GetUserData());
         auto pair = std::minmax(first_entity, second_entity);
         auto& count = active_pairs[{pair.first, pair.second}];
-        if (count++ == 0) pending.push_back({0, pair.first, pair.second, true});
+        if (count++ == 0 && held.erase({pair.first, pair.second}) == 0)
+            pending.push_back({0, pair.first, pair.second, true});
     }
     void OnContactRemoved(const JPH::SubShapeIDPair& shapes) override {
         const auto first = entities.find(shapes.GetBody1ID());
@@ -416,17 +422,19 @@ public:
             remove_constraint(joint);
             return true;
         });
-        auto& api = system_.GetBodyInterface();
         for (auto it = bodies_.begin(); it != bodies_.end();) {
             if (scene.contains(it->first)) {
                 ++it;
                 continue;
             }
             const auto entity = it->first;
-            api.RemoveBody(it->second);
-            api.DestroyBody(it->second);
-            contact_filter_.entities.erase(it->second);
+            destroy_body(it->second, entity);
             it = bodies_.erase(it);
+            std::erase_if(contact_filter_.held, [&](const std::pair<Entity, Entity>& pair) {
+                if (pair.first != entity && pair.second != entity) return false;
+                contact_filter_.pending.push_back({0, pair.first, pair.second, false});
+                return true;
+            });
             auto& pairs = contact_filter_.active_pairs;
             for (auto pair = pairs.begin(); pair != pairs.end();) {
                 if (pair->first.first != entity && pair->first.second != entity) {
@@ -436,6 +444,67 @@ public:
                 contact_filter_.pending.push_back({0, pair->first.first, pair->first.second, false});
                 pair = pairs.erase(pair);
             }
+        }
+    }
+
+    // Rebuilds the bodies of `targets` from the scene, keeping dynamic bodies' velocities. Their
+    // touching pairs are held until the next step shows whether they still touch, and joints on or
+    // to them are recreated.
+    void rebuild(const Scene& scene, const std::set<Entity>& targets) {
+        std::set<Entity> joint_owners(targets.begin(), targets.end());
+        std::erase_if(joints_, [&](const JointEntry& joint) {
+            if (!targets.contains(joint.owner) && !targets.contains(joint.connected)) return false;
+            remove_constraint(joint);
+            joint_owners.insert(joint.owner);
+            return true;
+        });
+        auto& api = system_.GetBodyInterface();
+        std::map<Entity, std::pair<JPH::Vec3, JPH::Vec3>> motion;
+        std::set<Entity> partners;
+        for (const auto entity : targets) {
+            const auto found = bodies_.find(entity);
+            if (found == bodies_.end()) continue;
+            if (api.GetMotionType(found->second) == JPH::EMotionType::Dynamic)
+                motion[entity] = {api.GetLinearVelocity(found->second),
+                                  api.GetAngularVelocity(found->second)};
+            destroy_body(found->second, entity);
+            bodies_.erase(found);
+            auto& pairs = contact_filter_.active_pairs;
+            for (auto pair = pairs.begin(); pair != pairs.end();) {
+                if (pair->first.first != entity && pair->first.second != entity) {
+                    ++pair;
+                    continue;
+                }
+                contact_filter_.held.insert(pair->first);
+                partners.insert(pair->first.first == entity ? pair->first.second : pair->first.first);
+                pair = pairs.erase(pair);
+            }
+        }
+        for (const auto entity : targets) {
+            if (!scene.contains(entity)) continue;
+            add_body(scene, entity, false);
+            const auto id = bodies_.find(entity);
+            const auto moved = motion.find(entity);
+            if (id == bodies_.end() || moved == motion.end() ||
+                api.GetMotionType(id->second) != JPH::EMotionType::Dynamic) continue;
+            api.SetLinearAndAngularVelocity(id->second, moved->second.first, moved->second.second);
+        }
+        // Sleeping partners would never report the contact again.
+        for (const auto entity : partners)
+            if (const auto id = bodies_.find(entity); id != bodies_.end()) api.ActivateBody(id->second);
+        for (const auto owner : joint_owners)
+            if (scene.contains(owner)) add_joint(scene, owner);
+    }
+
+    // Removes a body from the system and returns its mesh triangles to the budget.
+    void destroy_body(const JPH::BodyID id, const Entity entity) {
+        auto& api = system_.GetBodyInterface();
+        api.RemoveBody(id);
+        api.DestroyBody(id);
+        contact_filter_.entities.erase(id);
+        if (const auto found = mesh_triangles_.find(entity); found != mesh_triangles_.end()) {
+            triangle_budget_ += found->second;
+            mesh_triangles_.erase(found);
         }
     }
 
@@ -591,10 +660,12 @@ public:
         if (has_collider) {
             std::optional<JPH::ShapeRefC> created;
             if (mesh_based) {
+                const auto budget = triangle_budget_;
                 if (assets_)
                     created = shape_from_mesh(*record, *transform, *assets_,
                                               !queries_only && dynamic_body(*record),
                                               triangle_budget_, over_budget_);
+                if (budget != triangle_budget_) mesh_triangles_[entity] = budget - triangle_budget_;
             } else if (record->collider->type == BoxCollider::Type::box) {
                 created = shape_from_box(*geometry, *transform);
             } else {
@@ -664,6 +735,9 @@ public:
             RELAY_PROFILE_SCOPE("Jolt update");
             system_.Update(static_cast<float>(seconds), 1, &allocator_, &jobs_);
         }
+        for (const auto& pair : contact_filter_.held)
+            contact_filter_.pending.push_back({0, pair.first, pair.second, false});
+        contact_filter_.held.clear();
         std::stable_sort(contact_filter_.pending.begin(), contact_filter_.pending.end(),
                          [](const ContactEvent& a, const ContactEvent& b) {
             if (a.first != b.first) return a.first < b.first;
@@ -748,6 +822,7 @@ private:
     JPH::TempAllocatorMalloc allocator_;
     JPH::JobSystemSingleThreaded jobs_;
     std::map<Entity, JPH::BodyID> bodies_;
+    std::map<Entity, std::size_t> mesh_triangles_; // Budget taken by each triangle-mesh body.
     std::vector<JointEntry> joints_;
     std::deque<ContactEvent> events_;
     std::uint64_t latest_sequence_{};
@@ -797,6 +872,61 @@ void cast_ray(JoltState& state, const Scene& scene, const Vec3 origin, const Vec
         result.normal = from_jolt(lock.GetBody().GetWorldSpaceSurfaceNormal(
             hit.mSubShapeID2, ray.GetPointOnRay(hit.mFraction)));
     }
+}
+
+// Enabled colliders on `mask` layers, except `ignore`, for game queries.
+class SceneBodyFilter final : public JPH::BodyFilter {
+public:
+    SceneBodyFilter(const Scene& scene, const std::uint32_t mask, const Entity ignore)
+        : scene_(scene), mask_(mask), ignore_(ignore) {}
+    bool ShouldCollideLocked(const JPH::Body& body) const override {
+        const auto entity = from_user_data(body.GetUserData());
+        const auto* record = scene_.get(entity);
+        return record && record->collider && record->collider->enabled &&
+               (record->collider->layer & mask_) && !(ignore_.valid() && entity == ignore_);
+    }
+private:
+    const Scene& scene_;
+    std::uint32_t mask_;
+    Entity ignore_;
+};
+
+bool finite_vector(const Vec3 value) {
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+// A Jolt shape for a game query, or nothing when a size is not positive, finite and at most a
+// kilometre.
+std::optional<JPH::ShapeRefC> query_shape(const CollisionShape& shape) {
+    const auto size = [](const double value) { return std::isfinite(value) && value > 0.0 && value <= 1e3; };
+    if (!finite_vector(shape.rotation_degrees)) return std::nullopt;
+    JPH::ShapeSettings::ShapeResult result;
+    switch (shape.type) {
+    case CollisionShape::Type::sphere:
+        if (!size(shape.radius)) return std::nullopt;
+        result = JPH::SphereShapeSettings(static_cast<float>(shape.radius)).Create();
+        break;
+    case CollisionShape::Type::box: {
+        const auto& half = shape.half_extents;
+        if (!size(half.x) || !size(half.y) || !size(half.z)) return std::nullopt;
+        const auto rounding = std::min(JPH::cDefaultConvexRadius,
+                                       static_cast<float>(std::min({half.x, half.y, half.z})) * 0.5f);
+        result = JPH::BoxShapeSettings(to_jolt(half), rounding).Create();
+        break;
+    }
+    case CollisionShape::Type::capsule:
+        if (!size(shape.radius) || !std::isfinite(shape.half_height) || shape.half_height < 0.0 ||
+            shape.half_height > 1e3)
+            return std::nullopt;
+        // A capsule without a cylinder is a sphere; Jolt refuses zero-height capsules.
+        result = shape.half_height > 0.0
+            ? JPH::CapsuleShapeSettings(static_cast<float>(shape.half_height),
+                                        static_cast<float>(shape.radius)).Create()
+            : JPH::SphereShapeSettings(static_cast<float>(shape.radius)).Create();
+        break;
+    }
+    if (result.HasError()) return std::nullopt;
+    return result.Get();
 }
 
 } // namespace
@@ -1002,6 +1132,20 @@ void PhysicsWorld::add_bodies(const Scene& scene, const Entity root) {
 void PhysicsWorld::remove_missing_bodies(const Scene& scene) {
     if (impl_->state && impl_->state->built()) impl_->state->remove_missing_bodies(scene);
 }
+void PhysicsWorld::rebuild_bodies(const Scene& scene, const Entity root, const bool descendants) {
+    // Before the first step the world is built from the scene anyway.
+    if (!impl_->state || !impl_->state->built() || !scene.contains(root)) return;
+    std::set<Entity> targets{root};
+    if (descendants)
+        for (const auto entity : scene.entities())
+            for (auto current = entity; current.valid() && scene.contains(current);
+                 current = scene.get(current)->parent)
+                if (current == root) {
+                    targets.insert(entity);
+                    break;
+                }
+    impl_->state->rebuild(scene, targets);
+}
 CollisionOverlaps PhysicsWorld::overlaps(const Scene& scene, const Entity entity,
                                          const std::size_t maximum) {
     CollisionOverlaps result;
@@ -1040,6 +1184,61 @@ CollisionOverlaps PhysicsWorld::overlap_sphere(const Scene& scene, const Vec3 ce
     sphere.SetEmbedded();
     collect_overlaps(*impl_->state, scene, sphere, JPH::RMat44::sTranslation(to_jolt_position(center)),
                      layer_mask, std::nullopt, ignore, maximum, 0.0f, result);
+    return result;
+}
+CollisionOverlaps PhysicsWorld::overlap_shape(const Scene& scene, const CollisionShape& shape,
+                                              const Vec3 center, const std::uint32_t layer_mask,
+                                              const Entity ignore, const std::size_t maximum) {
+    CollisionOverlaps result;
+    initialize_jolt();
+    const auto built = query_shape(shape);
+    if (!built || !finite_vector(center)) {
+        result.error = "invalid overlap shape";
+        return result;
+    }
+    ensure_built(scene);
+    collect_overlaps(*impl_->state, scene, **built,
+                     JPH::RMat44::sRotationTranslation(rotation_from_euler(shape.rotation_degrees),
+                                                       to_jolt_position(center)),
+                     layer_mask, std::nullopt, ignore, maximum, 0.0f, result);
+    return result;
+}
+CollisionRaycast PhysicsWorld::shape_cast(const Scene& scene, const CollisionShape& shape,
+                                          const Vec3 origin, const Vec3 direction,
+                                          const double maximum_distance,
+                                          const std::uint32_t layer_mask, const Entity ignore) {
+    CollisionRaycast result;
+    double length{};
+    initialize_jolt();
+    const auto built = query_shape(shape);
+    if (!built || !valid_ray(origin, direction, maximum_distance, length) || maximum_distance > 1e6) {
+        result.error = "invalid shape cast";
+        return result;
+    }
+    ensure_built(scene);
+    auto& state = *impl_->state;
+    const Vec3 unit{direction.x / length, direction.y / length, direction.z / length};
+    // Relative to the origin, so single-precision results stay accurate far from the world origin.
+    const auto cast = JPH::RShapeCast::sFromWorldTransform(
+        built->GetPtr(), JPH::Vec3::sOne(),
+        JPH::RMat44::sRotationTranslation(rotation_from_euler(shape.rotation_degrees),
+                                          to_jolt_position(origin)),
+        to_jolt({unit.x * maximum_distance, unit.y * maximum_distance, unit.z * maximum_distance}));
+    JPH::ShapeCastSettings settings;
+    // A shape that starts inside a convex collider hits it at once, whichever way it moves.
+    settings.mBackFaceModeConvex = JPH::EBackFaceMode::CollideWithBackFaces;
+    settings.mReturnDeepestPoint = true;
+    JPH::ClosestHitCollisionCollector<JPH::CastShapeCollector> hit;
+    const SceneBodyFilter filter(scene, layer_mask, ignore);
+    state.system().GetNarrowPhaseQuery().CastShape(cast, settings, to_jolt_position(origin), hit, {}, {},
+                                                    filter);
+    if (!hit.HadHit()) return result;
+    result.hit = true;
+    result.entity = from_user_data(state.system().GetBodyInterface().GetUserData(hit.mHit.mBodyID2));
+    result.distance = static_cast<double>(hit.mHit.mFraction) * maximum_distance;
+    const auto contact = from_jolt(hit.mHit.mContactPointOn2);
+    result.point = {origin.x + contact.x, origin.y + contact.y, origin.z + contact.z};
+    result.normal = from_jolt(-hit.mHit.mPenetrationAxis.NormalizedOr(-to_jolt(unit)));
     return result;
 }
 bool PhysicsWorld::apply_impulse(const Scene& scene, Entity entity, Vec3 impulse,

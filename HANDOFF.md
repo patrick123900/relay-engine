@@ -637,6 +637,26 @@ Phase 3:
   Spawning is refused past 100000 entities and during `on_stop`. `PhysicsWorld::overlaps` counts
   colliders within Jolt's speculative contact distance, so resting neighbours are touching;
   `overlap_sphere` is exact and filters on the query mask only.
+- Scripts reshape nodes during Run Game through more appended host functions: `set_parent`
+  (keeping the world pose through `editor_inverse_affine`, in single precision, so a turned
+  non-uniform parent's shear is lost; or keeping the local transform), `has_component`,
+  `add_component`/`remove_component` (the shared `components.cpp` rules; scripts go through
+  `add_script`, which creates the instance at once, and `remove_script`, queued in
+  `pending_removal` and applied by `flush_destroyed` before destruction: `on_destroy`, then the
+  component, then `shift_components` renumbers the entity's later instances), component fields
+  (`component_get/set_numbers/text` over `src/scene/component_fields.cpp`, a table of
+  "<component>.<field>" names for camera, mesh renderer, light, collider, physics body, joint,
+  audio source and keyframes, set through the scene's validating setters; renderer and collider
+  meshes and materials are checked against the asset registry as the protocol does),
+  `joint_connect`, `shape_cast` and `overlap_shape` (`RelayShape`: sphere, box or capsule).
+  Collider, physics body, joint and keyframe presence changes, a renderer change under a collider,
+  scale writes and reparenting call `PhysicsWorld::rebuild_bodies`, which recreates the bodies from
+  the scene, keeps dynamic velocities, recreates joints on or to them from the current poses, and
+  moves their touching pairs to `ContactFilter::held`: the next step drops a held pair's new begin,
+  or ends it if it no longer touches, so a rebuild neither ends nor restarts a live contact. Mesh
+  collider triangles are returned to the world's budget when their body goes. Shape casts use
+  `CastShape` with a scene body filter and back faces on for convex shapes, so a shape starting
+  inside a collider hits it at distance zero.
 - Trust is per user, outside every project: `trusted-script-projects` in the user config
   directory (`RELAY_SCRIPT_TRUST_PATH` overrides it; tests use temporary files), keyed by the
   canonical project folder. `scripts.trust` is host-only; revoking trust unloads the library.
@@ -1155,9 +1175,11 @@ Phase 3:
 10. Native scripts cannot be contained: a crash or endless loop in a script takes the editor down,
    and in a trusted project agent-written code runs with the user's privileges. Windows script
    loading is not implemented (builds report unsupported), and the macOS `.dylib` path has never
-   been run. Scripts cannot add or remove components or reparent entities yet. A script-driven scale
-   change does not rebuild collider shapes until the next Run Game. The trust prompt and Scripts
-   diagnostics view are covered headlessly only.
+   been run. Script component fields do not cover the sky, reverb zones, music players or post
+   processing, and scripts cannot reach another behaviour's instance (there is no
+   GetComponent-style lookup). Rebuilding a body re-anchors its joints where the bodies are then,
+   and every scale write rebuilds the subtree's bodies, so animating scale from a script every step
+   is costly. The trust prompt and Scripts diagnostics view are covered headlessly only.
 11. Joints have headless and simulated coverage, not a desktop review of the Inspector section,
    the wireframe gizmos or the demo playground. Anchors and axes are captured when Run Game
    starts, so moving a jointed body with a script teleports it against its constraint. There are
@@ -1244,11 +1266,10 @@ Phase 3:
 
 ## Next priorities
 
-0. A desktop listening pass for audio, to tune the demo's levels, occlusion strength, zone
-   presets and music mix, and to check the headphone mode by ear.
-1. Extend the script API further where games need it: adding and configuring components,
-   reparenting, and shape casts. More example controllers (third-person, orbit) can follow the
-   demo's scripted first person controller.
+1. Give scripts a kinematic character controller (Jolt's CharacterVirtual: stepping up stairs,
+   slope limits, crouching) and add more example controllers (third-person, orbit) beside the
+   demo's scripted first person one. Scripts can now add, remove and configure components,
+   reparent nodes and shape cast.
 2. Grow joints where games need them: breakable joints, cone/swing-twist limits for ragdolls,
    hinge target angles (servo motors), and editing joint anchors with a viewport gizmo.
 
@@ -1272,7 +1293,10 @@ past the player), and spawning: templates at a position under a parent, a missin
 once, clones, empty nodes, children, deferred start and self-destruction with `on_destroy`, spawned
 bodies falling, `overlaps` on a resting body, `overlap_sphere` with an ignored entity, a destroyed
 body leaving raycasts and ending its contacts, and Stop Game undoing it all, plus a script driving a
-hinge motor and reading its angle), generated-protocol checks, and 26 ordinary bridge tests. The
+hinge motor and reading its angle, and a builder script that makes a falling crate from components,
+sets and reads fields with refusals, reparents under a turned and scaled parent, sphere, box and
+capsule queries, adds and self-removes a behaviour, rescales a crate that then rests higher, and
+retunes a resting body without ending its contact), generated-protocol checks, and 26 ordinary bridge tests. The
 engine suite covers the profiler (scope merging, self and total time, waits, GPU attachment,
 game-only and single-frame reports, pausing, clearing and the protocol), and the headless editor
 suite the Profiler panel (hotspots, pause and resume, inspecting a frame from the graph). The

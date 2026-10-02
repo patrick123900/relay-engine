@@ -58,6 +58,23 @@
 //     }
 //     void on_contact_begin(relay::Entity) override { self().destroy(); }
 //
+// Components: scripts add, remove and configure a node's components while the game runs, and move
+// nodes between parents. Fields are named "<component>.<field>" as scenes store them. Changes to
+// colliders, physics bodies and joints rebuild the node's physics body at once, keeping its velocity.
+//
+//     auto crate = relay::world::create("Crate");
+//     crate.add_component("collider");
+//     crate.set_field("collider.half_extents", relay::Vec3{0.5, 0.5, 0.5});
+//     crate.add_component("physics_body");
+//     crate.set_field("physics_body.mass", 20.0);
+//     held.set_parent(self());          // Carry it, keeping its place in the world.
+//
+// Shape casts sweep a sphere, box or capsule through the physics world, for ground checks,
+// melee hits and cover tests that a thin ray would miss:
+//
+//     if (auto hit = relay::world::sphere_cast(origin, 0.3, {0, -1, 0}, 1.0, ~0u, self()))
+//         relay::world::log("standing on " + hit->entity.name());
+//
 // Interface: Canvas, Control, Label, Button and the other UI nodes draw over the game's view
 // during Run Game. Scripts change them through Entity (set_text, set_visible, set_value, set_ui for
 // any field) and hear clicks, toggles and slider moves through on_ui, which reaches the control's
@@ -369,6 +386,82 @@ public:
         return std::vector<double>(values, values + std::min<size_t>(count, 4U));
     }
 
+    // Moves this entity under `parent` (an empty Entity for the top level). By default it keeps
+    // its place, turn and size in the world; with keep_world false it keeps its local transform
+    // and moves with the new parent. False if the parent is this entity or below it.
+    bool set_parent(Entity parent, bool keep_world = true) const {
+        return api().set_parent(api().context, handle_, parent.handle(), keep_world ? 1 : 0) != 0;
+    }
+
+    // Engine components by id, as the Add Component window lists them: "collider",
+    // "physics_body", "joint", "light", "camera", "mesh_renderer", "audio_source",
+    // "particle_emitter", "ui_label" and so on. Added components start with the editor's defaults.
+    // Stop Game restores the authored components. False, with a log message, when the component
+    // cannot be added or removed.
+    [[nodiscard]] bool has_component(std::string_view id) const {
+        return api().has_component(api().context, handle_, id.data(), id.size()) != 0;
+    }
+    bool add_component(std::string_view id) const {
+        return api().add_component(api().context, handle_, id.data(), id.size()) != 0;
+    }
+    bool remove_component(std::string_view id) const {
+        return api().remove_component(api().context, handle_, id.data(), id.size()) != 0;
+    }
+    // Attaches a behaviour with its code defaults; it starts before its first update.
+    bool add_script(std::string_view behaviour) const {
+        return api().add_script(api().context, handle_, behaviour.data(), behaviour.size()) != 0;
+    }
+    // Removes the first script component running `behaviour` once the current callbacks finish,
+    // after its on_destroy, so a behaviour may remove itself.
+    bool remove_script(std::string_view behaviour) const {
+        return api().remove_script(api().context, handle_, behaviour.data(), behaviour.size()) != 0;
+    }
+
+    // Component fields, named "<component>.<field>": "collider.radius", "collider.layer",
+    // "physics_body.mass", "physics_body.type" ("static" or "dynamic"), "light.color",
+    // "light.intensity", "camera.field_of_view_y_degrees", "mesh_renderer.material",
+    // "joint.limit_max", "audio_source.volume_db", "keyframes.playing". Choices are text. Interface
+    // controls use set_ui and particle emitters set_particles. False, with a log message, when
+    // the entity lacks the component or the value does not fit.
+    bool set_field(std::string_view field, double value) const {
+        return api().component_set_numbers(api().context, handle_, field.data(), field.size(), &value, 1U) != 0;
+    }
+    bool set_field(std::string_view field, int value) const { return set_field(field, static_cast<double>(value)); }
+    bool set_field(std::string_view field, std::uint32_t value) const {
+        return set_field(field, static_cast<double>(value));
+    }
+    bool set_field(std::string_view field, bool value) const { return set_field(field, value ? 1.0 : 0.0); }
+    bool set_field(std::string_view field, Vec3 value) const {
+        const double values[3] = {value.x, value.y, value.z};
+        return api().component_set_numbers(api().context, handle_, field.data(), field.size(), values, 3U) != 0;
+    }
+    bool set_field(std::string_view field, std::string_view text) const {
+        return api().component_set_text(api().context, handle_, field.data(), field.size(), text.data(),
+                                        text.size()) != 0;
+    }
+    bool set_field(std::string_view field, const char* text) const { return set_field(field, std::string_view{text}); }
+    // A field's numbers (booleans read 0 or 1, vectors three); empty without the component or for
+    // text and choices.
+    [[nodiscard]] std::vector<double> field_numbers(std::string_view field) const {
+        double values[3];
+        const size_t count =
+            api().component_get_numbers(api().context, handle_, field.data(), field.size(), values, 3U);
+        return std::vector<double>(values, values + std::min<size_t>(count, 3U));
+    }
+    [[nodiscard]] std::string field_text(std::string_view field) const {
+        std::string text(api().component_get_text(api().context, handle_, field.data(), field.size(), nullptr, 0U),
+                         '\0');
+        if (!text.empty())
+            (void)api().component_get_text(api().context, handle_, field.data(), field.size(), text.data(),
+                                           text.size());
+        return text;
+    }
+    // Connects this entity's joint to another entity's physics body, or to the world with an empty
+    // Entity, from the joint's current pose. False without a joint.
+    bool connect_joint(Entity other) const {
+        return api().joint_connect(api().context, handle_, other.handle()) != 0;
+    }
+
     // Enabled colliders touching this entity's enabled collider, sorted. Each side's layer must
     // be in the other's mask.
     [[nodiscard]] std::vector<Entity> overlaps() const {
@@ -447,11 +540,28 @@ struct Event {
 };
 } // namespace ui
 
+// A ray or shape cast's first hit. For shape casts `distance` is how far the shape's centre
+// travelled, `point` where it touched and `normal` the touched surface's, facing the shape.
 struct RayHit {
     Entity entity;
     double distance{};
     Vec3 point;
     Vec3 normal;
+};
+
+// A sphere, box or capsule for shape casts and overlaps. Capsules stand along their local Y axis;
+// rotations are Euler degrees, like transforms.
+struct Shape {
+    static Shape sphere(double radius) { return {{RELAY_SHAPE_SPHERE, radius, 0.0, {}, {}}}; }
+    static Shape box(Vec3 half_extents, Vec3 rotation = {}) {
+        return {{RELAY_SHAPE_BOX, 0.0, 0.0, {half_extents.x, half_extents.y, half_extents.z},
+                 {rotation.x, rotation.y, rotation.z}}};
+    }
+    // `half_height` is half the straight part, between the round ends.
+    static Shape capsule(double radius, double half_height, Vec3 rotation = {}) {
+        return {{RELAY_SHAPE_CAPSULE, radius, half_height, {}, {rotation.x, rotation.y, rotation.z}}};
+    }
+    RelayShape raw{};
 };
 
 // Scene-wide queries and services.
@@ -485,6 +595,33 @@ inline std::vector<Entity> overlap_sphere(Vec3 center, double radius,
     const auto handles = detail::collect([&](RelayEntity* out, size_t capacity) {
         return api().overlap_sphere(api().context, {center.x, center.y, center.z}, radius,
                                     layer_mask, ignore.handle(), out, capacity);
+    });
+    return {handles.begin(), handles.end()};
+}
+// Sweeps `shape` from `origin` along `direction` (which need not be normalized) and returns the
+// first enabled collider on `layer_mask` layers that it touches. A shape that starts touching a
+// collider hits it at distance zero, so ignore the caller's own collider when casting from it.
+inline std::optional<RayHit> shape_cast(const Shape& shape, Vec3 origin, Vec3 direction,
+                                        double maximum_distance, std::uint32_t layer_mask = 0xffffffffu,
+                                        Entity ignore = {}) {
+    RelayRayHit hit{};
+    if (!api().shape_cast(api().context, &shape.raw, {origin.x, origin.y, origin.z},
+                          {direction.x, direction.y, direction.z}, maximum_distance, layer_mask,
+                          ignore.handle(), &hit))
+        return std::nullopt;
+    return RayHit{Entity{hit.entity}, hit.distance, {hit.point.x, hit.point.y, hit.point.z},
+                  {hit.normal.x, hit.normal.y, hit.normal.z}};
+}
+inline std::optional<RayHit> sphere_cast(Vec3 origin, double radius, Vec3 direction, double maximum_distance,
+                                         std::uint32_t layer_mask = 0xffffffffu, Entity ignore = {}) {
+    return shape_cast(Shape::sphere(radius), origin, direction, maximum_distance, layer_mask, ignore);
+}
+// Enabled colliders on `layer_mask` layers that overlap `shape` centred at `center`, sorted.
+inline std::vector<Entity> overlap(const Shape& shape, Vec3 center, std::uint32_t layer_mask = 0xffffffffu,
+                                   Entity ignore = {}) {
+    const auto handles = detail::collect([&](RelayEntity* out, size_t capacity) {
+        return api().overlap_shape(api().context, &shape.raw, {center.x, center.y, center.z}, layer_mask,
+                                   ignore.handle(), out, capacity);
     });
     return {handles.begin(), handles.end()};
 }
@@ -721,8 +858,8 @@ public:
     virtual void on_contact_begin(Entity /*other*/) {}
     virtual void on_contact_end(Entity /*other*/) {}
     virtual void on_stop() {}
-    // A script destroyed this entity (or an ancestor) during the game; it is still in the scene.
-    // Stop Game calls on_stop instead.
+    // A script destroyed this entity (or an ancestor), or removed this behaviour, during the game;
+    // the entity is still in the scene. Stop Game calls on_stop instead.
     virtual void on_destroy() {}
     // Runs after hot reload replaces this instance with newly built code.
     virtual void on_reload() { on_start(); }

@@ -6,6 +6,8 @@
 #include "relay/observe/profiler.hpp"
 #include "relay/render/materials.hpp"
 #include "relay/editor/editor_math.hpp"
+#include "relay/scene/component_fields.hpp"
+#include "relay/scene/components.hpp"
 #include "relay/scene/scene_edit.hpp"
 #include "relay/scene/templates.hpp"
 
@@ -592,6 +594,8 @@ struct ScriptSystem::Impl {
         bool failed{};
         bool started{};   // on_start has run; instances spawned mid-game start before their update.
         bool destroyed{}; // on_destroy has run; the instance goes when the entity leaves the scene.
+        bool removing{};  // remove_script queued it; it goes with its component at the next flush.
+        bool removed{};   // Its script component is gone from the scene.
         std::uint32_t profile_name{}; // The behaviour's profiler scope, interned on first update.
     };
 
@@ -649,24 +653,9 @@ struct ScriptSystem::Impl {
             return self(context).write(entity, value, &Transform::scale);
         };
         host.world_position = [](void* context, RelayEntity entity, RelayVec3* value) {
-            const auto& scene = self(context).engine.scene();
-            auto current = unpack(entity);
-            if (!scene.contains(current)) return 0;
-            // Keyframed transforms are sampled so the result matches what is rendered.
-            auto world = editor_identity();
-            for (std::size_t depth = 0; current.valid() && depth < 4096U; ++depth) {
-                const auto* record = scene.get(current);
-                if (!record) return 0;
-                const auto local = record->transform_animation &&
-                                           !record->transform_animation->keys.empty()
-                    ? sample_transform_animation(*record->transform_animation, record->transform)
-                    : record->transform;
-                world = editor_multiply(editor_compose(local.position, local.rotation_degrees,
-                                                       local.scale), world);
-                current = record->parent;
-            }
-            const Vec3 point{world[12], world[13], world[14]};
-            *value = raw(point);
+            const auto world = self(context).world_matrix(unpack(entity));
+            if (!world) return 0;
+            *value = raw(Vec3{(*world)[12], (*world)[13], (*world)[14]});
             return 1;
         };
         host.get_velocity = [](void* context, RelayEntity entity, RelayVec3* value) {
@@ -1197,6 +1186,328 @@ struct ScriptSystem::Impl {
                                      .entities,
                                  out, capacity);
         };
+        host.set_parent = [](void* context, RelayEntity entity, RelayEntity parent, int keep_world) {
+            auto& impl = self(context);
+            auto& scene = impl.engine.scene();
+            const auto target = unpack(entity);
+            const auto owner = unpack(parent);
+            const auto where = "set_parent on " + target.to_string();
+            if (!scene.contains(target) || !impl.parent_alive(parent, where)) return 0;
+            std::optional<EditorMatrix> local;
+            if (keep_world != 0) {
+                const auto world = impl.world_matrix(target);
+                const auto inverse = owner.valid() ? editor_inverse_affine(*impl.world_matrix(owner))
+                                                   : std::optional{editor_identity()};
+                if (!inverse) {
+                    impl.warn(where + ": the new parent is scaled to nothing");
+                    return 0;
+                }
+                local = editor_multiply(*inverse, *world);
+            }
+            if (!scene.set_parent(target, owner)) {
+                impl.warn(where + ": an entity cannot move under itself or its descendants");
+                return 0;
+            }
+            if (local) {
+                auto transform = scene.get(target)->transform;
+                editor_decompose(*local, transform.position, transform.rotation_degrees, transform.scale);
+                (void)scene.set_transform(target, transform);
+            }
+            // World scale and pose may change for the whole subtree.
+            impl.engine.physics().rebuild_bodies(scene, target, true);
+            return 1;
+        };
+        host.has_component = [](void* context, RelayEntity entity, const char* id, size_t length) {
+            const auto* record = self(context).engine.scene().get(unpack(entity));
+            return record && relay::has_component(*record, {id, length}) ? 1 : 0;
+        };
+        host.add_component = [](void* context, RelayEntity entity, const char* id, size_t length) {
+            return self(context).change_component(unpack(entity), {id, length}, true) ? 1 : 0;
+        };
+        host.remove_component = [](void* context, RelayEntity entity, const char* id, size_t length) {
+            return self(context).change_component(unpack(entity), {id, length}, false) ? 1 : 0;
+        };
+        host.add_script = [](void* context, RelayEntity entity, const char* name, size_t length) {
+            auto& impl = self(context);
+            auto& scene = impl.engine.scene();
+            const std::string behaviour(name, length);
+            const auto target = unpack(entity);
+            const auto where = "add_script(\"" + behaviour + "\") on " + target.to_string();
+            if (!impl.running || impl.stopping || !impl.library || !scene.contains(target)) return 0;
+            if (!impl.library->index.contains(behaviour)) {
+                impl.warn(where + ": the scripts define no such behaviour");
+                return 0;
+            }
+            std::string error;
+            if (!relay::add_component(scene, target, "script", behaviour, error)) {
+                impl.warn(where + ": " + error);
+                return 0;
+            }
+            impl.add_instance(target, scene.get(target)->scripts.size() - 1U);
+            return 1;
+        };
+        host.remove_script = [](void* context, RelayEntity entity, const char* name, size_t length) {
+            auto& impl = self(context);
+            auto& scene = impl.engine.scene();
+            const std::string_view behaviour(name, length);
+            const auto target = unpack(entity);
+            if (!impl.running || impl.stopping || !scene.contains(target)) return 0;
+            auto scripts = scene.get(target)->scripts;
+            for (std::size_t component = 0; component < scripts.size(); ++component) {
+                if (scripts[component].behaviour != behaviour) continue;
+                auto* instance = impl.instance_of(target, component);
+                if (instance && instance->removing) continue;
+                if (instance) {
+                    instance->removing = true;
+                    impl.pending_removal.push_back(instance);
+                    return 1;
+                }
+                // A disabled script runs nothing, so it can go at once.
+                scripts.erase(scripts.begin() + static_cast<std::ptrdiff_t>(component));
+                (void)scene.set_scripts(target, std::move(scripts));
+                impl.shift_components(target, component);
+                return 1;
+            }
+            impl.warn("remove_script(\"" + std::string{behaviour} + "\") on " + target.to_string() +
+                      ": the entity has no such script left to remove");
+            return 0;
+        };
+        host.component_get_numbers = [](void* context, RelayEntity entity, const char* name, size_t length,
+                                         double* values, size_t capacity) -> size_t {
+            const auto* record = self(context).engine.scene().get(unpack(entity));
+            const auto value = record ? component_field_value(*record, {name, length}) : std::nullopt;
+            if (!value) return 0U;
+            std::vector<double> numbers;
+            if (const auto* flag = std::get_if<bool>(&*value)) numbers = {*flag ? 1.0 : 0.0};
+            else if (const auto* number = std::get_if<double>(&*value)) numbers = {*number};
+            else if (const auto* vector = std::get_if<Vec3>(&*value)) numbers = {vector->x, vector->y, vector->z};
+            for (std::size_t index = 0; index < std::min(numbers.size(), capacity); ++index)
+                values[index] = numbers[index];
+            return numbers.size();
+        };
+        host.component_set_numbers = [](void* context, RelayEntity entity, const char* name, size_t length,
+                                         const double* values, size_t count) {
+            auto& impl = self(context);
+            const std::string field_name(name, length);
+            const auto where = "set_field(\"" + field_name + "\") on " + unpack(entity).to_string();
+            const auto* info = impl.component_field(field_name, where);
+            if (!info) return 0;
+            const std::vector<double> numbers(values, values + (values ? count : 0U));
+            std::optional<ComponentFieldValue> value;
+            switch (info->type) {
+            case ComponentFieldType::boolean:
+                if (numbers.size() == 1U) value = ComponentFieldValue{numbers[0] != 0.0};
+                break;
+            case ComponentFieldType::number:
+            case ComponentFieldType::integer:
+                if (numbers.size() == 1U) value = ComponentFieldValue{numbers[0]};
+                break;
+            case ComponentFieldType::vec3:
+                if (numbers.size() == 3U) value = ComponentFieldValue{Vec3{numbers[0], numbers[1], numbers[2]}};
+                break;
+            default:
+                impl.warn(where + ": the field takes text, not numbers");
+                return 0;
+            }
+            if (!value) {
+                impl.warn(where + ": the field does not take " + std::to_string(numbers.size()) + " number(s)");
+                return 0;
+            }
+            return impl.set_field(unpack(entity), field_name, *value, where) ? 1 : 0;
+        };
+        host.component_get_text = [](void* context, RelayEntity entity, const char* name, size_t length,
+                                      char* buffer, size_t capacity) -> size_t {
+            const auto* record = self(context).engine.scene().get(unpack(entity));
+            const auto value = record ? component_field_value(*record, {name, length}) : std::nullopt;
+            const auto* text = value ? std::get_if<std::string>(&*value) : nullptr;
+            if (!text) return 0U;
+            if (buffer) std::memcpy(buffer, text->data(), std::min(text->size(), capacity));
+            return text->size();
+        };
+        host.component_set_text = [](void* context, RelayEntity entity, const char* name, size_t length,
+                                      const char* text, size_t text_length) {
+            auto& impl = self(context);
+            const std::string field_name(name, length);
+            const auto where = "set_field(\"" + field_name + "\") on " + unpack(entity).to_string();
+            const auto* info = impl.component_field(field_name, where);
+            if (!info) return 0;
+            if (info->type != ComponentFieldType::text && info->type != ComponentFieldType::choice) {
+                impl.warn(where + ": the field takes numbers, not text");
+                return 0;
+            }
+            std::string value(text ? text : "", text ? text_length : 0U);
+            std::string error;
+            if (!impl.asset_allowed(field_name, value, error)) {
+                impl.warn(where + ": " + error);
+                return 0;
+            }
+            return impl.set_field(unpack(entity), field_name, ComponentFieldValue{std::move(value)}, where) ? 1 : 0;
+        };
+        host.joint_connect = [](void* context, RelayEntity entity, RelayEntity other) {
+            auto& impl = self(context);
+            auto& scene = impl.engine.scene();
+            const auto target = unpack(entity);
+            const auto where = "connect_joint on " + target.to_string();
+            const auto* record = scene.get(target);
+            if (!record || !record->joint) {
+                if (record) impl.warn(where + ": the entity has no joint");
+                return 0;
+            }
+            if (!impl.parent_alive(other, where)) return 0;
+            auto joint = *record->joint;
+            joint.connected = unpack(other);
+            if (!scene.set_joint(target, joint)) {
+                impl.warn(where + ": a joint cannot connect its node to itself");
+                return 0;
+            }
+            impl.engine.physics().rebuild_bodies(scene, target, false);
+            return 1;
+        };
+        host.shape_cast = [](void* context, const RelayShape* shape, RelayVec3 origin, RelayVec3 direction,
+                             double maximum_distance, uint32_t layer_mask, RelayEntity ignore, RelayRayHit* hit) {
+            auto& impl = self(context);
+            const auto query = shape ? collision_shape(*shape) : std::nullopt;
+            if (!query || !hit) return 0;
+            auto& owner = impl.engine;
+            const auto result = owner.physics().shape_cast(owner.scene(), *query, {origin.x, origin.y, origin.z},
+                                                           {direction.x, direction.y, direction.z},
+                                                           maximum_distance, layer_mask, unpack(ignore));
+            if (!result.error.empty()) impl.warn("shape_cast: " + result.error);
+            if (!result.hit) return 0;
+            *hit = {result.entity.packed(), result.distance, raw(result.point), raw(result.normal)};
+            return 1;
+        };
+        host.overlap_shape = [](void* context, const RelayShape* shape, RelayVec3 center, uint32_t layer_mask,
+                                RelayEntity ignore, RelayEntity* out, size_t capacity) -> size_t {
+            auto& impl = self(context);
+            const auto query = shape ? collision_shape(*shape) : std::nullopt;
+            if (!query) return 0U;
+            auto& owner = impl.engine;
+            const auto result = owner.physics().overlap_shape(owner.scene(), *query, {center.x, center.y, center.z},
+                                                              layer_mask, unpack(ignore));
+            if (!result.error.empty()) impl.warn("overlap: " + result.error);
+            return copy_entities(result.entities, out, capacity);
+        };
+    }
+
+    static std::optional<CollisionShape> collision_shape(const RelayShape& shape) {
+        if (shape.type < RELAY_SHAPE_SPHERE || shape.type > RELAY_SHAPE_CAPSULE) return std::nullopt;
+        CollisionShape result;
+        result.type = static_cast<CollisionShape::Type>(shape.type);
+        result.radius = shape.radius;
+        result.half_height = shape.half_height;
+        result.half_extents = {shape.half_extents.x, shape.half_extents.y, shape.half_extents.z};
+        result.rotation_degrees = {shape.rotation.x, shape.rotation.y, shape.rotation.z};
+        return result;
+    }
+
+    // The entity's world matrix, with keyframed transforms sampled so it matches what is rendered.
+    [[nodiscard]] std::optional<EditorMatrix> world_matrix(Entity current) const {
+        const auto& scene = engine.scene();
+        if (!scene.contains(current)) return std::nullopt;
+        auto world = editor_identity();
+        for (std::size_t depth = 0; current.valid() && depth < 4096U; ++depth) {
+            const auto* record = scene.get(current);
+            if (!record) return std::nullopt;
+            const auto local = record->transform_animation && !record->transform_animation->keys.empty()
+                ? sample_transform_animation(*record->transform_animation, record->transform)
+                : record->transform;
+            world = editor_multiply(editor_compose(local.position, local.rotation_degrees, local.scale), world);
+            current = record->parent;
+        }
+        return world;
+    }
+
+    // Adds or removes an engine component during the game; scripts have their own calls.
+    bool change_component(const Entity entity, const std::string_view id, const bool add) {
+        auto& scene = engine.scene();
+        if (!scene.contains(entity)) return false;
+        const auto where = std::string{add ? "add_component(\"" : "remove_component(\""} + std::string{id} +
+                           "\") on " + entity.to_string();
+        if (id == "script") {
+            warn(where + ": use " + (add ? "add_script" : "remove_script") + " with the behaviour's name");
+            return false;
+        }
+        std::string error;
+        if (add ? !relay::add_component(scene, entity, id, {}, error)
+                : !relay::remove_component(scene, entity, id, 0U, error)) {
+            warn(where + ": " + error);
+            return false;
+        }
+        physics_changed(entity, id, true);
+        return true;
+    }
+
+    // Rebuilds the entity's physics body after a component change that shapes it.
+    void physics_changed(const Entity entity, const std::string_view component, const bool structural) {
+        const auto* record = engine.scene().get(entity);
+        const bool shapes = component == "collider" || component == "physics_body" || component == "joint" ||
+                            (structural && component == "keyframes") ||
+                            (component == "mesh_renderer" && record && record->collider);
+        if (shapes) engine.physics().rebuild_bodies(engine.scene(), entity, false);
+    }
+
+    const ComponentFieldInfo* component_field(const std::string& name, const std::string& where) {
+        const auto* info = find_component_field(name);
+        if (!info) {
+            const auto component = component_field_component(name);
+            warn(where + (component.starts_with("ui_") ? ": interface fields are set with set_ui"
+                          : component == "particle_emitter" ? ": particle emitters are set with set_particles"
+                                                            : ": no component has such a field"));
+        }
+        return info;
+    }
+
+    bool set_field(const Entity entity, const std::string& name, const ComponentFieldValue& value,
+                   const std::string& where) {
+        std::string error;
+        if (!set_component_field(engine.scene(), entity, name, value, error)) {
+            warn(where + ": " + error);
+            return false;
+        }
+        physics_changed(entity, component_field_component(name), false);
+        return true;
+    }
+
+    // Mesh and material names must be ones the Inspector could choose.
+    bool asset_allowed(const std::string& field, const std::string& value, std::string& error) const {
+        if ((field == "mesh_renderer.mesh" || (field == "collider.mesh" && !value.empty())) &&
+            !engine.assets().find_mesh(value)) {
+            error = "no mesh is registered as " + value;
+            return false;
+        }
+        if (field != "mesh_renderer.material") return true;
+        if (!valid_material_path(value)) {
+            if (engine.assets().find_material(value)) return true;
+            error = "no material is registered as " + value;
+            return false;
+        }
+        const auto kind = read_material_type(engine.asset_root(), value, error);
+        if (kind && *kind != "surface") error = value + " is not a surface material";
+        return kind && *kind == "surface";
+    }
+
+    // Creates, but does not start, the instance for one of the entity's script components.
+    void add_instance(const Entity entity, const std::size_t component) {
+        auto instance = std::make_unique<Instance>(Instance{entity, component, engine.scene().get(entity)->scripts[component]});
+        create(*instance);
+        by_entity[entity.packed()].push_back(instance.get());
+        instances.push_back(std::move(instance));
+    }
+
+    [[nodiscard]] Instance* instance_of(const Entity entity, const std::size_t component) const {
+        const auto found = by_entity.find(entity.packed());
+        if (found == by_entity.end()) return nullptr;
+        for (auto* instance : found->second)
+            if (instance->component == component && !instance->removed) return instance;
+        return nullptr;
+    }
+
+    // Script component `removed` left the entity; later components move down one place.
+    void shift_components(const Entity entity, const std::size_t removed) {
+        for (const auto& instance : instances)
+            if (instance->entity == entity && !instance->removed && instance->component > removed)
+                --instance->component;
     }
 
     struct UiFieldRef {
@@ -1365,14 +1676,8 @@ struct ScriptSystem::Impl {
         if (library)
             for (const auto entity : subtree(spawned)) {
                 const auto& scripts = engine.scene().get(entity)->scripts;
-                for (std::size_t component = 0; component < scripts.size(); ++component) {
-                    if (!scripts[component].enabled) continue;
-                    auto instance = std::make_unique<Instance>(
-                        Instance{entity, component, scripts[component]});
-                    create(*instance);
-                    by_entity[entity.packed()].push_back(instance.get());
-                    instances.push_back(std::move(instance));
-                }
+                for (std::size_t component = 0; component < scripts.size(); ++component)
+                    if (scripts[component].enabled) add_instance(entity, component);
             }
         return spawned.packed();
     }
@@ -1391,6 +1696,25 @@ struct ScriptSystem::Impl {
     // entities, their instances and their physics bodies go. on_destroy may destroy more.
     void flush_destroyed() {
         auto& scene = engine.scene();
+        // Removed scripts go first: on_destroy, then their components. on_destroy may remove more.
+        bool scripts_removed = false;
+        for (std::size_t pass = 0; !pending_removal.empty() && pass < 64U; ++pass) {
+            const auto batch = std::exchange(pending_removal, {});
+            for (auto* instance : batch) {
+                if (instance->started && scene.contains(instance->entity)) call(*instance, RELAY_CALLBACK_DESTROY);
+                instance->destroyed = true;
+            }
+            for (auto* instance : batch) {
+                instance->removed = true;
+                scripts_removed = true;
+                if (!scene.contains(instance->entity)) continue;
+                auto scripts = scene.get(instance->entity)->scripts;
+                if (instance->component >= scripts.size()) continue;
+                scripts.erase(scripts.begin() + static_cast<std::ptrdiff_t>(instance->component));
+                (void)scene.set_scripts(instance->entity, std::move(scripts));
+                shift_components(instance->entity, instance->component);
+            }
+        }
         bool removed = false;
         for (std::size_t pass = 0; !pending_destroy.empty() && pass < 64U; ++pass) {
             const auto batch = std::exchange(pending_destroy, {});
@@ -1407,16 +1731,17 @@ struct ScriptSystem::Impl {
             for (const auto top : batch) (void)scene.destroy(top);
             removed = true;
         }
-        if (!removed) return;
+        if (!removed && !scripts_removed) return;
         std::erase_if(instances, [&](const std::unique_ptr<Instance>& instance) {
-            if (scene.contains(instance->entity)) return false;
+            // Removals left queued past the pass limit stay until a later flush applies them.
+            if ((scene.contains(instance->entity) || instance->removing) && !instance->removed) return false;
             if (instance->object) library->module->destroy(instance->object);
             return true;
         });
         by_entity.clear();
         for (const auto& instance : instances)
             by_entity[instance->entity.packed()].push_back(instance.get());
-        engine.physics().remove_missing_bodies(scene);
+        if (removed) engine.physics().remove_missing_bodies(scene);
     }
 
     ~Impl() { cancel_build(); }
@@ -1443,8 +1768,11 @@ struct ScriptSystem::Impl {
         if (!record || !finite(value)) return 0;
         auto transform = record->transform;
         transform.*member = {value.x, value.y, value.z};
+        const bool resized = transform.scale != record->transform.scale;
         (void)scene.set_transform(target, transform);
-        engine.physics().sync_transforms(scene, target);
+        // Collider shapes bake in world scale, so a new scale rebuilds the subtree's bodies.
+        if (resized) engine.physics().rebuild_bodies(scene, target, true);
+        else engine.physics().sync_transforms(scene, target);
         return 1;
     }
 
@@ -1470,6 +1798,7 @@ struct ScriptSystem::Impl {
         instances.clear();
         by_entity.clear();
         pending_destroy.clear();
+        pending_removal.clear();
         templates.clear();
         running = false;
         library.reset();
@@ -1711,6 +2040,7 @@ struct ScriptSystem::Impl {
     // The interface event RELAY_CALLBACK_UI is delivering.
     std::optional<UiEvent> ui_event;
     std::vector<Entity> pending_destroy;
+    std::vector<Instance*> pending_removal; // remove_script, applied by flush_destroyed.
     std::map<std::string, std::optional<LoadedTemplate>, std::less<>> templates;
     bool entity_limit_warned{};
     Instance* active{};
@@ -1900,6 +2230,7 @@ void ScriptSystem::start() {
     impl.instances.clear();
     impl.by_entity.clear();
     impl.pending_destroy.clear();
+    impl.pending_removal.clear();
     impl.templates.clear();
     impl.entity_limit_warned = false;
     impl.running = true;
@@ -2001,6 +2332,7 @@ void ScriptSystem::stop() {
     impl.instances.clear();
     impl.by_entity.clear();
     impl.pending_destroy.clear();
+    impl.pending_removal.clear();
     impl.templates.clear();
     impl.running = false;
     impl.stopping = false;

@@ -44,6 +44,10 @@ void EditorLayout::bind(std::string key, bool* value) {
     preferences_.push_back({std::move(key), value, *value});
 }
 
+void EditorLayout::bind_text(std::string key, std::string* value) {
+    text_preferences_.push_back({std::move(key), value, *value});
+}
+
 void EditorLayout::read_preference(const std::string_view line) {
     const auto equals = line.find('=');
     if (equals == std::string_view::npos) return;
@@ -54,6 +58,11 @@ void EditorLayout::read_preference(const std::string_view line) {
             *preference.value = value == "1";
             preference.saved = *preference.value;
         }
+    for (auto& preference : text_preferences_)
+        if (preference.key == key) {
+            *preference.value = std::string(value);
+            preference.saved = *preference.value;
+        }
     preferences_loaded = true;
 }
 
@@ -61,6 +70,11 @@ void EditorLayout::write_preferences(std::string& output) const {
     output += "[Relay][Preferences]\n";
     for (const auto& preference : preferences_)
         output += preference.key + '=' + (*preference.value ? "1" : "0") + '\n';
+    for (const auto& preference : text_preferences_) {
+        auto text = *preference.value;
+        std::erase_if(text, [](const char character) { return character == '\n' || character == '\r'; });
+        output += preference.key + '=' + text + '\n';
+    }
     output += '\n';
 }
 
@@ -100,6 +114,11 @@ void EditorLayout::initialize(std::string override_path) {
 void EditorLayout::build(const float scale) {
     // Preference flags are not ImGui state, so changing one must schedule an ini save itself.
     for (auto& preference : preferences_)
+        if (*preference.value != preference.saved) {
+            preference.saved = *preference.value;
+            ImGui::MarkIniSettingsDirty();
+        }
+    for (auto& preference : text_preferences_)
         if (*preference.value != preference.saved) {
             preference.saved = *preference.value;
             ImGui::MarkIniSettingsDirty();

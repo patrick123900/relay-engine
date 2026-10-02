@@ -7,6 +7,7 @@
 #if defined(_WIN32)
 #include <process.h>
 #else
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 extern char** environ;
@@ -21,9 +22,16 @@ bool run(const std::vector<std::string>& command) {
     std::vector<char*> arguments;
     for (const auto& argument : command) arguments.push_back(const_cast<char*>(argument.c_str()));
     arguments.push_back(nullptr);
+    // Output and input go to /dev/null: the editor's own stdio can be the agent bridge's pipe.
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
     pid_t child{};
-    if (posix_spawnp(&child, arguments.front(), nullptr, nullptr, arguments.data(), environ) != 0)
-        return false;
+    const int started = posix_spawnp(&child, arguments.front(), &actions, nullptr, arguments.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (started != 0) return false;
     int status{};
     return waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }

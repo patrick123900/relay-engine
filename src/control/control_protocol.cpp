@@ -408,6 +408,10 @@ std::string ControlProtocol::handle(const std::string_view request) {
     }
     const auto* const specification = find_protocol_method(method);
     const bool read_only = specification != nullptr && specification->read_only;
+    if (!read_only && (method.starts_with("assets.") || method.starts_with("shaders.") ||
+                       method.starts_with("scripts.") || method.starts_with("project.") ||
+                       method.starts_with("templates.") || method == "scene.save" || method == "scene.load"))
+        ++asset_epoch_;
     if (engine_.game_session_active() && !read_only &&
         (method.starts_with("scene.") || method.starts_with("project.") ||
          method.starts_with("assets.") || method.starts_with("component.") ||
@@ -448,7 +452,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
                << ",\"elapsed_seconds\":" << status.elapsed_seconds
                << ",\"fixed_delta_seconds\":" << engine_.fixed_delta_seconds()
                << ",\"random_seed\":" << engine_.random_seed()
-               << ",\"width\":" << status.width << ",\"height\":" << status.height << "}}";
+               << ",\"width\":" << status.width << ",\"height\":" << status.height
+               << ",\"asset_epoch\":" << asset_epoch_ << "}}";
         return result.str();
     }
     if (method == "runtime.play") {
@@ -1475,9 +1480,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
     }
     if (method == "physics.debug_boxes") {
         const auto result = collision_debug_boxes(engine_.scene(), false, &engine_.assets());
-        std::ostringstream output;
-        output << std::setprecision(std::numeric_limits<double>::max_digits10)
-               << "{\"boxes\":[";
+        JsonWriter output;
+        output << "{\"boxes\":[";
         const auto vector = [&](const Vec3 value) {
             output << '[' << value.x << ',' << value.y << ',' << value.z << ']';
         };
@@ -1497,15 +1501,16 @@ std::string ControlProtocol::handle(const std::string_view request) {
             output << "],\"radius\":" << box.radius << ",\"axis\":";
             vector(box.axis);
             // Outline vertices come from single-precision meshes; seven digits keep them exact.
-            output << std::setprecision(7) << ",\"lines\":[";
+            output.precision(7);
+            output << ",\"lines\":[";
             for (std::size_t line = 0; line < box.lines.size(); ++line) {
                 if (line) output << ',';
                 vector(box.lines[line][0]);
                 output << ',';
                 vector(box.lines[line][1]);
             }
-            output << std::setprecision(std::numeric_limits<double>::max_digits10)
-                   << "],\"lines_truncated\":" << (box.lines_truncated ? "true" : "false") << '}';
+            output.precision(17);
+            output << "],\"lines_truncated\":" << (box.lines_truncated ? "true" : "false") << '}';
         }
         output << "],\"truncated\":" << (result.truncated ? "true" : "false") << ",\"joints\":[";
         for (std::size_t index = 0; index < result.joints.size(); ++index) {

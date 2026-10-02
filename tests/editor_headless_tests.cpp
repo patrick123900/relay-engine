@@ -393,6 +393,55 @@ void type_text(relay::EditorUi& ui, const char* text) {
     frame(ui, 2);
 }
 
+// The editor parses scene.list one node at a time and patches nodes that moved; whatever changed,
+// its cached nodes must equal what the protocol reports.
+void scene_list_cache_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    const auto handle_of = [&](const std::string& reply) {
+        const auto at = reply.find("\"entity\":\"") + 10U;
+        return *relay::Entity::parse(reply.substr(at, reply.find('"', at) - at));
+    };
+    const auto first = handle_of(protocol.handle(R"({"id":1,"method":"scene.create","name":"First"})"));
+    const auto second = handle_of(protocol.handle(R"({"id":2,"method":"scene.create","name":"Second"})"));
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize scene list editor");
+    frame(ui, 5);
+    const auto agrees = [&](const char* what) {
+        frame(ui, 80); // Longer than the 0.5 s refresh interval at the headless 60 Hz.
+        const auto listing = relay::JsonParser(protocol.handle(R"({"id":3,"method":"scene.list"})")).parse();
+        const auto* result = relay::field(*listing->object(), "result");
+        const auto* nodes = relay::field(*result->object(), "entities")->array();
+        bool same = true;
+        for (const auto& node : *nodes) {
+            const auto handle = *relay::field(*node.object(), "entity")->string();
+            const auto cached = ui.headless_scene_node(handle);
+            same = same && cached && *cached == relay::json_stringify(node);
+        }
+        check(same, what);
+    };
+    const auto send = [&](const std::string& request) {
+        check(protocol.handle(request).find("\"ok\":true") != std::string::npos, "scene list test request succeeds");
+    };
+    agrees("the editor's node cache starts equal to scene.list");
+    send(R"({"id":4,"method":"scene.set_transform","entity":")" + first.to_string() + R"(","px":4.5,"py":1,"pz":-2})");
+    agrees("a node that only moved is patched to match");
+    send(R"({"id":5,"method":"scene.rename","entity":")" + second.to_string() + R"(","name":"Renamed \"Two\""})");
+    agrees("a renamed node is reparsed");
+    send(R"({"id":6,"method":"component.add","entity":")" + first.to_string() + R"(","component":"light"})");
+    send(R"({"id":7,"method":"scene.set_parent","entity":")" + second.to_string() + R"(","parent":")" + first.to_string() + R"("})");
+    agrees("a new component and a reparent are picked up");
+    const auto third = handle_of(protocol.handle(R"({"id":8,"method":"scene.create","name":"Third"})"));
+    agrees("a new node appears");
+    check(ui.headless_item_rect("entity:" + third.to_string()).has_value(), "its hierarchy row is drawn");
+    send(R"({"id":9,"method":"scene.destroy","entity":")" + third.to_string() + R"("})");
+    agrees("a destroyed node leaves the cache");
+    check(!ui.headless_scene_node(third.to_string()).has_value(), "the destroyed node is gone from the editor");
+}
+
 void hierarchy_and_assets_ui() {
     relay::EngineConfig config;
     config.editor_mode = true;
@@ -612,6 +661,25 @@ void layout_persistence_ui() {
         frame(ui, 5);
         check(selected("Inspector") && selected("History"),
               "reopening restores the selected tab in each dock node, even under the Agent default");
+    }
+    {
+        // The external editor chosen in Editor preferences is saved with the layout.
+        std::filesystem::remove(".relay/headless-layout.ini");
+        {
+            relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+            check(ui.initialize_headless(error), "preferences session initializes");
+            frame(ui, 3);
+            click_center(ui, *ui.headless_item_rect("menu:edit"));
+            click_center(ui, *ui.headless_item_rect("menu:edit:editor_preferences"));
+            frame(ui, 2);
+            click_center(ui, *ui.headless_item_rect("prefs:ide"));
+            frame(ui, 2);
+            click_center(ui, *ui.headless_item_rect("prefs:ide:zed"));
+            frame(ui, 3);
+        }
+        std::ifstream layout_file(".relay/headless-layout.ini");
+        const std::string layout_text((std::istreambuf_iterator<char>(layout_file)), std::istreambuf_iterator<char>());
+        check(layout_text.find("ide.preset=zed") != std::string::npos, "the chosen external editor is saved with the layout");
     }
     std::cout << "Headless layout persistence tests passed\n";
 }
@@ -1755,6 +1823,41 @@ void scripts_ui() {
     check(ui.headless_item_rect("inspector:component:script:0").has_value(),
           "Inspector shows the script component of the selected entity");
 
+    // The Edit button opens the script's class in the IDE chosen in Editor preferences.
+    std::vector<relay::IdeLaunch> launches;
+    ui.set_ide_handler([&](const relay::IdeLaunch& launch) {
+        launches.push_back(launch);
+        return std::string{};
+    });
+    check(ui.headless_item_rect("inspector:component:script:0:edit").has_value(),
+          "a script component's header has an Edit button");
+    click_center(ui, *ui.headless_item_rect("inspector:component:script:0:edit"));
+    frame(ui, 2);
+    check(launches.size() == 1U && launches[0].file.filename() == "spin.cpp" && launches[0].line == 2 &&
+              launches[0].preset == "system",
+          "Edit opens the file registering the behaviour at its class, in the default editor");
+    click_center(ui, *ui.headless_item_rect("menu:edit"));
+    click_center(ui, *ui.headless_item_rect("menu:edit:editor_preferences"));
+    frame(ui, 2);
+    check(ui.headless_item_rect("prefs:window") && ui.headless_item_rect("prefs:ide"),
+          "Edit > Editor preferences opens the preferences window");
+    click_center(ui, *ui.headless_item_rect("prefs:ide"));
+    frame(ui, 2);
+    click_center(ui, *ui.headless_item_rect("prefs:ide:vscode"));
+    frame(ui, 2);
+    click_center(ui, *ui.headless_item_rect("inspector:component:script:0:edit"));
+    frame(ui, 2);
+    check(launches.size() == 2U && launches[1].preset == "vscode",
+          "the chosen editor is used by the Edit button");
+    {
+        const auto words = relay::ide_command_line("code {project} --goto {file}:{line}", "/a b/spin.cpp", 7, "/a b");
+        check(words.size() == 4U && words[0] == "code" && words[1] == "/a b" && words[3] == "/a b/spin.cpp:7",
+              "launch templates substitute {file}, {line} and {project} without a shell");
+        check(relay::ide_command_line("a \"b c\" d", {}, 1, {}).size() == 3U &&
+                  relay::ide_command_line("a \"b", {}, 1, {}).empty(),
+              "launch templates group quoted words and reject unclosed quotes");
+    }
+
     const auto run = ui.headless_item_rect("toolbar:run");
     check(run.has_value(), "toolbar exposes Run Game");
     click_center(ui, *run);
@@ -2614,6 +2717,139 @@ void interface_ui() {
     std::cout << "Headless interface editor tests passed\n";
 }
 
+
+// Opt-in cost report (RELAY_EDITOR_BENCH=1): builds the editor UI over the demo project at a
+// simulated 250 FPS, in Editor mode and while the game runs, and prints frame-time statistics, the
+// busiest scopes and what the slowest frames spent their time on.
+void editor_cost_report() {
+    namespace fs = std::filesystem;
+    fs::copy(RELAY_DEMO_DIRECTORY, "bench", fs::copy_options::recursive);
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize editor benchmark");
+    ImGui::GetIO().DeltaTime = 0.004F;
+    check(ui.open_project("bench/demo.relayproject"), "open the demo project");
+    frame(ui, 60);
+    const auto report = [&](const char* label, const int frames, const bool game) {
+        (void)protocol.handle(R"({"id":1,"method":"profiler.set","action":"clear"})");
+        std::vector<double> times;
+        int slow_shown = 0;
+        for (int i = 0; i < frames; ++i) {
+            if (game && i % 4 == 0) engine.step(1);
+            relay::profiler().begin_frame();
+            const auto start = std::chrono::steady_clock::now();
+            ui.build(1920, 1080);
+            times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            relay::profiler().end_frame(static_cast<std::uint64_t>(i), game);
+            if (times.back() > 1.0 && slow_shown < 4) {
+                ++slow_shown;
+                const auto reply = relay::JsonParser(protocol.handle(R"({"id":8,"method":"profiler.read","frames":1})")).parse();
+                const auto* result = reply ? relay::field(*reply->object(), "result") : nullptr;
+                const auto* spots = result ? relay::field(*result->object(), "hotspots") : nullptr;
+                std::cout << "   slow frame " << i << " (" << times.back() << " ms):\n";
+                int rows = 0;
+                if (spots && spots->array())
+                    for (const auto& item : *spots->array()) {
+                        if (rows++ == 8) break;
+                        const auto& o = *item.object();
+                        std::cout << "     " << *relay::field(o, "name")->string() << "  self " << *relay::field(o, "self_ms")->number() << '\n';
+                    }
+            }
+        }
+        auto sorted = times;
+        std::sort(sorted.begin(), sorted.end());
+        const auto at = [&](const double q) { return sorted[static_cast<std::size_t>(q * static_cast<double>(sorted.size() - 1U))]; };
+        double sum = 0.0;
+        for (const auto t : times) sum += t;
+        std::cout << "\n== " << label << ": " << frames << " frames, mean " << sum / static_cast<double>(frames)
+                  << " ms, median " << at(0.5) << ", p95 " << at(0.95) << ", p99 " << at(0.99) << ", max " << sorted.back() << "\n";
+        std::cout << "   frames over 3x median:";
+        int shown = 0;
+        for (std::size_t i = 0; i < times.size() && shown < 24; ++i)
+            if (times[i] > 3.0 * at(0.5)) { std::cout << ' ' << i << '(' << times[i] << ')'; ++shown; }
+        std::cout << "\n";
+        const auto print_hotspots = [&](const std::string& request, const char* heading) {
+            const auto reply = relay::JsonParser(protocol.handle(request)).parse();
+            const auto* result = reply ? relay::field(*reply->object(), "result") : nullptr;
+            const auto* spots = result ? relay::field(*result->object(), "hotspots") : nullptr;
+            std::cout << "   " << heading << '\n';
+            if (!spots || !spots->array()) return;
+            int rows = 0;
+            for (const auto& item : *spots->array()) {
+                if (rows++ == 14) break;
+                const auto& o = *item.object();
+                std::cout << "     " << *relay::field(o, "name")->string() << "  self " << *relay::field(o, "self_ms")->number()
+                          << "  total " << *relay::field(o, "total_ms")->number() << "  calls " << *relay::field(o, "calls")->number() << '\n';
+            }
+        };
+        print_hotspots("{\"id\":2,\"method\":\"profiler.read\",\"frames\":" + std::to_string(frames) + "}", "average per frame:");
+    };
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string reply;
+        for (int i = 0; i < 20; ++i) reply = protocol.handle(R"({"id":9,"method":"scene.list"})");
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 20; ++i) (void)relay::JsonParser(reply).parse();
+        const auto t2 = std::chrono::steady_clock::now();
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count() / 20.0; };
+        {
+            std::string boxes;
+            const auto d0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 20; ++i) boxes = protocol.handle(R"({"id":9,"method":"physics.debug_boxes"})");
+            const auto d1 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 20; ++i) (void)relay::JsonParser(boxes).parse();
+            const auto d2 = std::chrono::steady_clock::now();
+            const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count() / 20.0; };
+            std::cout << "physics.debug_boxes: " << boxes.size() / 1024 << " KiB, handle " << ms(d1 - d0) << " ms, parse " << ms(d2 - d1) << " ms\n";
+        }
+        std::cout << "scene.list: " << reply.size() / 1024 << " KiB, " << engine.scene().entities().size()
+                  << " entities, serialize " << ms(t1 - t0) << " ms, parse " << ms(t2 - t1) << " ms\n";
+    }
+    report("Editor mode", 1000, false);
+    // Running the game needs the demo's scripts built, which needs the project trusted.
+    (void)protocol.handle(R"({"id":4,"method":"scripts.trust","trusted":true})");
+    (void)protocol.handle(R"({"id":5,"method":"scripts.build"})");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{600};
+    for (;;) {
+        engine.tick();
+        frame(ui, 5);
+        const auto status = relay::JsonParser(protocol.handle(R"({"id":6,"method":"scripts.status"})")).parse();
+        const auto* result = status ? relay::field(*status->object(), "result") : nullptr;
+        const auto state = result ? relay::field(*result->object(), "state") : nullptr;
+        if (state && state->string() && (*state->string() == "ready" || *state->string() == "failed")) break;
+        if (std::chrono::steady_clock::now() > deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+    (void)protocol.handle(R"({"id":7,"method":"runtime.play"})");
+    for (int i = 0; i < 20; ++i) { engine.step(1); frame(ui, 4); }
+    report("Run Game", 1000, true);
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::size_t instances = 0;
+        for (int i = 0; i < 300; ++i) instances = relay::build_render_scene(engine.scene(), engine.assets(), 16.0F / 9.0F).instances.size();
+        const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 300.0;
+        std::cout << "build_render_scene: " << elapsed << " ms for " << instances << " instances, "
+                  << engine.scene().entities().size() << " nodes\n";
+    }
+    {
+        std::string reply;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 20; ++i) reply = protocol.handle(R"({"id":9,"method":"profiler.read","frames":60,"history":240})");
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 20; ++i) (void)relay::JsonParser(reply).parse();
+        const auto t2 = std::chrono::steady_clock::now();
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count() / 20.0; };
+        std::cout << "profiler.read: " << reply.size() / 1024 << " KiB, handle " << ms(t1 - t0) << " ms, parse " << ms(t2 - t1) << " ms\n";
+    }
+    ui.set_panel_visible("Profiler", true);
+    frame(ui, 30);
+    report("Run Game with the Profiler panel open", 1000, true);
+}
+
 int main() {
     const auto original = std::filesystem::current_path();
     const auto temporary = std::filesystem::temp_directory_path() /
@@ -2629,9 +2865,15 @@ int main() {
         scenario();
     };
     try {
+        if (std::getenv("RELAY_EDITOR_BENCH")) {
+            fresh(editor_cost_report);
+            std::filesystem::current_path(original);
+            return 0;
+        }
         fresh(run);
         fresh(project_ui);
         fresh(hierarchy_and_assets_ui);
+        fresh(scene_list_cache_ui);
         fresh(components_ui);
         fresh(node_templates_ui);
         fresh(joints_ui);

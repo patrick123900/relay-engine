@@ -1,4 +1,7 @@
 #include "relay/control/control_protocol.hpp"
+#include "relay/editor/ide.hpp"
+#include "relay/render/image_decode.hpp"
+#include "relay/ui/ui_font.hpp"
 #include "relay/control/generated_protocol.hpp"
 #include "relay/editor/editor_math.hpp"
 #include "relay/editor/editor_camera.hpp"
@@ -930,6 +933,76 @@ void test_particles() {
 }
 
 int main() {
+    {
+        // The window icon is built into the engine and decodes to a square RGBA image.
+        bool decoded = false;
+        for (const auto& file : relay::embedded_files())
+            if (file.name == "relay-icon.png") {
+                relay::TextureAsset icon;
+                std::string error;
+                decoded = relay::decode_image_rgba(file.bytes, "png", icon, error) && icon.width == 256U &&
+                          icon.height == 256U && icon.rgba.size() == 256U * 256U * 4U;
+            }
+        expect(decoded, "the embedded window icon decodes");
+    }
+#if defined(__linux__)
+    {
+        // A launched editor gets /dev/null for stdio (the editor's own can be the agent pipe) and
+        // the command line the preset describes.
+        namespace fs = std::filesystem;
+        const auto folder = fs::temp_directory_path() / "relay-ide-test";
+        fs::remove_all(folder);
+        fs::create_directories(folder);
+        const auto script = folder / "fake-ide.sh";
+        {
+            std::ofstream out(script);
+            out << "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" << (folder / "args.txt").string()
+                << "'\nreadlink /proc/$$/fd/0 > '" << (folder / "stdin.txt").string()
+                << "'\nreadlink /proc/$$/fd/1 > '" << (folder / "stdout.txt").string() << "'\n";
+        }
+        fs::permissions(script, fs::perms::owner_all);
+        relay::IdeLaunch launch;
+        launch.preset = "custom";
+        launch.custom_command = script.string() + " --goto {file}:{line}";
+        launch.file = folder / "spin.cpp";
+        launch.line = 12;
+        launch.project = folder;
+        const auto problem = relay::open_in_ide(launch);
+        expect(problem.empty(), "a custom editor command starts: " + problem);
+        for (int wait = 0; wait < 200 && !fs::exists(folder / "stdout.txt"); ++wait)
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto read = [&](const char* name) {
+            std::ifstream in(folder / name);
+            std::string text;
+            std::getline(in, text);
+            return text;
+        };
+        expect(read("stdin.txt") == "/dev/null" && read("stdout.txt") == "/dev/null",
+               "a launched editor does not inherit the editor's stdin or stdout");
+        expect(read("args.txt") == "--goto", "the command's arguments are passed");
+        launch.preset = "custom";
+        launch.custom_command = (folder / "missing-ide").string();
+        expect(!relay::open_in_ide(launch).empty(), "a missing editor program is reported");
+        fs::remove_all(folder);
+    }
+#endif
+    {
+        // The strict JSON reader keeps its rules.
+        const auto parses = [](const std::string& text) { return relay::JsonParser(text).parse().has_value(); };
+        expect(parses(R"({"a":[1,2.5,-3e2,true,false,null,"x\n\u00e9\ud83d\ude00"],"b":{"c":{}}})"), "JSON reader accepts valid documents");
+        expect(!parses(R"({"a":1,"a":2})"), "JSON reader rejects duplicate keys");
+        expect(!parses(R"({"a":1} x)"), "JSON reader rejects trailing content");
+        expect(!parses(R"({"a":[1,2)"), "JSON reader rejects unterminated arrays");
+        expect(!parses("{\"a\":\"line\nbreak\"}"), "JSON reader rejects raw control characters in strings");
+        expect(!parses(R"({"a":"\ud800"})"), "JSON reader rejects lone surrogates");
+        expect(!parses(std::string(100, '[') + std::string(100, ']')), "JSON reader rejects nesting beyond its limit");
+        const auto value = relay::JsonParser(R"({"s":"a\"b\\c","n":[1,[2,3]],"t":true})").parse();
+        expect(value && *relay::field(*value->object(), "s")->string() == "a\"b\\c" &&
+                   *(*relay::field(*value->object(), "n")->array())[1].array()->at(1).number() == 3.0 &&
+                   *relay::field(*value->object(), "t")->boolean(),
+               "JSON reader keeps strings, nested arrays and literals intact");
+    }
     test_game_interface();
     test_particles();
     {

@@ -9,6 +9,7 @@
 // same undo history and are recorded in the same deterministic trace.
 
 #include "relay/editor/editor_overlay.hpp"
+#include "relay/editor/ide.hpp"
 
 #include <filesystem>
 #include <functional>
@@ -28,6 +29,10 @@ public:
     // none installed.
     using FileBrowserHandler = std::function<void(const std::filesystem::path&, bool directory)>;
 
+    // Opens a script in the user's chosen IDE and returns an error message, or empty on success.
+    // Headless editors start with none installed.
+    using IdeHandler = std::function<std::string(const IdeLaunch&)>;
+
     using AttachmentPicker = std::function<void(std::function<void(std::vector<std::string>)>)>;
     explicit EditorUi(RequestHandler request);
     // Background test seam; the normal picker is opened only by a human button press.
@@ -41,6 +46,9 @@ public:
     // CPU-only ImGui frames for background interaction tests. No SDL window, GPU or OS input.
     bool initialize_headless(std::string& error);
     [[nodiscard]] std::optional<std::array<float, 4>> headless_item_rect(std::string_view key) const;
+    // The editor's cached listing of one node as JSON, or nothing when it has none. Tests compare it
+    // with the protocol, because the cache re-parses only the nodes that changed.
+    [[nodiscard]] std::optional<std::string> headless_scene_node(std::string_view handle) const;
     // True while Run Game owns keyboard and mouse input, after a click on the viewport.
     [[nodiscard]] bool game_has_input() const;
     // True while the game has input and the editor keeps the pointer locked for it.
@@ -52,6 +60,7 @@ public:
     void set_panel_visible(std::string_view name, bool visible);
     [[nodiscard]] bool panel_visible(std::string_view name) const;
     void set_file_browser_handler(FileBrowserHandler handler);
+    void set_ide_handler(IdeHandler handler);
     // Opens a workspace-relative project and its startup scene, as the Project panel does.
     bool open_project(std::string_view filename);
     // Host seam: invoked only after native protocol validation and agent authorization.

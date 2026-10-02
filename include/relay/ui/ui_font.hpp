@@ -24,7 +24,7 @@ struct EmbeddedFile {
     std::string_view name;
     std::span<const unsigned char> bytes;
 };
-// Files built into the engine: Inter-Regular.ttf and Inter-Bold.ttf.
+// Files built into the engine: Inter-Regular.ttf, Inter-Bold.ttf and relay-icon.png (window icon).
 [[nodiscard]] const std::vector<EmbeddedFile>& embedded_files();
 
 // Pixels a renderer uploads as a texture: 8-bit RGBA, sRGB with straight alpha. `revision` changes

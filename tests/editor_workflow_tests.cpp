@@ -833,6 +833,21 @@ void components_and_templates() {
               *relay::field(*with_project.back().object(), "id")->string() == "project:Enemy" &&
               *relay::field(*with_project.back().object(), "type")->string() == "RigidBody",
           "saved templates are listed with their root's type");
+    // The listing is cached per file; a rewritten template and a deleted one must show.
+    const auto has_component = [&](const char* id) {
+        const auto listing = request(protocol, "templates.list");
+        for (const auto& entry : *relay::field(*listing.object(), "templates")->array())
+            for (const auto& component : *relay::field(*entry.object(), "components")->array())
+                if (*component.string() == id) return true;
+        return false;
+    };
+    check(!has_component("particle_emitter"), "the cached listing starts without a particle emitter");
+    request(protocol, "component.add", "\"entity\":\"" + enemy.to_string() + "\",\"component\":\"particle_emitter\"");
+    request(protocol, "templates.save", "\"entity\":\"" + enemy.to_string() + "\",\"name\":\"Enemy\",\"replace\":true");
+    check(has_component("particle_emitter"), "a rewritten template file is listed with its new components");
+    request(protocol, "component.remove", "\"entity\":\"" + enemy.to_string() + "\",\"component\":\"particle_emitter\"");
+    request(protocol, "templates.save", "\"entity\":\"" + enemy.to_string() + "\",\"name\":\"Enemy\",\"replace\":true");
+    check(!has_component("particle_emitter"), "and without them once it is saved again");
     const auto parent = engine.scene().create("Spawner");
     const auto copy = created_entity(request(
         protocol, "templates.instantiate",

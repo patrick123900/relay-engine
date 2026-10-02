@@ -44,6 +44,9 @@ private:
     void policy_audit(std::string_view method, bool succeeded, std::uint64_t request_id = 0);
     [[nodiscard]] std::string audit_json(std::uint64_t after) const;
     std::vector<ScopedGrant> scoped_grants_;
+    // Counts requests that can add, remove or change project files or the asset registry, so an
+    // editor can relist them as soon as an agent changes something instead of on a timer.
+    std::uint64_t asset_epoch_{};
     std::deque<AccessRequest> access_requests_;
     std::uint64_t access_sequence_{};
     std::string policy_project_, bridge_token_;

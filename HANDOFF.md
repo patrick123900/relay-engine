@@ -152,6 +152,25 @@ without blocking simultaneous human editing.
   "##id" suffixes dropped, underscores become spaces, first letter capitalised, so script and shader
   names read "Wave height". Every Inspector checkbox (`inspector_checkbox`) and script text property
   puts its name in the left label column like other fields.
+- External editor: Edit → Editor preferences... (`draw_editor_preferences`) picks an `IdePreset`
+  (`src/editor/ide.cpp`: system default, VS Code, VSCodium, Cursor, Zed, Sublime, Kate, CLion, Qt
+  Creator, or a custom template with `{file}`/`{line}`/`{project}`; split on spaces, no shell). The
+  choice is two text preferences (`ide.preset`, `ide.command`) in the layout ini via the new
+  `EditorLayout::bind_text`. A script component header's pencil **Edit** button and context item call
+  `edit_script`, which scans `scripts/` (256 files, 1 MiB each) for the `RELAY_BEHAVIOUR(Name)` file,
+  jumps to the class line, and launches through `EditorUi::set_ide_handler` (host action like
+  Open in file browser, not a protocol method; headless editors install none). Launched programs (here and
+  in `show_in_file_browser`) get `/dev/null` for stdio and, for IDEs, their own session: the
+  editor's stdin/stdout can be the agent bridge's protocol pipe, and VS Code inheriting it ended
+  the editor. Launching real
+  IDEs has not been tried on a desktop; Windows goes through `cmd /c` and refuses cmd-special
+  characters in paths.
+- Window icon: `resources/relay-icon.png` (256 px, rendered from `docs/images/relay-mark.svg`) is
+  embedded with the interface fonts (`embedded_files()`), and `apply_window_icon`
+  (`src/platform/window_icon.cpp`) sets it on the Vulkan and CPU windows; both also call
+  `SDL_SetAppMetadata` with app id `relay-engine`. Taskbars that take icons from a `.desktop` file
+  (most Wayland desktops) still need one named `relay-engine.desktop`; none ships yet, and the icon
+  has not been checked on a desktop.
 - Development builds (`RELAY_OPEN_DEMO_PROJECT`, on in the dev preset) open
   `examples/demo/demo.relayproject` when the UI editor starts from the repository root, unless
   `RELAY_OPEN_DEMO_PROJECT=0`. Smoke tests set that override. `tools/generate_demo_project.py`
@@ -251,13 +270,47 @@ without blocking simultaneous human editing.
   with deadlines advanced by whole periods so the average rate is exact; unlimited leaves pacing
   to presentation (the refresh rate with vsync, none without). When the last draw presented nothing (a minimized window) the 4 ms floor
   applies in both modes. The profiler names the waits "Frame pacing" and "Frame rate limit".
-- The editor refreshes panels every 0.5 s, spread over four consecutive frames (scene state,
-  collider outlines, Agent panel, assets); refreshes right after an edit still run all at once.
-  Large periodic replies (`scene.list`, `physics.debug_boxes`, `session.review`,
-  `session.audit`) are compared as text and parsed only when changed, and outlines are
-  fetched only while the overlay can be drawn. Convex hull outlines are built once per mesh in
-  collider-local space and transformed per call. On the demo scene this took Debug-build refresh
-  frames from about 33 ms to under 3 ms headlessly, with the Agent panel open.
+- Editor cost (`RELAY_EDITOR_BENCH=1 ./build/dev/relay_editor_headless_tests` prints frame
+  statistics for the demo project in Editor mode and during Run Game, at a simulated 250 FPS, with
+  the busiest scopes and what the slowest frames spent; it is opt-in and not part of ctest). The
+  editor's own scopes show in the Profiler under "Editor UI": `Panel: ...`, `Viewport: ...`,
+  `Refresh: ...` and one `Editor request: <method>` per protocol round trip. Findings and fixes:
+  - Periodic refresh is split into ten slices (`refresh_part`), at most one per frame, every 0.5 s
+    (0.05 s while an animator plays): status, scene list, collider overlay, audio overlay, Agent
+    panel, then the asset stages (render.assets, project/asset listings, templates, audio and sky
+    files, shader files), which run when `assets_pending`, when the runtime's `asset_epoch`
+    (in `runtime.status`, counted for requests that can change project files: `assets.`,
+    `shaders.`, `scripts.`, `project.`, `templates.`, `scene.save/load`) changed, or every 2 s for
+    files changed outside the editor. Refreshes right after an edit still run every slice at once.
+  - `scene.list` is parsed one node at a time (`update_scene_list`, `ListedEntity`): a node whose
+    text is unchanged keeps its parsed value, and one that differs only in `"transform"` is patched
+    in place without rebuilding the node index. A running game that moves some bodies used to cost
+    a 12-14 ms hitch twice a second (full parse); now it is about 2 ms. `rebuild_index` also lists
+    the camera/light/emitter nodes the viewport marks (`marker_indices`).
+  - The collider and audio overlays are fetched again only after the scene listing or assets
+    changed. Collider outlines are kept as world-space segments (`rebuild_outlines`) and only
+    projected each frame, with nodes behind the camera or under a pixel skipped.
+  - Hierarchy leaf rows scrolled out of view cost only their height (`hierarchy_row_height`).
+  - `templates.list` keeps each template's parsed summary until its file's size or time changes.
+  - `JsonParser` parses in place (about twice as fast unoptimized) and `JsonWriter` builds
+    listings without ostream overhead (`scene.list`, `physics.debug_boxes`).
+  - Debug builds compile Dear ImGui with `-O2` and the editor's data path (`editor_ui.cpp`,
+    `editor_widgets.cpp`, `editor_layout.cpp`, `scene.cpp`, `ui.cpp`, `particles.cpp`,
+    `control_protocol.cpp`, `collision.cpp`, `scene_render.cpp`, the Vulkan window/lighting/ray tracing files, the UI renderer, particles, audio mixing, `engine.cpp` and the profiler) with `-Og`, set in `CMakeLists.txt`; at `-O0` the editor
+    was several times slower. Measured headlessly on the demo (Debug): Editor mode mean 1.66 to
+    0.36 ms and worst frame 7.2 to 1.9 ms; Run Game mean 0.53 to 0.18 ms and worst frame 15 to
+    2.6 ms; Release is about 0.15 and 0.05 ms. The remaining periodic spike is `scene.list`
+    serialization on the engine side (about 1.5 ms Debug, 0.2 ms Release for 91 nodes). The
+    real window adds ImGui's Vulkan backend, which the headless bench does not run.
+  - Threading: the game loop is single threaded (Jolt uses `JobSystemSingleThreaded`; scripts,
+    particles, render scene building and command recording all run on the main thread). The
+    bench also times `build_render_scene` on the demo (57 instances): 0.64 ms at `-O0`, 0.28 ms
+    at `-Og`, 0.026 ms in Release, so the Profiler's "Build render scene" hotspot in a Debug build
+    is mostly unoptimized code, and splitting it over threads would not pay at this size. Real
+    candidates when a scene needs them: Jolt's thread-pool job system (check determinism first),
+    a parallel per-instance loop in `build_render_scene` for thousands of instances (world
+    matrices first, then visibility and material lookups per chunk, then a sort), per-emitter
+    particle updates, and secondary command buffers per render pass.
 - The editor camera overlays world-space collider outlines from the same shape computation as
   physics queries: boxes, three great circles for spheres, rings and arcs for capsules, Jolt hull
   edges for convex colliders, and unique triangle edges for meshes. Selected colliders are amber,

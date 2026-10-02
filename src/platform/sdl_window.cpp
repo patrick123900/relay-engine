@@ -1,3 +1,4 @@
+#include "relay/platform/window_icon.hpp"
 #include "relay/platform/sdl_window.hpp"
 #include "relay/platform/sdl_input.hpp"
 
@@ -22,6 +23,7 @@ struct SdlWindow::Impl {
 
 SdlWindow::SdlWindow(std::string title, const std::uint32_t width, const std::uint32_t height)
     : impl_(std::make_unique<Impl>()) {
+    (void)SDL_SetAppMetadata("Relay Engine", nullptr, "relay-engine");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         impl_->error = SDL_GetError();
         return;
@@ -32,6 +34,7 @@ SdlWindow::SdlWindow(std::string title, const std::uint32_t width, const std::ui
         impl_->error = SDL_GetError();
         return;
     }
+    apply_window_icon(impl_->window);
     impl_->renderer = SDL_CreateRenderer(impl_->window, nullptr);
     if (impl_->renderer == nullptr) {
         impl_->error = SDL_GetError();

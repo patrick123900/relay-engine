@@ -1,4 +1,6 @@
 #include "relay/editor/editor_ui.hpp"
+#include "relay/editor/ide.hpp"
+#include "relay/observe/profiler.hpp"
 #include "relay/scene/components.hpp"
 #include "relay/editor/chat_media.hpp"
 #include "relay/audio/audio_settings.hpp"
@@ -51,6 +53,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <fstream>
 #include <mutex>
 #include <filesystem>
 
@@ -61,6 +64,9 @@ namespace {
 // inexpensive; mutations invalidate the scene immediately instead of waiting for the next idle
 // refresh.
 constexpr double refresh_interval_seconds = 0.5;
+// Project files and registries change only when something imports, saves or moves them, so they
+// are polled less often than the scene.
+constexpr double asset_refresh_interval_seconds = 2.0;
 // While a selected animator is playing, the inspector is showing a value that moves every frame,
 // and a twice-a-second playhead is not usable for judging a pose. Polling faster stays read-only
 // and untraced, and the cadence drops back the moment playback stops.
@@ -496,13 +502,43 @@ struct EditorUi::Impl {
     VkDevice device{};
 
     // Cached runtime state. The editor never touches Scene, SceneHistory or AssetRegistry directly.
-    JsonValue scene_list;
+    // scene.list, parsed one node at a time: a node whose text did not change since the last
+    // listing keeps its parsed value, so a running game that moves a few nodes does not make the
+    // editor parse the whole scene again twice a second.
+    struct ListedEntity {
+        std::string text;
+        JsonValue value;
+        bool seen{};
+    };
+
+    // Where a node's "transform" object lies in its listing text, or an empty span. A running game
+    // changes little but transforms, so a node that differs only there is patched, not reparsed.
+    static std::pair<std::size_t, std::size_t> transform_span(const std::string_view node) {
+        constexpr std::string_view key = "\"transform\":{";
+        const auto at = node.find(key);
+        if (at == std::string_view::npos) return {0U, 0U};
+        const auto begin = at + key.size() - 1U;
+        int depth = 0;
+        for (auto end = begin; end < node.size(); ++end) {
+            if (node[end] == '{') ++depth;
+            else if (node[end] == '}' && --depth == 0) return {begin, end + 1U};
+        }
+        return {0U, 0U};
+    }
+    std::unordered_map<std::string, ListedEntity> listed_entities;
+    std::vector<const JsonValue*> listed_order;
     JsonValue collider_boxes;
     // audio.debug_shapes: reverb zones and spatial source ranges for the viewport.
     JsonValue audio_shapes;
     std::string scene_list_reply, collider_boxes_reply, agent_review_reply, agent_audit_reply;
     std::string audio_shapes_reply;
-    static constexpr int refresh_stages = 4;
+    static constexpr int refresh_stages = 10;
+    bool assets_refreshing{}; // The asset stages of this refresh cycle are running.
+    double seen_asset_epoch{-1.0};
+    // The overlays are functions of the scene and the asset registry, so they are fetched again
+    // only after the scene listing or the assets changed (an overlay that is off starts empty).
+    std::uint64_t scene_list_serial{}, collider_overlay_serial{~std::uint64_t{}}, audio_overlay_serial{~std::uint64_t{}};
+    double collider_overlay_epoch{-1.0}, audio_overlay_epoch{-1.0};
     int startup_frames{}; // Frames built since the ImGui context and saved layout were created.
     int refresh_stage{-1}; // Next periodic refresh stage, or -1 between refreshes.
     std::vector<const JsonValue::Object*> entities;
@@ -636,6 +672,11 @@ struct EditorUi::Impl {
     std::vector<AssetEntry> asset_results;
     bool asset_results_truncated{}, asset_search_focus{};
     EditorUi::FileBrowserHandler file_browser = show_in_file_browser;
+    // The external editor scripts open in (Edit → Editor preferences), kept with the layout.
+    EditorUi::IdeHandler ide_launcher = [](const IdeLaunch& launch) { return open_in_ide(launch); };
+    std::string ide_preset{"system"}, ide_command;
+    std::array<char, 513> ide_command_buffer{};
+    bool preferences_open{};
 
     void open_in_file_browser(const std::string& path, const bool directory) {
         if (file_browser) file_browser(std::filesystem::path(assets_root) / path, directory);
@@ -779,6 +820,8 @@ struct EditorUi::Impl {
     // Applied to every row with children for one frame by the collapse/expand-all button.
     std::optional<bool> hierarchy_open_all;
     bool hierarchy_any_open{}, hierarchy_rows_open{};
+    std::vector<std::size_t> marker_indices; // Entities with a camera, light or particle emitter.
+    float hierarchy_row_height{}; // Height of the last row built, for skipping rows out of view.
     // "Show in hierarchy": ancestors to open and the row to scroll to on the next frame.
     std::set<std::string> hierarchy_reveal;
     std::string hierarchy_scroll_to;
@@ -858,15 +901,24 @@ struct EditorUi::Impl {
         return line + '}';
     }
 
+    // Times one protocol round trip under its method's name, so the Profiler shows which of the
+    // editor's reads cost what.
+    struct RequestScope {
+        explicit RequestScope(const std::string_view method) : scope(profiler().intern("Editor request: " + std::string(method))) {}
+        ProfileScope scope;
+    };
+
     std::optional<JsonValue> call(const std::string_view method,
                                   const std::string_view fields = {},
                                   const bool report_errors = true) {
+        const RequestScope timed(method);
         return parse_response(method, request(request_line(method, fields)), report_errors);
     }
 
     // For large periodic reads: returns nothing when the reply matches `previous`, so an unchanged
     // scene listing or collider overlay is not parsed again every refresh.
     std::optional<JsonValue> call_if_changed(const std::string_view method, std::string& previous) {
+        const RequestScope timed(method);
         const auto response = request(request_line(method, {}));
         const auto body = response.find(",\"ok\":");
         const auto key = body == std::string::npos ? response : response.substr(body);
@@ -2819,101 +2871,250 @@ struct EditorUi::Impl {
         if (++refresh_stage == refresh_stages) refresh_stage = -1;
     }
 
+    // One slice of the periodic refresh. Slices are small and numbered so that each frame pays for
+    // at most one of them.
     void refresh_part(const int stage) {
-        if (stage == 0) {
-            seconds_since_refresh = 0.0;
-            if (auto status = call("runtime.status")) runtime_status = std::move(*status);
-            if (auto project = call("project.status")) project_status = std::move(*project);
-            if (auto clipboard = call("scene.clipboard"); clipboard && clipboard->object())
-                clipboard_ready = number_or(*clipboard->object(), "entities", 0) > 0;
-            if (auto list = call_if_changed("scene.list", scene_list_reply)) {
-                scene_list = std::move(*list);
-                rebuild_index();
-            }
-            animator_playing = false;
-            if (const auto* entity = selection.empty() ? nullptr : find_entity(selection)) {
-                if (const auto* animator = component(*entity, "animator"))
-                    animator_playing = boolean_or(*animator, "playing", false);
-            }
-            if (panel_open[6])
-                for (const auto& target : animation_targets())
-                    if (const auto* entity = find_entity(target))
-                        if (const auto* animator = component(*entity, "animator"))
-                            animator_playing |= boolean_or(*animator, "playing", false);
-            if (auto logs = call("logs.read", "\"after\":" + std::to_string(last_log_sequence))) {
-                append_logs(*logs);
-            }
-            refresh_scripts();
-            refresh_game_input();
-            if (auto history = call("scene.history")) {
-                const auto* object = history->object();
-                const auto collect = [&](const std::string_view key, std::vector<std::string>& target) {
-                    target.clear();
-                    if (object == nullptr) return;
-                    const auto* value = field(*object, key);
-                    if (value == nullptr || value->array() == nullptr) return;
-                    for (const auto& item : *value->array()) {
-                        if (const auto* text = item.string()) target.push_back(*text);
-                    }
-                };
-                collect("undo", undo_labels);
-                collect("redo", redo_labels);
-                if (object != nullptr) {
-                    if (const auto* state = field(*object, "state"); state && state->object())
-                        scene_revision =
-                            static_cast<std::uint64_t>(number_or(*state->object(), "revision", 0.0));
-                }
-            }
-            return;
-        }
-        if (stage == 1) {
-            // The overlay is fetched only while it can be drawn.
-            if (collider_wireframes_enabled && panel_open[5] && camera_enabled &&
-                !(runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game")) {
-                if (auto boxes = call_if_changed("physics.debug_boxes", collider_boxes_reply))
-                    collider_boxes = std::move(*boxes);
-            } else {
-                collider_boxes_reply.clear();
-                collider_boxes = JsonValue{};
-            }
-            if (panel_open[5] && camera_enabled &&
-                !(runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game")) {
-                if (auto shapes = call_if_changed("audio.debug_shapes", audio_shapes_reply))
-                    audio_shapes = std::move(*shapes);
-            } else {
-                audio_shapes_reply.clear();
-                audio_shapes = JsonValue{};
-            }
-            return;
-        }
-        if (stage == 2) {
-            if (!panel_open[8]) return;
-            if (auto result = call_if_changed("session.review", agent_review_reply))
-                agent_review = std::move(*result);
-            if (auto result = call_if_changed("session.audit", agent_audit_reply))
-                agent_audit = std::move(*result);
-            if (auto result = call("chat.status")) chat_status = std::move(*result);
-            return;
+        switch (stage) {
+        case 0: refresh_status(); return;
+        case 1: refresh_scene_list(); return;
+        case 2: refresh_collider_overlay(); return;
+        case 3: refresh_audio_overlay(); return;
+        case 4: refresh_agent(); return;
+        default: break;
         }
         // Assets are refreshed on a cadence rather than only after a UI-driven import, because an
         // agent sharing this runtime can import a model at any time and the human's mesh and
         // material lists must reflect that.
-        const bool periodic = seconds_since_assets >= refresh_interval_seconds;
-        if (periodic) seconds_since_assets = 0.0;
-        if (!periodic && !assets_pending) return;
-        refresh_assets();
-        if (auto projects = call("project.list"); projects && projects->object()) {
-            project_files.clear();
-            if (const auto* list = field(*projects->object(), "projects"); list && list->array())
-                for (const auto& file : *list->array())
-                    if (file.string()) project_files.push_back(*file.string());
+        if (stage == 5) {
+            const bool periodic = seconds_since_assets >= asset_refresh_interval_seconds;
+            if (periodic) seconds_since_assets = 0.0;
+            // Requests that change project files (an agent's import or script write, say) are
+            // counted by the runtime, so those show up on the next refresh; the timer catches
+            // files changed outside the editor.
+            const auto epoch = runtime_status.object() ? number_or(*runtime_status.object(), "asset_epoch", 0.0) : 0.0;
+            const bool changed = epoch != seen_asset_epoch;
+            seen_asset_epoch = epoch;
+            assets_refreshing = periodic || assets_pending || changed;
+            if (!assets_refreshing) return;
+            refresh_assets();
+            return;
         }
-        refresh_asset_listing();
-        refresh_templates();
-        refresh_audio_files();
-        refresh_sky_files();
-        refresh_shader_files();
-        assets_pending = false;
+        if (!assets_refreshing) return;
+        switch (stage) {
+        case 6:
+            if (auto projects = call("project.list"); projects && projects->object()) {
+                project_files.clear();
+                if (const auto* list = field(*projects->object(), "projects"); list && list->array())
+                    for (const auto& file : *list->array())
+                        if (file.string()) project_files.push_back(*file.string());
+            }
+            refresh_asset_listing();
+            return;
+        case 7: refresh_templates(); return;
+        case 8:
+            refresh_audio_files();
+            refresh_sky_files();
+            return;
+        default:
+            refresh_shader_files();
+            assets_pending = false;
+            assets_refreshing = false;
+            return;
+        }
+    }
+
+    void refresh_status() {
+        RELAY_PROFILE_SCOPE("Refresh: status");
+        seconds_since_refresh = 0.0;
+        if (auto status = call("runtime.status")) runtime_status = std::move(*status);
+        if (auto project = call("project.status")) project_status = std::move(*project);
+        if (auto clipboard = call("scene.clipboard"); clipboard && clipboard->object())
+            clipboard_ready = number_or(*clipboard->object(), "entities", 0) > 0;
+        if (auto logs = call("logs.read", "\"after\":" + std::to_string(last_log_sequence))) {
+            append_logs(*logs);
+        }
+        refresh_scripts();
+        refresh_game_input();
+        if (auto history = call("scene.history")) {
+            const auto* object = history->object();
+            const auto collect = [&](const std::string_view key, std::vector<std::string>& target) {
+                target.clear();
+                if (object == nullptr) return;
+                const auto* value = field(*object, key);
+                if (value == nullptr || value->array() == nullptr) return;
+                for (const auto& item : *value->array()) {
+                    if (const auto* text = item.string()) target.push_back(*text);
+                }
+            };
+            collect("undo", undo_labels);
+            collect("redo", redo_labels);
+            if (object != nullptr) {
+                if (const auto* state = field(*object, "state"); state && state->object())
+                    scene_revision =
+                        static_cast<std::uint64_t>(number_or(*state->object(), "revision", 0.0));
+            }
+        }
+    }
+
+    // Reads the scene listing and rebuilds the node index when it changed.
+    void refresh_scene_list() {
+        RELAY_PROFILE_SCOPE("Refresh: scene list");
+        // A listing that differs only in transforms is patched in place, so the node index and
+        // the pointers into it stay valid and need no rebuilding.
+        const auto change = update_scene_list();
+        if (change != ListChange::none) ++scene_list_serial;
+        if (change == ListChange::structure) rebuild_index();
+        animator_playing = false;
+        if (const auto* entity = selection.empty() ? nullptr : find_entity(selection)) {
+            if (const auto* animator = component(*entity, "animator"))
+                animator_playing = boolean_or(*animator, "playing", false);
+        }
+        if (panel_open[6])
+            for (const auto& target : animation_targets())
+                if (const auto* entity = find_entity(target))
+                    if (const auto* animator = component(*entity, "animator"))
+                        animator_playing |= boolean_or(*animator, "playing", false);
+    }
+
+    enum class ListChange { none, transforms, structure };
+
+    // Fetches scene.list and parses only the nodes whose text differs from the previous listing.
+    ListChange update_scene_list() {
+        const RequestScope timed("scene.list");
+        const auto response = request(request_line("scene.list", {}));
+        const auto body = response.find(",\"ok\":");
+        const std::string_view current = body == std::string::npos ? std::string_view(response)
+                                                                   : std::string_view(response).substr(body);
+        if (current == scene_list_reply) return ListChange::none;
+        const auto fail = [&] {
+            // Anything unexpected is reported through the ordinary response path.
+            (void)parse_response("scene.list", response, true);
+            scene_list_reply.clear();
+            return ListChange::none;
+        };
+        constexpr std::string_view marker = "\"entities\":[";
+        const auto start = response.find(marker);
+        if (body == std::string::npos || start == std::string::npos ||
+            response.compare(body, 11U, ",\"ok\":true,") != 0)
+            return fail();
+        for (auto& [handle, listed] : listed_entities) listed.seen = false;
+        std::vector<ListedEntity*> order;
+        bool structure = false;
+        const std::string_view text(response);
+        std::size_t at = start + marker.size();
+        while (at < text.size()) {
+            while (at < text.size() && (text[at] == ',' || text[at] == ' ' || text[at] == '\n')) ++at;
+            if (at >= text.size() || text[at] == ']') break;
+            if (text[at] != '{') return fail();
+            // Scan to the matching brace, skipping strings.
+            std::size_t end = at;
+            int depth = 0;
+            bool in_string = false, escaped = false;
+            for (; end < text.size(); ++end) {
+                const char character = text[end];
+                if (in_string) {
+                    if (escaped) escaped = false;
+                    else if (character == '\\') escaped = true;
+                    else if (character == '"') in_string = false;
+                } else if (character == '"') {
+                    in_string = true;
+                } else if (character == '{') {
+                    ++depth;
+                } else if (character == '}' && --depth == 0) {
+                    ++end;
+                    break;
+                }
+            }
+            if (depth != 0) return fail();
+            const auto node = text.substr(at, end - at);
+            constexpr std::string_view prefix = "{\"entity\":\"";
+            const auto quote = node.starts_with(prefix) ? node.find('"', prefix.size()) : std::string_view::npos;
+            if (quote == std::string_view::npos) return fail();
+            auto& listed = listed_entities[std::string(node.substr(prefix.size(), quote - prefix.size()))];
+            if (listed.text != node) {
+                const auto [begin, finish] = transform_span(node);
+                const auto [old_begin, old_end] = transform_span(listed.text);
+                const std::string_view old_text(listed.text);
+                auto* members = std::get_if<JsonValue::Object>(&listed.value.data);
+                if (finish != 0U && old_end != 0U && members && begin == old_begin &&
+                    node.size() - (finish - begin) == old_text.size() - (old_end - old_begin) &&
+                    node.substr(0, begin) == old_text.substr(0, old_begin) &&
+                    node.substr(finish) == old_text.substr(old_end)) {
+                    JsonParser parser{node.substr(begin, finish - begin)};
+                    auto parsed = parser.parse();
+                    if (!parsed || !parsed->object()) return fail();
+                    (*members)["transform"] = std::move(*parsed);
+                } else {
+                    JsonParser parser{node};
+                    auto parsed = parser.parse();
+                    if (!parsed || !parsed->object()) return fail();
+                    listed.value = std::move(*parsed);
+                    structure = true;
+                }
+                listed.text = std::string(node);
+            }
+            listed.seen = true;
+            order.push_back(&listed);
+            at = end;
+        }
+        const auto removed = std::erase_if(listed_entities, [](const auto& item) { return !item.second.seen; });
+        // The same nodes in the same order, with only transforms patched, keep the index valid.
+        structure = structure || removed != 0U || order.size() != listed_order.size();
+        for (std::size_t index = 0; !structure && index < order.size(); ++index)
+            structure = &order[index]->value != listed_order[index];
+        if (structure) {
+            listed_order.clear();
+            for (const auto* listed : order) listed_order.push_back(&listed->value);
+        }
+        scene_list_reply = std::string(current);
+        return structure ? ListChange::structure : ListChange::transforms;
+    }
+
+    void refresh_collider_overlay() {
+        RELAY_PROFILE_SCOPE("Refresh: collider outlines");
+        // The overlay is fetched only while it can be drawn.
+        if (collider_wireframes_enabled && panel_open[5] && camera_enabled &&
+            !(runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game")) {
+            if (!collider_boxes_reply.empty() && collider_overlay_serial == scene_list_serial &&
+                collider_overlay_epoch == seen_asset_epoch) return;
+            collider_overlay_serial = scene_list_serial;
+            collider_overlay_epoch = seen_asset_epoch;
+            if (auto boxes = call_if_changed("physics.debug_boxes", collider_boxes_reply))
+            {
+                collider_boxes = std::move(*boxes);
+                ++collider_boxes_serial;
+            }
+        } else {
+            collider_boxes_reply.clear();
+            collider_boxes = JsonValue{};
+            ++collider_boxes_serial;
+        }
+    }
+
+    void refresh_audio_overlay() {
+        RELAY_PROFILE_SCOPE("Refresh: audio shapes");
+        if (panel_open[5] && camera_enabled &&
+            !(runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game")) {
+            if (!audio_shapes_reply.empty() && audio_overlay_serial == scene_list_serial &&
+                audio_overlay_epoch == seen_asset_epoch) return;
+            audio_overlay_serial = scene_list_serial;
+            audio_overlay_epoch = seen_asset_epoch;
+            if (auto shapes = call_if_changed("audio.debug_shapes", audio_shapes_reply))
+                audio_shapes = std::move(*shapes);
+        } else {
+            audio_shapes_reply.clear();
+            audio_shapes = JsonValue{};
+        }
+    }
+
+    void refresh_agent() {
+        if (!panel_open[8]) return;
+        RELAY_PROFILE_SCOPE("Refresh: agent");
+        if (auto result = call_if_changed("session.review", agent_review_reply))
+            agent_review = std::move(*result);
+        if (auto result = call_if_changed("session.audit", agent_audit_reply))
+            agent_audit = std::move(*result);
+        if (auto result = call("chat.status")) chat_status = std::move(*result);
     }
 
     void rebuild_index() {
@@ -2921,13 +3122,14 @@ struct EditorUi::Impl {
         children.clear();
         roots.clear();
         entity_index.clear();
-        const auto* object = scene_list.object();
-        if (object == nullptr) return;
-        const auto* list = field(*object, "entities");
-        if (list == nullptr || list->array() == nullptr) return;
-        for (const auto& value : *list->array()) {
-            if (const auto* entity = value.object()) entities.push_back(entity);
-        }
+        for (const auto* value : listed_order)
+            if (const auto* entity = value->object()) entities.push_back(entity);
+        // Nodes the viewport marks with an icon or guide, found once per listing, not each frame.
+        marker_indices.clear();
+        for (std::size_t index = 0; index < entities.size(); ++index)
+            if (component(*entities[index], "camera") || component(*entities[index], "light") ||
+                component(*entities[index], "particle_emitter"))
+                marker_indices.push_back(index);
         for (std::size_t index = 0; index < entities.size(); ++index) {
             entity_index.emplace(string_or(*entities[index], "entity"), index);
             const auto parent = string_or(*entities[index], "parent");
@@ -3069,21 +3271,23 @@ struct EditorUi::Impl {
         view.camera.far_plane = 5000.0;
     }
 
-    void draw_collider_wireframes() {
-        if (!collider_wireframes_enabled || !camera_enabled || !viewport_visible ||
-            !viewport_draw_list || (runtime_status.object() &&
-            string_or(*runtime_status.object(), "mode") == "game")) return;
-        const auto* result = collider_boxes.object();
-        const auto* values = result ? field(*result, "boxes") : nullptr;
-        const auto* boxes = values ? values->array() : nullptr;
-        if (!boxes) return;
-        const double width = viewport_max.x - viewport_min.x;
-        const double height = viewport_max.y - viewport_min.y;
-        if (width <= 0.0 || height <= 0.0) return;
-        const auto matrix = editor_view(view.position, view.target);
-        const double focal = 1.0 / std::tan(view.camera.field_of_view_y_degrees *
-                                            3.14159265358979323846 / 360.0);
-        const double near = view.camera.near_plane;
+    // One collider's or joint's outline as world-space segments. They are rebuilt only when the
+    // overlay data changes, so drawing a frame is just projecting segments, not reading JSON and
+    // sampling arcs again.
+    struct OutlineSet {
+        std::string entity;
+        bool joint{}, enabled{true};
+        std::size_t first{}, count{};
+        Vec3 center{};
+        double radius{};
+    };
+    std::vector<std::pair<Vec3, Vec3>> outline_segments;
+    std::vector<OutlineSet> outline_sets;
+    std::uint64_t collider_boxes_serial{}, outline_serial{~std::uint64_t{}};
+
+    void rebuild_outlines(const JsonValue::Array& boxes, const JsonValue::Object& result) {
+        outline_segments.clear();
+        outline_sets.clear();
         const auto read_vector = [](const JsonValue* value, Vec3& output) {
             const auto* array = value ? value->array() : nullptr;
             if (!array || array->size() != 3) return false;
@@ -3094,56 +3298,35 @@ struct EditorUi::Impl {
             output = {*x, *y, *z};
             return true;
         };
-        const auto camera_point = [&](const Vec3 point) {
-            return Vec3{
-                matrix[0] * point.x + matrix[4] * point.y + matrix[8] * point.z + matrix[12],
-                matrix[1] * point.x + matrix[5] * point.y + matrix[9] * point.z + matrix[13],
-                matrix[2] * point.x + matrix[6] * point.y + matrix[10] * point.z + matrix[14]};
-        };
-        const auto project = [&](const Vec3 point) {
-            const double depth = -point.z;
-            return ImVec2{
-                static_cast<float>(viewport_min.x + width * 0.5 +
-                                   point.x * focal * height * 0.5 / depth),
-                static_cast<float>(viewport_min.y + height * 0.5 -
-                                   point.y * focal * height * 0.5 / depth)};
-        };
         const auto add = [](const Vec3 a, const Vec3 b) {
             return Vec3{a.x + b.x, a.y + b.y, a.z + b.z};
         };
         const auto scaled = [](const Vec3 a, const double s) { return Vec3{a.x * s, a.y * s, a.z * s}; };
-        viewport_draw_list->PushClipRect(viewport_min, viewport_max, true);
-        for (const auto& value : *boxes) {
-            const auto* box = value.object();
-            if (!box) continue;
+        const auto finish = [&](OutlineSet set) {
+            set.first = outline_sets.empty() ? 0U : outline_sets.back().first + outline_sets.back().count;
+            set.count = outline_segments.size() - set.first;
+            if (set.count == 0U) return;
+            Vec3 low{1e300, 1e300, 1e300}, high{-1e300, -1e300, -1e300};
+            for (std::size_t index = set.first; index < outline_segments.size(); ++index)
+                for (const Vec3 point : {outline_segments[index].first, outline_segments[index].second}) {
+                    low = {std::min(low.x, point.x), std::min(low.y, point.y), std::min(low.z, point.z)};
+                    high = {std::max(high.x, point.x), std::max(high.y, point.y), std::max(high.z, point.z)};
+                }
+            set.center = {(low.x + high.x) * 0.5, (low.y + high.y) * 0.5, (low.z + high.z) * 0.5};
+            set.radius = 0.5 * std::sqrt((high.x - low.x) * (high.x - low.x) + (high.y - low.y) * (high.y - low.y) +
+                                         (high.z - low.z) * (high.z - low.z));
+            outline_sets.push_back(std::move(set));
+        };
+        const auto append_box = [&](const JsonValue::Object& box) {
             Vec3 center{};
             std::array<Vec3, 3> edges{};
-            const auto* edge_value = field(*box, "edges");
+            const auto* edge_value = field(box, "edges");
             const auto* edge_array = edge_value ? edge_value->array() : nullptr;
-            if (!read_vector(field(*box, "center"), center) || !edge_array ||
+            if (!read_vector(field(box, "center"), center) || !edge_array ||
                 edge_array->size() != 3 || !read_vector(&(*edge_array)[0], edges[0]) ||
                 !read_vector(&(*edge_array)[1], edges[1]) ||
-                !read_vector(&(*edge_array)[2], edges[2])) continue;
-            const auto selected = string_or(*box, "entity") == selection;
-            const auto enabled = boolean_or(*box, "enabled", true);
-            const ImU32 color = selected ? IM_COL32(255, 194, 67, 255) :
-                                  enabled ? IM_COL32(75, 224, 174, 190) :
-                                            IM_COL32(147, 156, 165, 110);
-            const float thickness = selected ? 2.0F : 1.4F;
-            const auto line = [&](const Vec3 from, const Vec3 to) {
-                auto a = camera_point(from), b = camera_point(to);
-                if (a.z > -near && b.z > -near) return;
-                if (a.z > -near || b.z > -near) {
-                    const double fraction = (-near - a.z) / (b.z - a.z);
-                    const Vec3 clipped{a.x + fraction * (b.x - a.x),
-                                       a.y + fraction * (b.y - a.y), -near};
-                    if (a.z > -near) a = clipped; else b = clipped;
-                }
-                const auto first = project(a), last = project(b);
-                if (!std::isfinite(first.x) || !std::isfinite(first.y) ||
-                    !std::isfinite(last.x) || !std::isfinite(last.y)) return;
-                viewport_draw_list->AddLine(first, last, color, thickness);
-            };
+                !read_vector(&(*edge_array)[2], edges[2])) return;
+            const auto line = [&](const Vec3 from, const Vec3 to) { outline_segments.emplace_back(from, to); };
             // Circle or arc of `radius` around `origin` in the plane spanned by unit u and v.
             const auto arc = [&](const Vec3 origin, const Vec3 u, const Vec3 v, const double radius,
                                  const double start, const double sweep) {
@@ -3159,17 +3342,17 @@ struct EditorUi::Impl {
                     previous = point;
                 }
             };
-            const auto type = string_or(*box, "type", "box");
-            const auto radius = number_or(*box, "radius", 0.0);
+            const auto type = string_or(box, "type", "box");
+            const auto radius = number_or(box, "radius", 0.0);
             constexpr double tau = 2.0 * 3.14159265358979323846;
             if (type == "sphere" && radius > 0.0) {
                 arc(center, {1, 0, 0}, {0, 1, 0}, radius, 0.0, tau);
                 arc(center, {0, 1, 0}, {0, 0, 1}, radius, 0.0, tau);
                 arc(center, {0, 0, 1}, {1, 0, 0}, radius, 0.0, tau);
-                continue;
+                return;
             }
             Vec3 axis{};
-            if (type == "capsule" && radius > 0.0 && read_vector(field(*box, "axis"), axis)) {
+            if (type == "capsule" && radius > 0.0 && read_vector(field(box, "axis"), axis)) {
                 const double length = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
                 const Vec3 up = length > 0.0 ? scaled(axis, 1.0 / length) : Vec3{0, 1, 0};
                 const Vec3 seed = std::abs(up.x) < 0.9 ? Vec3{1, 0, 0} : Vec3{0, 0, 1};
@@ -3190,21 +3373,21 @@ struct EditorUi::Impl {
                 arc(top, depth, up, radius, 0.0, tau / 2.0);
                 arc(bottom, side, up, radius, tau / 2.0, tau / 2.0);
                 arc(bottom, depth, up, radius, tau / 2.0, tau / 2.0);
-                continue;
+                return;
             }
-            const auto* line_value = field(*box, "lines");
+            const auto* line_value = field(box, "lines");
             const auto* lines = line_value ? line_value->array() : nullptr;
             bool drew_lines = false;
             if (lines && (type == "convex" || type == "mesh")) {
                 for (std::size_t index = 0; index + 1U < lines->size(); index += 2U) {
                     Vec3 a{}, b{};
                     if (!read_vector(&(*lines)[index], a) || !read_vector(&(*lines)[index + 1U], b))
-                        continue;
+                        return;
                     line(a, b);
                     drew_lines = true;
                 }
                 // A partial outline still shows the full extent through its bounds.
-                if (drew_lines && !boolean_or(*box, "lines_truncated", false)) continue;
+                if (drew_lines && !boolean_or(box, "lines_truncated", false)) return;
             }
             std::array<Vec3, 8> corners{};
             for (unsigned corner = 0; corner < 8; ++corner) {
@@ -3220,43 +3403,96 @@ struct EditorUi::Impl {
                     const unsigned other = corner ^ (1U << index);
                     if (corner < other) line(corners[corner], corners[other]);
                 }
-        }
+        };
+        for (const auto& value : boxes)
+            if (const auto* box = value.object()) {
+                const auto before = outline_segments.size();
+                append_box(*box);
+                if (outline_segments.size() != before)
+                    finish({string_or(*box, "entity"), false, boolean_or(*box, "enabled", true)});
+            }
         // Joints: a cross at the anchor, the hinge or slider axis, and a line to the partner.
-        const auto* joint_values = field(*result, "joints");
-        if (joint_values && joint_values->array())
-            for (const auto& value : *joint_values->array()) {
-                const auto* joint = value.object();
+        const auto append_joint = [&](const JsonValue::Object& joint) {
                 Vec3 anchor{}, axis{}, partner{};
-                if (!joint || !read_vector(field(*joint, "anchor"), anchor) ||
-                    !read_vector(field(*joint, "axis"), axis)) continue;
-                const auto selected = string_or(*joint, "entity") == selection;
-                const auto enabled = boolean_or(*joint, "enabled", true);
-                const ImU32 color = selected ? IM_COL32(255, 194, 67, 255) :
-                                      enabled ? IM_COL32(176, 140, 255, 220) :
-                                                IM_COL32(147, 156, 165, 110);
-                const float thickness = selected ? 2.0F : 1.4F;
-                const auto segment = [&](const Vec3 from, const Vec3 to) {
-                    auto a = camera_point(from), b = camera_point(to);
-                    if (a.z > -near && b.z > -near) return;
-                    if (a.z > -near || b.z > -near) {
-                        const double fraction = (-near - a.z) / (b.z - a.z);
-                        const Vec3 clipped{a.x + fraction * (b.x - a.x),
-                                           a.y + fraction * (b.y - a.y), -near};
-                        if (a.z > -near) a = clipped; else b = clipped;
-                    }
-                    const auto first = project(a), last = project(b);
-                    if (std::isfinite(first.x) && std::isfinite(first.y) &&
-                        std::isfinite(last.x) && std::isfinite(last.y))
-                        viewport_draw_list->AddLine(first, last, color, thickness);
-                };
+                if (!read_vector(field(joint, "anchor"), anchor) ||
+                    !read_vector(field(joint, "axis"), axis)) return;
+                const auto segment = [&](const Vec3 from, const Vec3 to) { outline_segments.emplace_back(from, to); };
                 constexpr double cross = 0.08;
                 for (const Vec3 direction : {Vec3{cross, 0, 0}, Vec3{0, cross, 0}, Vec3{0, 0, cross}})
                     segment(add(anchor, scaled(direction, -1.0)), add(anchor, direction));
-                const auto type = string_or(*joint, "type");
+                const auto type = string_or(joint, "type");
                 if (type == "hinge" || type == "slider")
                     segment(add(anchor, scaled(axis, -0.4)), add(anchor, scaled(axis, 0.4)));
-                if (read_vector(field(*joint, "partner"), partner)) segment(anchor, partner);
+                if (read_vector(field(joint, "partner"), partner)) segment(anchor, partner);
+        };
+        if (const auto* joint_values = field(result, "joints"); joint_values && joint_values->array())
+            for (const auto& value : *joint_values->array())
+                if (const auto* joint = value.object()) {
+                    const auto before = outline_segments.size();
+                    append_joint(*joint);
+                    if (outline_segments.size() != before)
+                        finish({string_or(*joint, "entity"), true, boolean_or(*joint, "enabled", true)});
+                }
+    }
+
+    void draw_collider_wireframes() {
+        if (!collider_wireframes_enabled || !camera_enabled || !viewport_visible ||
+            !viewport_draw_list || (runtime_status.object() &&
+            string_or(*runtime_status.object(), "mode") == "game")) return;
+        const auto* result = collider_boxes.object();
+        const auto* values = result ? field(*result, "boxes") : nullptr;
+        const auto* boxes = values ? values->array() : nullptr;
+        if (!boxes) return;
+        const double width = viewport_max.x - viewport_min.x;
+        const double height = viewport_max.y - viewport_min.y;
+        if (width <= 0.0 || height <= 0.0) return;
+        if (outline_serial != collider_boxes_serial) {
+            rebuild_outlines(*boxes, *result);
+            outline_serial = collider_boxes_serial;
+        }
+        const auto matrix = editor_view(view.position, view.target);
+        const double focal = 1.0 / std::tan(view.camera.field_of_view_y_degrees *
+                                            3.14159265358979323846 / 360.0);
+        const double near = view.camera.near_plane;
+        const auto camera_point = [&](const Vec3 point) {
+            return Vec3{
+                matrix[0] * point.x + matrix[4] * point.y + matrix[8] * point.z + matrix[12],
+                matrix[1] * point.x + matrix[5] * point.y + matrix[9] * point.z + matrix[13],
+                matrix[2] * point.x + matrix[6] * point.y + matrix[10] * point.z + matrix[14]};
+        };
+        const double scale = focal * height * 0.5;
+        const auto project = [&](const Vec3 point) {
+            const double depth = -point.z;
+            return ImVec2{static_cast<float>(viewport_min.x + width * 0.5 + point.x * scale / depth),
+                          static_cast<float>(viewport_min.y + height * 0.5 - point.y * scale / depth)};
+        };
+        viewport_draw_list->PushClipRect(viewport_min, viewport_max, true);
+        for (const auto& set : outline_sets) {
+            // Skip outlines wholly behind the camera or smaller than a pixel.
+            const auto center = camera_point(set.center);
+            if (center.z - set.radius > -near) continue;
+            if (set.radius * scale / std::max(-center.z, near) < 0.5) continue;
+            const auto selected = set.entity == selection;
+            const ImU32 color = selected ? IM_COL32(255, 194, 67, 255)
+                                : !set.enabled ? IM_COL32(147, 156, 165, 110)
+                                : set.joint    ? IM_COL32(176, 140, 255, 220)
+                                               : IM_COL32(75, 224, 174, 190);
+            const float thickness = selected ? 2.0F : 1.4F;
+            for (std::size_t index = set.first; index < set.first + set.count; ++index) {
+                auto a = camera_point(outline_segments[index].first);
+                auto b = camera_point(outline_segments[index].second);
+                if (a.z > -near && b.z > -near) continue;
+                if (a.z > -near || b.z > -near) {
+                    const double fraction = (-near - a.z) / (b.z - a.z);
+                    const Vec3 clipped{a.x + fraction * (b.x - a.x), a.y + fraction * (b.y - a.y), -near};
+                    if (a.z > -near) a = clipped; else b = clipped;
+                }
+                const auto first = project(a), last = project(b);
+                if (!std::isfinite(first.x) || !std::isfinite(first.y) || !std::isfinite(last.x) ||
+                    !std::isfinite(last.y)) continue;
+                viewport_draw_list->AddLine(first, last, color, thickness);
             }
+        }
         viewport_draw_list->PopClipRect();
     }
 
@@ -3544,8 +3780,9 @@ struct EditorUi::Impl {
         };
         viewport_draw_list->PushClipRect(viewport_min, viewport_max, true);
         std::size_t drawn = 0;
-        for (const auto* entity : entities) {
+        for (const auto marker : marker_indices) {
             if (drawn >= 2048U) break;
+            const auto* entity = entities[marker];
             const auto* camera = component(*entity, "camera");
             const auto* light = component(*entity, "light");
             const auto* particles = component(*entity, "particle_emitter");
@@ -3998,6 +4235,8 @@ struct EditorUi::Impl {
         layout.bind("view.collider_wireframes", &collider_wireframes_enabled);
         layout.bind("view.node_icons", &node_icons_enabled);
         layout.bind("view.camera_wireframes", &camera_wireframes_enabled);
+        layout.bind_text("ide.preset", &ide_preset);
+        layout.bind_text("ide.command", &ide_command);
     }
 
     void begin_rename(const RenameKind kind, const std::string& target, const std::string& name) {
@@ -4272,6 +4511,16 @@ struct EditorUi::Impl {
         if (!has_children) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
         drawing_rows.push_back(handle);
 
+        // Leaf rows scrolled out of view cost only their height, so a long list stays cheap. Rows
+        // that are being renamed or scrolled to are always built.
+        if (!has_children && !editing && hierarchy_row_height > 0.0F && hierarchy_scroll_to != handle) {
+            const auto* list = ImGui::GetWindowDrawList();
+            const float top = ImGui::GetCursorScreenPos().y;
+            if (top + hierarchy_row_height < list->GetClipRectMin().y || top > list->GetClipRectMax().y) {
+                ImGui::Dummy(ImVec2(1.0F, hierarchy_row_height));
+                return;
+            }
+        }
         if (selections.contains(handle)) flags |= ImGuiTreeNodeFlags_Selected;
 
         if (has_children && hierarchy_open_all)
@@ -4290,6 +4539,7 @@ struct EditorUi::Impl {
         }
         const auto row_min = ImGui::GetItemRectMin();
         const auto row_max = ImGui::GetItemRectMax();
+        hierarchy_row_height = row_max.y - row_min.y;
         // The node type is derived from its components; plain nodes stay unlabelled.
         if (const auto type = string_or(*entity, "type", "Node"); !editing && type != "Node") {
             const auto size = ImGui::CalcTextSize(type.c_str());
@@ -6573,8 +6823,9 @@ struct EditorUi::Impl {
     // A removable component's header carries an enable checkbox, as in Unity, then a close button
     // and a Remove context item; closing it removes the component through the protocol like any
     // other edit, and the checkbox switches it off or on without losing its settings.
+    // A script component's header also has an Edit button that opens its source in the user's IDE.
     bool component_header(const char* label, const std::string& id, const std::size_t index = 0,
-                          const bool removable = true) {
+                          const bool removable = true, const std::string& script_behaviour = {}) {
         bool keep = true;
         const bool switchable = removable && inspected_entity != nullptr && can_disable_component(id);
         if (switchable) ImGui::SetNextItemAllowOverlap();
@@ -6582,6 +6833,12 @@ struct EditorUi::Impl {
                                                   ImGuiTreeNodeFlags_DefaultOpen);
         const auto key = "inspector:component:" + id + (id == "script" ? ":" + std::to_string(index) : "");
         note_item(key);
+        // The context menu belongs to the header item, so it opens before the header's extra widgets.
+        if (removable && ImGui::BeginPopupContextItem()) {
+            if (!script_behaviour.empty() && ImGui::MenuItem("Edit script")) edit_script(script_behaviour);
+            if (ImGui::MenuItem("Remove component")) keep = false;
+            ImGui::EndPopup();
+        }
         if (switchable) {
             const ImVec2 low = ImGui::GetItemRectMin();
             const ImVec2 high = ImGui::GetItemRectMax();
@@ -6601,11 +6858,40 @@ struct EditorUi::Impl {
             }
             note_item(key + ":enabled");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip(enabled ? "Disable this component" : "Enable this component");
+            if (!script_behaviour.empty()) {
+                // A pencil button left of the checkbox, centred in the header.
+                const float side = std::round(ImGui::GetFontSize() * 1.15F);
+                const ImVec2 corner(x - style.ItemInnerSpacing.x * 2.0F - side,
+                                    low.y + std::round((high.y - low.y - side) * 0.5F));
+                ImGui::SetCursorScreenPos(corner);
+                const bool pressed = ImGui::InvisibleButton("##edit_script", ImVec2(side, side));
+                const bool hovered = ImGui::IsItemHovered();
+                auto* draw = ImGui::GetWindowDrawList();
+                const auto& palette = editor_palette();
+                if (hovered)
+                    draw->AddRectFilled(corner, ImVec2(corner.x + side, corner.y + side),
+                                        ImGui::GetColorU32(ImGuiCol_HeaderHovered, 2.0F), 4.0F * ui_scale);
+                const auto at = [&](const float u, const float v) {
+                    return ImVec2(corner.x + u * side, corner.y + v * side);
+                };
+                // The pencil runs from the tip at the bottom left to the end at the top right.
+                const ImU32 colour = ImGui::ColorConvertFloat4ToU32(editor_color(hovered ? palette.text : palette.text_dim));
+                const float half = 0.11F, n = 0.7071F;
+                const ImVec2 tip = at(0.17F, 0.83F);
+                const auto edge = [&](const float u, const float v, const float sign) {
+                    return at(u + sign * half * n, v + sign * half * n);
+                };
+                draw->AddTriangleFilled(tip, edge(0.33F, 0.67F, -1.0F), edge(0.33F, 0.67F, 1.0F), colour);
+                draw->AddQuadFilled(edge(0.37F, 0.63F, -1.0F), edge(0.37F, 0.63F, 1.0F),
+                                    edge(0.74F, 0.26F, 1.0F), edge(0.74F, 0.26F, -1.0F), colour);
+                draw->AddQuadFilled(edge(0.78F, 0.22F, -1.0F), edge(0.78F, 0.22F, 1.0F),
+                                    edge(0.88F, 0.12F, 1.0F), edge(0.88F, 0.12F, -1.0F),
+                                    ImGui::ColorConvertFloat4ToU32(editor_color(hovered ? palette.accent_hovered : palette.accent)));
+                if (pressed) edit_script(script_behaviour);
+                note_item(key + ":edit");
+                if (hovered) ImGui::SetTooltip("Edit script in %s", ide_display_name().c_str());
+            }
             ImGui::SetCursorScreenPos(resume);
-        }
-        if (removable && ImGui::BeginPopupContextItem()) {
-            if (ImGui::MenuItem("Remove component")) keep = false;
-            ImGui::EndPopup();
         }
         if (keep) return open;
         mutate("component.remove", entity_field(selection) + ",\"component\":\"" + id + '"' +
@@ -6723,7 +7009,7 @@ struct EditorUi::Impl {
             ImGui::PushID(static_cast<int>(index));
             const auto behaviour = string_or(*script, "behaviour");
             const auto label = behaviour + " (Script)###script";
-            if (!component_header(label.c_str(), "script", index)) {
+            if (!component_header(label.c_str(), "script", index, true, behaviour)) {
                 ImGui::PopID();
                 continue;
             }
@@ -8135,7 +8421,8 @@ struct EditorUi::Impl {
             ImGui::Separator();
             if (ImGui::MenuItem("Game Configuration...")) open_game_config();
             note_item("menu:edit:game_configuration");
-            future_action("Editor preferences...");
+            if (ImGui::MenuItem("Editor preferences...")) preferences_open = true;
+            note_item("menu:edit:editor_preferences");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Scene")) {
@@ -8750,6 +9037,138 @@ struct EditorUi::Impl {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
+    }
+
+    std::string ide_display_name() const {
+        const auto* preset = find_ide_preset(ide_preset);
+        return preset ? std::string(preset->name) : std::string("the system default");
+    }
+
+    struct ScriptSource {
+        std::filesystem::path file;
+        int line{1};
+    };
+
+    // The scripts/ file that registers a behaviour, and the line of its class (else of the
+    // RELAY_BEHAVIOUR registration). Bounded like the script builder: 256 files of at most 1 MiB.
+    std::optional<ScriptSource> find_script_source(const std::string& behaviour) const {
+        namespace fs = std::filesystem;
+        std::error_code error;
+        const auto root = fs::path(assets_root) / "scripts";
+        std::size_t visited = 0;
+        const auto line_of = [](const std::string& text, const std::size_t at) {
+            return 1 + static_cast<int>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(at), '\n'));
+        };
+        const auto identifier = [](const char character) {
+            return std::isalnum(static_cast<unsigned char>(character)) || character == '_';
+        };
+        for (fs::recursive_directory_iterator item(root, fs::directory_options::skip_permission_denied, error), end;
+             !error && item != end && visited < 256U; item.increment(error)) {
+            if (!item->is_regular_file(error)) continue;
+            const auto extension = item->path().extension().string();
+            if (extension != ".cpp" && extension != ".cc" && extension != ".cxx" && extension != ".hpp" &&
+                extension != ".h" && extension != ".hh")
+                continue;
+            ++visited;
+            if (item->file_size(error) > (1U << 20U)) continue;
+            std::ifstream input(item->path(), std::ios::binary);
+            const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            std::size_t registration = std::string::npos;
+            for (auto at = text.find("RELAY_BEHAVIOUR("); at != std::string::npos;
+                 at = text.find("RELAY_BEHAVIOUR(", at + 1U)) {
+                auto cursor = at + 16U;
+                while (cursor < text.size() && text[cursor] == ' ') ++cursor;
+                if (text.compare(cursor, behaviour.size(), behaviour) != 0) continue;
+                cursor += behaviour.size();
+                while (cursor < text.size() && text[cursor] == ' ') ++cursor;
+                if (cursor < text.size() && text[cursor] == ')') {
+                    registration = at;
+                    break;
+                }
+            }
+            if (registration == std::string::npos) continue;
+            ScriptSource found{item->path(), line_of(text, registration)};
+            for (const char* keyword : {"class ", "struct "}) {
+                const std::string declaration = keyword + behaviour;
+                for (auto at = text.find(declaration); at != std::string::npos; at = text.find(declaration, at + 1U)) {
+                    const auto after = at + declaration.size();
+                    if (after < text.size() && !identifier(text[after]) && (at == 0U || !identifier(text[at - 1U]))) {
+                        found.line = line_of(text, at);
+                        return found;
+                    }
+                }
+            }
+            return found;
+        }
+        return std::nullopt;
+    }
+
+    void edit_script(const std::string& behaviour) {
+        const auto source = find_script_source(behaviour);
+        if (!source) {
+            set_status("No file in scripts/ registers " + behaviour, true);
+            return;
+        }
+        if (!ide_launcher) return;
+        IdeLaunch launch;
+        launch.preset = ide_preset;
+        launch.custom_command = ide_command;
+        launch.file = source->file;
+        launch.line = source->line;
+        launch.project = assets_root;
+        const auto problem = ide_launcher(launch);
+        set_status(problem.empty() ? "Opened " + source->file.filename().string() + " in " + ide_display_name()
+                                   : problem,
+                   !problem.empty());
+    }
+
+    void draw_editor_preferences() {
+        if (!preferences_open) return;
+        ImGui::SetNextWindowSize(ImVec2(540.0F * ui_scale, 0.0F), ImGuiCond_FirstUseEver);
+        const bool visible = ImGui::Begin("Editor Preferences", &preferences_open, ImGuiWindowFlags_AlwaysAutoResize);
+        note_item("prefs:window");
+        if (!visible) {
+            ImGui::End();
+            return;
+        }
+        ImGui::PushFont(fonts.heading, fonts.heading_size);
+        ImGui::TextUnformatted("External editor");
+        ImGui::PopFont();
+        ImGui::TextWrapped("The Edit button on a script component opens its source here.");
+        ImGui::Spacing();
+        inspector_field_label("Editor");
+        if (ImGui::BeginCombo("##ide_preset", ide_display_name().c_str())) {
+            for (const auto& preset : ide_presets()) {
+                if (ImGui::Selectable(std::string(preset.name).c_str(), ide_preset == preset.id))
+                    ide_preset = std::string(preset.id);
+                note_item("prefs:ide:" + std::string(preset.id));
+            }
+            ImGui::EndCombo();
+        }
+        note_item("prefs:ide");
+        const auto* preset = find_ide_preset(ide_preset);
+        if (ide_preset == "custom") {
+            if (ImGui::GetActiveID() != ImGui::GetID("##ide_command")) {
+                ide_command_buffer.fill('\0');
+                std::copy_n(ide_command.begin(), std::min(ide_command.size(), ide_command_buffer.size() - 1U),
+                            ide_command_buffer.begin());
+            }
+            inspector_field_label("Command");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputTextWithHint("##ide_command", "myeditor --goto {file}:{line}", ide_command_buffer.data(),
+                                         ide_command_buffer.size()))
+                ide_command = ide_command_buffer.data();
+            note_item("prefs:command");
+            ImGui::TextDisabled("{file}, {line} and {project} are replaced; use \"quotes\" around spaces.");
+        } else if (preset && !preset->command.empty()) {
+            ImGui::TextDisabled("Runs: %s", std::string(preset->command).c_str());
+        } else {
+            ImGui::TextDisabled("Opens scripts with the program your system uses for .cpp files.");
+        }
+        const auto command = ide_preset == "custom" ? ide_command : preset ? std::string(preset->command) : std::string{};
+        if (const auto words = ide_command_line(command, "x", 1, "x"); !words.empty() && !ide_program_found(words.front()))
+            ImGui::TextColored(editor_color(editor_palette().warning), "'%s' was not found on your PATH.", words.front().c_str());
+        ImGui::End();
     }
 
     void open_game_config() {
@@ -12754,6 +13173,7 @@ bool EditorUi::initialize_headless(std::string& error) {
     impl_->layout.initialize(".relay/headless-layout.ini");
     // Headless editors never reach the desktop; tests install their own handler to observe calls.
     impl_->file_browser = {};
+    impl_->ide_launcher = {};
     impl_->bind_preferences();
     impl_->fonts = load_editor_fonts(1.0F);
     apply_editor_theme(1.0F);
@@ -12832,6 +13252,10 @@ void EditorUi::process_actions() {
 void EditorUi::set_panel_visible(const std::string_view name, const bool visible) {
     for (std::size_t i = 0; i < panel_names.size(); ++i)
         if (panel_names[i] == name) impl_->panel_open[i] = visible;
+}
+
+void EditorUi::set_ide_handler(IdeHandler handler) {
+    impl_->ide_launcher = std::move(handler);
 }
 
 void EditorUi::set_file_browser_handler(FileBrowserHandler handler) {
@@ -13040,7 +13464,10 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     impl_->composer_rect.reset();
     // A drag change the inspector chose not to send must not tag a later, unrelated edit.
     impl_->pending_gesture = 0;
-    ImGui::NewFrame();
+    {
+        RELAY_PROFILE_SCOPE("ImGui new frame");
+        ImGui::NewFrame();
+    }
     impl_->thumbnails.begin_frame(impl_->headless);
     ImGuizmo::BeginFrame();
     impl_->frame_open = true;
@@ -13048,9 +13475,12 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     const auto delta = static_cast<double>(ImGui::GetIO().DeltaTime);
     impl_->seconds_since_refresh += delta;
     impl_->seconds_since_assets += delta;
-    if (impl_->refresh_pending) impl_->refresh();
-    else if (impl_->refresh_stage >= 0 || impl_->seconds_since_refresh >= impl_->refresh_interval())
-        impl_->advance_refresh();
+    {
+        RELAY_PROFILE_SCOPE("Editor refresh");
+        if (impl_->refresh_pending) impl_->refresh();
+        else if (impl_->refresh_stage >= 0 || impl_->seconds_since_refresh >= impl_->refresh_interval())
+            impl_->advance_refresh();
+    }
 
     (void)width;
     (void)height;
@@ -13079,30 +13509,35 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     impl_->update_slow_click();
     if (impl_->panel_open[0]) {
         if (panel("Hierarchy", 0)) {
+            RELAY_PROFILE_SCOPE("Panel: Hierarchy");
             impl_->draw_hierarchy();
         }
         ImGui::End();
     }
     if (impl_->panel_open[1]) {
         if (panel("Inspector", 1)) {
+            RELAY_PROFILE_SCOPE("Panel: Inspector");
             impl_->draw_inspector();
         }
         ImGui::End();
     }
     if (impl_->panel_open[2]) {
         if (panel("Assets", 2)) {
+            RELAY_PROFILE_SCOPE("Panel: Assets");
             impl_->draw_assets();
         }
         ImGui::End();
     }
     if (impl_->panel_open[3]) {
         if (panel("History", 3)) {
+            RELAY_PROFILE_SCOPE("Panel: History");
             impl_->draw_history();
         }
         ImGui::End();
     }
     if (impl_->panel_open[4]) {
         if (panel("Diagnostics", 4)) {
+            RELAY_PROFILE_SCOPE("Panel: Diagnostics");
             impl_->draw_diagnostics();
         }
         ImGui::End();
@@ -13145,15 +13580,31 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
                 impl_->viewport_draw_list->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
             }
         }
+        RELAY_PROFILE_SCOPE("Panel: Viewport");
         impl_->draw_viewport_drop_target();
         impl_->update_camera_input();
         if (!impl_->chat_media.viewer_open()) impl_->update_shortcuts();
-        impl_->update_view();
-        impl_->draw_collider_wireframes();
-        impl_->draw_audio_shapes();
-        impl_->draw_scene_nodes();
+        {
+            RELAY_PROFILE_SCOPE("Viewport: view");
+            impl_->update_view();
+        }
+        {
+            RELAY_PROFILE_SCOPE("Viewport: collider outlines");
+            impl_->draw_collider_wireframes();
+        }
+        {
+            RELAY_PROFILE_SCOPE("Viewport: audio shapes");
+            impl_->draw_audio_shapes();
+        }
+        {
+            RELAY_PROFILE_SCOPE("Viewport: node icons");
+            impl_->draw_scene_nodes();
+        }
         impl_->draw_game_input_hint();
-        impl_->draw_gizmo();
+        {
+            RELAY_PROFILE_SCOPE("Viewport: gizmo");
+            impl_->draw_gizmo();
+        }
         impl_->draw_viewport_fps();
         impl_->update_selection_input();
         ImGui::End();
@@ -13165,12 +13616,12 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         if (!impl_->chat_media.viewer_open()) impl_->update_shortcuts();
     }
     if (impl_->panel_open[6]) {
-        if (panel("Timeline", 6)) impl_->draw_timeline();
+        if (panel("Timeline", 6)) { RELAY_PROFILE_SCOPE("Panel: Timeline"); impl_->draw_timeline(); }
         ImGui::End();
     }
     if (!impl_->panel_open[6]) impl_->timeline_scrub_targets.clear();
     if (impl_->panel_open[7]) {
-        if (panel("Project", 7)) impl_->draw_project();
+        if (panel("Project", 7)) { RELAY_PROFILE_SCOPE("Panel: Project"); impl_->draw_project(); }
         ImGui::End();
     }
     if (impl_->panel_open[8]) {
@@ -13182,7 +13633,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
             ImGui::SetNextWindowSize(size);
             ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - size.x - 16 * impl_->ui_scale, viewport->WorkPos.y + 16 * impl_->ui_scale));
         }
-        if (panel("Agent", 8)) impl_->draw_agent();
+        if (panel("Agent", 8)) { RELAY_PROFILE_SCOPE("Panel: Agent"); impl_->draw_agent(); }
         ImGui::End();
     }
     impl_->update_profiler_session();
@@ -13192,7 +13643,7 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
             if (const auto* diagnostics = ImGui::FindWindowByName("Diagnostics");
                 diagnostics && diagnostics->DockId)
                 ImGui::SetNextWindowDockID(diagnostics->DockId, ImGuiCond_FirstUseEver);
-        if (panel("Profiler", 9)) impl_->draw_profiler();
+        if (panel("Profiler", 9)) { RELAY_PROFILE_SCOPE("Panel: Profiler"); impl_->draw_profiler(); }
         ImGui::End();
     }
     if (impl_->panel_open[11]) {
@@ -13237,10 +13688,14 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     }
     impl_->draw_dialogs();
     impl_->draw_game_config();
+    impl_->draw_editor_preferences();
     impl_->draw_asset_browser();
 
     impl_->chat_media.draw_viewer(impl_->headless);
-    ImGui::Render();
+    {
+        RELAY_PROFILE_SCOPE("ImGui render");
+        ImGui::Render();
+    }
     impl_->frame_open = false;
 }
 
@@ -13284,6 +13739,12 @@ Entity EditorUi::selected_entity() const {
 std::optional<std::array<float, 4>> EditorUi::headless_item_rect(std::string_view key) const {
     const auto found = impl_->headless_items.find(key);
     return found == impl_->headless_items.end() ? std::nullopt : std::optional{found->second};
+}
+
+std::optional<std::string> EditorUi::headless_scene_node(const std::string_view handle) const {
+    const auto* node = impl_->find_entity(handle);
+    if (node == nullptr) return std::nullopt;
+    return json_stringify(JsonValue{*node});
 }
 
 std::vector<Entity> EditorUi::selected_entities() const {

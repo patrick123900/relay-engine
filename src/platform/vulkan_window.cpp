@@ -1,3 +1,4 @@
+#include "relay/platform/window_icon.hpp"
 #include "relay/platform/vulkan_window.hpp"
 #include "relay/platform/sdl_input.hpp"
 #include "relay/editor/editor_overlay.hpp"
@@ -732,6 +733,8 @@ struct VulkanWindow::Impl {
     }
 
     bool initialize(const std::string& title, const std::uint32_t width, const std::uint32_t height, const bool editor_window) {
+        // The application id lets desktops group the window under Relay and find its icon.
+        (void)SDL_SetAppMetadata("Relay Engine", nullptr, "relay-engine");
         if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
             last_error = SDL_GetError();
             return false;
@@ -745,6 +748,7 @@ struct VulkanWindow::Impl {
             last_error = SDL_GetError();
             return false;
         }
+        apply_window_icon(window);
         render_graph = make_scene_render_graph();
         if (!render_graph.valid) {
             last_error = "render graph compilation failed: " + render_graph.error;

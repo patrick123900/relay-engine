@@ -18,7 +18,10 @@ components a node has; switch one off, like Unity, with the checkbox on its head
 **×**, and on again without losing its settings (a disabled mesh renderer is not drawn, a disabled
 camera is never the active one, a disabled collider, body, joint, script, light, audio source,
 emitter, keyframe animation or interface widget is ignored). The Transform and Model animation have
-no checkbox. Remove one with the **×** on its header (or right-click → **Remove component**). **+ Add Component** at the bottom opens the Add Component window: categories on the
+no checkbox. A script component's header also has an **Edit** (pencil) button (and an **Edit script** context
+item) that opens the script's source, at its class, in your IDE; choose the IDE under **Edit →
+Editor preferences...** (Visual Studio Code, VSCodium, Cursor, Zed, Sublime Text, Kate, CLion, Qt
+Creator, your system default, or a custom command with `{file}`, `{line}` and `{project}`). Remove one with the **×** on its header (or right-click → **Remove component**). **+ Add Component** at the bottom opens the Add Component window: categories on the
 left, engine components and your script behaviours on the right, a description of the selection,
 and search. The Transform cannot be removed.
 

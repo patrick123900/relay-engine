@@ -64,10 +64,32 @@ target_include_directories(relay_stb_truetype SYSTEM PUBLIC "${stb_SOURCE_DIR}")
 if(UNIX)
     target_link_libraries(relay_stb_truetype PUBLIC m)
 endif()
-# The built-in interface font (Inter, SIL Open Font License), embedded so games need no font file.
+# Code that runs every frame (the editor and the data path it reads through, render scene
+# building and Vulkan recording, the game interface, particles, audio mixing, the frame loop and
+# the profiler) is optimized even in Debug builds: unoptimized standard containers, string building
+# and math made frames several times slower than they need to be, and made the Profiler point at
+# code that is cheap in a real build. The optimization level keeps it debuggable.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        src/editor/editor_ui.cpp src/editor/editor_widgets.cpp src/editor/editor_layout.cpp
+        src/scene/scene.cpp src/scene/ui.cpp src/scene/particles.cpp src/control/control_protocol.cpp
+        src/physics/collision.cpp
+        src/render/scene_render.cpp src/render/sky.cpp src/render/materials.cpp
+        src/platform/vulkan_window.cpp src/platform/vulkan_lighting.cpp
+        src/platform/vulkan_ray_tracing.cpp
+        src/ui/ui_render.cpp src/ui/ui_system.cpp src/ui/ui_font.cpp
+        src/particles/particle_system.cpp
+        src/audio/audio_system.cpp src/audio/audio_mixer.cpp src/audio/audio_effects.cpp
+        src/core/engine.cpp src/core/input.cpp src/observe/profiler.cpp
+        PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:Debug>:-Og>")
+endif()
+
+# The built-in interface font (Inter, SIL Open Font License) and the window icon, embedded so games
+# need no font file.
 set(RELAY_EMBEDDED_FILE_INPUTS
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/inter/Inter-Regular.ttf"
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/inter/Inter-Bold.ttf")
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/inter/Inter-Bold.ttf"
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/relay-icon.png")
 set(RELAY_EMBEDDED_FILES "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_files.cpp")
 add_custom_command(
     OUTPUT "${RELAY_EMBEDDED_FILES}"
@@ -278,7 +300,8 @@ if(RELAY_ENABLE_SDL)
     endif()
 
     if(TARGET SDL3::SDL3)
-        target_sources(relay_demo PRIVATE src/platform/sdl_window.cpp src/platform/sdl_input.cpp)
+        target_sources(relay_demo PRIVATE src/platform/sdl_window.cpp src/platform/sdl_input.cpp
+            src/platform/window_icon.cpp)
         target_link_libraries(relay_demo PRIVATE SDL3::SDL3)
         target_compile_definitions(relay_demo PRIVATE RELAY_HAS_SDL3=1)
 
@@ -516,6 +539,11 @@ if(RELAY_ENABLE_SDL)
                     "${imguicolortextedit_SOURCE_DIR}/TextEditor.cpp"
                 )
                 target_compile_features(relay_imgui PUBLIC cxx_std_20)
+                # Dear ImGui is third-party code that runs every frame. Optimizing it in Debug builds
+                # keeps the editor responsive while Relay's own code stays easy to debug.
+                if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+                    target_compile_options(relay_imgui PRIVATE $<$<CONFIG:Debug>:-O2>)
+                endif()
                 # SYSTEM keeps third-party headers from emitting warnings into Relay's strict builds.
                 target_include_directories(relay_imgui SYSTEM PUBLIC
                     "${dearimgui_SOURCE_DIR}"
@@ -530,7 +558,7 @@ if(RELAY_ENABLE_SDL)
 
                 target_sources(relay_demo PRIVATE src/editor/editor_ui.cpp src/editor/editor_theme.cpp
                     src/editor/editor_layout.cpp src/editor/chat_media.cpp
-                    src/editor/file_browser.cpp src/editor/shader_graph_canvas.cpp
+                    src/editor/file_browser.cpp src/editor/ide.cpp src/editor/shader_graph_canvas.cpp
                     src/editor/editor_widgets.cpp src/editor/asset_thumbnails.cpp
                     src/editor/interface_preview.cpp)
                 find_package(PkgConfig QUIET)
@@ -554,7 +582,7 @@ endif()
 
 if(RELAY_BUILD_TESTS)
     enable_testing()
-    add_executable(relay_tests tests/engine_tests.cpp)
+    add_executable(relay_tests tests/engine_tests.cpp src/editor/ide.cpp)
     target_link_libraries(relay_tests PRIVATE Relay::Engine)
     relay_enable_warnings(relay_tests)
     target_compile_definitions(relay_tests PRIVATE
@@ -608,10 +636,11 @@ if(RELAY_BUILD_TESTS)
     if(TARGET relay_imgui)
         add_executable(relay_editor_headless_tests tests/editor_headless_tests.cpp
             src/editor/editor_ui.cpp src/editor/editor_theme.cpp src/editor/editor_layout.cpp src/editor/chat_media.cpp
-            src/editor/file_browser.cpp src/editor/shader_graph_canvas.cpp src/editor/editor_widgets.cpp
+            src/editor/file_browser.cpp src/editor/ide.cpp src/editor/shader_graph_canvas.cpp src/editor/editor_widgets.cpp
             src/editor/asset_thumbnails.cpp src/editor/interface_preview.cpp src/platform/sdl_input.cpp)
         target_link_libraries(relay_editor_headless_tests PRIVATE Relay::Engine relay_imgui)
-        target_compile_definitions(relay_editor_headless_tests PRIVATE RELAY_CHAT_MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat-media")
+        target_compile_definitions(relay_editor_headless_tests PRIVATE RELAY_CHAT_MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat-media"
+            RELAY_DEMO_DIRECTORY="${CMAKE_CURRENT_SOURCE_DIR}/examples/demo")
         relay_enable_warnings(relay_editor_headless_tests)
         add_test(NAME relay_editor_headless_tests COMMAND relay_editor_headless_tests)
     endif()

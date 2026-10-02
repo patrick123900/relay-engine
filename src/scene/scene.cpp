@@ -46,11 +46,11 @@ std::string escape_json(const std::string_view value) {
     return escaped;
 }
 
-void append_vec3(std::ostringstream& output, const Vec3& value) {
+void append_vec3(JsonWriter& output, const Vec3& value) {
     output << "{\"x\":" << value.x << ",\"y\":" << value.y << ",\"z\":" << value.z << '}';
 }
 
-void append_entity(std::ostringstream& output, const Entity entity, const EntityRecord& record,
+void append_entity(JsonWriter& output, const Entity entity, const EntityRecord& record,
                    const bool derived = true) {
     output << "{\"entity\":\"" << entity.to_string() << "\",\"name\":\""
            << escape_json(record.name) << '"';
@@ -1111,8 +1111,7 @@ void Scene::restore_state(SceneState state) {
 std::string Scene::entity_json(const Entity entity) const {
     const auto* record = get(entity);
     if (record == nullptr) return "null";
-    std::ostringstream output;
-    output << std::setprecision(std::numeric_limits<double>::max_digits10);
+    JsonWriter output;
     append_entity(output, entity, *record);
     return output.str();
 }
@@ -1120,8 +1119,7 @@ std::string Scene::entity_json(const Entity entity) const {
 std::string Scene::list_json() const { return list_json(true); }
 
 std::string Scene::list_json(const bool derived) const {
-    std::ostringstream output;
-    output << std::setprecision(std::numeric_limits<double>::max_digits10);
+    JsonWriter output;
     output << "{\"entities\":[";
     const auto current_entities = entities();
     for (std::size_t index = 0; index < current_entities.size(); ++index) {
@@ -1134,8 +1132,7 @@ std::string Scene::list_json(const bool derived) const {
 }
 
 std::string Scene::serialize_json() const {
-    std::ostringstream output;
-    output << std::setprecision(std::numeric_limits<double>::max_digits10);
+    JsonWriter output;
     output << "{\"format\":\"relay.scene\",\"version\":" << scene_file_version
            << ",\"components\":[";
     const auto& descriptors = component_descriptors();

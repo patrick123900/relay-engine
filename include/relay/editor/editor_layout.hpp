@@ -15,6 +15,8 @@ class EditorLayout {
     void initialize(std::string override_path = {});
     // Persists a flag under `key`. Bind before the first frame, when ImGui reads the ini.
     void bind(std::string key, bool* value);
+    // The same for a line of text (no newlines), such as the user's chosen external editor.
+    void bind_text(std::string key, std::string* value);
     void build(float scale);
     void save() const;
     void reset() { reset_pending_ = true; }
@@ -32,6 +34,12 @@ class EditorLayout {
     };
     std::string ini_path_;
     std::vector<Preference> preferences_;
+    struct TextPreference {
+        std::string key;
+        std::string* value{};
+        std::string saved;
+    };
+    std::vector<TextPreference> text_preferences_;
     bool reset_pending_{false};
     bool controls_migrated_{false};
     bool optional_migrated_{false};

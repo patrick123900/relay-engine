@@ -119,7 +119,7 @@ def add_sky(project: pathlib.Path, sky: dict) -> None:
             path.write_text(json.dumps(document))
             return
     generations = document["scene"]["allocator"]["slot_generations"]
-    node = {key: None for key in entities[0]}
+    node = {key: ([] if key == "disabled_components" else None) for key in entities[0]}
     node.update(entity=f"{len(generations)}:1", name="Sky", scripts=[], sky=sky,
                 transform={"position": {"x": 0, "y": 0, "z": 0},
                            "rotation_degrees": {"x": -50, "y": 30, "z": 0},
@@ -205,7 +205,7 @@ def shader_checks(binary: str, folder: pathlib.Path) -> list:
         if entity["post_process"] is not None:
             entity["post_process"] = None
     generations = document["scene"]["allocator"]["slot_generations"]
-    node = {key: None for key in entities[0]}
+    node = {key: ([] if key == "disabled_components" else None) for key in entities[0]}
     node.update(entity=f"{len(generations)}:1", name="Post", scripts=[],
                 post_process={"effects": [{"material": "Edge.relay-material", "enabled": True, "editor": True}]},
                 transform={"position": {"x": 0, "y": 0, "z": 0},
@@ -365,7 +365,7 @@ def particle_checks(binary: str, folder: pathlib.Path) -> list:
     generations = document["scene"]["allocator"]["slot_generations"]
 
     def add(name: str, position: list, emitter: dict) -> None:
-        node = {key: None for key in entities[0]}
+        node = {key: ([] if key == "disabled_components" else None) for key in entities[0]}
         node.update(entity=f"{len(generations)}:1", name=name, scripts=[], parent=camera["entity"],
                     particle_emitter=emitter,
                     transform={"position": dict(zip("xyz", position)), "rotation_degrees": {"x": 0, "y": 0, "z": 0},

@@ -4,6 +4,9 @@
 #include "relay/scene/scene_edit.hpp"
 #include "relay/scene/scene_io.hpp"
 
+#include <optional>
+#include <mutex>
+#include <map>
 #include <algorithm>
 #include <array>
 #include <system_error>
@@ -41,6 +44,18 @@ std::vector<NodeTemplate> list_templates(const std::optional<fs::path>& project_
     std::error_code error;
     const auto directory = *project_root / template_directory;
     if (fs::is_symlink(directory, error) || !fs::is_directory(directory, error)) return project;
+    // The editor lists templates every few seconds, and reading each file means parsing a whole
+    // scene, so entries are kept until their file's size or modification time changes.
+    struct Cached {
+        fs::file_time_type time;
+        std::uintmax_t size{};
+        std::optional<NodeTemplate> entry; // Empty for a file that is not a valid template.
+        bool seen{};
+    };
+    static std::mutex cache_mutex;
+    static std::map<fs::path, Cached> cache;
+    const std::lock_guard lock(cache_mutex);
+    for (auto& [path, cached] : cache) cached.seen = false;
     for (fs::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
         const auto filename = it->path().filename().string();
         if (filename.starts_with('.') || it->is_symlink(error) || !it->is_regular_file(error) ||
@@ -48,20 +63,31 @@ std::vector<NodeTemplate> list_templates(const std::optional<fs::path>& project_
             continue;
         const auto name = filename.substr(0, filename.size() - template_suffix.size());
         if (!valid_template_name(name)) continue;
-        const auto loaded = load_scene_file(it->path());
-        if (!loaded) continue;
-        NodeTemplate entry{"project:" + name, name, "Node",
-                           std::string{template_directory} + "/" + filename, {}, {}};
-        for (const auto& slot : loaded.state->slots) {
-            if (!slot.alive || slot.record.parent.valid()) continue;
-            entry.type = node_type(slot.record);
-            for (const auto& kind : engine_components())
-                if (kind.id != "script" && has_component(slot.record, kind.id))
-                    entry.components.emplace_back(kind.id);
-            for (const auto& script : slot.record.scripts) entry.behaviours.push_back(script.behaviour);
+        const auto time = it->last_write_time(error);
+        const auto size = it->file_size(error);
+        auto& cached = cache[it->path()];
+        cached.seen = true;
+        if (cached.time != time || cached.size != size) {
+            cached.time = time;
+            cached.size = size;
+            cached.entry.reset();
+            if (const auto loaded = load_scene_file(it->path())) {
+                NodeTemplate entry{"project:" + name, name, "Node",
+                                   std::string{template_directory} + "/" + filename, {}, {}};
+                for (const auto& slot : loaded.state->slots) {
+                    if (!slot.alive || slot.record.parent.valid()) continue;
+                    entry.type = node_type(slot.record);
+                    for (const auto& kind : engine_components())
+                        if (kind.id != "script" && has_component(slot.record, kind.id))
+                            entry.components.emplace_back(kind.id);
+                    for (const auto& script : slot.record.scripts) entry.behaviours.push_back(script.behaviour);
+                }
+                cached.entry = std::move(entry);
+            }
         }
-        project.push_back(std::move(entry));
+        if (cached.entry) project.push_back(*cached.entry);
     }
+    std::erase_if(cache, [](const auto& item) { return !item.second.seen; });
     std::sort(project.begin(), project.end(),
               [](const NodeTemplate& a, const NodeTemplate& b) { return a.name < b.name; });
     return project;

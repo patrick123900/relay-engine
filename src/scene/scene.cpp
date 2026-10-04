@@ -183,7 +183,15 @@ void append_entity(JsonWriter& output, const Entity entity, const EntityRecord& 
             case ScriptProperty::Type::boolean: output << (property.boolean ? "true" : "false"); break;
             case ScriptProperty::Type::number: output << property.number; break;
             case ScriptProperty::Type::vector: append_vec3(output, property.vector); break;
-            case ScriptProperty::Type::text: output << '"' << escape_json(property.text) << '"'; break;
+            case ScriptProperty::Type::text:
+            case ScriptProperty::Type::asset:
+            case ScriptProperty::Type::component:
+                output << '"' << escape_json(property.text) << '"';
+                break;
+            case ScriptProperty::Type::entity:
+                if (property.entity.valid()) output << '"' << property.entity.to_string() << '"';
+                else output << "null";
+                break;
             }
             output << '}';
         }
@@ -366,6 +374,13 @@ bool Scene::destroy(const Entity entity) {
             slot.record.joint->connected = {};
             slot.record.joint->enabled = false;
         }
+    // Script references to a removed node go back to none rather than naming whatever reuses its slot.
+    for (auto& slot : slots_)
+        if (slot.alive)
+            for (auto& script : slot.record.scripts)
+                for (auto& property : script.properties)
+                    if (property.type == ScriptProperty::Type::entity && property.entity.valid() &&
+                        !contains(property.entity)) property.entity = {};
     return true;
 }
 
@@ -630,6 +645,9 @@ std::string_view script_property_type_name(const ScriptProperty::Type type) {
     case ScriptProperty::Type::number: return "number";
     case ScriptProperty::Type::vector: return "vector";
     case ScriptProperty::Type::text: return "text";
+    case ScriptProperty::Type::entity: return "entity";
+    case ScriptProperty::Type::asset: return "asset";
+    case ScriptProperty::Type::component: return "component";
     }
     return "number";
 }
@@ -639,6 +657,9 @@ std::optional<ScriptProperty::Type> script_property_type_from_name(const std::st
     if (name == "number") return ScriptProperty::Type::number;
     if (name == "vector") return ScriptProperty::Type::vector;
     if (name == "text") return ScriptProperty::Type::text;
+    if (name == "entity") return ScriptProperty::Type::entity;
+    if (name == "asset") return ScriptProperty::Type::asset;
+    if (name == "component") return ScriptProperty::Type::component;
     return std::nullopt;
 }
 
@@ -649,6 +670,8 @@ bool valid_script(const Script& script) {
     for (const auto& property : script.properties) {
         if (!valid_behaviour_name(property.name) || !names.insert(property.name).second ||
             property.text.size() > maximum_script_text_bytes ||
+            (property.type == ScriptProperty::Type::component && !property.text.empty() &&
+             !find_component_kind(property.text)) ||
             !std::isfinite(property.number) || !std::isfinite(property.vector.x) ||
             !std::isfinite(property.vector.y) || !std::isfinite(property.vector.z))
             return false;
@@ -966,6 +989,11 @@ bool Scene::set_scripts(const Entity entity, std::vector<Script> scripts) {
     auto* record = get(entity);
     if (!record || scripts.size() > maximum_scripts_per_entity ||
         !std::all_of(scripts.begin(), scripts.end(), valid_script)) return false;
+    // A node reference must name a node that exists, so a scene never saves a dangling one.
+    for (const auto& script : scripts)
+        for (const auto& property : script.properties)
+            if (property.type == ScriptProperty::Type::entity && property.entity.valid() &&
+                !contains(property.entity)) return false;
     record->scripts = std::move(scripts);
     return true;
 }
@@ -1028,6 +1056,13 @@ Entity Scene::duplicate(const Entity source) {
             const auto partner = copies.find(record.joint->connected);
             if (partner != copies.end()) record.joint->connected = partner->second;
         }
+        // Script references into the copied tree point at the copies; others keep their node.
+        for (auto& script : record.scripts)
+            for (auto& property : script.properties)
+                if (property.type == ScriptProperty::Type::entity) {
+                    const auto target = copies.find(property.entity);
+                    if (target != copies.end()) property.entity = target->second;
+                }
         slots_[copy.index].record = std::move(record);
     }
 

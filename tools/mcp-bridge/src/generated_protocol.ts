@@ -175,6 +175,38 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "editor_template_open",
+    {
+      title: "Open template window",
+      description: "Open a project template in the live editor's template window: a floating Hierarchy, viewport and Inspector over a private copy of the template, edited by a person (Save writes the template file). Focuses the window when it is already open. Unavailable without an editor. Agents edit templates by instantiating them in the scene, changing the copy and calling templates.save with replace.",
+      inputSchema: z.object({
+        "name": z.string().max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")).describe("Template name from templates.list, such as Enemy")
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["editor_template_open"];
+        if (override) return override(input as JsonObject);
+        return invoke("editor.template.open", {"name": input["name"]});
+      },
+  );
+
+  server.registerTool(
+    "editor_template_status",
+    {
+      title: "Inspect template windows",
+      description: "List the live editor's open template windows with their names, whether each has unsaved edits and whether its viewport shows a GPU-rendered picture (otherwise the CPU preview). Unavailable without an editor.",
+      inputSchema: z.object({}),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async () => {
+        const override = overrides["editor_template_status"];
+        if (override) return override({});
+        return invoke("editor.template.status", {});
+      },
+  );
+
+  server.registerTool(
     "render_capture",
     {
       title: "Capture Relay frame",
@@ -1785,7 +1817,7 @@ export function registerGeneratedTools(
     "scene_set_script_property",
     {
       title: "Set script property",
-      description: "Store a value for a behaviour property on one script component, or reset it to the code default. Send exactly one of number, boolean, text or vector unless resetting.",
+      description: "Store a value for a behaviour property on one script component, or reset it to the code default. Send exactly one of number, boolean, text, vector, target, asset or component unless resetting; the behaviour's declared type (scripts.status lists each property with its type) decides which. target is a node in the scene as an entity handle (an empty string clears it) for properties declared as relay::Entity or relay::Ref<Behaviour>, and any filter listed with the property (a behaviour, an engine component or a node type) limits what the Inspector offers. asset is a project file path for properties declared as a file kind (audio, template, image, ...). component is an engine component id such as camera. Scripts read node and script references through Entity and Ref<T>, and deleting or copying nodes keeps them valid.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
         "index": z.number().int().min(0).max(31).describe("Position among the node's script components, from zero"),
@@ -1794,6 +1826,9 @@ export function registerGeneratedTools(
         "boolean": z.boolean().optional(),
         "text": z.string().max(1024).optional(),
         "vector": z.array(z.number().finite()).min(3).max(3).optional(),
+        "target": z.string().regex(new RegExp("^(\\d+:\\d+)?$")).nullable().optional().describe("Entity handle of the node a node or script reference points at; empty or null for none"),
+        "asset": z.string().max(1024).optional().describe("Project file path for an asset property"),
+        "component": z.string().max(64).optional().describe("Engine component id for a component type property"),
         "reset": z.boolean().default(false),
         "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
       }),
@@ -1802,7 +1837,7 @@ export function registerGeneratedTools(
     async (input) => {
         const override = overrides["scene_set_script_property"];
         if (override) return override(input as JsonObject);
-        return invoke("scene.set_script_property", {"entity": input["entity"], "index": input["index"], "property": input["property"], "number": input["number"], "boolean": input["boolean"], "text": input["text"], "vector": input["vector"], "reset": input["reset"], "gesture": input["gesture"]});
+        return invoke("scene.set_script_property", {"entity": input["entity"], "index": input["index"], "property": input["property"], "number": input["number"], "boolean": input["boolean"], "text": input["text"], "vector": input["vector"], "target": input["target"], "asset": input["asset"], "component": input["component"], "reset": input["reset"], "gesture": input["gesture"]});
       },
   );
 

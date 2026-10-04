@@ -360,21 +360,30 @@ bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
     return true;
 }
 
-void AssetRegistry::set_sky_material(std::shared_ptr<const ResolvedSkyMaterial> material) {
-    sky_material_ = std::move(material);
+void AssetRegistry::set_sky_material(std::shared_ptr<const ResolvedSkyMaterial> material, const void* owner) {
+    if (material) sky_materials_[owner] = std::move(material);
+    else sky_materials_.erase(owner);
 }
 
 std::shared_ptr<const ResolvedSkyMaterial> AssetRegistry::sky_material(const std::string_view path) const {
-    return sky_material_ && sky_material_->path == path ? sky_material_ : nullptr;
+    for (const auto& [owner, material] : sky_materials_)
+        if (material && material->path == path) return material;
+    return nullptr;
 }
 
-void AssetRegistry::set_shader_materials(ShaderMaterials materials) {
-    shader_materials_ = std::move(materials);
+void AssetRegistry::set_shader_materials(ShaderMaterials materials, const void* owner) {
+    shader_materials_[owner] = std::move(materials);
+}
+
+void AssetRegistry::forget_owner(const void* owner) {
+    sky_materials_.erase(owner);
+    shader_materials_.erase(owner);
 }
 
 std::shared_ptr<const ResolvedShaderMaterial> AssetRegistry::shader_material(const std::string_view path) const {
-    const auto found = shader_materials_.find(path);
-    return found == shader_materials_.end() ? nullptr : found->second;
+    for (const auto& [owner, materials] : shader_materials_)
+        if (const auto found = materials.find(path); found != materials.end()) return found->second;
+    return nullptr;
 }
 
 } // namespace relay

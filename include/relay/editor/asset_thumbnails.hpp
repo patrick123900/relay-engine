@@ -45,6 +45,10 @@ public:
     // True when the last attempt to draw this file failed (it shows its icon instead).
     [[nodiscard]] bool failed(const std::string& path) const;
     void clear();
+    // Retires every texture for the backend to destroy over the next frames (keep calling begin_frame
+    // until idle()), instead of clear(), which unregisters at once and so leaks what the backend holds.
+    void release();
+    [[nodiscard]] bool idle() const;
 
 private:
     struct Impl;

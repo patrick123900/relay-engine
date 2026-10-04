@@ -326,6 +326,39 @@ struct VulkanWindow::Impl {
     // Whether each frame's targets hold a finished frame, and so can serve as history.
     std::array<bool, frames_in_flight> scene_targets_rendered{};
     VkExtent2D scene_extent{};
+    // Everything that belongs to one view of a scene: its targets and the history effects read.
+    // The window keeps a second one for drawing a scene other than the main viewport's into an
+    // image (an editor overlay's offscreen views, such as the template editor's viewport). It is
+    // swapped with the live members while that view records, so the same passes serve both.
+    struct ViewState {
+        std::array<SceneTargets, frames_in_flight> targets{};
+        std::array<bool, frames_in_flight> rendered{}, mips_ready{};
+        VkExtent2D extent{};
+        std::unordered_map<std::uint64_t, std::array<float, 16>> previous_models;
+        std::array<float, 16> previous_view_projection{}, previous_view{}, previous_projection{};
+        bool previous_frame_valid{false};
+        double last_frame_time{-1.0};
+        std::array<VkDescriptorSet, frames_in_flight> tone_sets{};
+        std::array<std::array<VkDescriptorSet, 2>, frames_in_flight> post_input_sets{};
+    };
+    ViewState offscreen_state;
+    // Where an offscreen view is tone mapped (a render-pass compatible target) and read back.
+    struct OffscreenOutput {
+        SceneImage color, depth;
+        VkFramebuffer framebuffer{};
+        VkExtent2D extent{};
+        VkBuffer readback{};
+        VkDeviceMemory readback_memory{};
+    } offscreen_output;
+    // The offscreen view being recorded, or null while the main view records.
+    struct OffscreenFrame {
+        const Scene* scene{};
+        ViewOverride view;
+        EditorViewport::Pixels region;
+        std::vector<Entity> selected;
+        bool grid{};
+    };
+    const OffscreenFrame* offscreen{nullptr};
     // Global illumination: requested by the host, available when the device and the FidelityFX
     // build allow it. The composite pass adds its light to the HDR image.
 #ifdef RELAY_HAS_FIDELITYFX
@@ -2105,22 +2138,22 @@ struct VulkanWindow::Impl {
         if (result == VK_SUCCESS)
             result = vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr, &post_pipeline_layout);
         const std::array pool_sizes{
-            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<std::uint32_t>(8U * frames_in_flight)},
-            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<std::uint32_t>(2U * frames_in_flight)}};
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<std::uint32_t>(16U * frames_in_flight)},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<std::uint32_t>(4U * frames_in_flight)}};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pool_info.maxSets = static_cast<std::uint32_t>(2U * frames_in_flight);
+        pool_info.maxSets = static_cast<std::uint32_t>(4U * frames_in_flight);
         pool_info.poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size());
         pool_info.pPoolSizes = pool_sizes.data();
         if (result == VK_SUCCESS) result = vkCreateDescriptorPool(device, &pool_info, nullptr, &post_input_pool);
-        std::array<VkDescriptorSetLayout, 2U * frames_in_flight> post_layouts{};
+        std::array<VkDescriptorSetLayout, 4U * frames_in_flight> post_layouts{};
         post_layouts.fill(post_input_layout);
         VkDescriptorSetAllocateInfo allocation{};
         allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         allocation.descriptorPool = post_input_pool;
         allocation.descriptorSetCount = static_cast<std::uint32_t>(post_layouts.size());
         allocation.pSetLayouts = post_layouts.data();
-        std::array<VkDescriptorSet, 2U * frames_in_flight> sets{};
+        std::array<VkDescriptorSet, 4U * frames_in_flight> sets{};
         if (result == VK_SUCCESS) result = vkAllocateDescriptorSets(device, &allocation, sets.data());
         if (result != VK_SUCCESS) {
             last_error = vk_error("shader material layouts", result);
@@ -2128,6 +2161,8 @@ struct VulkanWindow::Impl {
         }
         for (std::size_t frame = 0; frame < frames_in_flight; ++frame) {
             post_input_sets[frame] = {sets[frame * 2U], sets[frame * 2U + 1U]};
+            offscreen_state.post_input_sets[frame] = {sets[(frames_in_flight + frame) * 2U],
+                                                      sets[(frames_in_flight + frame) * 2U + 1U]};
             if (!create_buffer(sizeof(PostCamera), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                post_camera_buffers[frame], post_camera_memories[frame]))
@@ -2157,6 +2192,7 @@ void fragment() {
         shader_resources_ready = true;
         // Scene targets made before now have unwritten post-processing inputs.
         scene_extent = {};
+        offscreen_state.extent = {};
         return true;
     }
 
@@ -2524,7 +2560,10 @@ void fragment() {
     // images and sets, shaders their pipelines. Replacing or dropping resources waits for the
     // device, since the other frame in flight may still use them; that happens when a material's
     // shader or images change, not when only its parameters do (see write_frame_parameters).
-    void sync_shader_materials(const RenderScene& render_scene) {
+    // `keep_unused` leaves materials the scene does not use alone: an offscreen view draws a
+    // different scene from the main viewport and must not evict (and so rebuild every frame) the
+    // main viewport's.
+    void sync_shader_materials(const RenderScene& render_scene, const bool keep_unused = false) {
         if (!shader_resources_ready) return;
         std::vector<const ResolvedShaderMaterial*> wanted;
         for (const auto& draw_instance : render_scene.instances)
@@ -2554,13 +2593,13 @@ void fragment() {
         std::size_t unused = 0;
         for (const auto& [path, material] : custom_materials) unused += material.used ? 0U : 1U;
         for (const auto& [revision, shader] : custom_shaders) unused += shader.used ? 0U : 1U;
-        if (replace || unused > 16U) {
+        if (replace || (unused > 16U && !keep_unused)) {
             vkDeviceWaitIdle(device);
             for (auto it = custom_materials.begin(); it != custom_materials.end();) {
                 const bool rebuilt = std::find_if(build.begin(), build.end(), [&](const auto* material) {
                                          return material->path == it->first;
                                      }) != build.end();
-                if (!it->second.used || rebuilt) {
+                if ((!it->second.used && !keep_unused) || rebuilt) {
                     destroy_custom_material(it->second);
                     it = custom_materials.erase(it);
                 } else {
@@ -2568,7 +2607,7 @@ void fragment() {
                 }
             }
             for (auto it = custom_shaders.begin(); it != custom_shaders.end();) {
-                if (!it->second.used) {
+                if (!it->second.used && !keep_unused) {
                     for (const auto pipeline_handle : {it->second.surface, it->second.shadow, it->second.post})
                         vkDestroyPipeline(device, pipeline_handle, nullptr);
                     it = custom_shaders.erase(it);
@@ -3468,6 +3507,84 @@ void fragment() {
         previous_frame_valid = false;
     }
 
+    void swap_view(ViewState& view) {
+        std::swap(scene_targets, view.targets);
+        std::swap(scene_targets_rendered, view.rendered);
+        std::swap(post_mips_ready, view.mips_ready);
+        std::swap(scene_extent, view.extent);
+        std::swap(previous_models, view.previous_models);
+        std::swap(previous_view_projection, view.previous_view_projection);
+        std::swap(previous_view, view.previous_view);
+        std::swap(previous_projection, view.previous_projection);
+        std::swap(previous_frame_valid, view.previous_frame_valid);
+        std::swap(last_frame_time, view.last_frame_time);
+        std::swap(tone_sets, view.tone_sets);
+        std::swap(post_input_sets, view.post_input_sets);
+    }
+
+    void destroy_offscreen() {
+        if (device == VK_NULL_HANDLE) return;
+        swap_view(offscreen_state);
+        destroy_scene_targets();
+        swap_view(offscreen_state);
+        auto& output = offscreen_output;
+        vkDestroyFramebuffer(device, output.framebuffer, nullptr);
+        for (auto* image : {&output.color, &output.depth}) {
+            vkDestroyImageView(device, image->view, nullptr);
+            vkDestroyImage(device, image->image, nullptr);
+            vkFreeMemory(device, image->memory, nullptr);
+        }
+        vkDestroyBuffer(device, output.readback, nullptr);
+        vkFreeMemory(device, output.readback_memory, nullptr);
+        output = {};
+        // The tone pool goes with the swapchain's resources; the post-processing pool outlives them.
+        offscreen_state.tone_sets.fill(VK_NULL_HANDLE);
+    }
+
+    bool ensure_offscreen_output(const VkExtent2D extent) {
+        auto& output = offscreen_output;
+        if (output.framebuffer != VK_NULL_HANDLE && output.extent.width == extent.width &&
+            output.extent.height == extent.height)
+            return true;
+        vkDeviceWaitIdle(device);
+        vkDestroyFramebuffer(device, output.framebuffer, nullptr);
+        for (auto* image : {&output.color, &output.depth}) {
+            vkDestroyImageView(device, image->view, nullptr);
+            vkDestroyImage(device, image->image, nullptr);
+            vkFreeMemory(device, image->memory, nullptr);
+        }
+        vkDestroyBuffer(device, output.readback, nullptr);
+        vkFreeMemory(device, output.readback_memory, nullptr);
+        output = {};
+        output.extent = extent;
+        if (!create_scene_image(swapchain_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT, output.color, extent) ||
+            !create_scene_image(depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, output.depth, extent) ||
+            !create_buffer(static_cast<VkDeviceSize>(extent.width) * extent.height * 4U, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, output.readback,
+                           output.readback_memory)) {
+            output.extent = {};
+            return false;
+        }
+        const std::array attachments{output.color.view, output.depth.view};
+        VkFramebufferCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        info.renderPass = render_pass;
+        info.attachmentCount = static_cast<std::uint32_t>(attachments.size());
+        info.pAttachments = attachments.data();
+        info.width = extent.width;
+        info.height = extent.height;
+        info.layers = 1U;
+        const auto result = vkCreateFramebuffer(device, &info, nullptr, &output.framebuffer);
+        if (result != VK_SUCCESS) {
+            last_error = vk_error("offscreen framebuffer", result);
+            output.extent = {};
+            return false;
+        }
+        return true;
+    }
+
     // Matches the scene targets to the viewport. Resizing waits for the GPU, as swapchain
     // recreation does, because both frame sets are replaced together.
     bool ensure_scene_targets(const VkExtent2D extent) {
@@ -4096,24 +4213,30 @@ void fragment() {
         layout_info.pBindings = &binding;
         auto result = vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &tone_layout);
         if (result != VK_SUCCESS) { last_error = vk_error("tone descriptor layout", result); return false; }
+        // Two views' worth: the main viewport's and the offscreen view's.
         VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                       static_cast<std::uint32_t>(frames_in_flight)};
+                                       static_cast<std::uint32_t>(2U * frames_in_flight)};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pool_info.maxSets = static_cast<std::uint32_t>(frames_in_flight);
+        pool_info.maxSets = static_cast<std::uint32_t>(2U * frames_in_flight);
         pool_info.poolSizeCount = 1U;
         pool_info.pPoolSizes = &pool_size;
         result = vkCreateDescriptorPool(device, &pool_info, nullptr, &tone_pool);
         if (result != VK_SUCCESS) { last_error = vk_error("tone descriptor pool", result); return false; }
-        std::array<VkDescriptorSetLayout, frames_in_flight> layouts{};
+        std::array<VkDescriptorSetLayout, 2U * frames_in_flight> layouts{};
         layouts.fill(tone_layout);
         VkDescriptorSetAllocateInfo allocation{};
         allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         allocation.descriptorPool = tone_pool;
         allocation.descriptorSetCount = static_cast<std::uint32_t>(layouts.size());
         allocation.pSetLayouts = layouts.data();
-        result = vkAllocateDescriptorSets(device, &allocation, tone_sets.data());
+        std::array<VkDescriptorSet, 2U * frames_in_flight> tone_allocated{};
+        result = vkAllocateDescriptorSets(device, &allocation, tone_allocated.data());
         if (result != VK_SUCCESS) { last_error = vk_error("tone descriptor allocation", result); return false; }
+        for (std::size_t frame = 0; frame < frames_in_flight; ++frame) {
+            tone_sets[frame] = tone_allocated[frame];
+            offscreen_state.tone_sets[frame] = tone_allocated[frames_in_flight + frame];
+        }
         VkSamplerCreateInfo sampler_info{};
         sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
         sampler_info.magFilter = VK_FILTER_NEAREST;
@@ -5352,6 +5475,7 @@ void fragment() {
         }
         for (const auto framebuffer : framebuffers) vkDestroyFramebuffer(device, framebuffer, nullptr);
         framebuffers.clear();
+        destroy_offscreen();
         destroy_scene_targets();
         for (auto& shadow : shadow_attachments) {
             vkDestroyFramebuffer(device, shadow.framebuffer, nullptr);
@@ -6417,8 +6541,10 @@ void fragment() {
         static const auto build_stage = profiler().intern("Build render scene");
         static const auto upload_stage = profiler().intern("Upload frame data");
         static const auto record_stage = profiler().intern("Record draw commands");
-        const auto region = (overlay ? overlay->scene_viewport() : EditorViewport{}).pixels(
-            swapchain_extent.width, swapchain_extent.height);
+        const auto* const off = offscreen;
+        const auto region = off ? off->region
+                                : (overlay ? overlay->scene_viewport() : EditorViewport{}).pixels(
+                                      swapchain_extent.width, swapchain_extent.height);
         {
             // Without these, shader materials draw as ordinary grey surfaces and effects are off.
             const auto saved_error = last_error;
@@ -6428,8 +6554,10 @@ void fragment() {
             }
         }
         if (!ensure_scene_targets({region.width, region.height})) return false;
-        const bool lighting_wanted = scene != nullptr && prepare_global_illumination();
-        const bool reflections_wanted = scene != nullptr && prepare_reflections();
+        // Offscreen views draw without global illumination and reflections, which keep history in
+        // the main view's targets.
+        const bool lighting_wanted = !off && scene != nullptr && prepare_global_illumination();
+        const bool reflections_wanted = !off && scene != nullptr && prepare_reflections();
         // Both effects start once the other frame's targets can serve as history.
         const bool history_ready = previous_frame_valid &&
                                    scene_targets_rendered[(current_frame + 1U) % frames_in_flight];
@@ -6442,7 +6570,7 @@ void fragment() {
             render_scene =
                 build_render_scene(*scene, *assets,
                                    static_cast<float>(region.width) / static_cast<float>(region.height),
-                                   overlay != nullptr ? overlay->view_override() : nullptr, false,
+                                   off ? &off->view : overlay != nullptr ? overlay->view_override() : nullptr, false,
                                    lighting_wanted || reflections_wanted,
                                    capture_buffer == VK_NULL_HANDLE ? render_interpolation : nullptr);
         if (render_scene.deformation_overflow) {
@@ -6452,8 +6580,9 @@ void fragment() {
         cpu_stage.reset();
         cpu_stage.emplace(upload_stage);
         sync_sky_panorama(render_scene.sky);
-        prepare_material_preview();
-        if (scene || preview_material) sync_shader_materials(render_scene);
+        if (off) preview_material.reset();
+        else prepare_material_preview();
+        if (scene || preview_material) sync_shader_materials(render_scene, off != nullptr);
         if (!write_frame_parameters(render_scene)) return false;
         // Animated shaders follow the host's clock in live views and the frame's time in captures.
         const float frame_time = static_cast<float>(
@@ -6850,7 +6979,9 @@ void fragment() {
 
         {
             RELAY_PROFILE_SCOPE("Particles");
-            prepare_particles(commands, render_scene, scene);
+            // The engine's particles belong to the main scene.
+            if (off) particle_list = nullptr;
+            else prepare_particles(commands, render_scene, scene);
         }
         // Forward pass: transparent geometry, then editor-only overlays.
         scene_pass_info.renderPass = scene_render_pass;
@@ -7014,7 +7145,7 @@ void fragment() {
             bind_scene_state(transparent_pipeline);
         }
         {
-            if (overlay && overlay->ground_grid_visible() && capture_buffer == VK_NULL_HANDLE) {
+            if (off ? off->grid : (overlay && overlay->ground_grid_visible() && capture_buffer == VK_NULL_HANDLE)) {
                 DrawPushConstants grid_constants{};
                 grid_constants.model_view_projection = render_scene.camera.view_projection.values;
                 grid_constants.model[0] = static_cast<float>(render_scene.camera_position.x);
@@ -7026,8 +7157,9 @@ void fragment() {
                                    sizeof(grid_constants), &grid_constants);
                 vkCmdDraw(commands, 6, 2, 0, 0);
             }
-            const auto selected = overlay && capture_buffer == VK_NULL_HANDLE
-                                      ? overlay->selected_entities() : std::vector<Entity>{};
+            const auto selected = off                                       ? off->selected
+                                  : overlay && capture_buffer == VK_NULL_HANDLE ? overlay->selected_entities()
+                                                                                : std::vector<Entity>{};
             if (!selected.empty()) {
                 const auto draw_selection = [&](bool outline) {
                     vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -7079,7 +7211,7 @@ void fragment() {
         previous_view = render_scene.camera.view.values;
         if (capture_buffer == VK_NULL_HANDLE) last_frame_time = frame_time;
         previous_projection = render_scene.camera.projection.values;
-        {
+        if (!off) {
             RELAY_PROFILE_SCOPE("Game interface");
             prepare_game_ui(commands, region, scene);
         }
@@ -7088,19 +7220,19 @@ void fragment() {
         swapchain_clear[1].depthStencil = {1.0F, 0U};
         VkRenderPassBeginInfo render_info{};
         render_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        render_info.renderArea.extent = swapchain_extent;
+        render_info.renderArea.extent = off ? offscreen_output.extent : swapchain_extent;
         render_info.clearValueCount = static_cast<std::uint32_t>(swapchain_clear.size());
         render_info.pClearValues = swapchain_clear.data();
         // The display pass converts linear HDR into the swapchain's SDR color space. The editor
         // callback places this image at the viewport's position in ImGui's draw order.
         render_info.renderPass = render_pass;
-        render_info.framebuffer = framebuffers[image_index];
+        render_info.framebuffer = off ? offscreen_output.framebuffer : framebuffers[image_index];
         vkCmdBeginRenderPass(commands, &render_info, VK_SUBPASS_CONTENTS_INLINE);
         const auto draw_tone = [&] {
             vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, tone_pipeline);
             VkViewport viewport{};
-            viewport.width = static_cast<float>(swapchain_extent.width);
-            viewport.height = static_cast<float>(swapchain_extent.height);
+            viewport.width = static_cast<float>(off ? offscreen_output.extent.width : swapchain_extent.width);
+            viewport.height = static_cast<float>(off ? offscreen_output.extent.height : swapchain_extent.height);
             viewport.maxDepth = 1.0F;
             VkRect2D scissor{};
             scissor.offset = {static_cast<std::int32_t>(region.x),
@@ -7121,7 +7253,7 @@ void fragment() {
                                0U, sizeof(settings), &settings);
             vkCmdDraw(commands, 3U, 1U, 0U, 0U);
             ++latest_draw_calls;
-            draw_game_ui(commands, region);
+            if (!off) draw_game_ui(commands, region);
         };
         if (overlay != nullptr && overlay_ready && capture_buffer == VK_NULL_HANDLE) {
             RELAY_PROFILE_SCOPE("Record editor UI");
@@ -7136,10 +7268,13 @@ void fragment() {
                 VkBufferImageCopy copy{};
                 copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 copy.imageSubresource.layerCount = 1;
-                copy.imageExtent = {swapchain_extent.width, swapchain_extent.height, 1};
-                vkCmdCopyImageToBuffer(commands, swapchain_images[image_index],
+                copy.imageExtent = off ? VkExtent3D{offscreen_output.extent.width, offscreen_output.extent.height, 1}
+                                       : VkExtent3D{swapchain_extent.width, swapchain_extent.height, 1};
+                vkCmdCopyImageToBuffer(commands, off ? offscreen_output.color.image : swapchain_images[image_index],
                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, capture_buffer, 1, &copy);
             }
+            // An offscreen image is never presented, so it needs no barrier to the present layout.
+            if (!off) {
             VkImageMemoryBarrier present_barrier{};
             present_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             present_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
@@ -7155,6 +7290,7 @@ void fragment() {
             vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
                                  1, &present_barrier);
+            }
         }
         if (capture_buffer != VK_NULL_HANDLE) mark_gpu_pass(commands, capture_pass);
         result = vkEndCommandBuffer(commands);
@@ -7296,6 +7432,7 @@ void fragment() {
             return false;
         }
         current_frame = (current_frame + 1U) % frames_in_flight;
+        if (capture_buffer == VK_NULL_HANDLE) render_overlay_views();
         return true;
     }
 
@@ -7310,6 +7447,111 @@ void fragment() {
             }
         }
         return std::nullopt;
+    }
+
+    // Draws one offscreen view of the overlay synchronously, between frames: the same passes as the
+    // main view, recorded with the offscreen view's targets and history swapped in, into this frame
+    // slot's buffers (idle once its fence is signalled), then read back after waiting for it.
+    bool render_offscreen_view(const OffscreenView& view, OwnedFrame& output) {
+        if (submission_failed || !transfer_source_supported || swapchain == VK_NULL_HANDLE || view.scene == nullptr ||
+            view.width < 16U || view.height < 16U || view.width > 4096U || view.height > 4096U)
+            return false;
+        collect_readbacks(false);
+        if (!collect_upload_batch() || !refresh_mesh_assets()) return false;
+        auto result = vkWaitForFences(device, 1, &frame_fences[current_frame], VK_TRUE,
+                                      std::numeric_limits<std::uint64_t>::max());
+        if (result != VK_SUCCESS) {
+            last_error = vk_error("vkWaitForFences", result);
+            return false;
+        }
+        for (const auto semaphore : retired_upload_semaphores[current_frame]) vkDestroySemaphore(device, semaphore, nullptr);
+        retired_upload_semaphores[current_frame].clear();
+        old_asset_frame_pending[current_frame] = false;
+        if (!collect_upload_batch()) return false;
+        read_gpu_timings();
+        const VkExtent2D extent{view.width, view.height};
+        if (!ensure_offscreen_output(extent)) return false;
+        OffscreenFrame frame;
+        // A scene with no sky of its own is shown under Relay's default one with its sun, as a
+        // material preview is, so a bare template is not drawn in the dark.
+        std::unique_ptr<Scene> lit_copy;
+        if (!view.scene->active_sky()) {
+            lit_copy = std::make_unique<Scene>(*view.scene);
+            const auto environment = lit_copy->create("Default environment");
+            Sky sky;
+            sky.fog = false;
+            (void)lit_copy->set_sky(environment, sky);
+            (void)lit_copy->set_transform(environment, {{}, {-40.0, -35.0, 0.0}, {1.0, 1.0, 1.0}});
+            Light sun;
+            sun.type = Light::Type::directional;
+            sun.color = default_sun_color;
+            sun.intensity = default_sun_intensity;
+            (void)lit_copy->set_light(environment, sun);
+        }
+        frame.scene = lit_copy ? lit_copy.get() : view.scene;
+        frame.view = view.view;
+        frame.region = {0U, 0U, view.width, view.height};
+        frame.selected = view.selected;
+        frame.grid = view.grid;
+        swap_view(offscreen_state);
+        offscreen = &frame;
+        bool recorded = true;
+        vkResetCommandBuffer(command_buffers[current_frame], 0);
+        // Targets for another size are made inside; they wait for the GPU, which is idle here.
+        recorded = record_commands(command_buffers[current_frame], 0U, 0.0F, frame.scene, offscreen_output.readback);
+        offscreen = nullptr;
+        if (!recorded) {
+            swap_view(offscreen_state);
+            return false;
+        }
+        const std::array wait_semaphores{upload_complete};
+        const std::array<VkPipelineStageFlags, 1> wait_stages{VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                                                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT};
+        VkSubmitInfo submit_info{};
+        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit_info.waitSemaphoreCount = upload_wait_pending ? 1U : 0U;
+        submit_info.pWaitSemaphores = wait_semaphores.data();
+        submit_info.pWaitDstStageMask = wait_stages.data();
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &command_buffers[current_frame];
+        vkResetFences(device, 1, &frame_fences[current_frame]);
+        result = vkQueueSubmit(graphics_queue, 1, &submit_info, frame_fences[current_frame]);
+        if (result == VK_SUCCESS)
+            result = vkWaitForFences(device, 1, &frame_fences[current_frame], VK_TRUE,
+                                     std::numeric_limits<std::uint64_t>::max());
+        swap_view(offscreen_state);
+        if (result != VK_SUCCESS) {
+            submission_failed = true;
+            last_error = vk_error("offscreen view submit", result);
+            return false;
+        }
+        if (upload_wait_pending) {
+            retired_upload_semaphores[current_frame].push_back(upload_complete);
+            upload_complete = VK_NULL_HANDLE;
+            upload_wait_pending = false;
+        }
+        // Its timestamps describe another scene; keep them out of the profiler.
+        timestamp_submitted[current_frame] = false;
+        void* mapped = nullptr;
+        const auto bytes = static_cast<std::size_t>(extent.width) * extent.height * 4U;
+        if (vkMapMemory(device, offscreen_output.readback_memory, 0U, bytes, 0U, &mapped) != VK_SUCCESS) return false;
+        output.width = extent.width;
+        output.height = extent.height;
+        output.rgba.assign(static_cast<const std::uint8_t*>(mapped), static_cast<const std::uint8_t*>(mapped) + bytes);
+        vkUnmapMemory(device, offscreen_output.readback_memory);
+        if (swapchain_format == VK_FORMAT_B8G8R8A8_SRGB || swapchain_format == VK_FORMAT_B8G8R8A8_UNORM)
+            for (std::size_t offset = 0; offset < bytes; offset += 4U) std::swap(output.rgba[offset], output.rgba[offset + 2U]);
+        return true;
+    }
+
+    // After a frame is presented: the overlay's offscreen views, one picture each.
+    void render_overlay_views() {
+        if (overlay == nullptr || !overlay_ready) return;
+        auto views = overlay->offscreen_views();
+        for (auto& view : views) {
+            OwnedFrame frame;
+            if (render_offscreen_view(view, frame) && view.ready) view.ready(std::move(frame));
+        }
     }
 
     bool create_capture_buffer(VkBuffer& buffer, VkDeviceMemory& memory) {

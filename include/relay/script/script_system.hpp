@@ -43,10 +43,21 @@ struct ScriptRuntimeError {
     std::string message;
 };
 
+// What a property's editor offers, as declared in code beside the default: entity properties may
+// be limited to nodes running a behaviour, carrying an engine component or of a node type (with
+// its subtypes); asset properties list the file kinds they take, comma separated.
+struct ScriptPropertyFilter {
+    enum class Kind : std::uint8_t { none, behaviour, component, node_type, asset_kinds } kind{Kind::none};
+    std::string text;
+    auto operator<=>(const ScriptPropertyFilter&) const = default;
+};
+[[nodiscard]] std::string_view script_property_filter_name(ScriptPropertyFilter::Kind kind);
+
 // A behaviour the loaded library registers, with its declared properties at their code defaults.
 struct ScriptBehaviourInfo {
     std::string name;
     std::vector<ScriptProperty> properties;
+    std::vector<ScriptPropertyFilter> filters; // Parallel to `properties`.
 };
 
 struct ScriptStatus {

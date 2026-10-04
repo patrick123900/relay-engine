@@ -29,6 +29,9 @@ public:
     void draw(ImDrawList* target, const UiDrawList& list, ImVec2 origin, float scale, ImVec2 clip_min,
               ImVec2 clip_max);
     void clear();
+    // As AssetThumbnails::release: retire the textures for the backend to destroy.
+    void release();
+    [[nodiscard]] bool idle() const { return retired_.empty(); }
 
 private:
     struct Texture {

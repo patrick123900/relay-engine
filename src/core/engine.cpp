@@ -8,10 +8,11 @@
 
 namespace relay {
 
-Engine::Engine(EngineConfig config)
-    : config_(config), renderer_(config.width, config.height), scene_history_(scene_) {
+Engine::Engine(EngineConfig config, AssetRegistry* shared_assets)
+    : config_(config), renderer_(config.width, config.height), scene_history_(scene_),
+      assets_(shared_assets ? shared_assets : &owned_assets_), material_owner_(shared_assets ? this : nullptr) {
     mode_ = config.editor_mode ? RuntimeMode::editor : RuntimeMode::game;
-    physics_.set_assets(&assets_);
+    physics_.set_assets(assets_);
     std::ostringstream message;
     message << "Relay runtime initialized at " << config_.width << 'x' << config_.height;
     logs_.write(LogLevel::info, message.str());
@@ -35,6 +36,7 @@ Engine::Engine(EngineConfig config)
 }
 
 Engine::~Engine() {
+    if (material_owner_) assets_->forget_owner(material_owner_);
     if (gpu_flush_) gpu_flush_();
     if (video_.status().recording) {
         std::string ignored_error;
@@ -249,7 +251,7 @@ const LogBuffer& Engine::logs() const {
 Scene& Engine::scene() { return scene_; }
 const Scene& Engine::scene() const { return scene_; }
 SceneHistory& Engine::scene_history() { return scene_history_; }
-AssetRegistry& Engine::assets() { return assets_; }
+AssetRegistry& Engine::assets() { return *assets_; }
 
 InputState& Engine::input() {
     sync_input_map();
@@ -296,7 +298,7 @@ bool Engine::set_graphics_settings(const GraphicsSettings& settings, std::string
     return true;
 }
 
-const AssetRegistry& Engine::assets() const { return assets_; }
+const AssetRegistry& Engine::assets() const { return *assets_; }
 
 AudioSystem& Engine::audio() {
     sync_audio();
@@ -311,10 +313,10 @@ void Engine::sync_sky() {
     const auto sky = scene_.active_sky();
     const auto* record = sky ? scene_.get(*sky) : nullptr;
     if (!record || record->sky->material.empty()) {
-        assets_.set_sky_material(nullptr);
+        assets_->set_sky_material(nullptr, material_owner_);
         return;
     }
-    assets_.set_sky_material(sky_materials_.resolve(asset_root(), record->sky->material));
+    assets_->set_sky_material(sky_materials_.resolve(asset_root(), record->sky->material), material_owner_);
 }
 
 void Engine::sync_materials() {
@@ -332,7 +334,7 @@ void Engine::sync_materials() {
         for (const auto& effect : scene_.get(*post)->post_process->effects)
             if (effect.enabled) use(effect.material);
     use(previewed_material_);
-    assets_.set_shader_materials(std::move(used));
+    assets_->set_shader_materials(std::move(used), material_owner_);
 }
 
 void Engine::sync_render_assets() {
@@ -487,7 +489,7 @@ void Engine::advance_animations() {
         if (!record->animator || !record->animator->playing)
             continue;
         auto &animator = *record->animator;
-        const auto *model = assets_.find_model(animator.model);
+        const auto *model = assets_->find_model(animator.model);
         if (!model || animator.clip >= model->clips.size())
             continue;
         const auto duration = model->clips[animator.clip].duration_seconds;

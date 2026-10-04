@@ -21,6 +21,8 @@
 
 namespace relay {
 
+class AssetRegistry;
+
 class EditorUi : public EditorOverlay {
 public:
     // Handles one request line and returns one response line, matching ControlProtocol::handle.
@@ -56,6 +58,19 @@ public:
     // Host seam: whether the running game wants the cursor locked (the input map's lock_mouse
     // until a script changes it). A cursor a script frees for a menu appears mid-viewport.
     void set_game_cursor_locked(bool locked);
+    // Opens a project template in its own editing window (a floating Hierarchy, viewport and
+    // Inspector over a private copy of the template), or focuses it when it is already open. False,
+    // with a status message, when no project is open or the template cannot be read.
+    bool open_template(std::string_view name);
+    [[nodiscard]] std::size_t template_window_count() const;
+    // The registry of the engine the editor edits, which template windows share so the window's
+    // renderer can draw their scenes too. Without one they draw with the CPU preview.
+    void set_shared_assets(AssetRegistry* assets);
+    [[nodiscard]] std::vector<OffscreenView> offscreen_views() override;
+    // Whether the named template window currently shows a GPU-rendered picture.
+    [[nodiscard]] bool template_gpu_picture(std::string_view name) const;
+    // Whether the named template's window has edits that are not saved.
+    [[nodiscard]] bool template_dirty(std::string_view name) const;
     // Changes editor view state without mutating the scene.
     void set_panel_visible(std::string_view name, bool visible);
     [[nodiscard]] bool panel_visible(std::string_view name) const;

@@ -5,9 +5,13 @@
 #include "relay/control/generated_protocol.hpp"
 #include "relay/core/engine.hpp"
 #include "relay/core/json.hpp"
+#include "relay/scene/components.hpp"
+#include "relay/scene/scene_edit.hpp"
 #include "relay/scene/scene_io.hpp"
 #include "relay/script/script_system.hpp"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -1265,6 +1269,246 @@ void component_scripts(relay::Engine& engine, relay::ControlProtocol& protocol) 
     scene.restore_state(earlier);
 }
 
+const char* references_source = R"(#include "relay_script.hpp"
+
+class Health : public relay::Behaviour {
+public:
+    void properties(relay::Properties& p) override { p.add("hp", hp); }
+    void hurt(int amount) { hp -= amount; }
+    int remaining() const { return hp; }
+private:
+    int hp = 10;
+};
+RELAY_BEHAVIOUR(Health)
+
+class Tracker : public relay::Behaviour {
+public:
+    void properties(relay::Properties& p) override {
+        p.add("target", target);
+        p.add("lamp", lamp, relay::Only::component(relay::Component::light));
+        p.add("health", health);
+        p.add("kind", kind);
+        p.add("clip", clip);
+        p.add("prefab", prefab);
+    }
+    void on_start() override {
+        relay::world::log("target " + (target ? target.name() : std::string{"none"}));
+        relay::world::log("lamp " + (lamp ? lamp.name() : std::string{"none"}));
+        relay::world::log("health on " + (health.entity() ? health.entity().name() : std::string{"none"}) +
+                          (health ? " hp " + std::to_string(health->remaining()) : std::string{" missing"}));
+        relay::world::log("kind " + std::string{relay::component_id(kind)} + (target.has_component(kind) ? " held" : " absent"));
+        relay::world::log("clip " + (clip ? clip.path() : std::string{"none"}));
+        relay::world::log("prefab " + (prefab ? prefab.path() : std::string{"none"}));
+        relay::world::log("healthy nodes " + std::to_string(relay::world::entities_with<Health>().size()) + " scripts " +
+                          std::to_string(relay::world::scripts<Health>().size()));
+        relay::world::log("own script " + std::string{self().script<Tracker>() == this ? "found" : "lost"} +
+                          (self().script<Health>() ? " health too" : " no health"));
+    }
+    void on_update(double) override {
+        if (relay::world::frame() == 2 && health) {
+            health->hurt(3);
+            relay::world::log("hurt to " + std::to_string(health->remaining()));
+        }
+        if (relay::world::frame() == 4 && health.entity() && !health) relay::world::log("health lost");
+    }
+private:
+    relay::Entity target;
+    relay::Entity lamp;
+    relay::Ref<Health> health;
+    relay::Component kind = relay::Component::light;
+    relay::AudioClip clip{"sounds/default.wav"};
+    relay::Template prefab;
+};
+RELAY_BEHAVIOUR(Tracker)
+)";
+
+std::string property_value(const std::string& json, const std::string& name) {
+    const auto at = json.find("\"name\":\"" + name + "\"");
+    if (at == std::string::npos) return {};
+    const auto end = json.find("}", json.find("\"value\":", at));
+    return json.substr(at, end - at + 1U);
+}
+
+void references(relay::Engine& engine, relay::ControlProtocol& protocol) {
+    expect(ok(write_script(protocol, "references.cpp", references_source)) && ok(request(protocol, "scripts.build")),
+           "the references script is written");
+    const auto status = wait_for_build(engine, protocol);
+    expect(status.find("\"state\":\"ready\"") != std::string::npos,
+           "the references script compiles: " + status.substr(0, 800));
+    // Declared types and their filters reach the Inspector and agents.
+    const auto target_info = property_value(status, "target");
+    const auto lamp_info = property_value(status, "lamp");
+    const auto health_info = property_value(status, "health");
+    const auto kind_info = property_value(status, "kind");
+    const auto clip_info = property_value(status, "clip");
+    expect(target_info.find("\"type\":\"entity\"") != std::string::npos &&
+               target_info.find("\"filter\"") == std::string::npos,
+           "a plain node reference has no filter: " + target_info);
+    expect(lamp_info.find("\"type\":\"entity\"") != std::string::npos &&
+               lamp_info.find("\"filter\":{\"kind\":\"component\",\"text\":\"light\"}") != std::string::npos,
+           "a node reference can be limited to a component: " + lamp_info);
+    expect(health_info.find("\"filter\":{\"kind\":\"behaviour\",\"text\":\"Health\"}") != std::string::npos,
+           "a script reference is limited to its behaviour: " + health_info);
+    expect(kind_info.find("\"type\":\"component\"") != std::string::npos &&
+               kind_info.find("\"value\":\"light\"") != std::string::npos,
+           "a component type property reads its default id: " + kind_info);
+    expect(clip_info.find("\"type\":\"asset\"") != std::string::npos &&
+               clip_info.find("\"filter\":{\"kind\":\"asset_kinds\",\"text\":\"audio\"}") != std::string::npos &&
+               clip_info.find("sounds/default.wav") != std::string::npos,
+           "an asset property names its kind and keeps its code default: " + clip_info);
+
+    // The SDK's Component enum must name exactly the engine's components (scripts aside).
+    {
+        std::ifstream header(std::filesystem::path{relay::JsonParser(status).parse()
+                                                       ->object()->at("result").object()->at("sdk").string()->c_str()} /
+                             "relay_script.hpp");
+        const std::string text((std::istreambuf_iterator<char>(header)), std::istreambuf_iterator<char>());
+        const auto begin = text.find("component_ids[] = {");
+        const auto end = text.find("};", begin);
+        std::set<std::string> listed;
+        for (std::size_t at = text.find('"', begin); at != std::string::npos && at < end;) {
+            const auto close = text.find('"', at + 1U);
+            listed.insert(text.substr(at + 1U, close - at - 1U));
+            at = text.find('"', close + 1U);
+        }
+        std::set<std::string> engine_ids;
+        for (const auto& kind : relay::engine_components())
+            if (kind.id != "script") engine_ids.insert(std::string{kind.id});
+        expect(begin != std::string::npos && listed == engine_ids,
+               "the SDK's Component enum names exactly the engine's components");
+    }
+    auto& scene = engine.scene();
+    const auto earlier = scene.capture_state();
+    expect(ok(request(protocol, "scene.clear")), "start the references scene empty");
+    const auto target = scene.create("Target");
+    const auto lamp = scene.create("Lamp");
+    const auto victim = scene.create("Victim");
+    const auto watcher = scene.create("Watcher");
+    expect(ok(request(protocol, "component.add", "\"entity\":\"" + lamp.to_string() + "\",\"component\":\"light\"")) &&
+               ok(request(protocol, "component.add", "\"entity\":\"" + target.to_string() + "\",\"component\":\"light\"")),
+           "give the lamp and target a light");
+    expect(ok(add_script(protocol, victim, "Health")) && ok(add_script(protocol, watcher, "Tracker")),
+           "attach the scripts");
+    const auto point = [&](const std::string& property, const std::string& value) {
+        return set_property(protocol, watcher, 0, property, value);
+    };
+    expect(ok(point("target", "\"target\":\"" + target.to_string() + "\"")) &&
+               ok(point("lamp", "\"target\":\"" + lamp.to_string() + "\"")) &&
+               ok(point("health", "\"target\":\"" + victim.to_string() + "\"")) &&
+               ok(point("clip", "\"asset\":\"sounds/chosen.wav\"")) &&
+               ok(point("prefab", "\"asset\":\"templates/Thing.relay-template.json\"")) &&
+               ok(point("kind", "\"component\":\"light\"")),
+           "references, assets and component types are set through the protocol");
+    expect(!ok(point("target", "\"target\":\"999:999\"")) && !ok(point("kind", "\"component\":\"nonsense\"")) &&
+               !ok(point("target", "\"number\":4,\"target\":\"" + target.to_string() + "\"")),
+           "a reference to a missing node, an unknown component and two values at once are refused");
+    const auto listed = request(protocol, "scene.inspect", "\"entity\":\"" + watcher.to_string() + "\"");
+    expect(listed.find("\"name\":\"target\",\"type\":\"entity\",\"value\":\"" + target.to_string() + "\"") !=
+               std::string::npos,
+           "the scene reports a node reference as an entity handle: " + listed.substr(0, 900));
+
+    // Saving and loading keeps the references.
+    expect(ok(request(protocol, "scene.save", "\"filename\":\"references.relay.json\"")) &&
+               ok(request(protocol, "scene.load", "\"filename\":\"references.relay.json\"")),
+           "a scene with references saves and loads");
+    relay::Entity loaded_watcher{};
+    for (const auto entity : scene.entities())
+        if (scene.get(entity)->name == "Watcher") loaded_watcher = entity;
+    expect(loaded_watcher.valid() && scene.get(loaded_watcher)->scripts.size() == 1U &&
+               std::any_of(scene.get(loaded_watcher)->scripts[0].properties.begin(),
+                           scene.get(loaded_watcher)->scripts[0].properties.end(),
+                           [&](const relay::ScriptProperty& property) {
+                               return property.name == "health" &&
+                                      property.type == relay::ScriptProperty::Type::entity &&
+                                      scene.get(property.entity) &&
+                                      scene.get(property.entity)->name == "Victim";
+                           }),
+           "a reloaded scene still points the reference at the right node");
+    const auto saved = scene.capture_state();
+
+    expect(engine.run_game(), "the references scene runs");
+    expect(logged(engine, "target Target") && logged(engine, "lamp Lamp") &&
+               logged(engine, "health on Victim hp 10") && logged(engine, "kind light held") &&
+               logged(engine, "clip sounds/chosen.wav") && logged(engine, "prefab templates/Thing.relay-template.json"),
+           "node, script, asset and component values reach the script");
+    expect(logged(engine, "healthy nodes 1 scripts 1") && logged(engine, "own script found no health"),
+           "scripts list and find other scripts by type");
+    engine.step(3);
+    expect(logged(engine, "hurt to 7"), "a script reference calls the other script's methods");
+    expect(engine.stop_game(), "the references scene stops");
+    scene.restore_state(saved);
+
+    // Deleting a referenced node clears the reference instead of leaving a stale handle.
+    expect(ok(request(protocol, "scene.destroy", "\"entity\":\"" + target.to_string() + "\"")) ||
+               ok(request(protocol, "scene.destroy_many", "\"entities\":[\"" + target.to_string() + "\"]")),
+           "delete the referenced node");
+    bool cleared = false;
+    for (const auto entity : scene.entities())
+        if (scene.get(entity)->name == "Watcher")
+            for (const auto& property : scene.get(entity)->scripts[0].properties)
+                if (property.name == "target") cleared = !property.entity.valid();
+    expect(cleared, "deleting a node clears the references to it");
+
+    scene.restore_state(saved);
+    // Duplicating a tree remaps references inside it and keeps ones outside; copying to the clipboard
+    // drops the ones outside, since handles mean nothing in another scene.
+    const auto parent = scene.create("Group");
+    const auto inner = scene.create("Inner", parent);
+    const auto holder = scene.create("Holder", parent);
+    std::vector<relay::Script> scripts{relay::Script{"Tracker", true, {}}};
+    relay::ScriptProperty inside;
+    inside.name = "target";
+    inside.type = relay::ScriptProperty::Type::entity;
+    inside.entity = inner;
+    relay::ScriptProperty outside;
+    outside.name = "lamp";
+    outside.type = relay::ScriptProperty::Type::entity;
+    outside.entity = lamp;
+    scripts[0].properties = {inside, outside};
+    expect(scene.set_scripts(holder, scripts), "a script may reference nodes that exist");
+    relay::ScriptProperty missing = outside;
+    missing.entity = relay::Entity{4000U, 1U};
+    scripts[0].properties = {missing};
+    expect(!scene.set_scripts(holder, scripts), "a script may not reference a node that does not exist");
+    scripts[0].properties = {inside, outside};
+    const auto copy = scene.duplicate(parent);
+    relay::Entity copied_holder{}, copied_inner{};
+    for (const auto entity : scene.entities()) {
+        if (scene.get(entity)->parent == copy && scene.get(entity)->name == "Holder") copied_holder = entity;
+        if (scene.get(entity)->parent == copy && scene.get(entity)->name == "Inner") copied_inner = entity;
+    }
+    const auto& duplicated = scene.get(copied_holder)->scripts[0].properties;
+    expect(copy.valid() && duplicated.size() == 2U && duplicated[0].entity == copied_inner &&
+               duplicated[1].entity == lamp,
+           "duplicating a tree remaps references inside it and keeps those outside");
+    const std::array selection{parent};
+    const auto clipboard = relay::copy_selection(scene, selection);
+    const auto pasted = clipboard ? relay::paste_selection(scene, *clipboard, {}, true) : std::vector<relay::Entity>{};
+    relay::Entity pasted_holder{}, pasted_inner{};
+    for (const auto entity : scene.entities()) {
+        if (!pasted.empty() && scene.get(entity)->parent == pasted.front() && scene.get(entity)->name == "Holder")
+            pasted_holder = entity;
+        if (!pasted.empty() && scene.get(entity)->parent == pasted.front() && scene.get(entity)->name == "Inner")
+            pasted_inner = entity;
+    }
+    const auto& pasted_properties = scene.get(pasted_holder)->scripts[0].properties;
+    expect(pasted.size() == 1U && pasted_properties.size() == 2U && pasted_properties[0].entity == pasted_inner &&
+               !pasted_properties[1].entity.valid(),
+           "pasting remaps references inside the copy and clears those outside it");
+    // A clipboard made for pasting in place (duplicate many, Entity::clone) keeps outside references.
+    const auto in_place = relay::copy_selection(scene, selection, true);
+    const auto placed = in_place ? relay::paste_selection(scene, *in_place, {}, true) : std::vector<relay::Entity>{};
+    relay::Entity placed_holder{};
+    for (const auto entity : scene.entities())
+        if (!placed.empty() && scene.get(entity)->parent == placed.front() && scene.get(entity)->name == "Holder")
+            placed_holder = entity;
+    const auto& kept = scene.get(placed_holder)->scripts[0].properties;
+    expect(placed.size() == 1U && kept.size() == 2U && kept[0].entity != inner && kept[0].entity.valid() &&
+               kept[1].entity == lamp,
+           "an in-place copy remaps references inside it and keeps those outside");
+    scene.restore_state(earlier);
+}
+
 } // namespace
 
 int main() {
@@ -1294,6 +1538,7 @@ int main() {
         game_interface(engine, protocol);
         particle_scripts(engine, protocol);
         component_scripts(engine, protocol);
+        references(engine, protocol);
         compile_errors(engine, protocol);
         demo_first_person(engine, protocol);
     } catch (const std::exception& error) {

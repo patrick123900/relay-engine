@@ -29,7 +29,8 @@ std::optional<std::vector<Entity>> selection_roots(const Scene& scene,
 }
 
 std::optional<SceneClipboard> copy_selection(const Scene& scene,
-                                            const std::span<const Entity> selection) {
+                                            const std::span<const Entity> selection,
+                                            const bool same_scene) {
     auto roots = selection_roots(scene, selection);
     if (!roots) return {};
     SceneClipboard result;
@@ -51,11 +52,17 @@ std::optional<SceneClipboard> copy_selection(const Scene& scene,
             node.record.model_node.reset();
         // Likewise a joint to a node outside the copy is disabled rather than bound to whatever
         // that handle names where it is pasted.
-        if (node.record.joint && node.record.joint->connected.valid() &&
+        if (!same_scene && node.record.joint && node.record.joint->connected.valid() &&
             !included.contains(node.record.joint->connected)) {
             node.record.joint->connected = {};
             node.record.joint->enabled = false;
         }
+        // Script references to nodes outside the copy are cleared for the same reason.
+        if (!same_scene)
+            for (auto& script : node.record.scripts)
+                for (auto& property : script.properties)
+                    if (property.type == ScriptProperty::Type::entity && property.entity.valid() &&
+                        !included.contains(property.entity)) property.entity = {};
     }
     return result;
 }
@@ -78,8 +85,23 @@ std::vector<Entity> paste_selection(Scene& scene, const SceneClipboard& clipboar
                         : sibling && scene.contains(record.parent) ? record.parent : parent;
         if (record.camera) record.camera->active = false;
         if (record.model_node) record.model_node->root = copies.at(record.model_node->root);
-        if (record.joint && record.joint->connected.valid())
-            record.joint->connected = copies.at(record.joint->connected);
+        // References into the pasted trees point at the copies. Ones outside them (only a same-scene
+        // clipboard has any) keep their node while it exists.
+        if (record.joint && record.joint->connected.valid()) {
+            const auto partner = copies.find(record.joint->connected);
+            if (partner != copies.end()) record.joint->connected = partner->second;
+            else if (!scene.contains(record.joint->connected)) {
+                record.joint->connected = {};
+                record.joint->enabled = false;
+            }
+        }
+        for (auto& script : record.scripts)
+            for (auto& property : script.properties)
+                if (property.type == ScriptProperty::Type::entity && property.entity.valid()) {
+                    const auto target = copies.find(property.entity);
+                    if (target != copies.end()) property.entity = target->second;
+                    else if (!scene.contains(property.entity)) property.entity = {};
+                }
         *scene.get(copies.at(node.original)) = std::move(record);
     }
     std::set<std::string> names;

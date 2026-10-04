@@ -1,3 +1,4 @@
+#include "FirstPersonController.hpp"
 #include "relay_script.hpp"
 
 #include <cmath>
@@ -8,18 +9,14 @@
 class MusicSwitch : public relay::Behaviour {
 public:
     void properties(relay::Properties& p) override {
-        p.add("music_name", music_name);
+        p.add("music", music, relay::Only::component(relay::Component::music_player));
         p.add("reach", reach);
-        p.add("player_name", player_name);
-        p.add("camera_name", camera_name);
+        p.add("player", player);
     }
 
     void on_start() override {
         rest = self().position();
-        music = relay::world::find(music_name);
-        player = relay::world::find(player_name);
-        if (player) camera = player.child(camera_name);
-        if (!music) relay::world::warn("no node named " + music_name + " to switch");
+        if (!music) relay::world::warn("no music player is assigned to switch");
     }
 
     void on_update(double dt) override {
@@ -27,18 +24,21 @@ public:
             held -= dt;
             self().set_position(held > 0.0 ? rest - relay::Vec3{0.0, 0.04, 0.0} : rest);
         }
-        if (!camera || !relay::input::pressed("interact")) return;
+        if (!player || !relay::input::pressed("interact")) return;
+        // Aim from where the player looks.
+        const auto camera = player->view();
+        if (!camera) return;
         constexpr double radians = 3.14159265358979323846 / 180.0;
         const auto angles = camera.rotation();
         const double pitch = angles.x * radians, yaw = angles.y * radians;
         const relay::Vec3 forward{-std::cos(pitch) * std::sin(yaw), std::sin(pitch),
                                   -std::cos(pitch) * std::cos(yaw)};
-        const auto hit = relay::world::raycast(camera.world_position(), forward, reach, 0xffffffffu, player);
+        const auto hit = relay::world::raycast(camera.world_position(), forward, reach, 0xffffffffu, player.entity());
         if (hit && hit->entity == self()) press();
     }
 
     void on_contact_begin(relay::Entity other) override {
-        if (other != player) press();
+        if (other != player.entity()) press();
     }
 
 private:
@@ -48,11 +48,9 @@ private:
         held = 0.3;
     }
 
-    std::string music_name = "Soundtrack";
+    relay::Entity music;
     double reach = 3.0;
-    std::string player_name = "First Person Controller";
-    std::string camera_name = "Camera";
-    relay::Entity music, player, camera;
+    relay::Ref<FirstPersonController> player;
     relay::Vec3 rest;
     double held = 0.0;
 };

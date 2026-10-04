@@ -27,6 +27,10 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_editor_camera_frame{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 1> fields_editor_template_open{{
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 64U, "^[A-Za-z0-9_][A-Za-z0-9 _-]*$", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 2> fields_render_capture{{
     {"path", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^(captures/)?[A-Za-z0-9][A-Za-z0-9._-]*\\.(bmp|png)$", ""},
     {"source", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "vulkan|deterministic"},
@@ -504,7 +508,7 @@ constexpr std::array<ProtocolFieldSpec, 4> fields_scene_set_script{{
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 9> fields_scene_set_script_property{{
+constexpr std::array<ProtocolFieldSpec, 12> fields_scene_set_script_property{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"index", ProtocolValueType::integer, true, false, true, true, 0, 31, 0U, 0U, "", ""},
     {"property", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
@@ -512,6 +516,9 @@ constexpr std::array<ProtocolFieldSpec, 9> fields_scene_set_script_property{{
     {"boolean", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"text", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 1024U, "", ""},
     {"vector", ProtocolValueType::number_array, false, false, false, false, 0, 0, 3U, 3U, "", ""},
+    {"target", ProtocolValueType::string, false, true, false, false, 0, 0, 0U, 0U, "^(\\d+:\\d+)?$", ""},
+    {"asset", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 1024U, "", ""},
+    {"component", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 64U, "", ""},
     {"reset", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
@@ -832,7 +839,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_audio_set_spatialization{{
     {"mode", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "stereo|binaural"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 168> methods{{
+constexpr std::array<ProtocolMethodSpec, 170> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -843,6 +850,8 @@ constexpr std::array<ProtocolMethodSpec, 168> methods{{
     {"editor.camera.status", "editor_camera_status", "Inspect editor camera", "Read the live editor inspection viewpoint used by Vulkan captures. Unavailable without an editor. Does not modify scene cameras.", true, false, false, false, false, no_fields},
     {"editor.camera.set", "editor_camera_set", "Position editor inspection camera", "Set the live inspector camera target, orbit angles in radians and distance for visual confirmation using render_capture source vulkan. View-only: no scene or undo changes.", false, false, false, false, false, fields_editor_camera_set},
     {"editor.camera.frame", "editor_camera_frame", "Frame entity in inspection camera", "Frame an entity and its descendant bounds in the live inspection view before Vulkan capture. Does not change selection, scene cameras or undo history.", false, false, false, false, false, fields_editor_camera_frame},
+    {"editor.template.open", "editor_template_open", "Open template window", "Open a project template in the live editor's template window: a floating Hierarchy, viewport and Inspector over a private copy of the template, edited by a person (Save writes the template file). Focuses the window when it is already open. Unavailable without an editor. Agents edit templates by instantiating them in the scene, changing the copy and calling templates.save with replace.", false, false, false, false, false, fields_editor_template_open},
+    {"editor.template.status", "editor_template_status", "Inspect template windows", "List the live editor's open template windows with their names, whether each has unsaved edits and whether its viewport shows a GPU-rendered picture (otherwise the CPU preview). Unavailable without an editor.", true, false, false, false, false, no_fields},
     {"render.capture", "render_capture", "Capture Relay frame", "Save the current rendered frame in Relay's captures directory for visual inspection.", false, false, false, false, false, fields_render_capture},
     {"render.capture_async", "render_capture_async", "Queue Relay frame capture", "Capture real Vulkan or deterministic CPU frames through bounded background image workers.", false, false, false, false, false, fields_render_capture_async},
     {"render.capture_cancel", "render_capture_cancel", "Cancel pending capture", "Cancel a queued image or GPU readback job; writing and completed jobs cannot be cancelled. GPU slots remain alive until their fence completes.", false, false, false, false, false, fields_render_capture_cancel},
@@ -930,7 +939,7 @@ constexpr std::array<ProtocolMethodSpec, 168> methods{{
     {"component.remove", "component_remove", "Remove component", "Remove one component as an undoable transaction. The Transform and imported model animation cannot be removed.", false, true, false, false, false, fields_component_remove},
     {"component.set_enabled", "component_set_enabled", "Enable or disable component", "Switch one component on or off without removing it or losing its settings, like the checkbox on a Unity component, as one undoable transaction. A disabled component stays on the node and in the scene file but does nothing: a disabled mesh renderer is not drawn, a disabled camera or sky is never the one in use, a disabled collider, physics body, joint, script, light, audio source, music player, reverb zone, particle emitter, keyframe animation or interface component is ignored during Run Game and in the editor view. The Transform and imported model animation cannot be disabled.", false, false, false, false, false, fields_component_set_enabled},
     {"scene.set_script", "scene_set_script", "Configure script component", "Change the behaviour or enabled state of one of a node's script components, as an undoable transaction.", false, false, false, false, false, fields_scene_set_script},
-    {"scene.set_script_property", "scene_set_script_property", "Set script property", "Store a value for a behaviour property on one script component, or reset it to the code default. Send exactly one of number, boolean, text or vector unless resetting.", false, false, false, false, false, fields_scene_set_script_property},
+    {"scene.set_script_property", "scene_set_script_property", "Set script property", "Store a value for a behaviour property on one script component, or reset it to the code default. Send exactly one of number, boolean, text, vector, target, asset or component unless resetting; the behaviour's declared type (scripts.status lists each property with its type) decides which. target is a node in the scene as an entity handle (an empty string clears it) for properties declared as relay::Entity or relay::Ref<Behaviour>, and any filter listed with the property (a behaviour, an engine component or a node type) limits what the Inspector offers. asset is a project file path for properties declared as a file kind (audio, template, image, ...). component is an engine component id such as camera. Scripts read node and script references through Entity and Ref<T>, and deleting or copying nodes keeps them valid.", false, false, false, false, false, fields_scene_set_script_property},
     {"nodes.types", "nodes_types", "List node types", "List the node type tree. Each type adds components to its parent's; creatable types can be passed to scene.create. A node's reported type is the deepest type whose components it has.", true, false, false, false, false, no_fields},
     {"templates.list", "templates_list", "List node templates", "List the project's saved templates (prefabs) with the node type each root inherits and the root's components and script behaviours. Built-in node types are listed by nodes.types.", true, false, false, false, false, no_fields},
     {"templates.instantiate", "templates_instantiate", "Create node from template", "Create a saved node tree from a project template as one undoable transaction and return its root. The result is an independent copy.", false, false, false, false, false, fields_templates_instantiate},

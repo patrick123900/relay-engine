@@ -55,7 +55,11 @@ struct EngineStatus {
 
 class Engine {
 public:
-    explicit Engine(EngineConfig config = {});
+    // With `shared_assets` the engine draws on another engine's registry (imported meshes, materials
+    // and textures) instead of its own, and keeps its sky and shader materials beside that
+    // engine's. The registry must outlive this engine. A template editor window uses it so one
+    // renderer can draw both scenes.
+    explicit Engine(EngineConfig config = {}, AssetRegistry* shared_assets = nullptr);
     ~Engine();
 
     void tick();
@@ -169,7 +173,10 @@ private:
     SceneHistory scene_history_;
     SceneClipboard clipboard_;
     std::optional<Project> project_;
-    AssetRegistry assets_;
+    AssetRegistry owned_assets_;
+    AssetRegistry* assets_;
+    // Null for an engine with its own registry; this engine when it shares one.
+    const void* material_owner_{};
     GpuFrameSource gpu_source_;
     std::function<void()> gpu_flush_;
     CaptureQueue capture_queue_;

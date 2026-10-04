@@ -230,7 +230,8 @@ std::string capture_state_name(const CaptureJobState state) {
     return "failed";
 }
 
-void append_property(std::ostringstream& output, const ScriptProperty& property) {
+void append_property(std::ostringstream& output, const ScriptProperty& property,
+                     const ScriptPropertyFilter* filter = nullptr) {
     output << "{\"name\":\"" << escape_json(property.name) << "\",\"type\":\""
            << script_property_type_name(property.type) << "\",\"value\":";
     switch (property.type) {
@@ -240,8 +241,18 @@ void append_property(std::ostringstream& output, const ScriptProperty& property)
         output << '[' << property.vector.x << ',' << property.vector.y << ',' << property.vector.z
                << ']';
         break;
-    case ScriptProperty::Type::text: output << '"' << escape_json(property.text) << '"'; break;
+    case ScriptProperty::Type::text:
+    case ScriptProperty::Type::asset:
+    case ScriptProperty::Type::component: output << '"' << escape_json(property.text) << '"'; break;
+    case ScriptProperty::Type::entity:
+        if (property.entity.valid()) output << '"' << property.entity.to_string() << '"';
+        else output << "null";
+        break;
     }
+    // A property may be limited: "filter":{"kind":"behaviour","text":"Health"}.
+    if (filter && filter->kind != ScriptPropertyFilter::Kind::none)
+        output << ",\"filter\":{\"kind\":\"" << script_property_filter_name(filter->kind)
+               << "\",\"text\":\"" << escape_json(filter->text) << "\"}";
     output << '}';
 }
 
@@ -251,9 +262,10 @@ void append_behaviours(std::ostringstream& output, const std::vector<ScriptBehav
         output << (index ? "," : "") << "{\"name\":\"" << escape_json(behaviours[index].name)
                << "\",\"properties\":[";
         const auto& properties = behaviours[index].properties;
+        const auto& filters = behaviours[index].filters;
         for (std::size_t item = 0; item < properties.size(); ++item) {
             if (item) output << ',';
-            append_property(output, properties[item]);
+            append_property(output, properties[item], item < filters.size() ? &filters[item] : nullptr);
         }
         output << "]}";
     }
@@ -437,8 +449,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
         engine_.record_trace_event("command", std::string(request));
     }
 
-    if (method.starts_with("editor.camera.")) {
-        if (!editor_camera_handler_) return error_response(id, "editor inspection camera requires a live editor");
+    if (method.starts_with("editor.")) {
+        if (!editor_camera_handler_) return error_response(id, "editor requests require a live editor");
         return editor_camera_handler_(request);
     }
 
@@ -1857,7 +1869,7 @@ std::string ControlProtocol::handle(const std::string_view request) {
         if (!roots) return error_response(id, "selection contains a stale or invalid entity");
         std::optional<SceneClipboard> copied;
         if (method == "scene.copy" || method == "scene.cut" || method == "scene.duplicate_many") {
-            copied = copy_selection(engine_.scene(), selected);
+            copied = copy_selection(engine_.scene(), selected, method == "scene.duplicate_many");
             if (!copied) return error_response(id, "selected subtrees exceed the clipboard limit");
         }
         if (method == "scene.copy") {
@@ -2606,8 +2618,34 @@ std::string ControlProtocol::handle(const std::string_view request) {
                                            *items[2].number()};
                         ++given;
                     }
+                    if (const auto* value = field(fields, "asset")) {
+                        property.type = ScriptProperty::Type::asset;
+                        if (!value->string()) return error_response(id, "asset must be a project path");
+                        property.text = *value->string();
+                        ++given;
+                    }
+                    if (const auto* value = field(fields, "component")) {
+                        property.type = ScriptProperty::Type::component;
+                        if (!value->string() || (!value->string()->empty() && !find_component_kind(*value->string())))
+                            return error_response(id, "component must be an engine component id");
+                        property.text = *value->string();
+                        ++given;
+                    }
+                    if (const auto* value = field(fields, "target")) {
+                        // A node handle, or "" or null for none; `entity` is the node with the script.
+                        property.type = ScriptProperty::Type::entity;
+                        if (value->string() && !value->string()->empty()) {
+                            const auto target = Entity::parse(*value->string());
+                            if (!target || !engine_.scene().contains(*target))
+                                return error_response(id, "target must name a node in the scene");
+                            property.entity = *target;
+                        } else if (!value->is_null() && !(value->string() && value->string()->empty())) {
+                            return error_response(id, "target must be a node handle, an empty string or null");
+                        }
+                        ++given;
+                    }
                     if (given != 1)
-                        return error_response(id, "send exactly one of number, boolean, text or vector");
+                        return error_response(id, "send exactly one of number, boolean, text, vector, target, asset or component");
                     script.properties.push_back(std::move(property));
                 }
                 label = "Set " + script.behaviour + "." + name + " on " + entity->to_string();

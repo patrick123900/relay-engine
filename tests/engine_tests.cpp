@@ -1,4 +1,5 @@
 #include "relay/control/control_protocol.hpp"
+#include "relay/control/template_session.hpp"
 #include "relay/editor/ide.hpp"
 #include "relay/render/image_decode.hpp"
 #include "relay/ui/ui_font.hpp"
@@ -12,6 +13,7 @@
 #include "relay/observe/profiler.hpp"
 #include "relay/physics/collision.hpp"
 #include "relay/render/scene_render.hpp"
+#include "relay/render/scene_preview.hpp"
 #include "relay/render/asset_manifest.hpp"
 #include "relay/render/assets.hpp"
 #include "relay/render/asset_thumbnail.hpp"
@@ -29,6 +31,8 @@
 #include "../src/render/gltf_animation.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -932,7 +936,129 @@ void test_particles() {
     std::cout << "Particle tests passed\n";
 }
 
+// Editing a template in a private engine: its own scene and history, one root, saved back to its file.
+void test_template_session() {
+    namespace fs = std::filesystem;
+    const auto folder = fs::temp_directory_path() / "relay-template-session";
+    fs::remove_all(folder);
+    fs::create_directories(folder);
+    const auto original = fs::current_path();
+    fs::current_path(folder);
+    {
+        relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+        relay::ControlProtocol protocol(engine);
+        const auto ask = [&](relay::ControlProtocol& target, const std::string& body) {
+            return target.handle("{\"id\":1," + body + "}");
+        };
+        expect(ask(protocol, R"("method":"project.create","filename":"projects/t/project.relayproject","name":"T")")
+                       .find("\"ok\":true") != std::string::npos, "create the project for a template session");
+        const auto crate = engine.scene().create("Crate");
+        const auto lamp = engine.scene().create("Lamp", crate);
+        (void)lamp;
+        expect(ask(protocol, R"("method":"templates.save","entity":")" + crate.to_string() + R"(","name":"Crate")")
+                       .find("\"ok\":true") != std::string::npos, "save the template");
+
+        relay::TemplateSession missing("projects/t/project.relayproject", "Nope");
+        expect(!missing.ok(), "a missing template does not open");
+        relay::TemplateSession session("projects/t/project.relayproject", "Crate");
+        expect(session.ok() && session.root().valid() && session.engine().scene().entities().size() == 2U &&
+                   !session.dirty(),
+               "a template opens as its own two-node scene: " + session.error());
+        const auto root = session.root().to_string();
+        const auto edit = [&](const std::string& body) { return session.handle("{\"id\":2," + body + "}"); };
+        expect(engine.scene().entities().size() == 2U && engine.scene().contains(crate),
+               "the session leaves the main scene alone");
+        // Edits are undoable and mark it unsaved.
+        expect(edit(R"("method":"scene.create","name":"Extra")").find("\"ok\":true") != std::string::npos &&
+                   session.dirty() && session.engine().scene().entities().size() == 3U,
+               "a new node is added");
+        bool under_root = false;
+        for (const auto entity : session.engine().scene().entities())
+            if (session.engine().scene().get(entity)->name == "Extra")
+                under_root = session.engine().scene().get(entity)->parent == session.root();
+        expect(under_root, "a node created without a parent lands under the template's root");
+        expect(edit(R"("method":"scene.undo")").find("\"ok\":true") != std::string::npos && !session.dirty() &&
+                   session.engine().scene().entities().size() == 2U,
+               "undo returns to the saved state, which is not unsaved work");
+        // The root is protected, and project and run methods are refused.
+        expect(edit(R"("method":"scene.destroy","entity":")" + root + "\"").find("\"ok\":false") != std::string::npos &&
+                   edit(R"("method":"scene.duplicate","entity":")" + root + "\"").find("\"ok\":false") != std::string::npos &&
+                   edit(R"("method":"scene.set_parent","entity":")" + root + "\"").find("\"ok\":false") != std::string::npos,
+               "the root cannot be deleted, duplicated or moved");
+        expect(edit(R"("method":"runtime.play")").find("\"ok\":false") != std::string::npos &&
+                   edit(R"("method":"scene.save","filename":"x.relay.json")").find("\"ok\":false") != std::string::npos &&
+                   edit(R"("method":"project.close")").find("\"ok\":false") != std::string::npos,
+               "running the game, saving scenes and switching projects are refused");
+        // Save writes the file; a new instance in the main scene shows it.
+        expect(edit(R"("method":"scene.create","name":"Extra")").find("\"ok\":true") != std::string::npos, "add a node again");
+        std::string error;
+        expect(session.save(error) && !session.dirty(), "saving clears the unsaved mark: " + error);
+        const auto placed = ask(protocol, R"("method":"templates.instantiate","template":"project:Crate")");
+        expect(placed.find("\"ok\":true") != std::string::npos && engine.scene().entities().size() == 5U,
+               "the saved template has the added node");
+        // An imported model arrives at the top level and is adopted under the root.
+        fs::copy_file(std::filesystem::path{RELAY_TEST_SOURCE_DIR} / "tests/fixtures/models/relay-test-triangle.gltf",
+                      folder / "projects/t/triangle.gltf");
+        const auto imported = edit(R"("method":"assets.import_model","filename":"triangle.gltf","instantiate":true)");
+        std::size_t strays = 0;
+        for (const auto entity : session.engine().scene().entities())
+            if (entity != session.root() && !session.engine().scene().get(entity)->parent.valid()) ++strays;
+        expect(imported.find("\"ok\":true") != std::string::npos && strays == 0U && session.engine().scene().entities().size() > 3U,
+               "an imported model is placed inside the template: " + imported.substr(0, 200));
+        expect(session.revert(error), "revert after the import");
+        // Revert reads the file again and clears history.
+        expect(edit(R"("method":"scene.create","name":"Throwaway")").find("\"ok\":true") != std::string::npos && session.dirty(),
+               "edit again");
+        expect(session.revert(error) && !session.dirty() && session.engine().scene().entities().size() == 3U,
+               "revert goes back to the saved file: " + error);
+        expect(session.engine().scene_history().undo_depth() == 0U, "reverting starts a fresh undo history");
+    }
+    fs::current_path(original);
+    fs::remove_all(folder);
+}
+
+// The CPU scene preview used by editor windows that show a scene the main viewport does not.
+void test_scene_preview() {
+    relay::AssetRegistry assets;
+    relay::Scene scene;
+    const auto ball = scene.create("Ball");
+    (void)scene.set_mesh_renderer(ball, relay::MeshRenderer{"builtin.sphere", "builtin.orange"});
+    const auto floor = scene.create("Floor");
+    (void)scene.set_transform(floor, {{0, -1, 0}, {-90, 0, 0}, {8, 8, 1}});
+    (void)scene.set_mesh_renderer(floor, relay::MeshRenderer{"builtin.quad", "builtin.grey"});
+    relay::ViewOverride view;
+    view.position = {2.5, 2.0, 4.0};
+    view.target = {0, 0, 0};
+    view.camera.field_of_view_y_degrees = 50.0;
+    relay::ScenePreviewFrame frame;
+    std::string error;
+    expect(relay::render_scene_preview(scene, assets, view, 320, 200, {}, frame, error) && frame.rgba.size() == 320U * 200U * 4U,
+           "a scene preview renders: " + error);
+    const auto pixel = [&](const std::uint32_t x, const std::uint32_t y) {
+        const auto* p = &frame.rgba[(static_cast<std::size_t>(y) * frame.width + x) * 4U];
+        return std::array<int, 3>{p[0], p[1], p[2]};
+    };
+    const auto centre = pixel(160, 100), corner = pixel(2, 2);
+    expect(centre[0] > centre[2] + 40, "the orange ball is drawn at the centre of the view");
+    expect(corner != centre, "the background differs from the ball");
+    // The ball's world position projects to the middle of the picture.
+    const auto& m = frame.view_projection.values;
+    const float cx = m[12] / m[15], cy = m[13] / m[15];
+    expect(std::abs(cx) < 0.05F && std::abs(cy) < 0.05F, "the reported matrices project the target to the centre");
+    if (const char* out = std::getenv("RELAY_PREVIEW_OUT")) {
+        std::ofstream file(out, std::ios::binary);
+        file << "P6\n" << frame.width << ' ' << frame.height << "\n255\n";
+        for (std::size_t i = 0; i < frame.rgba.size(); i += 4U) file.write(reinterpret_cast<const char*>(&frame.rgba[i]), 3);
+    }
+    // A viewpoint inside geometry or an empty scene still renders.
+    relay::Scene empty;
+    expect(relay::render_scene_preview(empty, assets, view, 64, 64, {}, frame, error), "an empty scene renders");
+    expect(!relay::render_scene_preview(empty, assets, view, 2, 2, {}, frame, error), "tiny sizes are refused");
+}
+
 int main() {
+    test_scene_preview();
+    test_template_session();
     {
         // The window icon is built into the engine and decodes to a square RGBA image.
         bool decoded = false;
@@ -3005,7 +3131,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 52U && relay::protocol_methods().size() == 168U,
+    expect(relay::protocol_schema_version == 54U && relay::protocol_methods().size() == 170U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");

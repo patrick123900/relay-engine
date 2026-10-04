@@ -41,6 +41,18 @@
 #endif
 
 namespace relay {
+
+std::string_view script_property_filter_name(const ScriptPropertyFilter::Kind kind) {
+    switch (kind) {
+    case ScriptPropertyFilter::Kind::none: return "none";
+    case ScriptPropertyFilter::Kind::behaviour: return "behaviour";
+    case ScriptPropertyFilter::Kind::component: return "component";
+    case ScriptPropertyFilter::Kind::node_type: return "node_type";
+    case ScriptPropertyFilter::Kind::asset_kinds: return "asset_kinds";
+    }
+    return "none";
+}
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -786,7 +798,7 @@ struct ScriptSystem::Impl {
             const auto source = unpack(entity);
             if (!scene.contains(source) || !impl.can_spawn("clone")) return 0;
             const std::array selection{source};
-            const auto clipboard = copy_selection(scene, selection);
+            const auto clipboard = copy_selection(scene, selection, true);
             const auto pasted = clipboard ? paste_selection(scene, *clipboard, {}, true)
                                           : std::vector<Entity>{};
             if (pasted.size() != 1U) {
@@ -1217,6 +1229,26 @@ struct ScriptSystem::Impl {
             impl.engine.physics().rebuild_bodies(scene, target, true);
             return 1;
         };
+        host.script_instance = [](void* context, RelayEntity entity, const char* name,
+                                  size_t length) -> void* {
+            auto& impl = self(context);
+            const auto found = impl.by_entity.find(entity);
+            if (found == impl.by_entity.end()) return nullptr;
+            for (const auto* instance : found->second)
+                if (impl.runs(*instance, {name, length})) return instance->object;
+            return nullptr;
+        };
+        host.script_entities = [](void* context, const char* name, size_t length, RelayEntity* out,
+                                  size_t capacity) -> size_t {
+            auto& impl = self(context);
+            std::vector<RelayEntity> found;
+            for (const auto& instance : impl.instances)
+                if (impl.runs(*instance, {name, length})) found.push_back(instance->entity.packed());
+            std::sort(found.begin(), found.end());
+            found.erase(std::unique(found.begin(), found.end()), found.end());
+            std::copy_n(found.begin(), std::min(capacity, found.size()), out);
+            return found.size();
+        };
         host.has_component = [](void* context, RelayEntity entity, const char* id, size_t length) {
             const auto* record = self(context).engine.scene().get(unpack(entity));
             return record && relay::has_component(*record, {id, length}) ? 1 : 0;
@@ -1496,6 +1528,13 @@ struct ScriptSystem::Impl {
         instances.push_back(std::move(instance));
     }
 
+    // Whether the instance is a live object of this behaviour that scripts may use.
+    [[nodiscard]] bool runs(const Instance& instance, const std::string_view behaviour) const {
+        return instance.object && !instance.failed && !instance.removed && !instance.removing &&
+               !instance.destroyed && instance.script.behaviour == behaviour &&
+               engine.scene().contains(instance.entity);
+    }
+
     [[nodiscard]] Instance* instance_of(const Entity entity, const std::size_t component) const {
         const auto found = by_entity.find(entity.packed());
         if (found == by_entity.end()) return nullptr;
@@ -1643,7 +1682,14 @@ struct ScriptSystem::Impl {
     }
 
     // Project templates are read once per run; a missing one is reported once.
-    const LoadedTemplate* template_named(const std::string& name) {
+    const LoadedTemplate* template_named(const std::string& given) {
+        // A Template property holds the file's path; templates are named by their file stem.
+        std::string name = given;
+        constexpr std::string_view suffix = ".relay-template.json";
+        if (name.ends_with(suffix)) {
+            name.resize(name.size() - suffix.size());
+            if (const auto slash = name.rfind('/'); slash != std::string::npos) name.erase(0, slash + 1U);
+        }
         auto found = templates.find(name);
         if (found == templates.end()) {
             std::string error = "template names use letters, digits, spaces, '-' and '_'";
@@ -1873,6 +1919,9 @@ struct ScriptSystem::Impl {
             value.vector = raw(property.vector);
             value.text = property.text.data();
             value.text_length = property.text.size();
+            // A node that has since gone reads as none.
+            value.entity = property.entity.valid() && engine.scene().contains(property.entity)
+                               ? property.entity.packed() : 0;
             error[0] = '\0';
             auto* const property_caller = std::exchange(active, &instance);
             const int ok = library->module->set_property(instance.object, property.name.data(),
@@ -1928,7 +1977,7 @@ struct ScriptSystem::Impl {
                 error = std::string{"behaviour "} + name + " is registered more than once";
                 return nullptr;
             }
-            ScriptBehaviourInfo info{name, {}};
+            ScriptBehaviourInfo info{name, {}, {}};
             const auto properties = std::min<std::uint32_t>(
                 loaded->module->property_count(index),
                 static_cast<std::uint32_t>(maximum_script_properties));
@@ -1936,7 +1985,7 @@ struct ScriptSystem::Impl {
                 RelayPropertyInfo declared{};
                 if (!loaded->module->property_info(index, item, &declared) || !declared.name ||
                     declared.value.type < RELAY_PROPERTY_BOOLEAN ||
-                    declared.value.type > RELAY_PROPERTY_TEXT) continue;
+                    declared.value.type > RELAY_PROPERTY_COMPONENT) continue;
                 ScriptProperty property;
                 property.name = declared.name;
                 property.type = static_cast<ScriptProperty::Type>(declared.value.type);
@@ -1948,6 +1997,16 @@ struct ScriptSystem::Impl {
                     property.text.assign(declared.value.text,
                                          std::min(declared.value.text_length,
                                                   maximum_script_text_bytes));
+                // Code defaults for node references are always none: handles mean nothing there.
+                ScriptPropertyFilter filter;
+                if (declared.filter >= RELAY_FILTER_BEHAVIOUR && declared.filter <= RELAY_FILTER_ASSET_KINDS) {
+                    filter.kind = static_cast<ScriptPropertyFilter::Kind>(declared.filter);
+                    if (declared.filter_text)
+                        filter.text.assign(declared.filter_text,
+                                           std::min<std::size_t>(declared.filter_length, 256U));
+                }
+                if (property.type == ScriptProperty::Type::component && !property.text.empty() &&
+                    !find_component_kind(property.text)) property.text.clear();
                 const bool duplicate = std::any_of(
                     info.properties.begin(), info.properties.end(),
                     [&](const ScriptProperty& other) { return other.name == property.name; });
@@ -1959,6 +2018,7 @@ struct ScriptSystem::Impl {
                     return nullptr;
                 }
                 info.properties.push_back(std::move(property));
+                info.filters.push_back(std::move(filter));
             }
             loaded->behaviours.push_back(std::move(info));
         }

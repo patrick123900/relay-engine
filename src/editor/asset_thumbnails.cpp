@@ -264,6 +264,10 @@ bool AssetThumbnails::failed(const std::string& path) const {
     return found != impl_->entries.end() && found->second.failed;
 }
 
+void AssetThumbnails::release() { impl_->drop_all(); }
+
+bool AssetThumbnails::idle() const { return impl_->retired.empty(); }
+
 void AssetThumbnails::clear() {
     impl_->drop_all();
     for (auto& old : impl_->retired) ImGui::UnregisterUserTexture(old.texture.get());

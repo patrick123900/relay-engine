@@ -40,6 +40,25 @@ Rigid Body**. A palette icon marks each one; hover it to see "Custom template". 
 an independent copy, like a prefab without a live link. You can also double-click a template file
 in Assets or drag it into the viewport.
 
+### Editing a template
+
+Right-click a template file in Assets (or in the Asset Browser) and choose **Edit template...**, or
+press **Edit template...** in the Add Node window's details for it. The template opens in its own
+floating window with a Hierarchy, a viewport and an Inspector, working on a private copy of the
+template: nothing in the scene you are editing changes. The window has the editor's own tools, the
+gizmos, undo and redo, framing, the Add Node and Add Component windows and the Asset Browser, and
+drop a model or a file onto its viewport as you would in the main one. A template is one tree, so
+its root cannot be deleted, duplicated or moved, and new nodes join under it. **Save** (or Ctrl+S
+while the window has focus) writes the template file; **Revert** reads it again. The title shows
+`*` while there are unsaved changes, and closing asks what to do with them. Copies already placed
+in scenes are independent and are not changed.
+
+The window's viewport is drawn by the same GPU renderer as the main one (lit surfaces, shadows
+off, the scene's own sky or Relay's default sky and sun, shader materials), without global
+illumination, reflections, particles or the game interface, so metals look flatter than in the main
+view. A CPU preview stands in for the first moments and wherever the GPU path is unavailable.
+Script properties show as in the main Inspector once the project's scripts are built.
+
 ## Hierarchy
 
 The **Hierarchy** lists the scene's nodes. Right-click empty space to create a node, or a row to
@@ -182,7 +201,9 @@ spinner and a ball on a spring.
 Gameplay code is native C++. Choose **Create → C++ script...** in the Assets panel (or **New C++
 script...** in the Add Component window), add the behaviour to a node as a script component, and
 press **Run Game**. A node can carry several scripts, and fields a behaviour declares as
-properties are editable per node in the Inspector. Relay builds the project's scripts first and
+properties are editable per node in the Inspector, including references to nodes, other scripts,
+project files and component types, which you pick from a list or drag in from the Hierarchy or
+Assets. Relay builds the project's scripts first and
 starts the game when they compile; errors appear under **Diagnostics → Scripts** with file and
 line. Saving a script while the game runs rebuilds it and swaps in the new code.
 Because scripts run with your full user permissions, Relay only builds a project's scripts after

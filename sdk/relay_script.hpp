@@ -28,15 +28,41 @@
 // the values people or agents set there; fields left alone keep the default written in code, so
 // changing a default in code updates every node that has not overridden it. Relay assigns stored
 // values after construction and before on_start. Supported field types: bool, int, float, double,
-// relay::Vec3 and std::string.
+// relay::Vec3 and std::string, plus these, which the Inspector edits with pickers and the scene
+// keeps valid when nodes are copied, pasted or deleted:
+//
+//   relay::Entity            a node in the scene (drag one from the Hierarchy, or pick it). Optionally
+//                            limited: p.add("lamp", lamp, relay::Only::component(relay::Component::light))
+//                            or relay::Only::node_type("Camera"). Empty when none is chosen or the
+//                            node was deleted.
+//   relay::Ref<T>            another script: the node it runs on, and then ref.get() is that node's
+//                            T instance (null if it has none). The picker lists nodes running a T.
+//   relay::Component         an engine component type, for generic behaviours.
+//   relay::AudioClip, relay::Template, relay::Image, relay::Model, relay::Material, relay::Shader,
+//   relay::Scene, relay::TextFile
+//                            a project file of that kind. Template and AudioClip go straight into
+//                            world::instantiate and audio::play.
 //
 //     class Mover : public relay::Behaviour {
 //     public:
-//         void properties(relay::Properties& p) override { p.add("speed", speed); }
-//         void on_update(double dt) override { ... speed ... }
+//         void properties(relay::Properties& p) override {
+//             p.add("speed", speed);
+//             p.add("target", target);   // relay::Entity
+//             p.add("health", health);   // relay::Ref<Health>
+//         }
+//         void on_update(double dt) override {
+//             if (health && health->dead()) return;
+//             if (target) self().set_position(target.world_position());
+//         }
 //     private:
 //         double speed = 2.0;
+//         relay::Entity target;
+//         relay::Ref<Health> health;
 //     };
+//
+// Other scripts: entity.script<T>() is the first running T on a node (null without one), and
+// world::scripts<T>() lists every running T. Look them up when you use them: instances come and
+// go as nodes are destroyed, scripts removed and the project's scripts rebuilt.
 //
 // Input: relay::input reads the project's input map (Game Configuration > Input in the editor).
 // Actions are buttons such as "jump"; axes are values in [-1, 1] such as "move_x". Input is
@@ -106,7 +132,10 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <iterator>
 #include <string_view>
+#include <typeindex>
+#include <typeinfo>
 #include <vector>
 
 namespace relay {
@@ -116,6 +145,9 @@ inline const RelayHostApi*& host() {
     static const RelayHostApi* api = nullptr;
     return api;
 }
+// The registered name of a behaviour class, for Ref and the script<T> lookups; empty if the class
+// was never registered with RELAY_BEHAVIOUR.
+inline const char* behaviour_name(const std::type_info& type);
 // Runs a query that fills a buffer and reports the full count, growing the buffer until it fits.
 template <class Query>
 std::vector<RelayEntity> collect(Query query) {
@@ -166,6 +198,65 @@ namespace audio {
 // `player` uses the music player's own setting.
 enum class Sync { player = -1, immediate = 0, beat = 1, bar = 2, track_end = 3 };
 } // namespace audio
+
+// Engine component types, named as the Add Component window and scenes name them. Scripts are
+// not listed: use Entity::script<T>().
+enum class Component {
+    transform, mesh_renderer, camera, light, sky, post_process, particle_emitter, collider,
+    physics_body, joint, audio_source, audio_listener, reverb_zone, music_player, ui_canvas,
+    ui_control, ui_panel, ui_label, ui_image, ui_button, ui_toggle, ui_slider, ui_progress_bar,
+    ui_container, keyframes, animator
+};
+namespace detail {
+inline constexpr std::string_view component_ids[] = {
+    "transform", "mesh_renderer", "camera", "light", "sky", "post_process", "particle_emitter",
+    "collider", "physics_body", "joint", "audio_source", "audio_listener", "reverb_zone",
+    "music_player", "ui_canvas", "ui_control", "ui_panel", "ui_label", "ui_image", "ui_button",
+    "ui_toggle", "ui_slider", "ui_progress_bar", "ui_container", "keyframes", "animator"};
+} // namespace detail
+// The id the component is named by in scenes and the protocol, such as "mesh_renderer".
+[[nodiscard]] constexpr std::string_view component_id(Component component) {
+    return detail::component_ids[static_cast<std::size_t>(component)];
+}
+[[nodiscard]] inline std::optional<Component> component_from_id(std::string_view id) {
+    for (std::size_t index = 0; index < std::size(detail::component_ids); ++index)
+        if (detail::component_ids[index] == id) return static_cast<Component>(index);
+    return std::nullopt;
+}
+
+// A project file a property or call takes, by the kind the Assets panel files it under. Declare a
+// property as one of the aliases below (relay::AudioClip, relay::Template, ...); the Inspector then
+// offers only files of that kind.
+enum class AssetKind { model, scene, node_template, image, material, shader, text, audio };
+namespace detail {
+inline constexpr std::string_view asset_kind_names[] = {"model", "scene", "template", "image",
+                                                        "material", "shader", "text", "audio"};
+} // namespace detail
+
+template <AssetKind Kind>
+class Asset {
+public:
+    Asset() = default;
+    explicit Asset(std::string path) : path_(std::move(path)) {}
+    // The project-relative file path, or empty when none is chosen.
+    [[nodiscard]] const std::string& path() const { return path_; }
+    [[nodiscard]] bool empty() const { return path_.empty(); }
+    [[nodiscard]] explicit operator bool() const { return !path_.empty(); }
+    friend bool operator==(const Asset&, const Asset&) = default;
+
+private:
+    friend class Properties;
+    friend struct detail_access;
+    std::string path_;
+};
+using Model = Asset<AssetKind::model>;
+using Scene = Asset<AssetKind::scene>;
+using Template = Asset<AssetKind::node_template>;
+using Image = Asset<AssetKind::image>;
+using Material = Asset<AssetKind::material>;
+using Shader = Asset<AssetKind::shader>;
+using TextFile = Asset<AssetKind::text>;
+using AudioClip = Asset<AssetKind::audio>;
 
 class Entity {
 public:
@@ -398,6 +489,19 @@ public:
     // "particle_emitter", "ui_label" and so on. Added components start with the editor's defaults.
     // Stop Game restores the authored components. False, with a log message, when the component
     // cannot be added or removed.
+    [[nodiscard]] bool has_component(Component component) const {
+        const auto id = component_id(component);
+        return api().has_component(api().context, handle_, id.data(), id.size()) != 0;
+    }
+    bool add_component(Component component) const {
+        const auto id = component_id(component);
+        return api().add_component(api().context, handle_, id.data(), id.size()) != 0;
+    }
+    bool remove_component(Component component) const {
+        const auto id = component_id(component);
+        return api().remove_component(api().context, handle_, id.data(), id.size()) != 0;
+    }
+    // By id, for components added to Relay after this header: see Component for the names.
     [[nodiscard]] bool has_component(std::string_view id) const {
         return api().has_component(api().context, handle_, id.data(), id.size()) != 0;
     }
@@ -407,12 +511,23 @@ public:
     bool remove_component(std::string_view id) const {
         return api().remove_component(api().context, handle_, id.data(), id.size()) != 0;
     }
+    // Scripts on this node. script<T>() is the first running instance of behaviour T, or null.
+    // Look it up when you use it; do not keep the pointer across frames.
+    template <class T>
+    [[nodiscard]] T* script() const;
+    template <class T>
+    [[nodiscard]] bool has_script() const { return script<T>() != nullptr; }
     // Attaches a behaviour with its code defaults; it starts before its first update.
+    template <class T>
+    bool add_script() const;
+    // Removes the first script component running T once the current callbacks finish, after its
+    // on_destroy, so a behaviour may remove itself.
+    template <class T>
+    bool remove_script() const;
+    // The same by behaviour name, for behaviours another script library defines.
     bool add_script(std::string_view behaviour) const {
         return api().add_script(api().context, handle_, behaviour.data(), behaviour.size()) != 0;
     }
-    // Removes the first script component running `behaviour` once the current callbacks finish,
-    // after its on_destroy, so a behaviour may remove itself.
     bool remove_script(std::string_view behaviour) const {
         return api().remove_script(api().context, handle_, behaviour.data(), behaviour.size()) != 0;
     }
@@ -646,6 +761,30 @@ inline Entity instantiate(std::string_view template_name, Vec3 position,
     return Entity{api().instantiate(api().context, template_name.data(), template_name.size(),
                                     parent.handle(), &at, rotation ? &turn : nullptr)};
 }
+// The same for a Template property chosen in the Inspector.
+inline Entity instantiate(const Template& project_template, Entity parent = {}) {
+    return instantiate(std::string_view{project_template.path()}, parent);
+}
+inline Entity instantiate(const Template& project_template, Vec3 position,
+                          std::optional<Vec3> rotation = std::nullopt, Entity parent = {}) {
+    return instantiate(std::string_view{project_template.path()}, position, rotation, parent);
+}
+// Nodes running a T, sorted, and their T instances. Look them up when you use them.
+template <class T>
+std::vector<Entity> entities_with() {
+    const auto* name = detail::behaviour_name(typeid(T));
+    const auto handles = detail::collect([&](RelayEntity* out, size_t capacity) {
+        return api().script_entities(api().context, name, std::strlen(name), out, capacity);
+    });
+    return {handles.begin(), handles.end()};
+}
+template <class T>
+std::vector<T*> scripts() {
+    std::vector<T*> result;
+    for (const auto entity : entities_with<T>())
+        if (auto* instance = entity.template script<T>()) result.push_back(instance);
+    return result;
+}
 // Messages appear in the editor log, prefixed with the calling behaviour and entity.
 inline void log(std::string_view text) {
     api().log(api().context, RELAY_LOG_INFO, text.data(), text.size());
@@ -707,6 +846,13 @@ inline Sound play(std::string_view clip, Vec3 position, const OneShot& options =
 inline Sound play_flat(std::string_view clip, const OneShot& options = {}) {
     return detail_audio::play(clip, nullptr, options);
 }
+// The same for an AudioClip property chosen in the Inspector. Nothing plays when none is chosen.
+inline Sound play(const AudioClip& clip, Vec3 position, const OneShot& options = {}) {
+    return clip ? play(std::string_view{clip.path()}, position, options) : Sound{};
+}
+inline Sound play_flat(const AudioClip& clip, const OneShot& options = {}) {
+    return clip ? play_flat(std::string_view{clip.path()}, options) : Sound{};
+}
 
 // Game-time mixer changes, such as ducking music in a menu. Stop Game undoes them; the Mixer
 // panel changes the saved mixer.
@@ -735,6 +881,41 @@ inline bool set_bus_effect(std::string_view bus, std::uint32_t index, std::strin
 
 } // namespace audio
 
+// Limits what an Entity property's picker offers and accepts.
+class Only {
+public:
+    // Only nodes that have an engine component.
+    static Only component(Component component) { return {RELAY_FILTER_COMPONENT, std::string{component_id(component)}}; }
+    // Only nodes of a node type (Camera, RigidBody, ...) or one of its subtypes.
+    static Only node_type(std::string_view type) { return {RELAY_FILTER_NODE_TYPE, std::string{type}}; }
+
+private:
+    friend class Properties;
+    Only(int kind, std::string text) : kind_(kind), text_(std::move(text)) {}
+    int kind_;
+    std::string text_;
+};
+
+// Another script, held as the node it runs on. get() finds that node's T instance when it is
+// asked, so it is null while the node has none, after it is destroyed and across hot reloads.
+template <class T>
+class Ref {
+public:
+    Ref() = default;
+    explicit Ref(Entity entity) : entity_(entity) {}
+    [[nodiscard]] Entity entity() const { return entity_; }
+    // The T instance on the node, or null.
+    [[nodiscard]] T* get() const { return entity_ ? entity_.template script<T>() : nullptr; }
+    [[nodiscard]] T* operator->() const { return get(); }
+    [[nodiscard]] T& operator*() const { return *get(); }
+    // True when the node exists and runs a T.
+    [[nodiscard]] explicit operator bool() const { return get() != nullptr; }
+
+private:
+    friend class Properties;
+    Entity entity_;
+};
+
 // Collects a behaviour's editable fields. Names must be C++ identifiers and unique per behaviour.
 class Properties {
 public:
@@ -756,17 +937,43 @@ public:
     void add(std::string_view name, std::string& value) {
         push(name, RELAY_PROPERTY_TEXT, Storage::text, &value);
     }
+    // A node in the scene, optionally limited to nodes with a component or of a node type.
+    void add(std::string_view name, Entity& value) {
+        push(name, RELAY_PROPERTY_ENTITY, Storage::entity, &value);
+    }
+    void add(std::string_view name, Entity& value, const Only& only) {
+        push(name, RELAY_PROPERTY_ENTITY, Storage::entity, &value, only.kind_, only.text_);
+    }
+    // A script on a node: the picker lists nodes running a T.
+    template <class T>
+    void add(std::string_view name, Ref<T>& value) {
+        push(name, RELAY_PROPERTY_ENTITY, Storage::entity, &value.entity_, RELAY_FILTER_BEHAVIOUR,
+             detail::behaviour_name(typeid(T)));
+    }
+    // An engine component type.
+    void add(std::string_view name, Component& value) {
+        push(name, RELAY_PROPERTY_COMPONENT, Storage::component, &value);
+    }
+    // A project file of one kind.
+    template <AssetKind Kind>
+    void add(std::string_view name, Asset<Kind>& value) {
+        push(name, RELAY_PROPERTY_ASSET, Storage::asset, &value.path_, RELAY_FILTER_ASSET_KINDS,
+             std::string{detail::asset_kind_names[static_cast<std::size_t>(Kind)]});
+    }
 
 private:
-    enum class Storage { boolean, integer, single, number, vector, text };
+    enum class Storage { boolean, integer, single, number, vector, text, entity, asset, component };
     struct Field {
         std::string name;
         int type;
         Storage storage;
         void* address;
+        int filter;
+        std::string filter_text;
     };
-    void push(std::string_view name, int type, Storage storage, void* address) {
-        fields_.push_back({std::string{name}, type, storage, address});
+    void push(std::string_view name, int type, Storage storage, void* address, int filter = RELAY_FILTER_NONE,
+              std::string filter_text = {}) {
+        fields_.push_back({std::string{name}, type, storage, address, filter, std::move(filter_text)});
     }
     friend struct detail_access;
     std::vector<Field> fields_;
@@ -882,15 +1089,42 @@ namespace detail {
 struct Registration {
     const char* name;
     Behaviour* (*create)();
+    std::type_index type;
 };
 inline std::vector<Registration>& registry() {
     static std::vector<Registration> registrations;
     return registrations;
 }
 struct Registrar {
-    Registrar(const char* name, Behaviour* (*create)()) { registry().push_back({name, create}); }
+    Registrar(const char* name, Behaviour* (*create)(), const std::type_info& type) {
+        registry().push_back({name, create, std::type_index{type}});
+    }
 };
+inline const char* behaviour_name(const std::type_info& type) {
+    for (const auto& registration : registry())
+        if (registration.type == std::type_index{type}) return registration.name;
+    return "";
+}
 } // namespace detail
+
+template <class T>
+T* Entity::script() const {
+    const auto* name = detail::behaviour_name(typeid(T));
+    if (!*name) return nullptr;
+    const auto* host = detail::host();
+    return static_cast<T*>(static_cast<Behaviour*>(
+        host->script_instance(host->context, handle_, name, std::strlen(name))));
+}
+template <class T>
+bool Entity::add_script() const {
+    const auto* name = detail::behaviour_name(typeid(T));
+    return *name && add_script(std::string_view{name});
+}
+template <class T>
+bool Entity::remove_script() const {
+    const auto* name = detail::behaviour_name(typeid(T));
+    return *name && remove_script(std::string_view{name});
+}
 
 } // namespace relay
 
@@ -898,7 +1132,7 @@ struct Registrar {
 // once, at namespace scope, with an unqualified class name.
 #define RELAY_BEHAVIOUR(Type)                                                                     \
     static const ::relay::detail::Registrar relay_behaviour_registrar_##Type{                    \
-        #Type, []() -> ::relay::Behaviour* { return new Type(); }};
+        #Type, []() -> ::relay::Behaviour* { return new Type(); }, typeid(Type)};
 
 #ifdef RELAY_SCRIPT_DEFINE_ENTRY
 // Compiled once per script library by Relay's build; scripts never define this.
@@ -914,6 +1148,7 @@ struct PropertyDefaults {
     bool ready = false;
     std::vector<std::string> names;
     std::vector<std::string> texts;
+    std::vector<std::string> filters;
     std::vector<RelayPropertyInfo> infos;
 };
 inline RelayPropertyValue read_field(int type, detail_access::Storage storage, const void* address) {
@@ -930,7 +1165,10 @@ inline RelayPropertyValue read_field(int type, detail_access::Storage storage, c
         value.vector = {v.x, v.y, v.z};
         break;
     }
-    case S::text: break;
+    case S::entity: value.entity = static_cast<const relay::Entity*>(address)->handle(); break;
+    case S::text:
+    case S::asset:
+    case S::component: break;
     }
     return value;
 }
@@ -958,21 +1196,28 @@ inline const PropertyDefaults* property_defaults(uint32_t index) {
         const auto& fields = relay::detail_access::fields(properties);
         entry.names.reserve(fields.size());
         entry.texts.reserve(fields.size());
+        entry.filters.reserve(fields.size());
         for (const auto& field : fields) {
+            using S = relay::detail_access::Storage;
             entry.names.push_back(field.name);
-            entry.texts.push_back(field.storage == relay::detail_access::Storage::text
+            entry.texts.push_back(field.storage == S::text || field.storage == S::asset
                                       ? *static_cast<const std::string*>(field.address)
+                                  : field.storage == S::component
+                                      ? std::string{relay::component_id(*static_cast<const relay::Component*>(field.address))}
                                       : std::string{});
+            entry.filters.push_back(field.filter_text);
         }
         for (std::size_t item = 0; item < fields.size(); ++item) {
             auto value = read_field(fields[item].type, fields[item].storage, fields[item].address);
             value.text = entry.texts[item].data();
             value.text_length = entry.texts[item].size();
-            entry.infos.push_back({entry.names[item].c_str(), value});
+            entry.infos.push_back({entry.names[item].c_str(), value, fields[item].filter,
+                                   entry.filters[item].data(), entry.filters[item].size()});
         }
     } catch (...) {
         entry.names.clear();
         entry.texts.clear();
+        entry.filters.clear();
         entry.infos.clear();
     }
     return &entry;
@@ -1057,7 +1302,10 @@ relay_script_module_v1(const RelayHostApi* host) {
                 const std::string_view wanted{name, length};
                 for (const auto& field : relay::detail_access::fields(properties)) {
                     if (field.name != wanted) continue;
-                    if (field.type != value->type) {
+                    // Text saved before a property became an asset or component type still applies.
+                    const bool text_for_typed = value->type == RELAY_PROPERTY_TEXT &&
+                        (field.type == RELAY_PROPERTY_ASSET || field.type == RELAY_PROPERTY_COMPONENT);
+                    if (field.type != value->type && !text_for_typed) {
                         copy_error(error, capacity, "property type changed in code");
                         return 0;
                     }
@@ -1074,8 +1322,19 @@ relay_script_module_v1(const RelayHostApi* host) {
                             {value->vector.x, value->vector.y, value->vector.z};
                         break;
                     case S::text:
+                    case S::asset:
                         static_cast<std::string*>(field.address)->assign(value->text, value->text_length);
                         break;
+                    case S::entity: *static_cast<relay::Entity*>(field.address) = relay::Entity{value->entity}; break;
+                    case S::component: {
+                        const auto component = relay::component_from_id({value->text, value->text_length});
+                        if (!component) {
+                            copy_error(error, capacity, "unknown component type");
+                            return 0;
+                        }
+                        *static_cast<relay::Component*>(field.address) = *component;
+                        break;
+                    }
                     }
                     return 1;
                 }

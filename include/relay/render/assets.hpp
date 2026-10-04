@@ -187,13 +187,17 @@ public:
     // The sky material the scene's sky uses, loaded by the engine from the project. It lives
     // apart from the mesh and texture tables and does not change revision(): renderers compare
     // its panorama's own revision.
-    void set_sky_material(std::shared_ptr<const ResolvedSkyMaterial> material);
+    // Engines that share a registry each keep their own sky and materials under an `owner` (null for
+    // the registry's own engine), and lookups find any owner's.
+    void set_sky_material(std::shared_ptr<const ResolvedSkyMaterial> material, const void* owner = nullptr);
     // The loaded material when its path is `path`, else null.
     [[nodiscard]] std::shared_ptr<const ResolvedSkyMaterial> sky_material(std::string_view path) const;
     // Surface and post-processing materials the scene uses, by path, loaded by the engine in the
     // same way. Also apart from revision(): each material carries its own.
     using ShaderMaterials = std::map<std::string, std::shared_ptr<const ResolvedShaderMaterial>, std::less<>>;
-    void set_shader_materials(ShaderMaterials materials);
+    void set_shader_materials(ShaderMaterials materials, const void* owner = nullptr);
+    // Drops what `owner` registered, when its engine goes away.
+    void forget_owner(const void* owner);
     [[nodiscard]] std::shared_ptr<const ResolvedShaderMaterial> shader_material(std::string_view path) const;
 
 private:
@@ -205,8 +209,8 @@ private:
     std::vector<MaterialAsset> materials_;
     std::vector<TextureAsset> textures_;
     std::vector<ModelAsset> models_;
-    std::shared_ptr<const ResolvedSkyMaterial> sky_material_;
-    ShaderMaterials shader_materials_;
+    std::map<const void*, std::shared_ptr<const ResolvedSkyMaterial>> sky_materials_;
+    std::map<const void*, ShaderMaterials> shader_materials_;
     std::uint64_t revision_{1U};
 };
 

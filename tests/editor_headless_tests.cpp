@@ -1888,6 +1888,184 @@ void scripts_ui() {
     std::cout << "Headless script editor tests passed\n";
 }
 
+
+// Script properties that hold nodes, other scripts, assets and component types are picked in the
+// Inspector from what the scene and project offer, limited by the filter the script declares.
+void script_references_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    const auto ask = [&](const std::string& body) { return protocol.handle("{\"id\":1," + body + "}"); };
+    check(ask(R"("method":"project.create","filename":"projects/refs/project.relayproject","name":"Refs")")
+              .find("\"ok\":true") != std::string::npos, "create the references project");
+    std::filesystem::create_directories("projects/refs/scripts");
+    std::ofstream("projects/refs/scripts/follow.cpp")
+        << "#include \"relay_script.hpp\"\n"
+           "class Health : public relay::Behaviour {};\n"
+           "RELAY_BEHAVIOUR(Health)\n"
+           "class Follower : public relay::Behaviour {\n"
+           "public:\n"
+           "    void properties(relay::Properties& p) override {\n"
+           "        p.add(\"target\", target);\n"
+           "        p.add(\"lamp\", lamp, relay::Only::component(relay::Component::light));\n"
+           "        p.add(\"health\", health);\n"
+           "        p.add(\"kind\", kind);\n"
+           "        p.add(\"clip\", clip);\n"
+           "    }\n"
+           "    relay::Entity target, lamp;\n"
+           "    relay::Ref<Health> health;\n"
+           "    relay::Component kind = relay::Component::light;\n"
+           "    relay::AudioClip clip;\n"
+           "};\n"
+           "RELAY_BEHAVIOUR(Follower)\n";
+    std::filesystem::create_directories("projects/refs/sounds");
+    std::ofstream("projects/refs/sounds/bell.wav") << "RIFF";
+    const auto hero = engine.scene().create("Hero");
+    const auto bulb = engine.scene().create("Bulb");
+    const auto crate = engine.scene().create("Crate");
+    const auto tank = engine.scene().create("Tank");
+    const auto add = [&](const relay::Entity entity, const std::string& component, const std::string& behaviour) {
+        check(ask(R"("method":"component.add","entity":")" + entity.to_string() + R"(","component":")" + component +
+                  "\"" + (behaviour.empty() ? std::string{} : ",\"behaviour\":\"" + behaviour + "\"")).find("\"ok\":true") != std::string::npos,
+              ("add " + component + " " + behaviour).c_str());
+    };
+    add(hero, "script", "Follower");
+    add(tank, "script", "Health");
+    add(bulb, "light", {});
+    ask(R"("method":"scripts.trust","trusted":true)");
+    ask(R"("method":"scripts.build")");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{240};
+    while (std::chrono::steady_clock::now() < deadline &&
+           ask(R"("method":"scripts.status")").find("\"state\":\"building\"") != std::string::npos) {
+        engine.tick();
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    }
+    check(ask(R"("method":"scripts.status")").find("\"state\":\"ready\"") != std::string::npos,
+          "the reference script builds");
+
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize the references editor without windows");
+    frame(ui, 5);
+    click(ui, *ui.headless_item_rect("entity:" + hero.to_string()));
+    frame(ui, 3);
+    const auto key = [&](const std::string& property) {
+        return "inspector:script:\"entity\":\"" + hero.to_string() + "\",\"index\":0:" + property;
+    };
+    const auto script_of = [&] {
+        const auto* record = engine.scene().get(hero);
+        return record->scripts.empty() ? relay::Script{} : record->scripts.front();
+    };
+    const auto value_of = [&](const std::string& name) {
+        for (const auto& property : script_of().properties)
+            if (property.name == name) return property;
+        return relay::ScriptProperty{};
+    };
+    check(ui.headless_item_rect(key("target")) && ui.headless_item_rect(key("health")) &&
+              ui.headless_item_rect(key("clip")) && ui.headless_item_rect(key("lamp")),
+          "node, script and asset properties are reference fields");
+
+    // A node property offers every node; a limited one only those with the component.
+    click_center(ui, *ui.headless_item_rect(key("lamp")));
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:choice:" + bulb.to_string()) &&
+              !ui.headless_item_rect("asset_browser:choice:" + crate.to_string()),
+          "a node reference limited to a component lists only nodes that have it");
+    click_center(ui, *ui.headless_item_rect("asset_browser:choice:" + bulb.to_string()));
+    click_center(ui, *ui.headless_item_rect("asset_browser:choose"));
+    frame(ui, 3);
+    check(value_of("lamp").entity == bulb, "choosing a node stores the reference");
+
+    click_center(ui, *ui.headless_item_rect(key("health")));
+    frame(ui, 3);
+    check(ui.headless_item_rect("asset_browser:choice:" + tank.to_string()) &&
+              !ui.headless_item_rect("asset_browser:choice:" + crate.to_string()) &&
+              !ui.headless_item_rect("asset_browser:choice:" + hero.to_string()),
+          "a script reference lists only the nodes running that script");
+    click_center(ui, *ui.headless_item_rect("asset_browser:choice:" + tank.to_string()));
+    click_center(ui, *ui.headless_item_rect("asset_browser:choose"));
+    frame(ui, 3);
+    check(value_of("health").entity == tank, "choosing a node for a script reference stores it");
+
+    browse_and_choose(ui, key("clip"), "asset_browser:item:sounds/bell.wav", "sounds");
+    check(value_of("clip").type == relay::ScriptProperty::Type::asset && value_of("clip").text == "sounds/bell.wav",
+          "choosing a file stores an asset property");
+
+    // Deleting the node a property points at clears it in the Inspector too.
+    check(ask(R"("method":"scene.destroy","entity":")" + tank.to_string() + "\"").find("\"ok\":true") != std::string::npos,
+          "delete the referenced node");
+    frame(ui, 5);
+    check(!value_of("health").entity.valid(), "deleting the referenced node clears the reference");
+    std::cout << "Headless script reference tests passed\n";
+}
+
+
+// A project template opens in its own floating window, over a private engine: its own hierarchy,
+// inspector and viewport, undo history and save, without touching the scene in the main viewport.
+void template_editor_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    const auto ask = [&](const std::string& body) { return protocol.handle("{\"id\":1," + body + "}"); };
+    check(ask(R"("method":"project.create","filename":"projects/tpl/project.relayproject","name":"Tpl")")
+              .find("\"ok\":true") != std::string::npos, "create the template project");
+    // A small template: a crate with a child lamp.
+    const auto crate = engine.scene().create("Crate");
+    (void)engine.scene().set_mesh_renderer(crate, relay::MeshRenderer{"builtin.sphere", "builtin.orange"});
+    const auto lamp = engine.scene().create("Lamp", crate);
+    const auto saved_template = ask(R"("method":"templates.save","entity":")" + crate.to_string() + R"(","name":"Crate")");
+    check(saved_template.find("\"ok\":true") != std::string::npos, ("save the crate as a template: " + saved_template).c_str());
+    const auto before = engine.scene().entities().size();
+
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize the template editor without windows");
+    frame(ui, 5);
+    check(ui.template_window_count() == 0U && !ui.open_template("Missing"), "a missing template does not open");
+    check(ui.open_template("Crate") && ui.template_window_count() == 1U, "a template opens in a window");
+    frame(ui, 6);
+    check(ui.headless_item_rect("template:Crate:window") && ui.headless_item_rect("template:Crate:viewport"),
+          "the window has a viewport");
+    // The window's hierarchy lists the template's nodes, in its own scene.
+    check(ui.headless_item_rect("template:Crate:entity:0:1") && ui.headless_item_rect("template:Crate:entity:1:1"),
+          "the template window's hierarchy lists its nodes");
+    check(ui.open_template("Crate") && ui.template_window_count() == 1U, "opening it again focuses the same window");
+    frame(ui, 4);
+    if (const char* directory = std::getenv("RELAY_UI_SNAPSHOT_DIR"))
+        (void)relay_test::write_ui_snapshot(std::filesystem::path(directory) / "template-editor.png");
+    check(!ui.template_dirty("Crate") && engine.scene().entities().size() == before,
+          "opening a template changes nothing in the main scene");
+
+    // An edit in the window is its own undo history and leaves the main scene alone.
+    click(ui, *ui.headless_item_rect("template:Crate:entity:0:1"));
+    frame(ui, 3);
+    key(ui, ImGuiKey_D);
+    frame(ui, 4);
+    check(!ui.template_dirty("Crate"), "the template's root cannot be duplicated beside itself");
+    click(ui, *ui.headless_item_rect("template:Crate:entity:1:1"));
+    frame(ui, 3);
+    key(ui, ImGuiKey_D);
+    frame(ui, 4);
+    check(ui.template_dirty("Crate"), "editing the template marks it unsaved");
+    check(engine.scene().entities().size() == before && engine.scene().get(lamp)->name == "Lamp",
+          "the main scene is untouched by edits in the window");
+    check(ui.headless_item_rect("template:Crate:save").has_value(), "the window has a Save button");
+    click_center(ui, *ui.headless_item_rect("template:Crate:save"));
+    frame(ui, 3);
+    check(!ui.template_dirty("Crate"), "Save writes the template");
+    const auto listing = ask(R"("method":"templates.list")");
+    check(listing.find("\"name\":\"Crate\"") != std::string::npos, "the template is still listed after saving");
+    // The saved file now holds the duplicated node: placing it makes three nodes.
+    const auto placed = ask(R"("method":"templates.instantiate","template":"project:Crate")");
+    check(placed.find("\"ok\":true") != std::string::npos && engine.scene().entities().size() == before + 3U,
+          "an instance of the saved template has the edited node tree");
+    // Closing a clean window just closes it.
+    check(ui.headless_item_rect("template:Crate:window").has_value(), "the window is still open");
+    std::cout << "Headless template editor tests passed\n";
+}
+
 // The Sky section switches between the gradient and sky materials, edits a material's panorama
 // and turns fog off.
 void sky_ui() {
@@ -2890,6 +3068,8 @@ int main() {
         fresh(game_configuration_ui);
         fresh(game_input_ui);
         fresh(scripts_ui);
+        fresh(script_references_ui);
+        fresh(template_editor_ui);
         fresh(layout_persistence_ui);
         fresh(agent_ui);
         fresh(chat_ui);

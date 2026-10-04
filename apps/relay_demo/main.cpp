@@ -459,6 +459,7 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
         editor = std::make_unique<relay::EditorUi>(
             [&protocol](const std::string_view request) { return protocol.handle(request); });
         protocol.set_editor_camera_handler([&editor](std::string_view request) { return editor->handle_camera_request(request); });
+        editor->set_shared_assets(&engine.assets());
         editor->set_panel_visible("Agent", true);
         window.set_overlay(editor.get());
 #ifdef RELAY_DEMO_PROJECT

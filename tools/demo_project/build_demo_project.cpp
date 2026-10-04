@@ -98,6 +98,14 @@ struct Builder {
         call("component.add", "\"entity\":" + text(entity) +
                                   ",\"component\":\"script\",\"behaviour\":" + text(behaviour));
     }
+    // Points a script's node or script reference property (a relay::Entity or relay::Ref<T>) at a
+    // node; `script_index` is the script's place among the node's script components.
+    void reference(const std::string& entity, const unsigned script_index, const std::string& property,
+                   const std::string& target) {
+        call("scene.set_script_property", "\"entity\":" + text(entity) + ",\"index\":" +
+                                              std::to_string(script_index) + ",\"property\":" +
+                                              text(property) + ",\"target\":" + text(target));
+    }
     // A thump from where the body is whenever it hits something (scripts/ImpactSound.cpp). Heavier
     // things get a lower `pitch`.
     void impact(const std::string& entity, const double pitch, const double volume_db = 0.0) {
@@ -180,6 +188,10 @@ void add_interface(Builder& demo) {
     ui(footer, "ui_label", "\"text\":\"Tab closes the menu\",\"size\":18,\"horizontal_align\":\"center\","
                            "\"vertical_align\":\"bottom\",\"color\":[0.6,0.62,0.66,1]");
     demo.script(hud, "GameMenu");
+    demo.reference(hud, 0, "menu", menu);
+    demo.reference(hud, 0, "crosshair", crosshair);
+    demo.reference(hud, 0, "hints", hints);
+    demo.reference(hud, 0, "shots_label", shots);
 }
 
 // Particle effects: a campfire under the warm fill light (glowing coals, flames, rising embers and
@@ -616,9 +628,16 @@ int main(const int argument_count, char** arguments) {
     demo.call("scene.set_camera", "\"entity\":" + Builder::text(player_camera) +
                                       ",\"enabled\":true,\"active\":false,"
                                       "\"field_of_view_y_degrees\":75,\"near_plane\":0.05");
+    // The script holds the camera as a node reference; saving the template keeps it pointing at the
+    // template's own Camera.
+    demo.reference(player, 0, "camera", player_camera);
     demo.call("templates.save", player_field + ",\"name\":\"First Person Controller\",\"replace\":true");
     demo.transform(player, {0, 1, 8});
     demo.call("scene.set_camera", "\"entity\":" + Builder::text(player_camera) + ",\"active\":true");
+    // The sound tests find the player, the way MusicSwitch also finds its soundtrack, by reference.
+    demo.reference(button, 0, "player", player);
+    demo.reference(music_switch, 0, "player", player);
+    demo.reference(music_switch, 0, "music", soundtrack);
     add_interface(demo);
     add_particles(demo);
 

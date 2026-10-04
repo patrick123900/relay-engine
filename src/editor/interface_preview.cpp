@@ -67,6 +67,12 @@ void InterfacePreview::begin_frame(const bool headless) {
     }
 }
 
+void InterfacePreview::release() {
+    if (!ImGui::GetCurrentContext()) return;
+    for (auto& [id, texture] : textures_) retire(std::move(texture.data));
+    textures_.clear();
+}
+
 void InterfacePreview::clear() {
     if (!ImGui::GetCurrentContext()) return;
     for (auto& [id, texture] : textures_) retire(std::move(texture.data));

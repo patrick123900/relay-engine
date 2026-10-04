@@ -69,7 +69,25 @@ enum RelayPropertyType {
     RELAY_PROPERTY_BOOLEAN = 0,
     RELAY_PROPERTY_NUMBER = 1,
     RELAY_PROPERTY_VECTOR = 2,
-    RELAY_PROPERTY_TEXT = 3
+    RELAY_PROPERTY_TEXT = 3,
+    /* A node in the scene, or a script component on one: `entity`, 0 for none. */
+    RELAY_PROPERTY_ENTITY = 4,
+    /* A project file or built-in asset name, in `text`. */
+    RELAY_PROPERTY_ASSET = 5,
+    /* An engine component id such as "camera", in `text`. */
+    RELAY_PROPERTY_COMPONENT = 6
+};
+
+/* What a property's editor offers, declared in code beside the default: for an entity, nothing,
+ * or only nodes running a behaviour, carrying an engine component, or of a node type (and its
+ * subtypes); for an asset, the file kinds it takes as a comma separated list of the names the
+ * Assets panel uses ("audio", "node_template", "image", ...). */
+enum RelayPropertyFilter {
+    RELAY_FILTER_NONE = 0,
+    RELAY_FILTER_BEHAVIOUR = 1,
+    RELAY_FILTER_COMPONENT = 2,
+    RELAY_FILTER_NODE_TYPE = 3,
+    RELAY_FILTER_ASSET_KINDS = 4
 };
 
 /* One property value; only the member matching `type` is meaningful. `text` is not
@@ -81,6 +99,7 @@ typedef struct RelayPropertyValue {
     RelayVec3 vector;
     const char* text;
     size_t text_length;
+    RelayEntity entity;
 } RelayPropertyValue;
 
 /* A declared property and its default, as written in the behaviour's code. Pointers stay valid
@@ -88,6 +107,9 @@ typedef struct RelayPropertyValue {
 typedef struct RelayPropertyInfo {
     const char* name;
     RelayPropertyValue value;
+    int filter;            /* RelayPropertyFilter */
+    const char* filter_text; /* Not NUL-terminated. */
+    size_t filter_length;
 } RelayPropertyInfo;
 
 /* Functions returning int report 1 on success and 0 when the entity is gone or lacks the needed
@@ -282,6 +304,14 @@ typedef struct RelayHostApi {
     /* Enabled colliders on `layer_mask` layers overlapping `shape` centred at `center`. */
     size_t (*overlap_shape)(void* context, const RelayShape* shape, RelayVec3 center, uint32_t layer_mask,
                             RelayEntity ignore, RelayEntity* out, size_t capacity);
+    /* Script instances. The pointer is the object `RelayScriptModule::create` returned for the
+     * entity's first running script component of that behaviour, or null when it has none (or the
+     * instance failed or is going). It stays valid until the next scene change that removes the
+     * script, so scripts look it up when they use it. */
+    void* (*script_instance)(void* context, RelayEntity entity, const char* behaviour, size_t length);
+    /* Entities with a running script component of that behaviour, sorted; returns the total. */
+    size_t (*script_entities)(void* context, const char* behaviour, size_t length, RelayEntity* out,
+                              size_t capacity);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

@@ -7,6 +7,8 @@
 // linked into relay_demo alone, leaving the engine library free of UI dependencies.
 
 #include "relay/editor/editor_viewport.hpp"
+#include "relay/observe/capture.hpp"
+#include "relay/render/scene_render.hpp"
 #include "relay/scene/scene.hpp"
 #include <cstdint>
 #include <functional>
@@ -16,8 +18,6 @@
 #include <vulkan/vulkan.h>
 
 namespace relay {
-
-struct ViewOverride;
 
 // Everything an overlay needs to build pipelines compatible with the window's render pass.
 struct OverlayContext {
@@ -34,6 +34,20 @@ struct OverlayContext {
     VkRenderPass render_pass{};
     std::uint32_t image_count{};
     std::uint32_t frames_in_flight{};
+};
+
+// A scene the overlay wants drawn into an image by the window's renderer, other than the one in
+// the main viewport: the template editor's viewport. The window renders each requested view after
+// presenting a frame, with the same passes as the main view but without global illumination,
+// reflections, particles or the game interface, and hands the picture to `ready`.
+struct OffscreenView {
+    const Scene* scene{};
+    ViewOverride view;
+    std::uint32_t width{}, height{};
+    std::vector<Entity> selected; // Outlined, with their descendants.
+    bool grid{true};
+    // Called with 8-bit sRGB RGBA rows; not called when the view could not be drawn.
+    std::function<void(OwnedFrame)> ready;
 };
 
 class EditorOverlay {
@@ -67,6 +81,8 @@ public:
         return entity.valid() ? std::vector<Entity>{entity} : std::vector<Entity>{};
     }
     [[nodiscard]] virtual bool ground_grid_visible() const { return false; }
+    // Views to draw into images after this frame is presented; asked once per frame.
+    [[nodiscard]] virtual std::vector<OffscreenView> offscreen_views() { return {}; }
     // Material previews: the surface .relay-material the UI wants shown on a sphere (empty for
     // none), and the rendered result, as 8-bit sRGB RGBA rows, delivered a frame or two after the
     // material or its parameters last changed.

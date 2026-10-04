@@ -1,3 +1,4 @@
+#include "FirstPersonController.hpp"
 #include "relay_script.hpp"
 
 #include <array>
@@ -11,19 +12,15 @@ public:
     void properties(relay::Properties& p) override {
         p.add("reach", reach);
         p.add("travel", travel);
-        p.add("player_name", player_name);
-        p.add("camera_name", camera_name);
+        p.add("player", player);
         p.add("duck_bus", duck_bus);
         p.add("duck_db", duck_db);
     }
 
     void on_start() override {
         rest = self().position();
-        player = relay::world::find(player_name);
-        if (player) camera = player.child(camera_name);
-        if (!camera)
-            relay::world::warn("no " + player_name + " with a " + camera_name +
-                               " child, so only thrown balls press this button");
+        if (!player)
+            relay::world::warn("no player is assigned, so only thrown balls press this button");
     }
 
     void on_update(double dt) override {
@@ -35,7 +32,10 @@ public:
             ducked -= dt;
             if (ducked <= 0.0) relay::audio::set_bus_volume(duck_bus, music_volume, 1.0);
         }
-        if (!camera || !relay::input::pressed("interact")) return;
+        if (!player || !relay::input::pressed("interact")) return;
+        // Aim from where the player looks.
+        const auto camera = player->view();
+        if (!camera) return;
         // Cameras look down -Z; the controller turns its camera by pitch (X) then yaw (Y).
         constexpr double radians = 3.14159265358979323846 / 180.0;
         const auto angles = camera.rotation();
@@ -43,12 +43,12 @@ public:
         const relay::Vec3 forward{-std::cos(pitch) * std::sin(yaw), std::sin(pitch),
                                   -std::cos(pitch) * std::cos(yaw)};
         const auto hit = relay::world::raycast(camera.world_position(), forward, reach,
-                                               0xffffffffu, player);
+                                               0xffffffffu, player.entity());
         if (hit && hit->entity == self()) press();
     }
 
     void on_contact_begin(relay::Entity other) override {
-        if (other != player) press();
+        if (other != player.entity()) press();
     }
 
 private:
@@ -69,11 +69,9 @@ private:
 
     double reach = 3.0;   // Metres from the camera.
     double travel = 0.04; // How far the button dips, in metres.
-    std::string player_name = "First Person Controller";
-    std::string camera_name = "Camera";
+    relay::Ref<FirstPersonController> player;
     std::string duck_bus = "Music"; // Turned down while a note rings; empty leaves it alone.
     double duck_db = -10.0;
-    relay::Entity player, camera;
     double music_volume = 0.0;
     double ducked = 0.0;
     relay::Vec3 rest;

@@ -51,12 +51,73 @@ private:
 RELAY_BEHAVIOUR(Mover)
 ```
 
-`bool`, `int`, `float`, `double`, `relay::Vec3` and `std::string` fields are supported. The
+`bool`, `int`, `float`, `double`, `relay::Vec3` and `std::string` fields are supported, along with
+the reference types below. The
 Inspector shows each declared property on every script component using that behaviour; changing a
 value stores it on that node (in the scene file), and **Reset** returns it to the code's default.
 Properties a node has not changed follow the code, so editing a default in code updates every node
 that kept it. Relay assigns stored values after construction and before `on_start`. A stored
 value whose field was renamed or changed type is skipped with a warning in the log.
+
+### Referring to nodes, scripts, files and components
+
+Games spend most of their time pointing at things, so properties can hold the things themselves
+rather than their names. The Inspector edits each with a picker (click the field), or you can drag
+a node from the Hierarchy or a file from Assets onto it. Fields that would accept the drag are
+outlined; the ones that would not say what they take.
+
+| Declare | It holds | The picker offers |
+| --- | --- | --- |
+| `relay::Entity` | a node in the scene | every node |
+| `relay::Entity` with `relay::Only::component(relay::Component::light)` or `relay::Only::node_type("Camera")` | a node with that component, or of that type or a subtype | only those nodes |
+| `relay::Ref<T>` | another script `T`, held as the node it runs on | nodes running a `T` |
+| `relay::Component` | an engine component type | the component list |
+| `relay::AudioClip`, `Template`, `Model`, `Image`, `Material`, `Shader`, `Scene`, `TextFile` | a project file of that kind | files of that kind |
+
+```cpp
+class Turret : public relay::Behaviour {
+public:
+    void properties(relay::Properties& p) override {
+        p.add("target", target);                 // relay::Entity
+        p.add("health", health);                 // relay::Ref<Health>
+        p.add("shot", shot);                     // relay::AudioClip
+        p.add("bullet", bullet);                 // relay::Template
+    }
+    void on_update(double) override {
+        if (health && health->dead()) return;    // The Health script on that node, if it has one.
+        if (target && fire_ready()) {
+            relay::audio::play(shot, self().world_position());
+            relay::world::instantiate(bullet, self().world_position());
+        }
+    }
+private:
+    relay::Entity target;
+    relay::Ref<Health> health;
+    relay::AudioClip shot{"sounds/shot.wav"};    // A default, as for any property.
+    relay::Template bullet;
+};
+```
+
+A reference stays correct as the scene changes: copying a node tree points references inside it at
+the copies (templates and `Entity::clone` too), duplicating or cloning in place keeps references
+to nodes outside the tree, copy and paste into another scene clears them, and deleting a node
+clears every reference to it. A reference to a deleted node reads as empty (`if (target)`), and a
+node that dies mid-game makes `entity.alive()` false rather than leaving a dangling handle. Code
+defaults for nodes are always empty; wire them in the scene.
+
+`relay::Ref<T>` finds the `T` instance when you ask (`ref.get()`, `ref->`, `*ref`), so it is null
+while the node has no `T`, after the script is removed and across hot reloads; do not keep the
+pointer between frames. Scripts that reference each other need the class declared in a header
+under `scripts/` that both include (put `RELAY_BEHAVIOUR` in one `.cpp`), as the demo's
+[`FirstPersonController.hpp`](../examples/demo/scripts/FirstPersonController.hpp) does for
+`MusicSwitch` and `ToneButton`. Without a reference, use `entity.script<T>()` for the first running
+`T` on a node, `entity.has_script<T>()`, `relay::world::entities_with<T>()` for every node running
+one, and `relay::world::scripts<T>()` for the instances; `entity.add_script<T>()` and
+`remove_script<T>()` add and remove them.
+
+Components have a typed list too: `entity.has_component(relay::Component::collider)` and the same
+for `add_component` and `remove_component`. The string forms remain for component ids added after
+your SDK. A test keeps the `Component` enum in step with the engine.
 
 ## Input
 
@@ -99,7 +160,7 @@ trigger) shoots: it instantiates the demo's **Ball** template just in front of t
 its velocity along the view, plus the player's own motion. Balls sit on collider layer 2, which the
 player's collider mask leaves out, so they never knock into the shooter, and their
 [`Projectile`](../examples/demo/scripts/Projectile.cpp) script destroys them after six seconds. Its
-speeds, mouse sensitivity, camera name, ball template and ball speed are Inspector properties. Edit
+speeds, mouse sensitivity, camera node, ball template and ball speed are Inspector properties. Edit
 the script to change how the player moves, or copy the file and the template into another project.
 The demo's input map locks the mouse while the game has input.
 
@@ -214,8 +275,9 @@ void on_contact_begin(relay::Entity other) override {
   be in the other's mask.
 - `relay::world::overlap_sphere(center, radius, layer_mask, ignore)` lists the enabled colliders
   on those layers inside a sphere, for explosions, pickups and area checks.
-- `relay::world::find("Name")` and `entity.child("Name")` find entities by name;
-  `entity.children()` lists direct children.
+- `relay::world::find("Name")` and `entity.child("Name")` find entities by name, for nodes made
+  while the game runs; for nodes in the scene prefer a `relay::Entity` property (see
+  [Properties](#properties)). `entity.children()` lists direct children.
 
 All queries use the running physics world, including spawned bodies and excluding destroyed ones.
 
@@ -383,8 +445,11 @@ The compiler is the one Relay was built with. Set `RELAY_SCRIPT_COMPILER` to use
 The protocol methods are `scripts.sdk`, `scripts.read`, `scripts.write`, `scripts.create`,
 `scripts.build` and `scripts.status`, plus `component.add`/`component.remove` with component
 `script`, `scene.set_script` (behaviour and enabled state, by index) and
-`scene.set_script_property`. `component.types` lists built behaviours with their properties and
-code defaults. `input.map` and `input.set_map` read and replace the input map, and
+`scene.set_script_property`, which takes `number`, `boolean`, `text`, `vector`, `target` (a node
+handle, or empty to clear, for node and script references), `asset` (a project file path) or
+`component` (an id), by the property's declared type. `scripts.status` lists built behaviours with
+each property's type, code default and, when the code limits it, a `filter` (`behaviour`,
+`component`, `node_type` or `asset_kinds` with its `text`). `input.map` and `input.set_map` read and replace the input map, and
 `input.simulate` holds an action or sets an axis for a number of steps during Run Game, so agents
 can play-test with `runtime.step` and check the result. The loop is: read the SDK, write the
 source, build, poll `scripts.status` until the state is `ready` or `failed`, fix any diagnostics,

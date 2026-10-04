@@ -1,4 +1,6 @@
 #include "relay/editor/editor_ui.hpp"
+#include "relay/control/template_session.hpp"
+#include "relay/render/scene_preview.hpp"
 #include "relay/editor/ide.hpp"
 #include "relay/observe/profiler.hpp"
 #include "relay/scene/components.hpp"
@@ -450,6 +452,14 @@ struct EditorUi::Impl {
 
     bool imgui_context_created{false};
     bool headless{false};
+    // An editor drawn inside a window of another editor (the template editor): no ImGui backend,
+    // no saved layout, no application shortcuts. `window_tag` keeps its window ids apart from the
+    // main editor's, `embedded_save` is what Ctrl+S does there, and `gizmo_id` keeps its gizmo's
+    // drag state apart from the main viewport's.
+    bool embedded{false};
+    std::string window_tag;
+    int gizmo_id{0};
+    std::function<void()> embedded_save;
     // Width Inspector fields leave free on their right, for a button after them.
     float inspector_field_reserve{0.0F};
     // The Inspector's material preview: the surface material shown this frame and last frame
@@ -4188,8 +4198,11 @@ struct EditorUi::Impl {
         draw_list->PushClipRect(viewport_min, viewport_max, true);
         ImGuizmo::Enable(!navigating);
         ImGuizmo::SetGizmoSizeClipSpace(0.12F);
+        // Each viewport's gizmo keeps its own drag state.
+        ImGui::PushID(gizmo_id);
         const bool used = ImGuizmo::Manipulate(camera_view.data(), projection.data(),
                                                gizmo_operation, gizmo_mode, world.data());
+        ImGui::PopID();
         draw_list->PopClipRect();
         const bool using_gizmo = ImGuizmo::IsUsing();
         if (using_gizmo && !gizmo_active) gizmo_gesture = ++gesture_serial;
@@ -6915,12 +6928,64 @@ struct EditorUi::Impl {
         }
     }
 
-    // A text script property holds an asset path when its default or value names one.
-    static std::string script_asset_kind(const JsonValue::Object& declared, const JsonValue& value) {
-        for (const auto* text : {value.string(), field(declared, "value") ? field(declared, "value")->string() : nullptr})
-            if (text && !text->empty())
-                if (auto kind = asset_kind_of_file(*text); !kind.empty()) return kind;
-        return {};
+    // Whether a scene node is one a script property's filter allows (a behaviour it runs, an engine
+    // component it has, or a node type it derives from).
+    [[nodiscard]] bool passes_script_filter(const JsonValue::Object& candidate, const std::string& kind,
+                                            const std::string& text) const {
+        if (kind == "behaviour") {
+            const auto* scripts = field(candidate, "scripts");
+            if (!scripts || !scripts->array()) return false;
+            for (const auto& script : *scripts->array())
+                if (const auto* object = script.object(); object && string_or(*object, "behaviour") == text)
+                    return true;
+            return false;
+        }
+        if (kind == "component") {
+            if (text == "transform") return true;
+            if (text == "script") {
+                const auto* scripts = field(candidate, "scripts");
+                return scripts && scripts->array() && !scripts->array()->empty();
+            }
+            return component(candidate, component_key(text)) != nullptr;
+        }
+        if (kind == "node_type") return type_within(string_or(candidate, "type", "Node"), text);
+        return true;
+    }
+
+    // A node (or script) reference: pick from the scene's nodes, or drop one from the Hierarchy.
+    void draw_script_entity(const std::string& script_request, const std::string& name, const std::string& current,
+                            const std::string& filter_kind, const std::string& filter_text) {
+        const auto* target = current.empty() ? nullptr : find_entity(current);
+        const auto choose = [this, script_request, name](const std::string& handle) {
+            mutate("scene.set_script_property",
+                   script_request + ",\"property\":\"" + name + "\",\"target\":\"" + handle + '"',
+                   handle.empty() ? "Reference cleared" : "Reference set");
+        };
+        const auto key = "inspector:script:" + script_request + ":" + name;
+        asset_field(
+            name.c_str(), current, key,
+            [=, this] {
+                AssetPick pick;
+                pick.key = key;
+                pick.title = "Choose " + field_display_name(name);
+                pick.what = filter_kind == "behaviour" ? "a node running " + filter_text
+                            : filter_kind == "component" ? "a node with a " + filter_text + " component"
+                            : filter_kind == "node_type" ? "a " + filter_text + " node"
+                                                         : "a node";
+                pick.current = current;
+                pick.choices.push_back({"", "None", AssetIcon::node, "", "", std::nullopt});
+                for (const auto* candidate : entities) {
+                    if (!passes_script_filter(*candidate, filter_kind, filter_text)) continue;
+                    const auto handle = string_or(*candidate, "entity");
+                    pick.choices.push_back({handle, string_or(*candidate, "name"), AssetIcon::node, "@scene",
+                                            node_path(handle), std::nullopt});
+                }
+                pick.choose = choose;
+                return pick;
+            },
+            "None", AssetIcon::node,
+            target ? std::optional<Reference>(Reference{string_or(*target, "name"), AssetIcon::node, node_path(current)})
+                   : std::nullopt);
     }
 
     void draw_script_property(const std::string& script_request, const JsonValue::Object& declared,
@@ -6952,14 +7017,25 @@ struct EditorUi::Impl {
             if (drag_vector3(name.c_str(), current, 0.01F, 72.0F * ui_scale))
                 set("\"vector\":[" + number_text(current[0]) + "," + number_text(current[1]) +
                     "," + number_text(current[2]) + "]");
-        } else if (const auto asset_kind = type == "text" ? script_asset_kind(declared, *value) : std::string{};
-                   !asset_kind.empty()) {
-            // Text naming a project file (its default or value has an asset's extension) is edited
-            // as an asset reference.
+        } else if (type == "entity") {
+            const auto* filter = field(declared, "filter");
+            draw_script_entity(script_request, name, value->string() ? *value->string() : std::string{},
+                               filter && filter->object() ? string_or(*filter->object(), "kind") : std::string{},
+                               filter && filter->object() ? string_or(*filter->object(), "text") : std::string{});
+        } else if (type == "asset") {
+            // Kinds come from the type the script declares (relay::AudioClip, relay::Template, ...).
+            const auto* filter = field(declared, "filter");
+            const auto kinds_text = filter && filter->object() ? string_or(*filter->object(), "text") : std::string{};
+            std::vector<std::string> kinds;
+            for (std::size_t start = 0; start <= kinds_text.size();) {
+                const auto end = std::min(kinds_text.find(',', start), kinds_text.size());
+                if (end > start) kinds.push_back(kinds_text.substr(start, end - start));
+                start = end + 1U;
+            }
             const auto current = value->string() ? *value->string() : std::string{};
             const auto choose = [this, script_request, name](const std::string& file) {
                 mutate("scene.set_script_property",
-                       script_request + ",\"property\":\"" + name + "\",\"text\":\"" + json_escape(file) + '"',
+                       script_request + ",\"property\":\"" + name + "\",\"asset\":\"" + json_escape(file) + '"',
                        "Property updated");
             };
             const auto key = "inspector:script:" + script_request + ":" + name;
@@ -6968,14 +7044,29 @@ struct EditorUi::Impl {
                 [=, this] {
                     AssetPick pick;
                     pick.key = key;
-                    pick.title = "Choose " + name;
+                    pick.title = "Choose " + field_display_name(name);
                     pick.current = current;
-                    pick.kinds = {asset_kind};
+                    pick.kinds = kinds;
                     pick.choices.push_back({"", "None", AssetIcon::other, "", "", std::nullopt});
                     pick.choose = choose;
                     return pick;
                 },
-                "None", asset_icon_for_kind(asset_kind));
+                "None", asset_icon_for_kind(kinds.empty() ? std::string{} : kinds.front()));
+        } else if (type == "component") {
+            const auto current = value->string() ? *value->string() : std::string{};
+            const auto* kind = find_component_kind(current);
+            if (inspector_begin_combo(name.c_str(), kind ? std::string{kind->name}.c_str() : "None")) {
+                if (ImGui::Selectable("None", current.empty()))
+                    mutate("scene.set_script_property",
+                           script_request + ",\"property\":\"" + name + "\",\"component\":\"\"", "Property updated");
+                for (const auto& option : engine_components())
+                    if (ImGui::Selectable(std::string{option.name}.c_str(), option.id == current))
+                        mutate("scene.set_script_property",
+                               script_request + ",\"property\":\"" + name + "\",\"component\":\"" +
+                                   std::string{option.id} + '"',
+                               "Property updated");
+                ImGui::EndCombo();
+            }
         } else if (type == "text") {
             auto& buffer = script_text_buffers[script_request + name];
             // Show the stored value unless the person is typing in this field.
@@ -6997,6 +7088,13 @@ struct EditorUi::Impl {
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Use the default from the script's code");
         }
         ImGui::PopID();
+    }
+
+    // A stored value belongs to a declared property of the same type. Text stored before a property
+    // became an asset or component type still reads as that type.
+    [[nodiscard]] static bool same_property_type(const std::string& stored, const std::string& declared) {
+        return stored == declared ||
+               (stored == "text" && (declared == "asset" || declared == "component"));
     }
 
     void draw_script_sections(const JsonValue::Object& entity) {
@@ -7030,7 +7128,7 @@ struct EditorUi::Impl {
                         for (const auto& candidate : *stored_list->array())
                             if (const auto* object = candidate.object();
                                 object && string_or(*object, "name") == string_or(*property, "name") &&
-                                string_or(*object, "type") == string_or(*property, "type"))
+                                same_property_type(string_or(*object, "type"), string_or(*property, "type")))
                                 stored = object;
                     draw_script_property(script_request, *property, stored);
                 }
@@ -8987,6 +9085,8 @@ struct EditorUi::Impl {
                 ImGui::TextWrapped("A custom template saved in this project. Creates a copy of the "
                                    "saved node and its children; later changes to the template do "
                                    "not affect copies.");
+                if (ImGui::Button("Edit template...")) open_template(template_entry->name);
+                note_item("node_window:edit_template");
                 ImGui::Spacing();
                 ImGui::SeparatorText("Components");
                 for (const auto& component : template_entry->components)
@@ -10260,6 +10360,467 @@ struct EditorUi::Impl {
         viewport_draw_list->PopClipRect();
     }
 
+
+    // ---- Template editor ------------------------------------------------------------------------
+    // Each open template is a floating window over its own engine (a TemplateSession) and an
+    // embedded copy of this editor driving that engine through the ordinary protocol, so it has the
+    // real Hierarchy, Inspector, gizmos, undo and Asset Browser. Its viewport is the CPU scene preview.
+    struct TemplateWindow {
+        std::string name;
+        std::unique_ptr<TemplateSession> session;
+        std::unique_ptr<Impl> ui;
+        bool focus_pending{true}, confirm_close{}, closing{};
+        float hierarchy_width{0.0F}, inspector_width{0.0F};
+        std::string signature, render_error;
+        double last_render{-1000.0};
+        std::uint64_t texture_id{next_ui_texture_id()}, texture_revision{};
+        std::shared_ptr<UiTexture> texture;
+        UiDrawList quad;
+        std::uint32_t picture_width{}, picture_height{};
+        int id{};
+        // The GPU picture: asked for after each presented frame, delivered by the window's renderer.
+        bool gpu_ready{};          // A GPU picture has arrived and is the one shown.
+        bool gpu_request_valid{};
+        OffscreenView gpu_request; // What to draw; `ready` is filled in when it is handed over.
+        std::string gpu_signature, gpu_drawn_signature;
+        double gpu_last{-1000.0};
+        int gpu_unanswered{};      // Frames a request has gone unanswered, to fall back to the CPU.
+        ~TemplateWindow();
+    };
+    std::vector<std::unique_ptr<TemplateWindow>> template_windows;
+    bool template_focused{false};
+    int template_serial{0};
+    AssetRegistry* shared_assets{nullptr};
+    // Whether the window's renderer draws template viewports; off headless and after it fails.
+    bool gpu_views{false};
+    std::string template_project;
+
+    // Clears what an embedded editor holds in the shared ImGui context, all at once (shutdown).
+    void release_embedded() {
+        if (!ImGui::GetCurrentContext()) return;
+        thumbnails.clear();
+        interface_preview.clear();
+        if (preview_texture) ImGui::UnregisterUserTexture(preview_texture.get());
+        preview_texture.reset();
+    }
+
+    // Closed windows' editors wait here until the backend has destroyed their textures, so no
+    // ImGui texture is freed while the backend still holds it.
+    std::vector<std::unique_ptr<Impl>> closing_editors;
+    void retire_embedded(std::unique_ptr<Impl> editor) {
+        editor->thumbnails.release();
+        editor->interface_preview.release();
+        if (editor->preview_texture) ImGui::UnregisterUserTexture(editor->preview_texture.get());
+        editor->preview_texture.reset();
+        closing_editors.push_back(std::move(editor));
+    }
+    void close_template_windows() {
+        for (auto& window : template_windows)
+            if (window->ui) retire_embedded(std::move(window->ui));
+        template_windows.clear();
+    }
+    void drain_closing_editors() {
+        for (auto item = closing_editors.begin(); item != closing_editors.end();) {
+            (*item)->thumbnails.begin_frame(headless);
+            (*item)->interface_preview.begin_frame(headless);
+            if ((*item)->thumbnails.idle() && (*item)->interface_preview.idle()) item = closing_editors.erase(item);
+            else ++item;
+        }
+    }
+
+    bool open_template(const std::string& name) {
+        if (embedded) return false;
+        const auto* project = active_project();
+        if (!project) {
+            set_status("Open a project to edit its templates", true);
+            return false;
+        }
+        const auto filename = string_or(*project, "filename");
+        if (filename != template_project) {
+            close_template_windows();
+            template_project = filename;
+        }
+        for (auto& existing : template_windows)
+            if (existing->name == name) {
+                existing->focus_pending = true;
+                return true;
+            }
+        auto window = std::make_unique<TemplateWindow>();
+        window->name = name;
+        window->session = std::make_unique<TemplateSession>(
+            filename, name, [this](const std::string_view line) { return request(line); }, shared_assets);
+        window->id = template_serial + 1;
+        if (!window->session->ok()) {
+            set_status("Cannot edit template " + name + ": " + window->session->error(), true);
+            return false;
+        }
+        auto* session = window->session.get();
+        auto child = std::make_unique<Impl>([session](const std::string_view line) { return session->handle(line); });
+        child->embedded = true;
+        child->window_tag = "#template" + std::to_string(++template_serial);
+        child->gizmo_id = 1000 + template_serial;
+        child->headless = headless;
+        child->imgui_context_created = imgui_context_created;
+        child->vulkan_backend_started = vulkan_backend_started;
+        child->device = device;
+        child->fonts = fonts;
+        child->ui_scale = ui_scale;
+        child->grid_enabled = grid_enabled;
+        child->collider_wireframes_enabled = collider_wireframes_enabled;
+        child->node_icons_enabled = node_icons_enabled;
+        child->camera_wireframes_enabled = camera_wireframes_enabled;
+        child->ide_preset = ide_preset;
+        child->ide_command = ide_command;
+        child->ide_launcher = ide_launcher;
+        child->embedded_save = [this, raw = window.get()] { save_template_window(*raw); };
+        child->refresh();
+        child->viewport_min = {0.0F, 0.0F};
+        child->viewport_max = {640.0F, 400.0F};
+        if (session->root().valid()) {
+            child->select(session->root().to_string());
+            child->focus_selection();
+        }
+        window->ui = std::move(child);
+        template_windows.push_back(std::move(window));
+        set_status("Editing template " + name, false);
+        return true;
+    }
+
+    void save_template_window(TemplateWindow& window) {
+        std::string error;
+        if (!window.session->save(error)) {
+            set_status("Cannot save template " + window.name + ": " + error, true);
+            window.ui->set_status("Cannot save: " + error, true);
+            return;
+        }
+        // The Add Node window and Assets list follow the file.
+        assets_pending = true;
+        set_status("Saved template " + window.name, false);
+        window.ui->set_status("Saved " + window.name, false);
+    }
+
+    // Shows a finished picture (8-bit sRGB RGBA) in the viewport. The picture goes into the corner of
+    // a texture whose size changes only in coarse steps: dragging the window's edge changes the
+    // picture's size every frame, and a new ImGui texture each time (an image, memory and a
+    // descriptor set from the backend's small pool) ran the pool dry and crashed the editor.
+    void set_template_picture(TemplateWindow& window, std::vector<std::uint8_t> rgba, const std::uint32_t width,
+                              const std::uint32_t height) {
+        constexpr std::uint32_t step = 256U;
+        const auto round_up = [](const std::uint32_t value) { return (value + step - 1U) / step * step; };
+        auto capacity_width = window.texture ? window.texture->width : 0U;
+        auto capacity_height = window.texture ? window.texture->height : 0U;
+        // Grows to fit; shrinks only when the picture is under half of it both ways.
+        if (width > capacity_width || height > capacity_height || width * 2U < capacity_width ||
+            height * 2U < capacity_height) {
+            capacity_width = round_up(width);
+            capacity_height = round_up(height);
+        }
+        auto texture = std::make_shared<UiTexture>();
+        texture->id = window.texture_id;
+        texture->revision = ++window.texture_revision;
+        texture->width = capacity_width;
+        texture->height = capacity_height;
+        texture->rgba.assign(static_cast<std::size_t>(capacity_width) * capacity_height * 4U, 0U);
+        for (std::uint32_t row = 0; row < height; ++row)
+            std::copy_n(rgba.begin() + static_cast<std::ptrdiff_t>(row) * width * 4,
+                        static_cast<std::ptrdiff_t>(width) * 4,
+                        texture->rgba.begin() + static_cast<std::ptrdiff_t>(row) * capacity_width * 4);
+        window.texture = std::move(texture);
+        window.picture_width = width;
+        window.picture_height = height;
+        auto& quad = window.quad;
+        quad = {};
+        quad.width = width;
+        quad.height = height;
+        const auto w = static_cast<float>(width), h = static_cast<float>(height);
+        const float u = w / static_cast<float>(capacity_width), v = h / static_cast<float>(capacity_height);
+        quad.vertices = {{0, 0, 0, 0, 0xFFFFFFFFU}, {w, 0, u, 0, 0xFFFFFFFFU}, {w, h, u, v, 0xFFFFFFFFU}, {0, h, 0, v, 0xFFFFFFFFU}};
+        quad.indices = {0, 1, 2, 0, 2, 3};
+        quad.commands = {{0, 0, 6, {0, 0, w, h}}};
+        quad.textures = {window.texture};
+    }
+
+    // The viewport's picture. With the window's renderer (a live editor) it is drawn on the GPU by
+    // the same passes as the main viewport, asked for here and delivered after the frame is
+    // presented; until the first one arrives, and whenever the GPU cannot, the CPU preview stands in.
+    void render_template_picture(TemplateWindow& window, const ImVec2 size) {
+        auto& ui = *window.ui;
+        const float density = std::max(ImGui::GetIO().DisplayFramebufferScale.x, 1.0F);
+        auto width = static_cast<std::uint32_t>(std::max(16.0F, std::round(size.x * density)));
+        auto height = static_cast<std::uint32_t>(std::max(16.0F, std::round(size.y * density)));
+        constexpr double maximum_pixels = 1.4e6;
+        if (static_cast<double>(width) * height > maximum_pixels) {
+            const double shrink = std::sqrt(maximum_pixels / (static_cast<double>(width) * height));
+            width = std::max(16U, static_cast<std::uint32_t>(width * shrink));
+            height = std::max(16U, static_cast<std::uint32_t>(height * shrink));
+        }
+        std::ostringstream key;
+        key << window.session->engine().scene_history().revision() << '|' << ui.scene_list_serial << '|' << width
+            << 'x' << height << '|' << ui.view.position.x << ',' << ui.view.position.y << ',' << ui.view.position.z
+            << '|' << ui.view.target.x << ',' << ui.view.target.y << ',' << ui.view.target.z << '|'
+            << ui.grid_enabled << '|';
+        for (const auto& handle : ui.selections.handles) key << handle << ';';
+        const double now = ImGui::GetTime();
+        std::vector<Entity> selected;
+        for (const auto& handle : ui.selections.handles)
+            if (const auto entity = Entity::parse(handle)) selected.push_back(*entity);
+        if (gpu_views && window.gpu_unanswered < 180) {
+            window.gpu_signature = key.str();
+            window.gpu_request_valid = true;
+            window.gpu_request = {};
+            window.gpu_request.scene = &window.session->engine().scene();
+            window.gpu_request.view = ui.view;
+            window.gpu_request.width = width;
+            window.gpu_request.height = height;
+            window.gpu_request.selected = selected;
+            window.gpu_request.grid = ui.grid_enabled;
+            if (window.gpu_ready) return;
+        } else {
+            window.gpu_request_valid = false;
+            window.gpu_ready = false;
+        }
+        // Assets (textures, shader materials) can finish loading with no scene change, so the
+        // picture is also refreshed once a second.
+        if (key.str() != window.signature || now - window.last_render > 1.0 || !window.texture) {
+            window.signature = key.str();
+            window.last_render = now;
+            ScenePreviewOptions options;
+            options.grid = ui.grid_enabled;
+            options.highlight = selected;
+            ScenePreviewFrame frame;
+            if (render_scene_preview(window.session->engine().scene(), window.session->engine().assets(), ui.view,
+                                     width, height, options, frame, window.render_error))
+                set_template_picture(window, std::move(frame.rgba), width, height);
+        }
+    }
+
+    void draw_template_viewport(TemplateWindow& window, const ImVec2 size) {
+        auto& ui = *window.ui;
+        ui.viewport_visible = ImGui::BeginChild("##template_viewport", size, ImGuiChildFlags_None,
+                                                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ui.viewport_hovered = ui.viewport_visible && ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+        const auto origin = ImGui::GetCursorScreenPos();
+        const auto available = ImGui::GetContentRegionAvail();
+        ui.viewport_min = origin;
+        ui.viewport_max = {origin.x + std::max(available.x, 1.0F), origin.y + std::max(available.y, 1.0F)};
+        ui.viewport_draw_list = ImGui::GetWindowDrawList();
+        if (headless)
+            ui.headless_items["viewport"] = {ui.viewport_min.x, ui.viewport_min.y, ui.viewport_max.x, ui.viewport_max.y};
+        if (ui.viewport_visible && available.x > 16.0F && available.y > 16.0F) {
+            ui.draw_viewport_drop_target();
+            ui.update_camera_input();
+            ui.update_view();
+            render_template_picture(window, available);
+            if (window.texture && window.picture_width > 0U) {
+                const float scale = available.x / static_cast<float>(window.picture_width);
+                ui.interface_preview.draw(ui.viewport_draw_list, window.quad, origin, scale, ui.viewport_min,
+                                          ui.viewport_max);
+            } else if (!window.render_error.empty()) {
+                ImGui::TextDisabled("%s", window.render_error.c_str());
+            }
+            ui.draw_collider_wireframes();
+            ui.draw_audio_shapes();
+            ui.draw_scene_nodes();
+            ui.draw_gizmo();
+            ui.update_selection_input();
+        } else {
+            ui.gizmo_active = false;
+        }
+        ImGui::EndChild();
+    }
+
+    // A vertical bar between two panes; returns how far it was dragged this frame.
+    float template_splitter(const char* id, const float height) {
+        ImGui::InvisibleButton(id, ImVec2(5.0F * ui_scale, height));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        const auto low = ImGui::GetItemRectMin(), high = ImGui::GetItemRectMax();
+        const float x = (low.x + high.x) * 0.5F;
+        ImGui::GetWindowDrawList()->AddLine({x, low.y}, {x, high.y},
+                                            ImGui::IsItemActive() || ImGui::IsItemHovered()
+                                                ? ImGui::GetColorU32(ImGuiCol_SeparatorActive)
+                                                : ImGui::GetColorU32(ImGuiCol_Separator));
+        return ImGui::IsItemActive() ? ImGui::GetIO().MouseDelta.x : 0.0F;
+    }
+
+    void draw_template_window(TemplateWindow& window) {
+        auto& ui = *window.ui;
+        const std::string prefix = "template:" + window.name + ":";
+        window.session->tick();
+        // What a top-level editor does at the start of its frame.
+        if (ui.ui_scale != ui_scale) {
+            ui.ui_scale = ui_scale;
+            ui.fonts = fonts;
+        }
+        ui.headless_items.clear();
+        ui.thumbnails.begin_frame(headless);
+        ui.interface_preview.begin_frame(headless);
+        ui.pending_gesture = 0;
+        ui.composer_rect.reset();
+        const double delta = static_cast<double>(ImGui::GetIO().DeltaTime);
+        ui.seconds_since_refresh += delta;
+        ui.seconds_since_assets += delta;
+        if (ui.refresh_pending) ui.refresh();
+        else if (ui.refresh_stage >= 0 || ui.seconds_since_refresh >= ui.refresh_interval()) ui.advance_refresh();
+        ui.frame_open = true;
+        ui.update_slow_click();
+
+        const std::string title = std::string(window.session->dirty() ? "* " : "") + "Template: " + window.name +
+                                  "###template:" + window.name;
+        ImGui::SetNextWindowSize(ImVec2(980.0F * ui_scale, 620.0F * ui_scale), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(640.0F * ui_scale, 400.0F * ui_scale), ImVec2(FLT_MAX, FLT_MAX));
+        if (window.focus_pending) {
+            ImGui::SetNextWindowFocus();
+            window.focus_pending = false;
+        }
+        bool open = true;
+        const bool visible = ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse);
+        if (!open) {
+            if (window.session->dirty()) window.confirm_close = true;
+            else window.closing = true;
+        }
+        if (visible) {
+            const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+            if (focused) template_focused = true;
+            if (headless) {
+                const auto at = ImGui::GetWindowPos(), extent = ImGui::GetWindowSize();
+                headless_items[prefix + "window"] = {at.x, at.y, at.x + extent.x, at.y + extent.y};
+            }
+            // The toolbar: save and revert, then the editor's own undo, framing and gizmo tools.
+            ImGui::BeginDisabled(!window.session->dirty());
+            if (ImGui::Button("Save")) save_template_window(window);
+            note_item(prefix + "save");
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Save the template (Ctrl+S). Copies already placed in scenes are not changed.");
+            ImGui::SameLine();
+            if (ImGui::Button("Revert")) {
+                std::string error;
+                if (window.session->revert(error)) {
+                    ui.select(window.session->root().to_string());
+                    ui.refresh_pending = true;
+                    window.signature.clear();
+                } else {
+                    set_status("Cannot revert " + window.name + ": " + error, true);
+                }
+            }
+            note_item(prefix + "revert");
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Discard changes and read the template file again");
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(ui.undo_labels.empty());
+            if (ui.toolbar_button("##tpl_undo", ToolIcon::undo, false,
+                                  ui.undo_labels.empty() ? "Nothing to undo" : ui.undo_labels.front().c_str()))
+                ui.mutate("scene.undo", {}, "Undone");
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(ui.redo_labels.empty());
+            if (ui.toolbar_button("##tpl_redo", ToolIcon::redo, false,
+                                  ui.redo_labels.empty() ? "Nothing to redo" : ui.redo_labels.front().c_str()))
+                ui.mutate("scene.redo", {}, "Redone");
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ui.toolbar_button("##tpl_frame", ToolIcon::focus, false, "Frame selection (F)")) ui.focus_selection();
+            ImGui::SameLine();
+            if (ui.toolbar_button("##tpl_move", ToolIcon::move, ui.gizmo_operation == ImGuizmo::TRANSLATE, "Move (W)"))
+                ui.gizmo_operation = ImGuizmo::TRANSLATE;
+            ImGui::SameLine();
+            if (ui.toolbar_button("##tpl_rotate", ToolIcon::rotate, ui.gizmo_operation == ImGuizmo::ROTATE, "Rotate (E)"))
+                ui.gizmo_operation = ImGuizmo::ROTATE;
+            ImGui::SameLine();
+            if (ui.toolbar_button("##tpl_scale", ToolIcon::scale, ui.gizmo_operation == ImGuizmo::SCALE, "Scale (R)"))
+                ui.gizmo_operation = ImGuizmo::SCALE;
+            ImGui::SameLine();
+            if (ui.toolbar_button("##tpl_orientation", ui.gizmo_mode == ImGuizmo::LOCAL ? ToolIcon::local : ToolIcon::world, false,
+                                  ui.gizmo_mode == ImGuizmo::LOCAL ? "Local axes: switch to world" : "World axes: switch to local"))
+                ui.gizmo_mode = ui.gizmo_mode == ImGuizmo::LOCAL ? ImGuizmo::WORLD : ImGuizmo::LOCAL;
+            ImGui::NewLine();
+
+            // Hierarchy | viewport | inspector, with draggable dividers.
+            const auto region = ImGui::GetContentRegionAvail();
+            const float height = std::max(region.y, 60.0F);
+            const float bar = 5.0F * ui_scale;
+            const float spacing = ImGui::GetStyle().ItemSpacing.x;
+            if (window.hierarchy_width <= 0.0F) {
+                window.hierarchy_width = region.x * 0.22F;
+                window.inspector_width = region.x * 0.30F;
+            }
+            const float minimum = 140.0F * ui_scale;
+            const float room = region.x - 2.0F * (bar + spacing) - 160.0F * ui_scale;
+            window.hierarchy_width = std::clamp(window.hierarchy_width, minimum, std::max(minimum, room - minimum));
+            window.inspector_width = std::clamp(window.inspector_width, minimum, std::max(minimum, room - window.hierarchy_width));
+            const float centre = std::max(region.x - window.hierarchy_width - window.inspector_width - 2.0F * (bar + spacing) - 2.0F * spacing, 80.0F);
+            if (ui.begin_region("##template_hierarchy", ImVec2(window.hierarchy_width, height))) {
+                RELAY_PROFILE_SCOPE("Template: Hierarchy");
+                ui.draw_hierarchy();
+            }
+            ImGui::EndChild();
+            ImGui::SameLine();
+            window.hierarchy_width += template_splitter("##template_split_left", height);
+            ImGui::SameLine();
+            draw_template_viewport(window, ImVec2(centre, height));
+            ImGui::SameLine();
+            window.inspector_width -= template_splitter("##template_split_right", height);
+            ImGui::SameLine();
+            if (ui.begin_region("##template_inspector", ImVec2(0.0F, height))) {
+                RELAY_PROFILE_SCOPE("Template: Inspector");
+                ui.draw_inspector();
+            }
+            ImGui::EndChild();
+
+            if (focused) ui.update_shortcuts();
+            ui.draw_dialogs();
+            ui.draw_asset_browser();
+            if (window.confirm_close) {
+                ImGui::OpenPopup("Save template changes?");
+                window.confirm_close = false;
+            }
+            if (ImGui::BeginPopupModal("Save template changes?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("%s has unsaved changes.", window.name.c_str());
+                if (ImGui::Button("Save and close")) {
+                    save_template_window(window);
+                    if (!window.session->dirty()) window.closing = true;
+                    ImGui::CloseCurrentPopup();
+                }
+                note_item(prefix + "close_save");
+                ImGui::SameLine();
+                if (ImGui::Button("Discard changes")) {
+                    window.closing = true;
+                    ImGui::CloseCurrentPopup();
+                }
+                note_item(prefix + "close_discard");
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+        } else {
+            ui.viewport_visible = false;
+            ui.viewport_hovered = false;
+            ui.gizmo_active = false;
+        }
+        ImGui::End();
+        ui.frame_open = false;
+        if (headless)
+            for (const auto& [key, rect] : ui.headless_items) headless_items[prefix + key] = rect;
+    }
+
+    void draw_template_windows() {
+        template_focused = false;
+        // Templates belong to a project; another project's windows cannot stay.
+        if (!template_windows.empty()) {
+            const auto* project = active_project();
+            if (!project || string_or(*project, "filename") != template_project) close_template_windows();
+        }
+        drain_closing_editors();
+        for (std::size_t index = 0; index < template_windows.size();) {
+            draw_template_window(*template_windows[index]);
+            if (template_windows[index]->closing) {
+                if (template_windows[index]->ui) retire_embedded(std::move(template_windows[index]->ui));
+                template_windows.erase(template_windows.begin() + static_cast<std::ptrdiff_t>(index));
+            } else {
+                ++index;
+            }
+        }
+    }
+
     // Keyboard shortcuts, ignored whenever a text field has focus so typing a name never switches
     // the gizmo or deletes the selection.
     void update_shortcuts() {
@@ -10270,6 +10831,8 @@ struct EditorUi::Impl {
             ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
             return;
         const auto& shortcuts = ImGui::GetIO();
+        // A template window has the keyboard: its own editor handles the keys.
+        if (!embedded && template_focused) return;
         if (update_asset_shortcuts()) return;
         if (hierarchy_focused && shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
             hierarchy_search_focus = true;
@@ -10280,16 +10843,18 @@ struct EditorUi::Impl {
             if (const auto* entity = find_entity(selection))
                 begin_rename(RenameKind::entity, selection, string_or(*entity, "name"));
         }
-        if (shortcuts.KeyCtrl && shortcuts.KeyShift && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+        if (!embedded && shortcuts.KeyCtrl && shortcuts.KeyShift && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
             panel_open[8] = true; agent_expand_pending = true; return;
         }
         if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-            if (shortcuts.KeyShift) file_dialog(FileAction::save_as, scene_filename.data());
+            if (embedded) {
+                if (embedded_save) embedded_save();
+            } else if (shortcuts.KeyShift) file_dialog(FileAction::save_as, scene_filename.data());
             else (void)save_scene();
         }
-        if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false))
+        if (!embedded && shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false))
             discarding_action(PendingAction::open_scene);
-        if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N, false))
+        if (!embedded && shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N, false))
             discarding_action(PendingAction::new_scene);
         if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false) && !selection.empty())
             duplicate_selection();
@@ -10510,6 +11075,11 @@ struct EditorUi::Impl {
         begin_rename(RenameKind::asset, path, name);
     }
 
+    // The template an Assets entry under templates/ holds, by its name without the file suffix.
+    static std::string template_name_of(const AssetEntry& entry) {
+        return entry.name.substr(0, entry.name.size() - std::string_view{".relay-template.json"}.size());
+    }
+
     void open_asset(const AssetEntry& entry) {
         if (entry.folder && asset_search_active()) reveal_asset(entry.path);
         else if (entry.folder) set_asset_folder_open(entry.path, !expanded_asset_folders.contains(entry.path));
@@ -10564,6 +11134,11 @@ struct EditorUi::Impl {
             if (ImGui::MenuItem("Import to scene")) import_model(entry.path);
             if (ImGui::MenuItem("Import to scene as static mesh"))
                 import_model(entry.path, "static_mesh");
+            ImGui::Separator();
+        }
+        if (entry.kind == "template" && entry.path.starts_with("templates/")) {
+            if (ImGui::MenuItem("Edit template...")) open_template(template_name_of(entry));
+            note_item("assets:menu:edit_template");
             ImGui::Separator();
         }
         if (entry.folder) {
@@ -11929,6 +12504,9 @@ struct EditorUi::Impl {
             if (ImGui::MenuItem("Stop", nullptr, false, !browser.playing.empty())) stop_browser_sound();
             ImGui::Separator();
         }
+        if (tile.entry->kind == "template" && tile.entry->path.starts_with("templates/") &&
+            ImGui::MenuItem("Edit template..."))
+            open_template(template_name_of(*tile.entry));
         if (ImGui::MenuItem("Show in Assets")) {
             panel_open[2] = true;
             reveal_asset(tile.entry->path);
@@ -12130,7 +12708,7 @@ struct EditorUi::Impl {
             ImGui::SetNextWindowFocus();
             browser.focus = false;
         }
-        const auto title = (browser.pick ? browser.pick->title : std::string{"Asset Browser"}) + "###asset_browser";
+        const auto title = (browser.pick ? browser.pick->title : std::string{"Asset Browser"}) + "###asset_browser" + window_tag;
         bool open = true;
         const bool visible = ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse);
         // Escape in one of the browser's menus closes only the menu.
@@ -13117,6 +13695,10 @@ struct EditorUi::Impl {
     }
 };
 
+EditorUi::Impl::TemplateWindow::~TemplateWindow() {
+    if (ui) ui->release_embedded();
+}
+
 EditorUi::EditorUi(RequestHandler request) : impl_(std::make_unique<Impl>(std::move(request))) {
     (void)impl_->call("session.auto_approval", "\"enabled\":true");
 }
@@ -13124,6 +13706,52 @@ EditorUi::EditorUi(RequestHandler request) : impl_(std::make_unique<Impl>(std::m
 void EditorUi::set_attachment_picker(AttachmentPicker picker) { impl_->attachment_picker = std::move(picker); }
 
 bool EditorUi::game_has_input() const { return impl_->game_input_focus; }
+
+bool EditorUi::open_template(const std::string_view name) { return impl_->open_template(std::string{name}); }
+
+void EditorUi::set_shared_assets(AssetRegistry* assets) { impl_->shared_assets = assets; }
+
+bool EditorUi::template_gpu_picture(const std::string_view name) const {
+    for (const auto& window : impl_->template_windows)
+        if (window->name == name) return window->gpu_ready;
+    return false;
+}
+
+std::vector<OffscreenView> EditorUi::offscreen_views() {
+    std::vector<OffscreenView> views;
+    if (!impl_->gpu_views) return views;
+    const double now = ImGui::GetCurrentContext() ? ImGui::GetTime() : 0.0;
+    for (auto& window : impl_->template_windows) {
+        if (!window->gpu_request_valid) continue;
+        // Drawn again when the view, the scene or the size changed, and once a second for assets
+        // that finish loading.
+        if (window->gpu_signature == window->gpu_drawn_signature && now - window->gpu_last < 1.0) continue;
+        ++window->gpu_unanswered;
+        auto view = window->gpu_request;
+        const int id = window->id;
+        const auto signature = window->gpu_signature;
+        view.ready = [this, id, signature, now](OwnedFrame frame) {
+            for (auto& candidate : impl_->template_windows) {
+                if (candidate->id != id) continue;
+                impl_->set_template_picture(*candidate, std::move(frame.rgba), frame.width, frame.height);
+                candidate->gpu_ready = true;
+                candidate->gpu_unanswered = 0;
+                candidate->gpu_drawn_signature = signature;
+                candidate->gpu_last = now;
+            }
+        };
+        views.push_back(std::move(view));
+    }
+    return views;
+}
+
+std::size_t EditorUi::template_window_count() const { return impl_->template_windows.size(); }
+
+bool EditorUi::template_dirty(const std::string_view name) const {
+    for (const auto& window : impl_->template_windows)
+        if (window->name == name) return window->session->dirty();
+    return false;
+}
 
 void EditorUi::set_game_cursor_locked(const bool locked) {
     auto& impl = *impl_;
@@ -13150,6 +13778,9 @@ EditorUi::~EditorUi() {
         impl_->sdl_backend_started = false;
     }
     if (impl_->imgui_context_created) {
+        impl_->template_windows.clear();
+        for (auto& editor : impl_->closing_editors) editor->release_embedded();
+        impl_->closing_editors.clear();
         impl_->layout.save();
         impl_->chat_media.clear();
         impl_->thumbnails.clear();
@@ -13238,6 +13869,7 @@ bool EditorUi::initialize(const OverlayContext& context, std::string& error) {
         return false;
     }
     impl_->vulkan_backend_started = true;
+    impl_->gpu_views = true;
     return true;
 }
 
@@ -13690,8 +14322,30 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     impl_->draw_game_config();
     impl_->draw_editor_preferences();
     impl_->draw_asset_browser();
+    impl_->draw_template_windows();
 
     impl_->chat_media.draw_viewer(impl_->headless);
+    // The title bar and the body of a rounded window are two anti-aliased fills that meet at one
+    // edge, which leaves a pixel-high seam showing what is behind the window. Both are the panel
+    // color, so a strip of it laid over the seam closes it.
+    {
+        auto& context = *ImGui::GetCurrentContext();
+        for (auto* window : context.Windows) {
+            if (!window->WasActive || window->Hidden || window->Collapsed || window->DockIsActive ||
+                (window->Flags & (ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_Tooltip |
+                                  ImGuiWindowFlags_NoBackground)) ||
+                window->TitleBarHeight <= 0.0F)
+                continue;
+            const float border = window->WindowBorderSize;
+            const float top = window->Pos.y + window->TitleBarHeight;
+            auto* list = window->DrawList;
+            list->PushClipRect(window->Pos, ImVec2(window->Pos.x + window->Size.x, window->Pos.y + window->Size.y), false);
+            list->AddRectFilled(ImVec2(window->Pos.x + border, top - 1.0F),
+                                ImVec2(window->Pos.x + window->Size.x - border, top + 1.0F),
+                                ImGui::GetColorU32(ImGuiCol_WindowBg));
+            list->PopClipRect();
+        }
+    }
     {
         RELAY_PROFILE_SCOPE("ImGui render");
         ImGui::Render();
@@ -13706,6 +14360,19 @@ std::string EditorUi::handle_camera_request(std::string_view request) {
     const auto id = number_or(fields, "id", 0);
     const auto prefix = "{\"id\":" + number_text(id);
     const auto method = string_or(fields, "method", "");
+    if (method == "editor.template.open") {
+        const auto name = string_or(fields, "name", "");
+        if (name.empty() || !impl_->open_template(name))
+            return prefix + ",\"ok\":false,\"error\":\"" + json_escape(impl_->status_message.empty() ? "cannot open the template" : impl_->status_message) + "\"}";
+    }
+    if (method == "editor.template.open" || method == "editor.template.status") {
+        std::string windows;
+        for (const auto& window : impl_->template_windows)
+            windows += std::string(windows.empty() ? "" : ",") + "{\"name\":\"" + json_escape(window->name) +
+                       "\",\"dirty\":" + (window->session->dirty() ? "true" : "false") +
+                       ",\"gpu\":" + (window->gpu_ready ? "true" : "false") + '}';
+        return prefix + ",\"ok\":true,\"result\":{\"windows\":[" + windows + "]}}";
+    }
     if (method == "editor.camera.set") {
         auto& camera = impl_->navigation_camera;
         camera.target.x = number_or(fields, "target_x", camera.target.x);

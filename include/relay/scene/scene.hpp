@@ -307,13 +307,19 @@ void set_default_joint_limits(Joint& joint);
 
 // An authored value for one of a behaviour's declared properties. Properties a node does not
 // override keep the default written in the script's code.
+//   entity     a node in the scene (or script component on one), kept in `entity`; invalid is none.
+//              Scene copies remap it, and destroying the node clears it.
+//   asset      a project file path or built-in asset name in `text`.
+//   component  an engine component id ("camera", "collider", ...) in `text`.
 struct ScriptProperty {
-    enum class Type : std::uint8_t { boolean, number, vector, text } type{Type::number};
+    enum class Type : std::uint8_t { boolean, number, vector, text, entity, asset, component }
+        type{Type::number};
     std::string name;
     bool boolean{};
     double number{};
     Vec3 vector{};
     std::string text;
+    Entity entity{};
     auto operator<=>(const ScriptProperty&) const = default;
 };
 

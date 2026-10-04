@@ -9,7 +9,7 @@ overview for visitors. Protocol details belong in [`docs/protocol.md`](docs/prot
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v52: 168 native methods. Scene v27, project v2, import manifest v3.
+- Protocol schema v54: 170 native methods. Scene v28, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
@@ -424,6 +424,64 @@ without blocking simultaneous human editing.
   paste's "<name> Copy". There is no live prefab link or override tracking. `templates.list`
   reports each template's root node type (`node_type()` of the saved root), its engine component
   ids and its script behaviours.
+- Template editor: **Edit template...** (Assets and Asset Browser context menus, the Add Node
+  window's template details; `EditorUi::open_template(name)`) opens a floating ImGui window per
+  template (`EditorUi::Impl::TemplateWindow`, `draw_template_windows`). Each owns a
+  `TemplateSession` (`src/control/template_session.cpp`: a private editor-mode `Engine` and
+  `ControlProtocol` that `project.open`s the same project, clears the scene and `place_template`s
+  the template, with `scene_history().revision()` as the saved marker, `save_template(replace)` to
+  write and a reload to revert) and an embedded second `EditorUi::Impl` (`embedded`, `window_tag`,
+  `gizmo_id`, `embedded_save`) whose request handler is the session. The window draws that
+  editor's real `draw_hierarchy`, `draw_inspector`, dialogs, Asset Browser, shortcuts and
+  viewport tools (camera input, wireframes, icons, `draw_gizmo`, picking) inside child regions
+  with draggable dividers; only the picture differs. `session.handle` forwards `scripts.status`
+  and the other read-only `scripts.*` to the main engine (only it has built the scripts), refuses
+  `scene.save/load/clear`, `project.*`, `runtime.*`, `trace.*` and script writes, protects the
+  root (no delete, duplicate, cut or move), injects the root as the parent of `scene.create`,
+  `scene.paste` and `templates.instantiate`, and moves an imported model under the root. The
+  window's items appear in headless tests as `template:<name>:<key>` (`window`, `viewport`, `save`,
+  `revert`, `close_save`, `close_discard`, and the embedded editor's own keys such as
+  `entity:<handle>`). The viewport picture comes from the window's own renderer:
+  `EditorOverlay::offscreen_views()` (an `OffscreenView`: scene, `ViewOverride`, size, selection,
+  grid, `ready` callback) is asked once per frame after presenting, and
+  `VulkanWindow::render_overlay_views` / `render_offscreen_view` draw each synchronously between
+  frames. The same `record_commands` runs with `offscreen` set: a second `ViewState` (scene
+  targets, history, tone and post input sets) is swapped in with `swap_view`, the region is the
+  view's, the tone pass writes an offscreen image (`offscreen_output`, a render-pass compatible
+  framebuffer) that is copied to a host buffer, and global illumination, reflections, particles,
+  the game interface, the material preview and the swapchain acquire/present are skipped; shader
+  materials are kept alive (`keep_unused`) and the slot's timestamps are dropped. A scene without a
+  sky gets a copy with Relay's default sky and sun (as a material preview does). The editor shows
+  the picture through `InterfacePreview` as one textured quad. Until the first GPU picture, and
+  after 180 unanswered requests or headless, `render_scene_preview`
+  (`src/render/scene_preview.cpp`, `ScenePreviewFrame`: perspective-correct Lambert shading over
+  `build_render_scene`, base colors, textures, lights or a key light, sky, ground grid, near
+  clipping, alpha blending, an orange selection outline) stands in. The GPU picture arrives one
+  frame late (the gizmo leads it slightly while dragging) and is redrawn when the history
+  revision, scene listing, size, view or selection changes, and once a second.
+  To let one renderer draw both scenes, a session's `Engine` borrows the editor's
+  `AssetRegistry` (`Engine(config, shared_assets)`, `EditorUi::set_shared_assets` from
+  `relay_demo`), and the registry keeps sky and shader materials per owning engine
+  (`set_sky_material`/`set_shader_materials(..., owner)`, `forget_owner`), looking up any
+  owner's. Imports made in a template window land in the shared registry.
+  `editor.template.open` and `editor.template.status` (protocol v54; the editor handler now serves
+  every `editor.*` method) open and list the windows (`status` reports `gpu`).
+  `tests/editor_template_smoke.py` is the real-desktop check (opens the Ball template, drags the
+  gizmo, undoes, saves, restores the file); it and a resize of the window and opening the First
+  Person Controller template were run against the live editor on Linux/RADV.
+  The picture is stored in the corner of a texture that changes size only in 256 px steps
+  (`set_template_picture`): a new ImGui texture per frame while the window is resized ran the
+  backend's 256-set descriptor pool dry and crashed the editor. Closed windows' editors wait in
+  `closing_editors` until the backend has destroyed their textures (`release()`, `idle()` on
+  `AssetThumbnails` and `InterfacePreview`).
+  Not done: the Inspector's material preview and thumbnails of imported models in the embedded
+  editor's Asset Browser come from the renderer's single preview slot and are blank or iconic
+  there; the Add Node/Add Component windows of the main editor and a template window cannot both
+  be open; a template edited in two windows, or in a window while a scene instance is edited, has
+  no conflict handling; agents can open and list template windows but not edit them in place (they
+  instantiate, edit and `templates.save` with `replace`); metals show without reflections (no
+  global illumination in offscreen views); the unsaved-changes prompt on closing has headless
+  coverage only.
 - The Inspector draws only present components, with an enable checkbox (`component_header`: a
   text-free `editor_checkbox` just left of the close button, drawn over the header with
   `SetNextItemAllowOverlap`), a close button and Remove context item on removable headers, and script components as "<Behaviour> (Script)" sections with typed property
@@ -671,6 +729,40 @@ Phase 3:
   never returns a stale mapping; superseded libraries are deleted after a successful load.
   Compiler output is parsed into file/line diagnostics. Limits: 256 files, 1 MiB each, 120 s per
   compile, 64 KiB of output.
+- Script property references (scene v28, protocol v53): `ScriptProperty::Type` gained `entity` (a
+  node, held in `ScriptProperty::entity`, saved as an entity handle or null), `asset` (a project
+  path in `text`) and `component` (an engine component id in `text`, checked with
+  `find_component_kind`). In the SDK: `relay::Entity` (optionally `relay::Only::component(...)` or
+  `Only::node_type(...)`), `relay::Ref<T>` (a node reference filtered to behaviour `T`, resolved on
+  use by `Entity::script<T>()`), `relay::Component` (an enum mirroring `engine_components()`,
+  kept in step by a test) and `relay::Asset<Kind>` aliases (`AudioClip`, `Template`, `Image`, ...).
+  Code declares a property's filter (`RelayPropertyInfo::filter`, `RelayPropertyFilter`), which
+  reaches the Inspector through `scripts.status` (`ScriptBehaviourInfo::filters`, parallel to
+  `properties`). `RelayHostApi` appended `script_instance` (the `create`d object of the entity's
+  first running component of a behaviour, found through `Impl::runs`, so failed, removed, removing
+  and destroyed instances are skipped) and `script_entities`; `RelayPropertyValue` gained `entity`
+  and `RelayPropertyInfo` the filter, so every script library must be rebuilt (the object cache is
+  keyed by the SDK, so it is). Scene handling: `Scene::set_scripts` rejects references to missing
+  nodes; `Scene::destroy` clears references to the removed nodes; `Scene::duplicate` remaps
+  references inside the copy and keeps outside ones; `copy_selection` clears references outside the
+  copy unless `same_scene` is true (duplicate-many and `Entity::clone`, so a clone keeps its
+  target), and `paste_selection` remaps references into the pasted trees; loading rejects stale
+  references. Templates remap the same way, so a template's script can point at its own child (the
+  demo's player holds its `Camera`). `scene.set_script_property` takes `target`, `asset` and
+  `component` beside `number`, `boolean`, `text` and `vector`. Text stored before a property
+  became `asset` or `component` still applies (the SDK's `set_property` and the Inspector accept
+  it). `instantiate` accepts a template's path as well as its name. The Inspector draws entity
+  properties with `draw_script_entity` (the joint partner's picker pattern: `asset_field` with
+  `@scene` choices, so Hierarchy drags drop onto them) and asset properties with the file browser
+  filtered to the declared kinds; the old guess of a text property's kind from its extension is gone.
+  The demo wires its references in the scene: the player's `camera`, `GameMenu`'s controls,
+  `ToneButton` and `MusicSwitch` holding a `Ref<FirstPersonController>` (declared in
+  `scripts/FirstPersonController.hpp`), and the switch's soundtrack. The committed scene and the
+  player template were patched in place (`tools/demo_project/build_demo_project.cpp` sets the same
+  references through the protocol, but regenerating it would drop the shader showcase, which the
+  builder does not author). Still by name or text: audio buses, input actions and key names,
+  `relay::world::find`, `set_field("component.field")` strings, and the string `has_component`
+  overloads.
 - Behaviours declare properties in `properties(relay::Properties&)`. The SDK reads names, types
   and code defaults once from a fresh instance per behaviour (`property_count`/`property_info`),
   and the host assigns a node's stored values through `set_property` after construction and
@@ -1245,10 +1337,12 @@ Phase 3:
    and in a trusted project agent-written code runs with the user's privileges. Windows script
    loading is not implemented (builds report unsupported), and the macOS `.dylib` path has never
    been run. Script component fields do not cover the sky, reverb zones, music players or post
-   processing, and scripts cannot reach another behaviour's instance (there is no
-   GetComponent-style lookup). Rebuilding a body re-anchors its joints where the bodies are then,
+   processing, and a `Ref<T>` pointer must not be kept across frames (scripts look instances up
+   when they use them; `entity.script<T>()` is the GetComponent-style lookup). Rebuilding a body re-anchors its joints where the bodies are then,
    and every scale write rebuilds the subtree's bodies, so animating scale from a script every step
-   is costly. The trust prompt and Scripts diagnostics view are covered headlessly only.
+   is costly. The trust prompt and Scripts diagnostics view are covered headlessly only, as are the
+   node, script, asset and component property pickers (including drag and drop onto them), which
+   have not been used on a desktop.
 11. Joints have headless and simulated coverage, not a desktop review of the Inspector section,
    the wireframe gizmos or the demo playground. Anchors and axes are captured when Run Game
    starts, so moving a jointed body with a script teleports it against its constraint. There are
@@ -1350,6 +1444,17 @@ Deferred:
   MSVC CRT and Windows SDK (for example through `xwin`) or a Windows machine to verify.
 
 ## Verification baseline
+
+Script references and the template editor: `relay_script_tests` covers node, script, asset and
+component properties (declared types and filters, protocol, save/load, hot calls between scripts,
+remapping on duplicate, paste and in-place copies, deletion) and that the SDK's `Component` enum
+matches the engine's; `relay_tests` covers the CPU scene preview and `TemplateSession` (root
+protection, edits, undo, save, revert, imports); the headless editor suite drives the reference
+pickers and a template window (hierarchy, edits, Save, root protection). `tests/editor_template_smoke.py`
+is the real-desktop check of the template window (GPU picture, gizmo edit, undo, Save, continuous
+resize) and was run against the live editor on Linux/RADV; it needs `xdotool` and `spectacle` and
+restores the template file it saves.
+
 
 The current implementation was verified with development and release builds, all seven native
 CTest suites (including `relay_fidelityfx_tests`, which creates every FidelityFX effect on a
@@ -1516,7 +1621,7 @@ RELAY_SUSTAINED_TEST_MS=130000 node --test --test-isolation=none tools/mcp-bridg
 | Protocol source | `protocol/relay.protocol.json` |
 | Native protocol/session | `src/control/`, `include/relay/control/` |
 | Engine and scene | `src/core/`, `src/scene/` |
-| Components and templates | `src/scene/components.cpp`, `src/scene/templates.cpp` |
+| Components and templates | `src/scene/components.cpp`, `src/scene/templates.cpp`, `src/control/template_session.cpp`, `src/render/scene_preview.cpp` |
 | Demo project and generator | `examples/demo/`, `tools/generate_demo_project.py`, `tools/demo_project/` |
 | Test fixture models | `tests/fixtures/models/` |
 | Physics and collision | `src/physics/`, `include/relay/physics/` |

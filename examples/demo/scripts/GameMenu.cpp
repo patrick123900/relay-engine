@@ -6,24 +6,23 @@
 // The showcase's interface: a crosshair, control hints and a count of balls fired while playing,
 // and a menu on Tab that frees the cursor for its button, switch and slider.
 //
-// Put it on the HUD canvas. It finds its controls by name: "Menu" (hidden until the menu opens),
-// "Crosshair", "Hints" and "Shots", and hears the menu's "Resume" button, "Show hints" switch and
-// "Music volume" slider through on_ui, which reaches this script from every control below it.
+// Put it on the HUD canvas and assign its controls in the Inspector: the menu (hidden until the
+// menu opens), the crosshair, the hints and the shots label. It hears the menu's "Resume" button,
+// "Show hints" switch and "Music volume" slider through on_ui, which reaches this script from every
+// control below it.
 // The First Person Controller stands still while the menu has the cursor.
 class GameMenu : public relay::Behaviour {
 public:
     void properties(relay::Properties& p) override {
         p.add("menu_key", menu_key);
         p.add("music_bus", music_bus);
+        p.add("menu", menu, relay::Only::component(relay::Component::ui_control));
+        p.add("crosshair", crosshair, relay::Only::component(relay::Component::ui_control));
+        p.add("hints", hints, relay::Only::component(relay::Component::ui_control));
+        p.add("shots_label", shots_label, relay::Only::component(relay::Component::ui_label));
     }
 
-    void on_start() override {
-        menu = relay::world::find("Menu");
-        crosshair = relay::world::find("Crosshair");
-        hints = relay::world::find("Hints");
-        shots_label = relay::world::find("Shots");
-        menu.set_visible(false);
-    }
+    void on_start() override { menu.set_visible(false); }
 
     void on_update(double) override {
         if (relay::input::key_pressed(menu_key)) show_menu(!open);

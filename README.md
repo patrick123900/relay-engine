@@ -27,15 +27,16 @@ edits the same project alongside it.
   profiler, mixer and shader graph editor, built with SDL3 and Dear ImGui.
 - **Agents built in** — an embedded chat workspace with sign-in, attachments, inline renders and
   permission controls; agents frame, capture and review the viewport as they work.
-- **One typed API** — 168 versioned native methods for scenes, assets, rendering, capture and
+- **One typed API** — 170 versioned native methods for scenes, assets, rendering, capture and
   authorization, generated for C++, TypeScript and an MCP bridge.
 - **Rendering** — Vulkan HDR pipeline with PBR materials, cascaded and punctual shadows, sky, sun
   and fog, and AMD FidelityFX global illumination and ray traced reflections.
 - **Shaders** — surface and post-processing shaders edited as node graphs, saved as readable
   GLSL-based code, with materials, per-object values and ready-made effects.
-- **Gameplay** — components, node types and templates, native C++ scripts with hot reload that
-  spawn, reparent and reconfigure nodes and shape cast, input mapping, Jolt physics with joints,
-  and a playable first person demo.
+- **Gameplay** — components, node types and templates (edited in their own window), native C++
+  scripts with hot reload that spawn, reparent and reconfigure nodes and shape cast, hold typed
+  references to nodes, other scripts, files and components, input mapping, Jolt physics with
+  joints, and a playable first person demo.
 - **Game interface** — Godot-style canvases, anchored controls and containers: labels, images,
   buttons, check boxes, sliders and progress bars, laid out and drawn in an Interface editor and
   shown over the game while it runs.

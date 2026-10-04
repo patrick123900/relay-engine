@@ -654,8 +654,15 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                         valid = read_vec3(value, property.vector);
                         break;
                     case ScriptProperty::Type::text:
+                    case ScriptProperty::Type::asset:
+                    case ScriptProperty::Type::component:
                         valid = value->string() != nullptr;
                         if (valid) property.text = *value->string();
+                        break;
+                    case ScriptProperty::Type::entity:
+                        valid = value->is_null() || (value->string() != nullptr &&
+                                                     Entity::parse(*value->string()).has_value());
+                        if (valid && !value->is_null()) property.entity = *Entity::parse(*value->string());
                         break;
                     }
                     if (!valid) {
@@ -1094,6 +1101,19 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
             result.error = "joint connects to a missing, stale or identical node";
             return result;
         }
+    }
+    for (const auto& slot : state.slots) {
+        if (!slot.alive) continue;
+        for (const auto& script : slot.record.scripts)
+            for (const auto& property : script.properties) {
+                if (property.type != ScriptProperty::Type::entity || !property.entity.valid()) continue;
+                const auto target = property.entity;
+                if (target.index >= state.slots.size() || !state.slots[target.index].alive ||
+                    state.slots[target.index].generation != target.generation) {
+                    result.error = "script property " + property.name + " references a missing or stale node";
+                    return result;
+                }
+            }
     }
     for (const auto &slot : state.slots)
         if (slot.alive && slot.record.model_node) {

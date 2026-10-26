@@ -35,6 +35,20 @@ public:
     // Headless editors start with none installed.
     using IdeHandler = std::function<std::string(const IdeLaunch&)>;
 
+    // A request for the operating system's own file dialog.
+    struct FileDialogRequest {
+        enum class Kind { open_file, save_file, open_folder } kind{Kind::open_file};
+        std::string title;
+        std::string start; // A folder, or a file whose folder opens first. Empty for the system's choice.
+        std::string default_name; // Save dialogs: the file name offered.
+        // (label, extensions separated by ';' without dots; "*" for any file), for file dialogs.
+        std::vector<std::pair<std::string, std::string>> filters;
+    };
+    // Answers a request with the absolute path chosen, or nothing when cancelled. May be called from
+    // any thread, once. The editor's own handler shows the SDL system dialog; tests install their own.
+    using FileDialogDone = std::function<void(std::optional<std::string>)>;
+    using FileDialogHandler = std::function<void(const FileDialogRequest&, FileDialogDone)>;
+
     using AttachmentPicker = std::function<void(std::function<void(std::vector<std::string>)>)>;
     explicit EditorUi(RequestHandler request);
     // Background test seam; the normal picker is opened only by a human button press.
@@ -76,6 +90,9 @@ public:
     [[nodiscard]] bool panel_visible(std::string_view name) const;
     void set_file_browser_handler(FileBrowserHandler handler);
     void set_ide_handler(IdeHandler handler);
+    // Replaces the system file dialog, for tests and hosts with their own. Headless editors have
+    // none, and their Browse buttons stay disabled.
+    void set_file_dialog_handler(FileDialogHandler handler);
     // Opens a workspace-relative project and its startup scene, as the Project panel does.
     bool open_project(std::string_view filename);
     // Host seam: invoked only after native protocol validation and agent authorization.

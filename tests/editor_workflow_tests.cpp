@@ -5,6 +5,8 @@
 #include "relay/core/engine.hpp"
 #include "relay/core/input.hpp"
 #include "relay/core/json.hpp"
+#include "relay/core/pak.hpp"
+#include "relay/render/cooked_assets.hpp"
 #include "relay/editor/editor_math.hpp"
 #include "relay/editor/editor_selection.hpp"
 #include "relay/editor/editor_timeline.hpp"
@@ -3035,6 +3037,257 @@ void particles() {
     check(engine.particles().particle_count() == 0U, "Stop Game clears the game's particles");
 }
 
+// A game's files in one archive: the archive itself, the virtual folder it appears as, and the models
+// and shaders a build cooks into it.
+bool same_registry(const relay::AssetRegistry& a, const relay::AssetRegistry& b) {
+    const auto same_bytes = [](const auto& x, const auto& y) {
+        return x.size() == y.size() && (x.empty() || std::memcmp(x.data(), y.data(), x.size_bytes()) == 0);
+    };
+    if (!same_bytes(a.mesh_vertices(), b.mesh_vertices()) || !same_bytes(a.mesh_indices(), b.mesh_indices()) ||
+        a.meshes().size() != b.meshes().size() || a.materials().size() != b.materials().size() ||
+        a.textures().size() != b.textures().size() || a.models().size() != b.models().size())
+        return false;
+    for (std::size_t i = 0; i < a.meshes().size(); ++i) {
+        const auto &x = a.meshes()[i], &y = b.meshes()[i];
+        if (x.name != y.name || x.first_index != y.first_index || x.index_count != y.index_count ||
+            x.vertex_offset != y.vertex_offset || x.vertex_count != y.vertex_count || x.bounds_min != y.bounds_min ||
+            x.bounds_max != y.bounds_max || x.joints.size() != y.joints.size() || x.skin.size() != y.skin.size() ||
+            x.morph_targets.size() != y.morph_targets.size() || x.label != y.label || x.source != y.source)
+            return false;
+        for (std::size_t j = 0; j < x.joints.size(); ++j)
+            if (x.joints[j].node != y.joints[j].node || x.joints[j].inverse_bind != y.joints[j].inverse_bind) return false;
+    }
+    for (std::size_t i = 0; i < a.materials().size(); ++i) {
+        const auto &x = a.materials()[i], &y = b.materials()[i];
+        if (x.name != y.name || x.color != y.color || x.texture != y.texture || x.metallic_factor != y.metallic_factor ||
+            x.roughness_factor != y.roughness_factor || x.normal_texture != y.normal_texture ||
+            x.emissive_factor != y.emissive_factor || x.alpha_mode != y.alpha_mode || x.double_sided != y.double_sided)
+            return false;
+    }
+    for (std::size_t i = 0; i < a.textures().size(); ++i)
+        if (a.textures()[i].name != b.textures()[i].name || a.textures()[i].rgba != b.textures()[i].rgba ||
+            a.textures()[i].width != b.textures()[i].width)
+            return false;
+    for (std::size_t i = 0; i < a.models().size(); ++i) {
+        const auto &x = a.models()[i], &y = b.models()[i];
+        if (x.name != y.name || x.nodes != y.nodes || x.parents != y.parents || x.binding_layout != y.binding_layout ||
+            x.rest_transforms.size() != y.rest_transforms.size() || x.clips.size() != y.clips.size())
+            return false;
+        for (std::size_t j = 0; j < x.clips.size(); ++j) {
+            if (x.clips[j].name != y.clips[j].name || x.clips[j].duration_seconds != y.clips[j].duration_seconds ||
+                x.clips[j].tracks.size() != y.clips[j].tracks.size() ||
+                x.clips[j].morph_tracks.size() != y.clips[j].morph_tracks.size())
+                return false;
+            for (std::size_t t = 0; t < x.clips[j].tracks.size(); ++t) {
+                const auto &p = x.clips[j].tracks[t], &q = y.clips[j].tracks[t];
+                if (p.node != q.node || p.positions.size() != q.positions.size() || p.rotations.size() != q.rotations.size() ||
+                    p.scales.size() != q.scales.size() || p.position_interpolation != q.position_interpolation)
+                    return false;
+                for (std::size_t k = 0; k < p.rotations.size(); ++k)
+                    if (p.rotations[k].time != q.rotations[k].time || p.rotations[k].value != q.rotations[k].value) return false;
+            }
+        }
+    }
+    return true;
+}
+
+void cooked_game_files() {
+    namespace fs = std::filesystem;
+    // The archive: names, bytes, checksums, damage, and the folder it appears as.
+    fs::create_directories("pakwork/root");
+    {
+        std::ofstream("pakwork/disk.bin", std::ios::binary) << std::string(5000, 'd');
+        const std::vector<relay::PakInput> inputs{{"a/b.txt", {}, "hello"}, {"disk.bin", "pakwork/disk.bin", {}},
+                                                  {".cooked/x", {}, std::string(1000, 'z')}, {"empty", {}, ""}};
+        std::string error;
+        check(relay::write_pak("pakwork/game.pak", inputs, error), "an archive is written");
+        auto archive = relay::PakArchive::open("pakwork/game.pak", error);
+        check(archive && archive->entries().size() == 4U, "the archive opens with its four files");
+        const auto hello = archive->find("a/b.txt");
+        check(hello && std::string(hello->begin(), hello->end()) == "hello" && archive->find("empty") &&
+                  archive->find("empty")->empty() && !archive->find("missing") && archive->find("disk.bin")->size() == 5000U,
+              "files read back as they went in, empty ones too");
+        check(archive->verify(error), "every file matches its checksum");
+        relay::vfs::mount(archive, "pakwork/root");
+        const auto inside = fs::absolute("pakwork/root/a/b.txt");
+        check(relay::vfs::packed(inside) && relay::vfs::packed("pakwork/root/./a/../a/b.txt") &&
+                  !relay::vfs::packed("pakwork/root/../a/b.txt") && !relay::vfs::packed("pakwork/other/a/b.txt") &&
+                  !relay::vfs::packed("pakwork/root/a") && relay::vfs::packed_name(".cooked/x"),
+              "packed files appear below the mounted folder and nowhere else");
+        std::string text, reason;
+        check(relay::vfs::read_all("pakwork/root/a/b.txt", 100, text, reason) && text == "hello" &&
+                  !relay::vfs::read_all("pakwork/root/a/b.txt", 3, text, reason) && reason == "file is too large" &&
+                  !relay::vfs::read_all("pakwork/root/none.txt", 100, text, reason),
+              "reads see the archive and respect the size limit");
+        const auto stamp = relay::vfs::stamp("pakwork/root/disk.bin");
+        check(stamp.found && stamp.size == 5000U && !relay::vfs::stamp("pakwork/root/nothing").found,
+              "stamps cover packed files");
+        relay::vfs::unmount();
+        check(!relay::vfs::mounted() && !relay::vfs::packed(inside), "unmounting hides the archive again");
+        const auto offset = archive->entries()[0].offset; // ".cooked/x" sorts first
+        archive.reset();
+        {
+            std::fstream damage("pakwork/game.pak", std::ios::in | std::ios::out | std::ios::binary);
+            damage.seekp(static_cast<std::streamoff>(offset + 10));
+            damage.put('Q');
+        }
+        const auto damaged = relay::PakArchive::open("pakwork/game.pak", error);
+        check(damaged && !damaged->verify(error) && error.find(".cooked/x") != std::string::npos,
+              "a damaged file is found by its checksum");
+        fs::resize_file("pakwork/game.pak", 20);
+        check(!relay::PakArchive::open("pakwork/game.pak", error) && !relay::PakArchive::open("pakwork/none.pak", error),
+              "a cut-short or missing archive does not open");
+    }
+
+    // Models: what the importer registers is what a game registers from the cooked file.
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    (void)request(protocol, "project.create", "\"filename\":\"projects/cook/project.relayproject\",\"name\":\"Cook\"");
+    fs::create_directories("projects/cook/models");
+    for (const char* model : {"relay-dynamic-golden.glb", "relay-pbr-golden.glb"})
+        fs::copy_file(fs::path{RELAY_TEST_SOURCE_DIR} / "tests/fixtures/models" / model,
+                      fs::path{"projects/cook/models"} / model, fs::copy_options::overwrite_existing);
+    (void)request(protocol, "assets.import_model", "\"filename\":\"models/relay-dynamic-golden.glb\",\"instantiate\":false");
+    (void)request(protocol, "assets.import_model", "\"filename\":\"models/relay-pbr-golden.glb\",\"instantiate\":false");
+    relay::AssetRegistry live;
+    const auto report = relay::reload_imported_assets("projects/cook", live);
+    check(report.restored == 2U && report.failed == 0U && live.models().size() >= 2U, "both models import");
+
+    std::string bytes, error;
+    check(relay::cook_models("projects/cook", {"models/relay-dynamic-golden.glb", "models/relay-pbr-golden.glb"}, bytes, error),
+          "models cook");
+    relay::CookedModels cooked;
+    check(relay::parse_cooked_models({reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()}, cooked, error) &&
+              cooked.models == 2U && !cooked.steps.empty(),
+          "cooked models parse");
+    relay::AssetRegistry replayed;
+    relay::apply_cooked_models(cooked, replayed);
+    check(same_registry(live, replayed), "the cooked models register exactly what the importer registered");
+    check(live.models().size() > 0U && std::any_of(live.models().begin(), live.models().end(),
+                                                    [](const relay::ModelAsset& model) { return !model.clips.empty(); }),
+          "the fixtures include animation, so clips are covered");
+    // Only the models asked for are cooked.
+    std::string only;
+    check(relay::cook_models("projects/cook", {"models/relay-pbr-golden.glb"}, only, error) && only.size() < bytes.size(),
+          "a single model cooks alone");
+    // Damaged files are refused, not trusted.
+    for (const std::size_t cut : {std::size_t{3}, std::size_t{40}, bytes.size() / 2U}) {
+        relay::CookedModels broken;
+        check(!relay::parse_cooked_models({reinterpret_cast<const std::uint8_t*>(bytes.data()), cut}, broken, error),
+              "a cut-short cooked file is refused");
+    }
+
+    // A game reads them from its archive with the importer out of the picture: the model files are
+    // not even on disk.
+    {
+        const std::vector<relay::PakInput> inputs{{std::string{relay::cooked_models_name}, {}, bytes}};
+        check(relay::write_pak("projects/cook/game.pak", inputs, error), "a game archive with cooked models is written");
+        const auto archive = relay::PakArchive::open("projects/cook/game.pak", error);
+        relay::vfs::mount(archive, "projects/cook/data");
+        relay::AssetRegistry from_archive;
+        const auto restored = relay::reload_imported_assets("projects/cook/data", from_archive);
+        relay::vfs::unmount();
+        check(restored.restored == 2U && restored.failed == 0U && same_registry(live, from_archive),
+              "a game restores its models from the archive");
+    }
+
+    // Shaders.
+    const std::string shader_path = "shaders/tint.relay-shader";
+    fs::create_directories("projects/cook/shaders");
+    std::ofstream("projects/cook/" + shader_path) << relay::shader_template(relay::ShaderType::surface);
+    check(relay::cook_shader("projects/cook", shader_path, bytes, error), "a shader cooks");
+    check(!relay::cook_shader("projects/cook", "shaders/missing.relay-shader", bytes, error), "a missing shader does not cook");
+    std::ofstream("projects/cook/shaders/broken.relay-shader") << "shader_type surface;\nvoid fragment() { ALBEDO = nope; }\n";
+    check(!relay::cook_shader("projects/cook", "shaders/broken.relay-shader", bytes, error) &&
+              error.find("broken.relay-shader") != std::string::npos && error.find("line") != std::string::npos,
+          "a shader that does not compile fails the build with its error");
+    check(relay::cook_shader("projects/cook", shader_path, bytes, error), "the shader cooks again");
+    const auto direct = relay::compile_relay_shader(shader_path, relay::shader_template(relay::ShaderType::surface));
+    const auto parsed = relay::parse_cooked_shader({reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()}, error);
+    check(direct && direct->ok() && parsed && parsed->fragment == direct->fragment && parsed->vertex == direct->vertex &&
+              parsed->shadow_fragment == direct->shadow_fragment && parsed->hit == direct->hit &&
+              parsed->parsed.uniforms.size() == direct->parsed.uniforms.size() &&
+              parsed->parsed.uniform_bytes == direct->parsed.uniform_bytes &&
+              parsed->parsed.texture_count == direct->parsed.texture_count && parsed->parsed.type == direct->parsed.type &&
+              parsed->ok(),
+          "the cooked shader is the compiled one");
+    for (std::size_t i = 0; i < direct->parsed.uniforms.size(); ++i)
+        check(parsed->parsed.uniforms[i].name == direct->parsed.uniforms[i].name &&
+                  parsed->parsed.uniforms[i].offset == direct->parsed.uniforms[i].offset &&
+                  parsed->parsed.uniforms[i].default_value == direct->parsed.uniforms[i].default_value,
+              "cooked shader parameters keep their layout and defaults");
+    check(!relay::parse_cooked_shader({reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size() / 2U}, error),
+          "a cut-short cooked shader is refused");
+    {
+        const std::vector<relay::PakInput> inputs{{std::string{relay::cooked_shader_directory} + shader_path + ".bin", {}, bytes}};
+        check(relay::write_pak("projects/cook/shaders.pak", inputs, error), "an archive with a cooked shader is written");
+        const auto archive = relay::PakArchive::open("projects/cook/shaders.pak", error);
+        relay::vfs::mount(archive, "projects/cook");
+        fs::remove("projects/cook/" + shader_path); // The source is not part of the game.
+        relay::ShaderLibrary library;
+        const auto resolved = library.resolve("projects/cook", shader_path);
+        const auto again = library.resolve("projects/cook", shader_path);
+        relay::vfs::unmount();
+        check(resolved && resolved->ok() && resolved == again && resolved->fragment == direct->fragment,
+              "a game's shader library reads the cooked shader without its source");
+    }
+}
+
+// A person can keep a project anywhere on disk; an agent stays inside the workspace.
+void projects_anywhere() {
+    namespace fs = std::filesystem;
+    const auto outside = fs::temp_directory_path() /
+        ("relay-anywhere-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto project_file = (outside / "My Game (v2)" / "project.relayproject").generic_string();
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    const auto ok = [](const std::string& response) { return response.find("\"ok\":true") != std::string::npos; };
+    check(ok(protocol.handle(R"({"id":1,"method":"project.create","filename":")" + relay::json_escape(project_file) +
+                             R"(","name":"Anywhere"})")) && fs::is_regular_file(project_file),
+          "a project is created at an absolute path outside the workspace");
+    check(engine.project() && engine.project()->filename == project_file &&
+              fs::absolute(engine.project()->root()) == fs::path{project_file}.parent_path(),
+          "its root is the folder it was made in");
+    check(ok(protocol.handle(R"({"id":2,"method":"graphics.set_settings","vsync":true})")) &&
+              ok(protocol.handle(R"({"id":3,"method":"scene.create","name":"Crate"})")) &&
+              ok(protocol.handle(R"({"id":4,"method":"scene.save","filename":"level.relay.json"})")) &&
+              fs::is_regular_file(outside / "My Game (v2)" / "scenes" / "level.relay.json") &&
+              ok(protocol.handle(R"({"id":41,"method":"project.add_scene","scene_file":"level.relay.json"})")) &&
+              ok(protocol.handle(R"({"id":42,"method":"project.set_startup","scene_file":"level.relay.json"})")),
+          "its settings and scenes save inside it");
+    check(ok(protocol.handle(R"({"id":5,"method":"project.close"})")) &&
+              ok(protocol.handle(R"({"id":6,"method":"project.open","filename":")" + relay::json_escape(project_file) + R"("})")) &&
+              engine.project() && engine.project()->graphics && engine.project()->graphics->vsync &&
+              engine.scene().entities().size() == 1U,
+          "it opens again from there with its settings and startup scene");
+    for (const std::string bad : {(outside / "x" / ".." / "p" / "project.relayproject").generic_string() ,
+                                  (outside / "notaproject.txt").generic_string(),
+                                  (outside / ".hidden.relayproject").generic_string(),
+                                  std::string{"/"} + std::string(2000, 'a') + ".relayproject"})
+        check(!ok(protocol.handle(R"({"id":7,"method":"project.open","filename":")" + relay::json_escape(bad) + R"("})")),
+              "an unsafe absolute project path is refused");
+    check(!ok(protocol.handle(R"({"id":8,"method":"project.open","filename":"../outside/project.relayproject"})")),
+          "a relative path still cannot leave the workspace");
+    // An agent with the permission to open projects still cannot leave the workspace.
+    check(ok(protocol.handle(R"({"id":12,"method":"project.create","filename":"projects/anywhere/project.relayproject","name":"Inside"})")),
+          "create a project inside the workspace");
+    std::string error;
+    check(protocol.set_agent_grants({"project.open", "project.create"}, error), "grant an agent project access");
+    const auto denied = protocol.handle_agent(R"({"id":9,"method":"project.open","filename":")" + relay::json_escape(project_file) + R"("})");
+    check(denied.find("inside the workspace") != std::string::npos,
+          "an agent cannot open a project outside the workspace");
+    const auto denied_create = protocol.handle_agent(R"({"id":10,"method":"project.create","name":"Agent","filename":")" +
+                                                     relay::json_escape((outside / "agent" / "project.relayproject").generic_string()) + R"("})");
+    check((denied_create.find("inside the workspace") != std::string::npos || denied_create.find("denied") != std::string::npos) &&
+              !fs::exists(outside / "agent"),
+          "an agent cannot create one there either");
+    fs::remove_all(outside);
+}
+
 int main() {
     const auto original = std::filesystem::current_path();
     const auto temporary = std::filesystem::temp_directory_path() /
@@ -3049,6 +3302,7 @@ int main() {
         clipboard_and_groups();
         selections_and_timeline();
         projects();
+        projects_anywhere();
         asset_files();
         demo_project();
         components_and_templates();
@@ -3069,6 +3323,7 @@ int main() {
         shader_graphs();
         game_interface();
         particles();
+        cooked_game_files();
         std::cout << "Background editor workflow tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

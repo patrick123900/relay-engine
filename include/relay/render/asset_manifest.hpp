@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -60,6 +61,9 @@ public:
     std::size_t move_sources(std::string_view from, std::string_view to);
 
     [[nodiscard]] const std::vector<ImportManifestEntry>& entries() const;
+    // The file's text, and the manifest without the entries of models outside `sources`.
+    [[nodiscard]] std::string json() const;
+    void keep_sources(const std::set<std::string>& sources);
 
 private:
     std::vector<ImportManifestEntry> entries_;
@@ -67,7 +71,10 @@ private:
 
 // Re-imports every model the manifest records, so asset IDs saved inside a scene resolve again
 // after a restart. Entries whose content changed are reported rather than silently re-pointed.
+// With `only_sources`, restores just those models. A game restores them from its archive's cooked
+// models instead, without the importer.
 [[nodiscard]] ImportReloadReport reload_imported_assets(const std::filesystem::path& assets_root,
-                                                        AssetRegistry& registry);
+                                                        AssetRegistry& registry,
+                                                        const std::set<std::string>* only_sources = nullptr);
 
 } // namespace relay

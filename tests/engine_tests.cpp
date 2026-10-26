@@ -1,3 +1,4 @@
+#include "relay/core/pak.hpp"
 #include "relay/control/control_protocol.hpp"
 #include "relay/control/template_session.hpp"
 #include "relay/editor/ide.hpp"
@@ -38,6 +39,7 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -3159,7 +3161,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 56U && relay::protocol_methods().size() == 172U,
+    expect(relay::protocol_schema_version == 58U && relay::protocol_methods().size() == 177U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");
@@ -3247,7 +3249,7 @@ int main() {
         expect(relay::save_scene_file_atomic(engine.scene(), package_root / "scenes/main.relay.json",
                                              package_error), "test member scene saves");
         write_file(package_root / "textures/pixel.png", "asset-bytes");
-        write_file(package_root / ".relay-imports.json", "{}\n");
+        write_file(package_root / ".relay-imports.json", "{\"version\":3,\"entries\":[]}\n");
         write_file(package_root / "captures/private.png", "private");
         std::uint64_t package_bytes{};
         expect(relay::package_project(package, "bundle.tar", package_error, package_bytes),
@@ -3278,6 +3280,198 @@ int main() {
         expect(!relay::package_project(package, "unsafe.tar", package_error, package_bytes) &&
                    package_error.find("symlink") != std::string::npos,
                "package export rejects linked asset files");
+        // A zip holds the same files, stored with correct sizes, and a long path fits a tar.
+        write_file(package_root / "scenes/spare.relay.json", "{}");
+        write_file(package_root / "builds/release/old.bin", "old build");
+        const std::string deep = "textures/" + std::string(60, 'd') + "/" + std::string(60, 'e') + "/" + std::string(60, 'f') + ".png";
+        std::filesystem::create_directories((package_root / deep).parent_path());
+        write_file(package_root / deep, "deep");
+        std::filesystem::remove(package_root / "textures/link.png");
+        expect(relay::package_project(package, "bundle.zip", package_error, package_bytes),
+               "project packaging writes a zip: " + package_error);
+        std::ifstream zip_stream(package_root / "exports/bundle.zip", std::ios::binary);
+        const std::string zip_data{std::istreambuf_iterator<char>(zip_stream), {}};
+        expect(zip_data.size() == package_bytes && zip_data.starts_with("PK\x03\x04") &&
+                   zip_data.find("project.relayproject") != std::string::npos &&
+                   zip_data.find("scenes/spare.relay.json") != std::string::npos &&
+                   zip_data.find("textures/pixel.png") != std::string::npos &&
+                   zip_data.find("asset-bytes") != std::string::npos &&
+                   zip_data.find("builds/release/old.bin") == std::string::npos &&
+                   zip_data.find("captures/private.png") == std::string::npos,
+               "the zip holds every scene and asset, but no builds or captures");
+        expect(relay::package_project(package, "second.tar", package_error, package_bytes),
+               "a path over 100 characters packages into a tar: " + package_error);
+        std::ifstream long_stream(package_root / "exports/second.tar", std::ios::binary);
+        const std::string long_data{std::istreambuf_iterator<char>(long_stream), {}};
+        expect(long_data.find(std::string(60, 'f') + ".png") != std::string::npos &&
+                   long_data.find("scenes/spare.relay.json") != std::string::npos,
+               "the long tar path is stored through the ustar prefix and unlisted scenes are kept");
+
+        // Building needs the game's player program; a stand-in with a shader file serves here, and
+        // game_build_tests builds and runs the real one.
+        const auto fake_player = std::filesystem::temp_directory_path() /
+            ("relay-fake-player-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(fake_player / "shaders");
+        std::filesystem::copy_file("/bin/true", fake_player / "relay_player");
+        write_file(fake_player / "shaders" / "test.spv", "spirv");
+        setenv("RELAY_PLAYER_BINARY", (fake_player / "relay_player").c_str(), 1);
+        // Build settings save in the project file and drive project.build.
+        engine.project() = package;
+        expect(protocol.handle(R"({"id":12010,"method":"project.build_settings"})").find(R"("saved":false)") != std::string::npos,
+               "build settings start at their defaults");
+        expect(protocol.handle(R"({"id":12011,"method":"project.set_build_settings","game_name":"Portable Game","author":"Test Author","release_date":"2026-02-28","description":"Line one\nLine two","version":"2.1.0-beta.1"})")
+                       .find(R"("ok":true)") != std::string::npos &&
+                   engine.build_settings().game_name == "Portable Game",
+               "the game's details are changed through the protocol");
+        expect(protocol.handle(R"({"id":12012,"method":"project.set_build_profile","name":"Linux","window_mode":"borderless","window_width":1920,"window_height":1080})")
+                       .find(R"("ok":true)") != std::string::npos &&
+                   engine.build_settings().active().window_mode == "borderless",
+               "the default profile is changed through the protocol");
+        for (const char* bad : {
+                 R"({"id":12013,"method":"project.set_build_settings","release_date":"2026-02-30"})",
+                 R"({"id":12014,"method":"project.set_build_settings","icon":"../outside.png"})",
+                 R"({"id":12015,"method":"project.set_build_settings","icon":"art/pic.jpg"})",
+                 R"({"id":12016,"method":"project.set_build_settings","version":"1..0"})",
+                 R"({"id":12017,"method":"project.set_build_settings","version":"v1"})",
+                 R"({"id":12018,"method":"project.set_build_settings","version":"1.0-"})",
+                 R"({"id":12019,"method":"project.set_build_settings","version":""})",
+                 R"({"id":120191,"method":"project.set_build_settings","active_profile":"Nowhere"})",
+                 R"({"id":120192,"method":"project.set_build_profile","name":"Linux","output_directory":"a/../../b"})",
+                 R"({"id":120193,"method":"project.set_build_profile","name":"Linux","output_directory":"relative/../x"})",
+                 R"({"id":120194,"method":"project.set_build_profile","name":"Linux","target_platform":"windows"})",
+                 R"({"id":120195,"method":"project.set_build_profile","name":"Linux","configuration":"profile"})",
+                 R"({"id":120196,"method":"project.set_build_profile","name":"Linux","window_mode":"maximized"})",
+                 R"({"id":120197,"method":"project.set_build_profile","name":"Linux","window_width":100})",
+                 R"({"id":120198,"method":"project.set_build_profile","name":"Linux","window_height":20000})",
+                 R"({"id":120199,"method":"project.set_build_profile","name":"Other","copy_from":"Missing"})",
+                 R"({"id":1201910,"method":"project.remove_build_profile","name":"Linux"})"})
+            expect(protocol.handle(bad).find(R"("ok":false)") != std::string::npos,
+                   std::string("invalid build settings are refused: ") + bad);
+        expect(engine.build_settings().release_date == "2026-02-28" && engine.build_settings().profiles.size() == 1U,
+               "refused settings change nothing");
+        {
+            std::string reload_error;
+            const auto reloaded = relay::load_project(package.filename, reload_error);
+            expect(reloaded && reloaded->build && reloaded->build->author == "Test Author" &&
+                       reloaded->build->version == "2.1.0-beta.1" &&
+                       reloaded->build->description == "Line one\nLine two" &&
+                       reloaded->build->profiles.size() == 1U &&
+                       reloaded->build->profiles[0].window_mode == "borderless" &&
+                       reloaded->build->profiles[0].window_width == 1920U &&
+                       reloaded->build->profiles[0].window_height == 1080U,
+                   "build settings survive saving and reloading the project");
+        }
+        // Profiles: one per target, created, copied, renamed and removed through the protocol.
+        expect(protocol.handle(R"({"id":12020,"method":"project.set_build_profile","name":"Debug Linux","copy_from":"Linux","configuration":"debug"})")
+                       .find(R"("ok":true)") != std::string::npos &&
+                   engine.build_settings().profiles.size() == 2U &&
+                   engine.build_settings().find_profile("Debug Linux")->window_width == 1920U &&
+                   engine.build_settings().find_profile("Debug Linux")->configuration == "debug",
+               "a profile is created as a copy of another");
+        expect(protocol.handle(R"({"id":12021,"method":"project.set_build_profile","name":"Debug Linux","new_name":"Linux"})")
+                       .find(R"("ok":false)") != std::string::npos,
+               "two profiles cannot share a name");
+        expect(protocol.handle(R"({"id":12022,"method":"project.set_build_settings","active_profile":"Debug Linux"})")
+                       .find(R"("ok":true)") != std::string::npos &&
+                   protocol.handle(R"({"id":12023,"method":"project.set_build_profile","name":"Debug Linux","new_name":"Dev"})")
+                       .find(R"("ok":true)") != std::string::npos &&
+                   engine.build_settings().active_profile == "Dev",
+               "renaming the active profile keeps it active");
+        write_file(package_root / "textures/icon.png", "png-bytes");
+        expect(protocol.handle(R"({"id":12024,"method":"project.set_build_settings","icon":"textures/icon.png","active_profile":"Linux"})")
+                   .find(R"("ok":true)") != std::string::npos, "the icon is set");
+        // The scene names one texture; nothing names the other, so a build leaves it behind.
+        write_file(package_root / "textures/used.png", "used-bytes");
+        write_file(package_root / "scenes/main.relay.json", R"({"texture":"textures/used.png"})");
+        const auto pak_names = [&](const std::filesystem::path& file) {
+            std::set<std::string> names;
+            std::string pak_error;
+            if (const auto archive = relay::PakArchive::open(file, pak_error))
+                for (const auto& entry : archive->entries()) names.insert(entry.name);
+            return names;
+        };
+        const auto built = protocol.handle(R"({"id":12025,"method":"project.build"})");
+        const auto packed = pak_names(package_root / "builds/release/game.pak");
+        expect(built.find(R"("ok":true)") != std::string::npos &&
+                   built.find(R"("executable":true)") != std::string::npos &&
+                   std::filesystem::is_regular_file(package_root / "builds/release/Portable_Game") &&
+                   std::filesystem::is_regular_file(package_root / "builds/release/shaders/test.spv") &&
+                   std::filesystem::is_directory(package_root / "builds/debug") &&
+                   std::filesystem::is_regular_file(package_root / "builds/release/build.json") &&
+                   std::filesystem::is_regular_file(package_root / "builds/release/icon.png") &&
+                   !std::filesystem::exists(package_root / "builds/release/data"),
+               "project.build writes the game's program and archive into the release folder: " + built);
+        expect(packed.contains("project.relayproject") && packed.contains("scenes/main.relay.json") &&
+                   packed.contains("textures/used.png") && !packed.contains("textures/pixel.png") &&
+                   !packed.contains("captures/private.png") && !packed.contains("builds/release/old.bin"),
+               "the archive holds what the game refers to and leaves the rest behind");
+        expect(protocol.handle(R"({"id":120251,"method":"project.set_build_profile","name":"Linux","include_unused_assets":true})")
+                       .find(R"("ok":true)") != std::string::npos &&
+                   protocol.handle(R"({"id":120252,"method":"project.build"})").find(R"("ok":true)") != std::string::npos &&
+                   pak_names(package_root / "builds/release/game.pak").contains("textures/pixel.png"),
+               "a profile can ship every file");
+        expect(protocol.handle(R"({"id":120253,"method":"project.set_build_profile","name":"Linux","include_unused_assets":false})")
+                       .find(R"("ok":true)") != std::string::npos, "unused files are left out again");
+        {
+            std::ifstream manifest_stream(package_root / "builds/release/build.json");
+            const std::string manifest{std::istreambuf_iterator<char>(manifest_stream), {}};
+            expect(manifest.find("\"name\": \"Portable Game\"") != std::string::npos &&
+                       manifest.find("\"file_name\": \"Portable_Game\"") != std::string::npos &&
+                       manifest.find("\"author\": \"Test Author\"") != std::string::npos &&
+                       manifest.find("\"release_date\": \"2026-02-28\"") != std::string::npos &&
+                       manifest.find("\"version\": \"2.1.0-beta.1\"") != std::string::npos &&
+                       manifest.find("\"profile\": \"Linux\"") != std::string::npos &&
+                       manifest.find("\"mode\": \"borderless\", \"width\": 1920, \"height\": 1080") != std::string::npos &&
+                       manifest.find("\"architecture\": \"x86_64\"") != std::string::npos &&
+                       manifest.find("\"executable\": \"Portable_Game\"") != std::string::npos &&
+                       manifest.find("\"scripts\": null") != std::string::npos,
+                   "build.json describes the game, profile and target");
+        }
+        write_file(package_root / "builds/release/stale.bin", "stale");
+        expect(protocol.handle(R"({"id":12026,"method":"project.build"})").find(R"("ok":true)") != std::string::npos &&
+                   !std::filesystem::exists(package_root / "builds/release/stale.bin"),
+               "a rebuild replaces the previous build");
+        expect(protocol.handle(R"({"id":12027,"method":"project.build","profile":"Dev"})")
+                       .find(R"("ok":true)") != std::string::npos &&
+                   std::filesystem::is_regular_file(package_root / "builds/debug/build.json") &&
+                   engine.build_settings().active_profile == "Linux",
+               "a named profile builds its own configuration without becoming active");
+        expect(protocol.handle(R"({"id":12028,"method":"project.build","profile":"Missing"})")
+                   .find(R"("ok":false)") != std::string::npos, "an unknown profile cannot be built");
+        std::filesystem::remove(package_root / "builds/debug/build.json");
+        write_file(package_root / "builds/debug/mine.txt", "not a build");
+        expect(protocol.handle(R"({"id":12029,"method":"project.build","profile":"Dev"})")
+                       .find(R"("ok":false)") != std::string::npos &&
+                   std::filesystem::exists(package_root / "builds/debug/mine.txt"),
+               "a build refuses to clear a folder that is not a previous build");
+        // A build folder elsewhere on disk, and an export to a chosen folder.
+        const auto elsewhere = std::filesystem::temp_directory_path() /
+            ("relay-build-elsewhere-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        expect(protocol.handle(R"({"id":12030,"method":"project.set_build_profile","name":"Elsewhere","copy_from":"Linux","output_directory":")" +
+                               elsewhere.generic_string() + R"("})").find(R"("ok":true)") != std::string::npos &&
+                   protocol.handle(R"({"id":12031,"method":"project.build","profile":"Elsewhere"})").find(R"("ok":true)") != std::string::npos &&
+                   std::filesystem::is_regular_file(elsewhere / "release/build.json") &&
+                   std::filesystem::is_directory(elsewhere / "debug"),
+               "a build can be written to an absolute folder outside the project");
+        const auto export_folder = elsewhere / "archives";
+        const auto exported = protocol.handle(R"({"id":12032,"method":"project.package","filename":"copy.zip","directory":")" +
+                                              export_folder.generic_string() + R"("})");
+        expect(exported.find(R"("ok":true)") != std::string::npos && std::filesystem::is_regular_file(export_folder / "copy.zip") &&
+                   protocol.handle(R"({"id":12033,"method":"project.package","filename":"bad.zip","directory":"../up"})")
+                       .find(R"("ok":false)") != std::string::npos,
+               "an export can be written to a chosen folder, but not through ..: " + exported);
+        std::filesystem::remove_all(elsewhere);
+        expect(protocol.handle(R"({"id":12034,"method":"project.remove_build_profile","name":"Elsewhere"})").find(R"("ok":true)") != std::string::npos &&
+                   engine.build_settings().find_profile("Elsewhere") == nullptr,
+               "a profile is removed");
+        setenv("RELAY_PLAYER_BINARY", (fake_player / "missing").c_str(), 1);
+        expect(protocol.handle(R"({"id":12036,"method":"project.build","profile":"Linux"})").find("player was not found") != std::string::npos,
+               "a build without the player program says so");
+        unsetenv("RELAY_PLAYER_BINARY");
+        std::filesystem::remove_all(fake_player);
+        engine.project().reset();
+        expect(protocol.handle(R"({"id":12035,"method":"project.build"})").find(R"("ok":false)") != std::string::npos,
+               "building needs an open project");
         std::filesystem::remove_all(package_root);
     }
     const auto set_camera = protocol.handle(

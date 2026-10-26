@@ -1,3 +1,4 @@
+#include "relay/core/pak.hpp"
 #include "relay/scene/project.hpp"
 #include "relay/core/json.hpp"
 
@@ -30,13 +31,26 @@ std::optional<std::filesystem::path> workspace_file(const std::string_view direc
     std::error_code ec;
     const auto root = std::filesystem::path(directory);
     auto path = root;
-    // Check every ancestor, including the root, so nested links cannot escape the workspace.
-    auto ancestor = std::filesystem::path{};
-    for (const auto& part : root / relative) {
+    // Check every ancestor, including the root, so nested links cannot escape the workspace. An
+    // absolute root is a folder a person chose themselves, so only what lies below it is checked.
+    auto ancestor = root.is_absolute() ? root : std::filesystem::path{};
+    for (const auto& part : root.is_absolute() ? relative : root / relative) {
         ancestor /= part;
         if (std::filesystem::is_symlink(ancestor, ec)) return {};
     }
     path /= relative;
+    return path;
+}
+
+std::optional<std::filesystem::path> project_file_path(const std::string_view filename, const bool allow_absolute) {
+    const std::filesystem::path path{filename};
+    if (!path.is_absolute()) return workspace_file(".", filename, ".relayproject");
+    if (!allow_absolute || filename.size() > 1024U || !filename.ends_with(".relayproject")) return {};
+    for (const char c : filename)
+        if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) return {};
+    for (const auto& part : path)
+        if (part == ".." || part == ".") return {};
+    if (path.filename().string().front() == '.') return {};
     return path;
 }
 
@@ -52,7 +66,7 @@ std::string Project::json(const bool with_settings) const {
         files += '"' + json_escape(scene) + '"';
     }
     std::string settings;
-    if (with_settings && (input || graphics || audio)) {
+    if (with_settings && (input || graphics || audio || build)) {
         std::string entries;
         if (input) {
             // The map keeps its own format and version; indented to sit inside the project object.
@@ -70,6 +84,10 @@ std::string Project::json(const bool with_settings) const {
             if (!entries.empty()) entries += ',';
             entries += "\n    \"audio\": " + audio_settings_json(*audio);
         }
+        if (build) {
+            if (!entries.empty()) entries += ',';
+            entries += "\n    \"build\": " + build_settings_json(*build);
+        }
         settings = ",\n  \"settings\": {" + entries + "\n  }";
     }
     return "{\n  \"format\": \"relay.project\",\n  \"version\": " +
@@ -82,7 +100,7 @@ std::string Project::json(const bool with_settings) const {
 
 namespace {
 bool valid(const Project& project) {
-    if (!workspace_file(".", project.filename, ".relayproject") ||
+    if (!project_file_path(project.filename, true) ||
         project.name.empty() || project.name.size() > 128 || project.scenes.size() > 128) return false;
     std::set<std::string> unique;
     for (const auto& file : project.scenes)
@@ -91,24 +109,23 @@ bool valid(const Project& project) {
 }
 } // namespace
 
-std::optional<Project> load_project(const std::string_view filename, std::string& error) {
+std::optional<Project> load_project(const std::string_view filename, std::string& error,
+                                    const bool allow_absolute) {
     std::string warning;
-    return load_project(filename, error, warning);
+    return load_project(filename, error, warning, allow_absolute);
 }
 
 std::optional<Project> load_project(const std::string_view filename, std::string& error,
-                                    std::string& warning) {
+                                    std::string& warning, const bool allow_absolute) {
     warning.clear();
-    const auto path = workspace_file(".", filename, ".relayproject");
-    std::error_code ec;
+    const auto path = project_file_path(filename, allow_absolute);
     // Room for the largest input map (256 KiB) and the rest of the settings.
-    if (!path || !std::filesystem::is_regular_file(*path, ec) ||
-        std::filesystem::file_size(*path, ec) > 512U * 1024U || ec) {
+    std::string text;
+    std::string read_error;
+    if (!path || !vfs::read_all(*path, 512U * 1024U, text, read_error)) {
         error = "project must be an existing safe .relayproject file inside the workspace";
         return {};
     }
-    std::ifstream stream(*path, std::ios::binary);
-    const std::string text{std::istreambuf_iterator<char>(stream), {}};
     JsonParser parser(text);
     const auto value = parser.parse();
     const auto* object = value ? value->object() : nullptr;
@@ -127,7 +144,7 @@ std::optional<Project> load_project(const std::string_view filename, std::string
         return {};
     }
     Project project{std::string(filename), string_at("name"), {}, string_at("startup_scene"), {}, false,
-                    {}, {}};
+                    {}, {}, {}};
     for (const auto& scene : *scenes->array()) {
         if (!scene.string()) { error = "project scenes must be filenames"; return {}; }
         project.scenes.push_back(*scene.string());
@@ -153,13 +170,18 @@ std::optional<Project> load_project(const std::string_view filename, std::string
         project.audio = parse_audio_settings(*audio, problem);
         if (!project.audio) { error = "invalid audio settings in the project: " + problem; return {}; }
     }
+    if (const auto* build = settings ? field(*settings->object(), "build") : nullptr) {
+        std::string problem;
+        project.build = parse_build_settings(*build, problem);
+        if (!project.build) { error = "invalid build settings in the project: " + problem; return {}; }
+    }
     error.clear();
     return project;
 }
 
 bool save_project(const Project& project, std::string& error, const bool create) {
     if (!valid(project)) { error = "invalid project metadata or unsafe path"; return false; }
-    const auto path = *workspace_file(".", project.filename, ".relayproject");
+    const auto path = *project_file_path(project.filename, true);
     std::error_code ec;
     if (create && std::filesystem::exists(path, ec)) {
         error = "project already exists";

@@ -176,6 +176,8 @@ private:
     };
     std::map<std::string, Entry, std::less<>> entries_;
     std::map<std::string, std::string, std::less<>> previews_;
+    // Shaders read ready-compiled from a game's archive.
+    std::map<std::string, std::shared_ptr<const CompiledShader>, std::less<>> cooked_;
 };
 
 [[nodiscard]] std::optional<std::string> read_shader_file(const std::filesystem::path& root,

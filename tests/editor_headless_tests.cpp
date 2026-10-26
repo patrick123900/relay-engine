@@ -1,3 +1,4 @@
+#include "relay/scene/scene_io.hpp"
 #include "relay/control/control_protocol.hpp"
 #include "relay/core/input.hpp"
 #include "relay/core/json.hpp"
@@ -1495,6 +1496,245 @@ void profiler_ui() {
     frame(ui, 2);
     check(!profiler.paused(), "Resume records frames again");
     std::cout << "Headless profiler tests passed\n";
+}
+
+std::optional<std::array<float, 4>> need_item(relay::EditorUi& ui, const std::string& key) {
+    auto rect = ui.headless_item_rect(key);
+    if (!rect) throw std::runtime_error("missing editor item: " + key);
+    return rect;
+}
+
+// File > Export project writes a zip or tar, to a folder picked with Browse, and Run > Build project
+// keeps one profile per target and stages a build for the selected one.
+void export_and_build_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/shipping/project.relayproject","name":"Shipping"})")
+              .find("\"ok\":true") != std::string::npos, "create shipping project");
+    // Building copies the game's player program; a stand-in with a shader file serves here.
+    std::filesystem::create_directories("fake-player/shaders");
+    std::filesystem::copy_file("/bin/true", "fake-player/relay_player", std::filesystem::copy_options::overwrite_existing);
+    std::ofstream("fake-player/shaders/test.spv") << "spirv";
+    setenv("RELAY_PLAYER_BINARY", (std::filesystem::current_path() / "fake-player/relay_player").c_str(), 1);
+    std::filesystem::create_directories("projects/shipping/art");
+    std::filesystem::create_directories("projects/shipping/handover/inbox");
+    std::ofstream("projects/shipping/art/note.txt") << "note";
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize shipping editor without windows");
+    // Browse buttons ask the system for a folder; the test answers in its place.
+    std::vector<relay::EditorUi::FileDialogRequest> asked;
+    std::optional<std::string> answer;
+    ui.set_file_dialog_handler([&](const relay::EditorUi::FileDialogRequest& request, relay::EditorUi::FileDialogDone done) {
+        asked.push_back(request);
+        done(answer);
+    });
+    frame(ui, 5);
+
+    // Export: a floating window with format, name and destination.
+    click_center(ui, *need_item(ui, "menu:file"));
+    click_center(ui, *need_item(ui, "menu:file:export_project"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("export:name").has_value() && ui.headless_item_rect("export:directory") &&
+              ui.headless_item_rect("export:directory:browse"),
+          "Export project opens a window with a name and a destination folder");
+    click_center(ui, *need_item(ui, "export:tar"));
+    frame(ui, 2);
+    click_center(ui, *need_item(ui, "export:zip"));
+    frame(ui, 2);
+    answer = std::filesystem::absolute("projects/shipping/handover/inbox").string();
+    click_center(ui, *need_item(ui, "export:directory:browse"));
+    frame(ui, 3);
+    check(asked.size() == 1U && asked.back().kind == relay::EditorUi::FileDialogRequest::Kind::open_folder &&
+              asked.back().title.find("export") != std::string::npos,
+          "Browse asks the system for a folder");
+    click_center(ui, *need_item(ui, "export:confirm"));
+    frame(ui, 3);
+    check(std::filesystem::is_regular_file("projects/shipping/handover/inbox/project.zip") &&
+              !ui.headless_item_rect("export:name").has_value(),
+          "Export writes the zip into the chosen folder and closes the window");
+
+    // Build: profiles on the left, fields on the right.
+    click_center(ui, *need_item(ui, "menu:run"));
+    click_center(ui, *need_item(ui, "menu:run:build_project"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("build:window").has_value() && ui.headless_item_rect("build:profile:Linux") &&
+              ui.headless_item_rect("build:add") && ui.headless_item_rect("build:duplicate") &&
+              ui.headless_item_rect("build:profile_name") && ui.headless_item_rect("build:platform") &&
+              ui.headless_item_rect("build:architecture") && ui.headless_item_rect("build:configuration") &&
+              ui.headless_item_rect("build:output") && ui.headless_item_rect("build:output:browse") &&
+              ui.headless_item_rect("build:window_mode") && ui.headless_item_rect("build:window_width") &&
+              ui.headless_item_rect("build:window_height"),
+          "Build project shows the profile list and the profile's fields");
+    click_center(ui, *need_item(ui, "build:build"));
+    frame(ui, 3);
+    check(std::filesystem::is_regular_file("projects/shipping/builds/release/build.json"),
+          "Build stages the release folder");
+    check(std::filesystem::is_directory("projects/shipping/builds/debug"),
+          "Build also creates the debug folder");
+    check(std::filesystem::is_regular_file("projects/shipping/builds/release/game.pak"),
+          "The release folder holds the game's archive");
+
+    click_center(ui, *need_item(ui, "build:duplicate"));
+    frame(ui, 4);
+    check(engine.build_settings().profiles.size() == 2U && engine.build_settings().active_profile == "Linux copy",
+          "Copy adds a profile and selects it");
+    click_center(ui, *need_item(ui, "build:configuration"));
+    frame(ui, 2);
+    click_center(ui, *need_item(ui, "build:configuration:debug"));
+    frame(ui, 3);
+    check(engine.build_settings().active().configuration == "debug" &&
+              engine.build_settings().find_profile("Linux")->configuration == "release",
+          "a profile's configuration changes without touching the others");
+    click_center(ui, *need_item(ui, "build:include_unused"));
+    frame(ui, 3);
+    check(engine.build_settings().active().include_unused_assets, "Include unused files saves in the profile");
+    click_center(ui, *need_item(ui, "build:include_unused"));
+    frame(ui, 3);
+    check(!engine.build_settings().active().include_unused_assets, "and switches off again");
+    click_center(ui, *need_item(ui, "build:window_mode"));
+    frame(ui, 2);
+    click_center(ui, *need_item(ui, "build:window_mode:fullscreen"));
+    frame(ui, 3);
+    check(engine.build_settings().active().window_mode == "fullscreen", "choosing Fullscreen saves the window mode");
+    answer = std::filesystem::absolute("projects/shipping/handover").string();
+    click_center(ui, *need_item(ui, "build:output:browse"));
+    frame(ui, 4);
+    check(asked.size() == 2U && asked.back().kind == relay::EditorUi::FileDialogRequest::Kind::open_folder,
+          "the build folder's Browse asks the system for a folder");
+    answer = std::nullopt;
+    click_center(ui, *need_item(ui, "build:output:browse"));
+    frame(ui, 4);
+    check(asked.size() == 3U && engine.build_settings().active().output_directory == "handover",
+          "cancelling the dialog changes nothing");
+    check(engine.build_settings().active().output_directory == "handover",
+          "a build folder chosen inside the project is saved relative to it");
+    click_center(ui, *need_item(ui, "build:build"));
+    frame(ui, 3);
+    check(std::filesystem::is_regular_file("projects/shipping/handover/debug/build.json"),
+          "the copy builds into its own folder and configuration");
+    click_center(ui, *need_item(ui, "build:profile:Linux"));
+    frame(ui, 4);
+    check(engine.build_settings().active_profile == "Linux", "clicking a profile selects it");
+    click_center(ui, *need_item(ui, "build:profile:Linux copy"));
+    frame(ui, 4);
+    click_center(ui, *need_item(ui, "build:delete"));
+    frame(ui, 4);
+    check(engine.build_settings().profiles.size() == 1U && engine.build_settings().active_profile == "Linux",
+          "Delete removes the selected profile");
+    unsetenv("RELAY_PLAYER_BINARY");
+    std::cout << "Headless export and build tests passed\n";
+}
+
+// The project and file dialogs ask the operating system for paths (answered here by a stand-in) and
+// accept projects anywhere on disk, copying scenes and models picked outside the project into it.
+void system_dialogs_ui() {
+    namespace fs = std::filesystem;
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    // A project inside the workspace to open, and a folder elsewhere on disk.
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/inside/project.relayproject","name":"Inside"})")
+              .find("\"ok\":true") != std::string::npos, "create the workspace project");
+    const auto outside = fs::temp_directory_path() /
+        ("relay-outside-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::create_directories(outside / "incoming");
+    const auto models = fs::path{RELAY_DEMO_DIRECTORY}.parent_path().parent_path() / "tests/fixtures/models";
+    fs::copy_file(models / "relay-test-triangle.gltf", outside / "incoming/triangle.gltf");
+
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize dialog editor without windows");
+    std::vector<relay::EditorUi::FileDialogRequest> asked;
+    std::optional<std::string> answer;
+    ui.set_file_dialog_handler([&](const relay::EditorUi::FileDialogRequest& request, relay::EditorUi::FileDialogDone done) {
+        asked.push_back(request);
+        done(answer);
+    });
+    frame(ui, 5);
+    check(ui.open_project("projects/inside/project.relayproject"), "open the workspace project");
+    frame(ui, 3);
+
+    // New project: a name and a folder, which the system dialog picks. The project can live anywhere.
+    click_center(ui, *need_item(ui, "menu:file"));
+    click_center(ui, *need_item(ui, "menu:file:new_project"));
+    frame(ui, 3);
+    check(ui.headless_item_rect("dialog:project:name") && ui.headless_item_rect("dialog:project:location") &&
+              ui.headless_item_rect("dialog:project:browse"),
+          "New project asks for a name and a location, with a Browse button");
+    answer = outside.string();
+    click_center(ui, *need_item(ui, "dialog:project:browse"));
+    frame(ui, 3);
+    check(asked.size() == 1U && asked.back().kind == relay::EditorUi::FileDialogRequest::Kind::open_folder &&
+              asked.back().title.find("create") != std::string::npos,
+          "Browse asks the system for a folder to create the project in");
+    click_center(ui, *need_item(ui, "dialog:file:continue"));
+    frame(ui, 4);
+    const auto created = outside / "my-project" / "project.relayproject";
+    check(fs::is_regular_file(created) && engine.project() && engine.project()->filename == created.generic_string() &&
+              fs::absolute(engine.project()->root()) == outside / "my-project",
+          "the project is created in the chosen folder and opened");
+    // Open project: Browse offers .relayproject files and fills in the path, relative when it can.
+    click_center(ui, *need_item(ui, "menu:file"));
+    click_center(ui, *need_item(ui, "menu:file:open_project"));
+    frame(ui, 3);
+    answer = fs::absolute("projects/inside/project.relayproject").string();
+    click_center(ui, *need_item(ui, "dialog:file:browse"));
+    frame(ui, 3);
+    check(asked.size() == 2U && asked.back().kind == relay::EditorUi::FileDialogRequest::Kind::open_file &&
+              !asked.back().filters.empty() && asked.back().filters.front().second == "relayproject",
+          "Open project asks the system for a .relayproject file");
+    click_center(ui, *need_item(ui, "dialog:file:continue"));
+    frame(ui, 4);
+    check(engine.project() && engine.project()->filename == "projects/inside/project.relayproject",
+          "a project inside the workspace opens by its relative path");
+    click_center(ui, *need_item(ui, "menu:file"));
+    click_center(ui, *need_item(ui, "menu:file:open_project"));
+    frame(ui, 3);
+    answer = created.string();
+    click_center(ui, *need_item(ui, "dialog:file:browse"));
+    frame(ui, 3);
+    click_center(ui, *need_item(ui, "dialog:file:continue"));
+    frame(ui, 4);
+    check(engine.project() && engine.project()->filename == created.generic_string(),
+          "a project elsewhere on disk opens by its full path");
+
+    // Import: a model picked outside the project is copied into its models folder, with what it needs.
+    answer = (outside / "incoming/triangle.gltf").string();
+    click_center(ui, *need_item(ui, "menu:file"));
+    click_center(ui, *need_item(ui, "menu:file:import_model"));
+    frame(ui, 3);
+    click_center(ui, *need_item(ui, "dialog:file:browse"));
+    frame(ui, 3);
+    check(asked.back().kind == relay::EditorUi::FileDialogRequest::Kind::open_file &&
+              asked.back().filters.front().second.find("glb") != std::string::npos,
+          "Import model asks the system for a 3D model file");
+    click_center(ui, *need_item(ui, "dialog:file:continue"));
+    frame(ui, 4);
+    check(fs::is_regular_file(outside / "my-project/models/triangle.gltf") && fs::exists(outside / "incoming/triangle.gltf"),
+          "the model is copied into the project and the original is left alone");
+
+    // Add an existing scene from elsewhere: it is copied into the project's scenes folder.
+    check(relay::save_scene_file_atomic(engine.scene(), outside / "incoming/extra.relay.json", error), "write a scene to add");
+    ui.set_panel_visible("Project", true);
+    frame(ui, 3);
+    answer = (outside / "incoming/extra.relay.json").string();
+    click_center(ui, *need_item(ui, "project:add_scene"));
+    frame(ui, 3);
+    click_center(ui, *need_item(ui, "dialog:file:browse"));
+    frame(ui, 3);
+    click_center(ui, *need_item(ui, "dialog:file:continue"));
+    frame(ui, 4);
+    check(fs::is_regular_file(outside / "my-project/scenes/extra.relay.json") &&
+              std::find(engine.project()->scenes.begin(), engine.project()->scenes.end(), "extra.relay.json") !=
+                  engine.project()->scenes.end(),
+          "a scene from elsewhere is copied into the project and added");
+
+    fs::remove_all(outside);
+    std::cout << "Headless system dialog tests passed\n";
 }
 
 // Hierarchy search, type filters and collapse/expand all, and the same button in Assets.
@@ -3188,6 +3428,8 @@ int main() {
         fresh(interface_ui);
         fresh(hierarchy_order_ui);
         fresh(hierarchy_search_ui);
+        fresh(export_and_build_ui);
+        fresh(system_dialogs_ui);
         fresh(profiler_ui);
         fresh(game_configuration_ui);
         fresh(game_input_ui);

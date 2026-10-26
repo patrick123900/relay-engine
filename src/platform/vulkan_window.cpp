@@ -6,6 +6,7 @@
 #include "relay/observe/profiler.hpp"
 #include "relay/particles/particle_system.hpp"
 #include "relay/render/assets.hpp"
+#include "relay/render/image_decode.hpp"
 #include "relay/render/materials.hpp"
 #include "relay/render/shader_language.hpp"
 #include "relay/render/scene_render.hpp"
@@ -35,6 +36,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <iterator>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -142,7 +144,19 @@ constexpr std::uint32_t no_draw_slot = std::numeric_limits<std::uint32_t>::max()
 // with FidelityFX.
 constexpr float reflection_roughness_limit = 0.25F;
 
-std::vector<std::uint32_t> read_shader(const std::filesystem::path& path, std::string& error) {
+// Compiled shaders are read from a shaders folder beside the executable when there is one, as
+// there is for a built game, and otherwise from where this build of Relay put them.
+std::filesystem::path shader_location(const std::filesystem::path& built) {
+    if (const char* base = SDL_GetBasePath()) {
+        const auto folder = std::filesystem::path{base} / "shaders";
+        std::error_code ignored;
+        if (std::filesystem::is_directory(folder, ignored)) return folder / built.filename();
+    }
+    return built;
+}
+
+std::vector<std::uint32_t> read_shader(const std::filesystem::path& built, std::string& error) {
+    const auto path = shader_location(built);
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream) {
         error = "could not open compiled shader: " + path.string();
@@ -8325,6 +8339,49 @@ void VulkanWindow::resize(const std::uint32_t width, const std::uint32_t height)
     if (!impl_ || impl_->window == nullptr) return;
     SDL_SetWindowSize(impl_->window, static_cast<int>(width), static_cast<int>(height));
     impl_->resized = true;
+}
+
+void VulkanWindow::set_title(const std::string& title) {
+    if (impl_ && impl_->window != nullptr) (void)SDL_SetWindowTitle(impl_->window, title.c_str());
+}
+
+bool VulkanWindow::set_icon_png(const std::filesystem::path& path) {
+    if (!impl_ || impl_->window == nullptr) return false;
+    std::ifstream stream(path, std::ios::binary);
+    const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream), {}};
+    TextureAsset icon;
+    std::string error;
+    if (bytes.empty() || !decode_image_rgba(bytes, "png", icon, error) || icon.width == 0U || icon.height == 0U)
+        return false;
+    SDL_Surface* surface = SDL_CreateSurfaceFrom(static_cast<int>(icon.width), static_cast<int>(icon.height),
+                                                 SDL_PIXELFORMAT_RGBA32, icon.rgba.data(),
+                                                 static_cast<int>(icon.width * 4U));
+    if (surface == nullptr) return false;
+    const bool set = SDL_SetWindowIcon(impl_->window, surface); // SDL copies the pixels.
+    SDL_DestroySurface(surface);
+    return set;
+}
+
+void VulkanWindow::set_window_mode(const std::string_view mode) {
+    if (!impl_ || impl_->window == nullptr) return;
+    if (mode == "windowed") {
+        (void)SDL_SetWindowFullscreen(impl_->window, false);
+    } else if (mode == "borderless") {
+        // A null mode is a borderless window at the desktop's size and resolution.
+        (void)SDL_SetWindowFullscreenMode(impl_->window, nullptr);
+        (void)SDL_SetWindowFullscreen(impl_->window, true);
+    } else if (mode == "fullscreen") {
+        // Exclusive fullscreen at the display's current mode.
+        const auto display = SDL_GetDisplayForWindow(impl_->window);
+        if (const auto* desktop = SDL_GetDesktopDisplayMode(display))
+            (void)SDL_SetWindowFullscreenMode(impl_->window, desktop);
+        (void)SDL_SetWindowFullscreen(impl_->window, true);
+    }
+    impl_->resized = true;
+}
+
+void VulkanWindow::set_pointer_locked(const bool locked) {
+    if (impl_ && impl_->window != nullptr) (void)SDL_SetWindowRelativeMouseMode(impl_->window, locked);
 }
 
 void VulkanWindow::set_overlay(EditorOverlay* const overlay) {

@@ -1,3 +1,4 @@
+#include "relay/core/pak.hpp"
 #include "relay/scene/templates.hpp"
 
 #include "relay/scene/components.hpp"
@@ -105,7 +106,7 @@ std::optional<LoadedTemplate> load_template(const std::optional<fs::path>& proje
     }
     const auto path = template_file(*project_root, id.substr(8));
     std::error_code code;
-    if (!path || !fs::is_regular_file(*path, code)) {
+    if (!path || (!vfs::packed(*path) && !fs::is_regular_file(*path, code))) {
         error = "project template not found";
         return std::nullopt;
     }

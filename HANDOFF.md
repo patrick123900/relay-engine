@@ -9,14 +9,16 @@ overview for visitors. Protocol details belong in [`docs/protocol.md`](docs/prot
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v56: 172 native methods. Scene v29, project v2, import manifest v3.
+- Protocol schema v58: 177 native methods. Scene v29, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
   colliders, Jolt body simulation with fixed/point/hinge/slider/distance/cone/swing-twist joints (servo motors, breakable), a Unity-style
   component model with derived node types and templates/prefabs shown in the node type tree, native
   C++ gameplay scripts, per-project input mapping, a scripted first person controller template in
-  the demo project, portable project export, and FidelityFX global illumination and hardware ray
-  traced reflections, a frame profiler, and audio (sources, listeners, spatialisation and mixer
+  the demo project, portable project export (zip or tar), game builds (a standalone Linux player
+  with one archive of the files the game uses, models and shaders cooked at build time, and compiled
+  scripts), project files anywhere on disk chosen with the system's file dialogs, and FidelityFX
+  global illumination and hardware ray traced reflections, a frame profiler, and audio (sources, listeners, spatialisation and mixer
   buses, bus effects, reverb zones, occlusion, streaming, music players and headphone output),
   a Sky node (gradient or panorama sky material, sky lighting, sun and distance fog), and custom
   shaders (a GLSL-based language for surfaces and post processing, shader materials, a Shader
@@ -346,10 +348,114 @@ without blocking simultaneous human editing.
   display depth is capped independently of the authored far clipping plane. Markers follow
   scene-owned transform keys and parent transforms, can be toggled in View, and are hidden during
   Run Game.
-- `project.package` writes a bounded uncompressed tar under `exports/` containing normalized
-  project metadata, member scenes, and non-hidden project assets, including import metadata.
-  It excludes private state, captures, traces, and prior exports, and refuses overwrites. The
-  project panel exposes the same operation. Save scene changes before packaging.
+- Export means "save the project to move it to another machine"; Build means "make the game".
+  `project.package` writes a portable copy of the project: an uncompressed ustar tar or a stored
+  zip, chosen by the `.tar`/`.zip` extension (`src/scene/project_package.cpp`; paths over 100
+  characters use the ustar prefix, at most 65,535 files and 2 GiB), to `exports/` or to the optional
+  `directory` (absolute or project-relative, created, no `..`). Both formats come from
+  `collect_project_files`: every scene (listed or not), template, script, asset and
+  `.relay-imports.json`, plus a normalized `project.relayproject`, minus hidden entries, captures,
+  traces, exports and every in-project build folder. It refuses overwrites and links. File → Export
+  project... and the Project panel's button open the floating Export Project window
+  (`draw_export_window`, keys `export:*`: format, name, destination with **Browse...**). Both
+  formats were extracted with `unzip`, Python's zipfile and GNU `tar`.
+- File dialogs: every Browse button opens the operating system's dialog through SDL3
+  (`EditorUi::Impl::choose_path` / `choose_folder`, `show_system_dialog`: `SDL_ShowOpenFileDialog`,
+  `SDL_ShowSaveFileDialog`, `SDL_ShowOpenFolderDialog`), which on Linux goes through the desktop portal
+  (xdg-desktop-portal, else zenity or kdialog, as SDL3 decides). The answer arrives on another thread and
+  waits in `DialogMailbox` until the next frame (`drain_dialog_results`); one dialog at a time. Tests and
+  hosts replace the dialog with `EditorUi::set_file_dialog_handler`; headless editors have none, so
+  their Browse buttons are disabled (with a tooltip). There is no custom file or folder browser (the
+  earlier `FolderPicker` is gone); AGENTS.md says to keep it that way. Browse buttons: New project
+  (location), Open project, Add existing scene, Save scene as, Open scene, Import model, the Export
+  window's folder and the Build window's folder. Scenes and models picked outside the project are
+  copied in on Continue (`copy_picked_file`, `model_companions`: a glTF's `uri` files and an OBJ's
+  `mtllib`; anything else a model needs must be copied by hand, and the importer will say so). Screenshot
+  and recording names stay plain names inside `captures/`. Not tried with a real portal on a desktop.
+- Projects anywhere: `project_file_path(filename, allow_absolute)` accepts an absolute `.relayproject`
+  path (no `.`/`..` parts, no control characters, 1024 characters). `project.open` and `project.create`
+  accept one only when the call is not an agent's (`agent_dispatch_`); agents get "agents can only
+  use projects inside the workspace" and the protocol's filename limit rose to 1024. `workspace_file`
+  no longer checks the symlinks of an absolute root or the folders above it, only what lies below
+  the root. Relative paths behave as before. Recent-projects lists do not exist yet.
+- Build settings (protocol v58): `settings.build` in the project file (`BuildSettings` and
+  `BuildProfile`, `src/scene/build_settings.cpp`). The game's details are shared: name,
+  description, author, release date, version, icon (a project PNG) and `active_profile`. A project
+  has 1 to 16 uniquely named **profiles**, each with a target platform, architecture, configuration
+  (release/debug), build folder (project-relative, or absolute for a folder elsewhere; no `..`) and
+  window mode (windowed/borderless/fullscreen) and size (320-16384). The default is one profile,
+  "Linux" (linux, x86_64, release, `builds`, windowed 1280x720). A project saved with the earlier
+  flat form (target fields beside the game's) loads as one profile. Methods:
+  `project.build_settings`, `project.set_build_settings` (game details, `active_profile`),
+  `project.set_build_profile` (creates when missing, optional `copy_from` and `new_name`),
+  `project.remove_build_profile` and `project.build` (optional `profile`). Run → Build project...
+  opens the floating Build Project window (`draw_build_window`, keys `build:*`): the profile list
+  on the left, the selected profile's fields (with a Browse button for the build folder) and the
+  shared game details on the right, and a Build button; each change is saved at once.
+  `build_project` (`src/scene/project_build.cpp`) builds `<build folder>/<configuration>/` through a
+  hidden staging folder and replaces the old folder only if it holds `build.json` or nothing. It
+  runs synchronously on the protocol thread, so the editor waits for script compilation.
+- Game builds (Linux x86_64 only): the result is `<Game_Name>` (a copy of `relay_player`, found by
+  `find_player_binary`: `RELAY_PLAYER_BINARY`, else beside the running program, else the build's
+  `RELAY_PLAYER_DEFAULT_PATH`), `game.pak`, `scripts/relay-scripts.so`, `shaders/*.spv` (copied from
+  `<player dir>/shaders`), `lib/` (every library `ldd` lists for the player except the C library, the
+  Vulkan loader and desktop and driver libraries, see `system_library`), `icon.png` and `build.json`
+  (`relay.build` v1 with `game`, `profile`, `window`, `target`, `content` (archive, root, counts of
+  cooked models and shaders and of unused files left out), `scripts` and `executable`).
+  - **Pruning** (`src/scene/asset_references.cpp`): `find_referenced_assets` keeps what the project
+    file, the listed scenes and the scripts reach. Strings in scenes, templates, materials and
+    shaders match a file by exact path (after trimming `.mesh.0`-style suffixes) or by an imported
+    model's identity (`asset.<content id>.mesh.N`, mapped to its source through the import record);
+    strings in script sources also match any path they start or end, a file name, a name prefix of
+    four or more characters and a name before the first dot (generous on purpose: scripts build
+    names). Models' import dependencies are kept but listed in `import_only`, so the build drops
+    them when the model ships cooked. The profile's `include_unused_assets` ships every file.
+  - **Archive** (`include/relay/core/pak.hpp`, `src/core/pak.cpp`): `RELAYPAK` v1, 16-byte aligned
+    files, a table at the end with CRC32s, mapped with mmap (read into memory elsewhere).
+    `vfs::mount(archive, root)` makes paths below `root` read from it; `vfs::packed`, `packed_name`,
+    `stamp` and `read_all` are what loaders call. Routed through it: scenes and templates
+    (`load_scene_file`), the project file, sky and surface materials and their images, shader files,
+    audio (clips decode from memory, music streams from the mapping), UI images and fonts, and the
+    import record. Not routed (editor-only): asset browsing and listings, thumbnails, writers, the
+    model importer's own file reads. `relay_player --verify` checks every checksum.
+  - **Cooking** (`src/render/cooked_assets.cpp`): `cook_models` replays the import record into a
+    scratch registry with an `AssetRecorder` (`AssetRegistry::set_recorder`, called from
+    `register_imported` and `register_model`) and writes `.cooked/models.bin`: the batches and
+    models in order, so a game's registry is identical to the importer's (same identities, same
+    buffer layout). `reload_imported_assets` applies the cooked file when the archive holds one;
+    the build refuses a model whose import record is stale (the editor rebinds scenes, a game
+    cannot). `cook_shader` compiles each kept `.relay-shader` with glslang into
+    `.cooked/shaders/<path>.bin` (SPIR-V for each stage plus the parameter layout, without source);
+    `ShaderLibrary::resolve` reads those first. Sources that shipped cooked (model files, shader
+    files, `.relay-imports.json`) are not packed. Embedded model textures are cooked as raw RGBA
+    (large for big textures), and project images and audio are packed as authored: there is no
+    texture conversion or compression yet (GPU formats, mip chains, deflate are open).
+  - **Runtime engine library**: CMake builds `relay_engine_common` (objects), `relay_engine` (plus
+    `model_import.cpp` and `shader_language.cpp` with Assimp and glslang) and
+    `relay_engine_runtime` (the same two files compiled without them: the importer reports it is
+    unavailable and project shaders cannot compile). `relay_player` links the runtime library, so
+    `lib/` has no Assimp, glslang or SPIRV libraries.
+  - **Player** (`apps/relay_player/main.cpp`): shares `apps/common/window_hooks.hpp` with the editor;
+    RPATH `$ORIGIN/lib` (old-style `--disable-new-dtags`, so bundled libraries' own dependencies
+    resolve there too); chdirs to its folder, mounts `game.pak` as `<folder>/data`, opens
+    `data/project.relayproject` through `ControlProtocol`, loads scripts with
+    `ScriptSystem::adopt_prebuilt`, calls `Engine::run_game` and runs the live editor's loop.
+    `VulkanWindow` gained `set_title`, `set_icon_png`, `set_window_mode` and `set_pointer_locked`;
+    `read_shader` takes `.spv` files from a `shaders/` folder beside the executable whenever one
+    exists. Scripts compile through `compile_scripts_for_export` (release `-O2 -DNDEBUG`, debug
+    `-O0 -g`, cached under `.relay-cache/export-scripts`) and need the project to be trusted. The two
+    configurations differ only in the scripts' flags and in the player printing its log (debug).
+  - Tests: `relay_game_build_tests` builds the demo, checks the archive's contents, the libraries
+    and the cooking, runs the game offscreen from the build folder and from a moved copy and checks
+    the frame shows the scene; `relay_workflow_tests` (`cooked_game_files`) covers the archive,
+    the virtual folder, damaged files, model cooking against the importer (animated and PBR
+    fixtures), reading a game's models and shaders from an archive with the sources absent, and
+    shader errors failing a build; `relay_tests` covers pruning, `include_unused_assets` and the
+    archive's contents with a stand-in player (`/bin/true` plus a shader file).
+  - Known gaps: the build is not asynchronous or cancellable; no launcher/desktop entry; the game has
+    no pause or quit key of its own (scripts and the window close); glibc and libstdc++ versions limit
+    which distributions the result runs on (libstdc++ is bundled, glibc is not); the real windows
+    have not been looked at on a desktop, and no real GPU window was opened (offscreen only).
 
 ### Frame profiler
 
@@ -549,7 +655,11 @@ without blocking simultaneous human editing.
   `input.simulate` (Run Game only; holds an action or sets an axis for N steps, taking precedence
   over devices), host-only `input.release` (sends `input:reset`, which traces record), and the
   older `input.recent` event log. Scripts use the appended `RelayHostApi` input functions through
-  `relay::input` in the SDK. `RelayHostApi` also gained `child` (first direct child by name) and
+  `relay::input` in the SDK. `RelayHostApi` also gained `render_frame_rate` (`relay::world::frame_rate()`: drawn
+  frames per second, smoothed over about half a second by `Engine::record_render_performance`, which
+  the editor and the player call once per drawn frame; scripts update at a fixed 60 Hz, so this is
+  the only view of the display's rate; the demo's `FpsCounter` script on the HUD's "FPS" label shows
+  it, green, amber below 60 and red below 30), `child` (first direct child by name) and
   `activate_camera` (a game-time camera switch that Stop Game undoes with the rest of the scene).
 - Editor: during Run Game the game gets keyboard and mouse only after a click on the viewport;
   Escape or losing window focus returns input and releases held controls, and a viewport label
@@ -1478,12 +1588,41 @@ Phase 3:
 
 ## Next priorities
 
-1. Keep the character controller project agnostic: every behaviour a game might need (inner body,
+1. Finish game builds (Run > Build project; see "Game builds" above for what exists). In rough order of value:
+   - **Asynchronous build with progress and cancel.** `project.build` runs on the protocol thread, so the
+     editor freezes while scripts compile (the first build of a script-heavy project takes a while). Run it
+     on a worker (script compile already has `run_build`), report stages (collecting, cooking models, cooking
+     shaders, compiling scripts, writing the archive) through a status call the Build window polls, and let
+     the person cancel. Keep the staging-folder swap so a cancelled build leaves the old one intact.
+   - **Look at it on a desktop.** The player and the Build, Export and file-dialog windows were only run
+     headlessly or offscreen: check a real window (title, icon, windowed/borderless/fullscreen, pointer
+     lock, resize), the system file dialogs through a real portal, and Wayland as well as X11. Fullscreen
+     and exclusive modes are untested.
+   - **Texture and audio cooking.** Project images and audio are packed as authored and embedded model
+     textures are raw RGBA. Add an encoder (stb_dxt is public domain) and GPU-compressed formats with mip
+     chains, which needs renderer support for compressed uploads; optionally deflate the archive's text
+     entries and re-encode audio. Models could also be cooked further (quantized vertices, meshlets).
+   - **A list of what was left out.** Pruning is generous for scripts but still a guess: show the dropped
+     files in the Build window, let a profile keep named folders (`always_include`) and warn when a script
+     builds a path whose prefix matches nothing.
+   - **A separate debug player.** Debug and release differ only in the scripts' flags and the player's log;
+     a debug player with assertions and symbols (and a stripped release player: the dev tree's is 100 MB)
+     would make the configurations mean something.
+   - **Run the built game from the editor** (a Run button in the Build window, as a host action like
+     Open in file browser), a build log with the script compiler's diagnostics in the window, and a
+     `.desktop` file or launcher script.
+   - **Portability.** The result needs a glibc at least as new as the machine that built it (libstdc++ is
+     bundled, glibc is not); consider building releases in an older container, and check the bundle list
+     (`system_library`) on other distributions. Other targets: Windows and macOS players, `.dll` and
+     `.dylib` scripts (the deferred item below), Arm Linux (the build refuses non-x86_64 hosts).
+   - **Recent projects and remembered folders** for the system dialogs (last Open/New/Export/Build
+     locations), now that projects can live anywhere.
+2. Keep the character controller project agnostic: every behaviour a game might need (inner body,
    layers, shape, step and slope limits) is a `CharacterSettings` field, and example controllers
    are secondary. Candidates: other shapes than the upright capsule, a settable up direction,
    moving the inner body by the character's own velocity for better pushes, and a Jolt inner
    body that is a real `CharacterVirtual` inner body for character-versus-character pushing.
-2. Grow joints where games need them: swing-twist motors (drive a ragdoll to a pose), a `joint_broken`
+3. Grow joints where games need them: swing-twist motors (drive a ragdoll to a pose), a `joint_broken`
    event or callback instead of polling, an axis gizmo and cone drawing in the viewport, and
    re-attaching a broken joint from a script.
 

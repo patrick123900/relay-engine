@@ -225,9 +225,9 @@ std::vector<ScriptDiagnostic> parse_diagnostics(std::string_view output, const f
     return diagnostics;
 }
 
-std::vector<std::string> split_flags() {
+std::vector<std::string> split_flags(const std::string_view text) {
     std::vector<std::string> flags;
-    std::istringstream stream{std::string{compile_flags}};
+    std::istringstream stream{std::string{text}};
     for (std::string flag; stream >> flag;) flags.push_back(flag);
     return flags;
 }
@@ -240,6 +240,8 @@ struct BuildRequest {
     fs::path sdk;
     std::vector<SourceFile> files;
     std::string fingerprint;
+    // Compiler flags; empty means the editor's (compile_flags).
+    std::string flags;
 };
 
 struct BuildResult {
@@ -293,8 +295,9 @@ BuildResult run_build(const BuildRequest& request, const std::atomic<bool>& canc
         headers.update(file.relative.data(), file.relative.size() + 1U);
         headers.update(text->data(), text->size());
     }
+    const std::string_view flag_text = request.flags.empty() ? compile_flags : std::string_view{request.flags};
     const auto toolchain = hash_text({std::to_string(RELAY_SCRIPT_ABI_VERSION), request.compiler,
-                                      compile_flags, *sdk_header, *sdk_abi});
+                                      std::string{flag_text}, *sdk_header, *sdk_abi});
     const auto header_hash = headers.hex();
     const auto objects = request.cache / "obj";
     std::error_code code;
@@ -328,7 +331,7 @@ BuildResult run_build(const BuildRequest& request, const std::atomic<bool>& canc
     }
     for (auto& unit : units) unit.cached = fs::exists(unit.object, code);
 
-    const auto flags = split_flags();
+    const auto flags = split_flags(flag_text);
     std::mutex output_mutex;
     std::atomic<std::size_t> next{0};
     std::atomic<bool> failed{false};
@@ -1460,6 +1463,7 @@ struct ScriptSystem::Impl {
             const auto state = owner.physics().joint_state(owner.scene(), unpack(entity));
             return state && state->broken ? 1 : 0;
         };
+        host.render_frame_rate = [](void* context) { return self(context).engine.render_frame_rate(); };
         host.character_remove = [](void* context, RelayEntity entity) {
             return self(context).engine.physics().remove_character(unpack(entity)) ? 1 : 0;
         };
@@ -1903,6 +1907,7 @@ struct ScriptSystem::Impl {
         templates.clear();
         running = false;
         library.reset();
+        prebuilt = false;
         root = current;
         trusted = root && project_scripts_trusted(*root);
         state = ScriptBuildState::idle;
@@ -2147,6 +2152,8 @@ struct ScriptSystem::Impl {
     RelayHostApi host{};
     std::optional<fs::path> root;
     bool trusted{};
+    // The library was built when the game was, so sources are neither scanned nor compiled.
+    bool prebuilt{};
     ScriptBuildState state{ScriptBuildState::idle};
     std::unique_ptr<Library> library;
     // Heap-allocated, so spawning during a callback never moves the instance being called.
@@ -2204,9 +2211,82 @@ bool ScriptSystem::set_trusted(const bool trusted, std::string& error) {
     return true;
 }
 
+ScriptExport compile_scripts_for_export(const std::filesystem::path& project_root, const bool debug) {
+    ScriptExport exported;
+    auto scan = scan_sources(project_root);
+    if (!scan.error.empty()) {
+        exported.error = scan.error;
+        return exported;
+    }
+    for (const auto& file : scan.files) exported.sources += file.header ? 0U : 1U;
+    if (exported.sources == 0U) {
+        exported.succeeded = true;
+        return exported;
+    }
+#ifdef _WIN32
+    exported.error = "native scripts are not yet supported on Windows";
+    return exported;
+#else
+    BuildRequest request;
+    request.build = 1;
+    request.root = fs::absolute(project_root);
+    request.cache = request.root / ".relay-cache" / "export-scripts";
+    request.compiler = environment("RELAY_SCRIPT_COMPILER", RELAY_SCRIPT_DEFAULT_COMPILER);
+    request.sdk = script_sdk_directory();
+    request.files = std::move(scan.files);
+    request.fingerprint = scan.fingerprint;
+    request.flags = debug ? "-std=c++20 -O0 -g -fPIC -fvisibility=hidden -fvisibility-inlines-hidden "
+                            "-fdiagnostics-color=never -Wall -Wextra"
+                          : "-std=c++20 -O2 -DNDEBUG -fPIC -fvisibility=hidden -fvisibility-inlines-hidden "
+                            "-fdiagnostics-color=never -Wall -Wextra";
+    const std::atomic<bool> never{false};
+    auto result = run_build(request, never);
+    exported.succeeded = result.succeeded;
+    exported.library = result.library;
+    exported.error = result.error;
+    exported.output = result.output;
+    exported.diagnostics = std::move(result.diagnostics);
+    if (result.succeeded) {
+        // Only the library just built is wanted; earlier ones would pile up.
+        std::error_code ec;
+        for (fs::directory_iterator it(request.cache / "lib", ec), end; !ec && it != end; it.increment(ec))
+            if (it->path() != result.library && it->path().extension() == library_suffix)
+                fs::remove(it->path(), ec);
+    }
+    return exported;
+#endif
+}
+
+bool ScriptSystem::adopt_prebuilt(const std::filesystem::path& library, std::string& error) {
+    auto& impl = *impl_;
+    impl.observe_project();
+    if (!impl.root) {
+        error = "open the project before loading its scripts";
+        return false;
+    }
+    BuildResult result;
+    result.build = 1;
+    result.succeeded = true;
+    result.library = library;
+    result.fingerprint = "prebuilt";
+    auto loaded = impl.load(result, error);
+    if (!loaded) return false;
+    impl.library = std::move(loaded);
+    impl.prebuilt = true;
+    impl.trusted = true;
+    impl.state = ScriptBuildState::ready;
+    impl.attempted_fingerprint = "prebuilt";
+    impl.build_counter = 1;
+    return true;
+}
+
 bool ScriptSystem::start_build(std::string& error) {
     impl_->observe_project();
     auto& impl = *impl_;
+    if (impl.prebuilt) {
+        error = "this game's scripts were built with it";
+        return false;
+    }
     if (!impl.root) {
         error = "scripts need an open project";
         return false;
@@ -2272,7 +2352,7 @@ ScriptStatus ScriptSystem::status() {
     status.supported = true;
 #endif
     status.state = impl.state;
-    if (impl.root && impl.trusted) {
+    if (impl.root && impl.trusted && !impl.prebuilt) {
         const auto scan = scan_sources(*impl.root);
         status.stale = scan.fingerprint != impl.attempted_fingerprint &&
                        impl.state != ScriptBuildState::building;
@@ -2325,8 +2405,8 @@ bool ScriptSystem::can_start(const Scene& scene, std::string& error) {
         error = "scripts have not been built yet; run scripts.build first";
         return false;
     }
-    const auto scan = scan_sources(*impl.root);
-    if (scan.fingerprint != impl.library->fingerprint) {
+    const auto scan = impl.prebuilt ? SourceScan{} : scan_sources(*impl.root);
+    if (!impl.prebuilt && scan.fingerprint != impl.library->fingerprint) {
         error = "scripts changed since the last build; run scripts.build first";
         return false;
     }

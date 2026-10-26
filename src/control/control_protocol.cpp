@@ -1729,13 +1729,135 @@ std::string ControlProtocol::handle(const std::string_view request) {
     if (method == "project.package") {
         if (!engine_.project()) return error_response(id, "no project is open");
         const auto filename = string_field(request, "filename");
+        const auto directory = string_field(request, "directory");
         std::string error;
         std::uint64_t bytes{};
-        if (!package_project(*engine_.project(), filename, error, bytes))
+        std::filesystem::path written;
+        if (!package_project(*engine_.project(), filename, directory, error, bytes, &written))
             return error_response(id, error);
-        return response_prefix(id) + "{\"filename\":\"" +
-               escape_json((engine_.project()->root() / "exports" / filename).generic_string()) +
+        return response_prefix(id) + "{\"filename\":\"" + escape_json(written.generic_string()) +
                "\",\"bytes\":" + std::to_string(bytes) + "}}";
+    }
+    if (method == "project.build_settings") {
+        const auto settings = engine_.build_settings();
+        const auto* project = engine_.project() ? &*engine_.project() : nullptr;
+        const auto list = [](const std::vector<std::string_view>& values) {
+            std::string text = "[";
+            for (const auto value : values) {
+                if (text.size() > 1) text += ',';
+                text += '\"' + std::string{value} + '\"';
+            }
+            return text + ']';
+        };
+        std::string builds = "[";
+        for (const auto& profile : settings.profiles) {
+            if (builds.size() > 1) builds += ',';
+            std::error_code ec;
+            const auto directory = project ? build_output_root(project->root(), profile) / profile.configuration
+                                           : std::filesystem::path{};
+            const bool built = project && std::filesystem::is_regular_file(directory / "build.json", ec);
+            builds += "{\"profile\":\"" + escape_json(profile.name) + "\",\"directory\":\"" +
+                      escape_json(directory.generic_string()) + "\",\"built\":" +
+                      (built ? "true" : "false") + '}';
+        }
+        return response_prefix(id) + "{\"settings\":" + build_settings_json(settings) +
+               ",\"saved\":" + (project && project->build ? "true" : "false") +
+               ",\"defaults\":" + build_settings_json(BuildSettings{}) +
+               ",\"game_name\":\"" +
+               escape_json(effective_game_name(settings, project ? project->name : std::string{})) +
+               "\",\"platforms\":" + list(build_platforms()) +
+               ",\"architectures\":" + list(build_architectures()) +
+               ",\"configurations\":" + list(build_configurations()) +
+               ",\"window_modes\":" + list(build_window_modes()) +
+               ",\"builds\":" + builds + "]}}";
+    }
+    if (method == "project.set_build_settings") {
+        auto settings = engine_.build_settings();
+        const auto assign = [&](const char* key, std::string& target) {
+            if (const auto value = optional_string_field(request, key)) target = *value;
+        };
+        assign("game_name", settings.game_name);
+        assign("description", settings.description);
+        assign("author", settings.author);
+        assign("release_date", settings.release_date);
+        assign("version", settings.version);
+        assign("icon", settings.icon);
+        assign("active_profile", settings.active_profile);
+        std::string error;
+        if (!engine_.set_build_settings(settings, error)) return error_response(id, error);
+        engine_.logs().write(LogLevel::info, "Build settings saved");
+        return response_prefix(id) + "{\"settings\":" + build_settings_json(settings) + "}}";
+    }
+    if (method == "project.set_build_profile") {
+        auto settings = engine_.build_settings();
+        const auto name = string_field(request, "name");
+        auto* profile = settings.find_profile(name);
+        if (profile == nullptr) {
+            BuildProfile created;
+            if (const auto source = optional_string_field(request, "copy_from")) {
+                const auto* original = settings.find_profile(*source);
+                if (original == nullptr) return error_response(id, "there is no build profile named " + *source);
+                created = *original;
+            }
+            created.name = name;
+            settings.profiles.push_back(std::move(created));
+            profile = &settings.profiles.back();
+        }
+        const auto assign = [&](const char* key, std::string& target) {
+            if (const auto value = optional_string_field(request, key)) target = *value;
+        };
+        const bool was_active = settings.active_profile == name;
+        assign("new_name", profile->name);
+        assign("target_platform", profile->target_platform);
+        assign("architecture", profile->architecture);
+        assign("configuration", profile->configuration);
+        assign("output_directory", profile->output_directory);
+        assign("window_mode", profile->window_mode);
+        profile->window_width = static_cast<std::uint32_t>(
+            unsigned_field(request, "window_width", profile->window_width));
+        profile->window_height = static_cast<std::uint32_t>(
+            unsigned_field(request, "window_height", profile->window_height));
+        profile->include_unused_assets =
+            boolean_field(request, "include_unused_assets", profile->include_unused_assets);
+        if (was_active) settings.active_profile = profile->name;
+        const auto shown = *profile;
+        std::string error;
+        if (!engine_.set_build_settings(settings, error)) return error_response(id, error);
+        engine_.logs().write(LogLevel::info, "Build profile " + shown.name + " saved");
+        return response_prefix(id) + "{\"profile\":" + build_profile_json(shown) + ",\"settings\":" +
+               build_settings_json(settings) + "}}";
+    }
+    if (method == "project.remove_build_profile") {
+        auto settings = engine_.build_settings();
+        const auto name = string_field(request, "name");
+        if (settings.find_profile(name) == nullptr)
+            return error_response(id, "there is no build profile named " + name);
+        if (settings.profiles.size() == 1)
+            return error_response(id, "the last build profile cannot be removed");
+        std::erase_if(settings.profiles, [&](const BuildProfile& profile) { return profile.name == name; });
+        if (settings.active_profile == name) settings.active_profile = settings.profiles.front().name;
+        std::string error;
+        if (!engine_.set_build_settings(settings, error)) return error_response(id, error);
+        engine_.logs().write(LogLevel::info, "Build profile " + name + " removed");
+        return response_prefix(id) + "{\"settings\":" + build_settings_json(settings) + "}}";
+    }
+    if (method == "project.build") {
+        if (!engine_.project()) return error_response(id, "no project is open");
+        const auto settings = engine_.build_settings();
+        const auto requested = optional_string_field(request, "profile");
+        const auto* profile = requested ? settings.find_profile(*requested) : &settings.active();
+        if (profile == nullptr) return error_response(id, "there is no build profile named " + *requested);
+        std::string error;
+        BuildReport report;
+        if (!build_project(*engine_.project(), settings, *profile, error, report))
+            return error_response(id, error);
+        engine_.logs().write(LogLevel::info, "Built " + report.directory.generic_string());
+        return response_prefix(id) + "{\"profile\":\"" + escape_json(profile->name) + "\",\"directory\":\"" +
+               escape_json(report.directory.generic_string()) +
+               "\",\"configuration\":\"" + escape_json(profile->configuration) +
+               "\",\"files\":" + std::to_string(report.files) +
+               ",\"bytes\":" + std::to_string(report.bytes) +
+               ",\"executable\":" + (report.executable ? "true" : "false") + "}}";
     }
     if (method == "project.close") {
         engine_.project().reset();
@@ -1745,8 +1867,13 @@ std::string ControlProtocol::handle(const std::string_view request) {
         std::string error;
         const auto filename = string_field(request, "filename");
         std::string warning;
-        auto project = method == "project.open" ? load_project(filename, error, warning)
-                                                : std::optional{Project{filename, string_field(request, "name"), {}, {}, {}, false, {}, {}}};
+        // A person may open or create a project anywhere on disk; an agent stays in the workspace.
+        const bool absolute = std::filesystem::path{filename}.is_absolute();
+        if (absolute && agent_dispatch_)
+            return error_response(id, "agents can only use projects inside the workspace");
+        if (absolute && !project_file_path(filename, true)) return error_response(id, "unsafe project path");
+        auto project = method == "project.open" ? load_project(filename, error, warning, true)
+                                                : std::optional{Project{filename, string_field(request, "name"), {}, {}, {}, false, {}, {}, {}}};
         if (!project) return error_response(id, error);
         if (!warning.empty()) engine_.logs().write(LogLevel::warning, warning);
         SceneState state;

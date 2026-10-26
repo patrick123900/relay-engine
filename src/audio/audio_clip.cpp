@@ -1,3 +1,4 @@
+#include "relay/core/pak.hpp"
 #include "relay/audio/audio_clip.hpp"
 #include "relay/scene/project.hpp"
 
@@ -78,7 +79,20 @@ std::optional<AudioClip> decode_audio(const std::vector<std::uint8_t>& bytes, st
     return clip;
 }
 
+// A file's decoder: over the game archive's mapped bytes when the file is packed in it.
+static ma_result init_decoder(const std::filesystem::path& path, const ma_decoder_config* config, ma_decoder* decoder) {
+    if (const auto packed = vfs::packed(path)) return ma_decoder_init_memory(packed->data(), packed->size(), config, decoder);
+    return ma_decoder_init_file(path.string().c_str(), config, decoder);
+}
+
 std::optional<AudioClip> decode_audio_file(const std::filesystem::path& path, std::string& error) {
+    if (const auto packed = vfs::packed(path)) {
+        if (packed->size() > maximum_audio_file_bytes) {
+            error = "the audio file is larger than 256 MiB";
+            return std::nullopt;
+        }
+        return decode_audio(std::vector<std::uint8_t>(packed->begin(), packed->end()), error);
+    }
     std::error_code failure;
     const auto size = std::filesystem::file_size(path, failure);
     if (failure || !std::filesystem::is_regular_file(path, failure)) {
@@ -115,7 +129,7 @@ std::optional<AudioFileSummary> summarize_audio_file(const std::filesystem::path
                                                      const std::size_t buckets, std::string& error) {
     ma_decoder decoder;
     const auto config = ma_decoder_config_init(ma_format_f32, 0, 0);
-    if (ma_decoder_init_file(path.string().c_str(), &config, &decoder) != MA_SUCCESS) {
+    if (init_decoder(path, &config, &decoder) != MA_SUCCESS) {
         error = "not a readable WAV, FLAC, MP3 or Ogg Vorbis file";
         return std::nullopt;
     }
@@ -169,14 +183,14 @@ std::shared_ptr<AudioStream> AudioStream::open(const std::filesystem::path& path
     std::shared_ptr<AudioStream> stream(new AudioStream());
     auto decoder = std::make_unique<Decoder>();
     auto config = ma_decoder_config_init(ma_format_f32, 0, 0);
-    if (ma_decoder_init_file(path.string().c_str(), &config, &decoder->decoder) != MA_SUCCESS) {
+    if (init_decoder(path, &config, &decoder->decoder) != MA_SUCCESS) {
         error = "not a readable WAV, FLAC, MP3 or Ogg Vorbis file";
         return nullptr;
     }
     if (decoder->decoder.outputChannels > 2U) {
         ma_decoder_uninit(&decoder->decoder);
         config = ma_decoder_config_init(ma_format_f32, 2, 0);
-        if (ma_decoder_init_file(path.string().c_str(), &config, &decoder->decoder) != MA_SUCCESS) {
+        if (init_decoder(path, &config, &decoder->decoder) != MA_SUCCESS) {
             error = "could not mix the audio file down to stereo";
             return nullptr;
         }
@@ -254,9 +268,10 @@ bool AudioClipCache::streams(const std::string_view path, std::string& error) {
     const auto resolved = resolve(path, error);
     if (!resolved) return false;
     std::error_code failure;
-    const auto modified = std::filesystem::last_write_time(*resolved, failure);
-    const auto size = failure ? 0U : std::filesystem::file_size(*resolved, failure);
-    if (failure) {
+    const auto file = vfs::stamp(*resolved);
+    const auto modified = file.time;
+    const auto size = file.size;
+    if (!file.found) {
         error = "audio clip " + std::string(path) + " not found";
         return false;
     }
@@ -267,7 +282,7 @@ bool AudioClipCache::streams(const std::string_view path, std::string& error) {
     ma_decoder decoder;
     const auto config = ma_decoder_config_init(ma_format_f32, 0, 0);
     bool stream = false;
-    if (ma_decoder_init_file(resolved->string().c_str(), &config, &decoder) == MA_SUCCESS) {
+    if (init_decoder(*resolved, &config, &decoder) == MA_SUCCESS) {
         ma_uint64 length = 0;
         const bool known = ma_decoder_get_length_in_pcm_frames(&decoder, &length) == MA_SUCCESS && length;
         stream = known ? static_cast<double>(length) / decoder.outputSampleRate > audio_stream_threshold_seconds
@@ -283,9 +298,10 @@ std::shared_ptr<const AudioClip> AudioClipCache::load(const std::string_view pat
     const auto resolved = resolve(path, error);
     if (!resolved) return nullptr;
     std::error_code failure;
-    const auto modified = std::filesystem::last_write_time(*resolved, failure);
-    const auto size = failure ? 0U : std::filesystem::file_size(*resolved, failure);
-    if (failure) {
+    const auto file = vfs::stamp(*resolved);
+    const auto modified = file.time;
+    const auto size = file.size;
+    if (!file.found) {
         error = "audio clip " + std::string(path) + " not found";
         return nullptr;
     }

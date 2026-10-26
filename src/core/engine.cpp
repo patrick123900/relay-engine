@@ -200,6 +200,16 @@ VideoStatus Engine::video_status() const { return video_.status(); }
 void Engine::record_render_performance(const double gpu_milliseconds, const std::uint32_t draw_calls,
                                        const std::uint32_t resource_count) {
     performance_.record_render(frame_index_, gpu_milliseconds, draw_calls, resource_count);
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_render_).count();
+    last_render_ = now;
+    // A long gap (a pause, a minimized window) starts the average again instead of dragging it.
+    if (seconds > 1e-6 && seconds < 1.0)
+        render_frame_rate_ = render_frame_rate_ <= 0.0
+                                 ? 1.0 / seconds
+                                 : render_frame_rate_ + (1.0 / seconds - render_frame_rate_) * std::min(1.0, seconds / 0.5);
+    else
+        render_frame_rate_ = 0.0;
 }
 
 PerformanceSnapshot Engine::performance(const std::uint64_t after_frame) const {
@@ -293,6 +303,23 @@ bool Engine::set_graphics_settings(const GraphicsSettings& settings, std::string
     }
     auto updated = *project_;
     updated.graphics = settings;
+    if (!save_project(updated, error)) return false;
+    *project_ = std::move(updated);
+    return true;
+}
+
+BuildSettings Engine::build_settings() const {
+    return project_ && project_->build ? *project_->build : BuildSettings{};
+}
+
+bool Engine::set_build_settings(const BuildSettings& settings, std::string& error) {
+    if (!project_) {
+        error = "build settings are saved with a project; open one first";
+        return false;
+    }
+    if (!validate_build_settings(settings, error)) return false;
+    auto updated = *project_;
+    updated.build = settings;
     if (!save_project(updated, error)) return false;
     *project_ = std::move(updated);
     return true;

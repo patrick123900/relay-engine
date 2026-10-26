@@ -1,6 +1,7 @@
 #pragma once
 
 #include "relay/audio/audio_settings.hpp"
+#include "relay/scene/build_settings.hpp"
 #include "relay/core/input.hpp"
 #include "relay/render/graphics_settings.hpp"
 
@@ -28,6 +29,8 @@ struct Project {
     std::optional<GraphicsSettings> graphics;
     // settings.audio, the mixer's buses; none until someone changes them.
     std::optional<AudioSettings> audio;
+    // settings.build, the options of Run > Build Project; none until someone changes them.
+    std::optional<BuildSettings> build;
     [[nodiscard]] std::filesystem::path root() const;
     // The file contents; protocol replies leave the settings out.
     [[nodiscard]] std::string json(bool with_settings = true) const;
@@ -35,16 +38,70 @@ struct Project {
 
 [[nodiscard]] std::optional<std::filesystem::path> workspace_file(
     std::string_view directory, std::string_view filename, std::string_view suffix);
+// The project file's path. A relative `filename` must lie inside the workspace (workspace_file).
+// With `allow_absolute`, a path the person chose in a system file dialog is also accepted: absolute,
+// without . or .. parts, wherever on disk it is. Only human-driven requests pass it; agents stay
+// inside the workspace.
+[[nodiscard]] std::optional<std::filesystem::path> project_file_path(std::string_view filename,
+                                                                     bool allow_absolute);
 inline constexpr std::uint32_t project_file_version = 2;
 // Reads versions 1 and 2. `warning` reports a legacy input map that could not be read.
-[[nodiscard]] std::optional<Project> load_project(std::string_view filename, std::string& error);
 [[nodiscard]] std::optional<Project> load_project(std::string_view filename, std::string& error,
-                                                  std::string& warning);
+                                                  bool allow_absolute = false);
+[[nodiscard]] std::optional<Project> load_project(std::string_view filename, std::string& error,
+                                                  std::string& warning, bool allow_absolute = false);
 [[nodiscard]] bool save_project(const Project& project, std::string& error, bool create = false);
 [[nodiscard]] std::vector<std::string> available_projects();
-// Write a portable, uncompressed tar of on-disk project metadata, member scenes,
-// and non-hidden assets. The archive is created under the project's exports folder.
+// One file of a project package or build: where it is on disk and its path inside the archive.
+struct ProjectFile {
+    std::filesystem::path source; // Empty for generated content, which is `text`.
+    std::string name;
+    std::uint64_t size{};
+    std::string text;
+};
+
+inline constexpr std::size_t maximum_package_files = 65535U;
+inline constexpr std::uint64_t maximum_package_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+
+// Lists what a portable copy of the project needs, sorted by name: every scene, template, script,
+// asset and import record, plus a normalized project.relayproject (generated, so `source` is
+// empty; its text is returned in `metadata`). Private state and anything that is output rather
+// than input is left out: hidden entries (except .relay-imports.json), captures, traces, exports
+// and each folder in `excluded` (the build folder). Symlinks and oversized files are refused.
+[[nodiscard]] bool collect_project_files(const Project& project,
+                                         const std::vector<std::string>& excluded,
+                                         std::vector<ProjectFile>& files, std::string& metadata,
+                                         std::string& error);
+// Write a portable copy of the project to the project's exports folder: an uncompressed tar or a
+// zip (stored, no compression), chosen by the filename's .tar or .zip extension. Extracting it
+// anywhere gives a folder that opens as an identical project. Refuses to overwrite.
+// `directory` is where to write it: empty for the project's exports folder, otherwise an absolute
+// folder or one relative to the project, created if needed.
 [[nodiscard]] bool package_project(const Project& project, std::string_view filename,
-                                   std::string& error, std::uint64_t& bytes);
+                                   std::string_view directory, std::string& error,
+                                   std::uint64_t& bytes, std::filesystem::path* written = nullptr);
+
+[[nodiscard]] inline bool package_project(const Project& project, std::string_view filename,
+                                          std::string& error, std::uint64_t& bytes) {
+    return package_project(project, filename, {}, error, bytes);
+}
+
+// What Run > Build Project produced.
+struct BuildReport {
+    std::filesystem::path directory; // <output>/<configuration>
+    std::uint64_t files{};
+    std::uint64_t bytes{};
+    // The game's program inside `directory`.
+    bool executable{};
+    std::filesystem::path executable_path;
+};
+// Builds the game for `profile` (one of `settings.profiles`) into <output folder>/<configuration>/
+// (both configuration folders are created; the folder is project-relative or absolute). The
+// result runs on its own: the game's program named for the game, data/ (the project, without
+// script sources), scripts/ (the behaviours compiled for the configuration), shaders/, lib/ (the
+// libraries the program needs that a system may lack), build.json and icon.png. A previous build
+// of the same configuration is replaced. Needs the player program (relay_player) from this Relay.
+[[nodiscard]] bool build_project(const Project& project, const BuildSettings& settings,
+                                 const BuildProfile& profile, std::string& error, BuildReport& report);
 
 } // namespace relay

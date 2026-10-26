@@ -1,3 +1,4 @@
+#include "relay/core/pak.hpp"
 #include "relay/scene/components.hpp"
 #include "relay/scene/scene_io.hpp"
 
@@ -138,21 +139,30 @@ bool replace_atomically(const std::filesystem::path& temporary,
 
 SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
     SceneFileLoadResult result;
-    std::error_code filesystem_error;
-    const auto size = std::filesystem::file_size(path, filesystem_error);
-    if (filesystem_error) {
-        result.error = "could not inspect scene file: " + filesystem_error.message();
-        return result;
-    }
-    if (size > max_scene_bytes) {
-        result.error = "scene file exceeds the 16 MiB limit";
-        return result;
-    }
-    std::ifstream input(path, std::ios::binary);
-    std::string text(static_cast<std::size_t>(size), '\0');
-    if (!input.read(text.data(), static_cast<std::streamsize>(text.size())) && !text.empty()) {
-        result.error = "could not read the complete scene file";
-        return result;
+    std::string text;
+    if (const auto packed = vfs::packed(path)) {
+        if (packed->size() > max_scene_bytes) {
+            result.error = "scene file exceeds the 16 MiB limit";
+            return result;
+        }
+        text.assign(reinterpret_cast<const char*>(packed->data()), packed->size());
+    } else {
+        std::error_code filesystem_error;
+        const auto size = std::filesystem::file_size(path, filesystem_error);
+        if (filesystem_error) {
+            result.error = "could not inspect scene file: " + filesystem_error.message();
+            return result;
+        }
+        if (size > max_scene_bytes) {
+            result.error = "scene file exceeds the 16 MiB limit";
+            return result;
+        }
+        std::ifstream input(path, std::ios::binary);
+        text.assign(static_cast<std::size_t>(size), '\0');
+        if (!input.read(text.data(), static_cast<std::streamsize>(text.size())) && !text.empty()) {
+            result.error = "could not read the complete scene file";
+            return result;
+        }
     }
 
     JsonParser parser(text);

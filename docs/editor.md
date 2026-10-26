@@ -11,6 +11,19 @@ panels are open, and the **View** menu toggles. They are saved per user in
 `~/Library/Application Support/Relay` on macOS). **Layout → Reset layout** restores the default
 arrangement, and `RELAY_EDITOR_LAYOUT_PATH` points the editor at another file.
 
+## Projects and file dialogs
+
+**File → New project...** takes a name and a location. Type a folder (relative paths start in the
+workspace, where the editor was launched) or press **Browse...** to choose one in your system's
+own file dialog; the project is made in a folder of its own inside it, named after the project. **File →
+Open project...** takes a path or **Browse...** for a `.relayproject` file. Projects can live
+anywhere on disk. Relay never shows its own file browser: every **Browse...** button opens the
+operating system's dialog (through the desktop portal on Linux). **Add existing scene**, **Save scene
+as...** and **Import model...** have one too; a scene or model picked from outside the project is copied
+into its `scenes/` or `models/` folder (a glTF's buffers and images, and an OBJ's material file, come
+along), and the original is left alone. The Export and Build windows' folder fields browse the same way.
+Agents are limited to projects inside the workspace.
+
 ## Nodes, components and templates
 
 A node is a Transform plus the components you give it. The **Inspector** shows only the
@@ -122,10 +135,60 @@ can be dragged from it into fields, the viewport or the hierarchy.
 ## Keyframes and export
 
 Select an entity and open **Transform keyframes** in the Inspector to add, edit, scrub, or play
-position, rotation, and scale keys. To share a project, save its scenes, then use **Export saved
-project** in the Project panel. Relay writes an uncompressed `.tar` under that project's `exports/`
-folder, containing the project metadata, member scenes, and non-hidden assets. Export refuses to
-overwrite an existing package.
+position, rotation, and scale keys. To move a project to another machine and keep working on it, save its scenes, then use
+**File → Export project...**. The Export Project window takes a format (Zip or Tar), a file name and a
+folder (type one or press **Browse...**; the default is the project's `exports/` folder). The archive
+is uncompressed and holds the project file and its settings, every scene, template, script, asset and
+import record. Captures, traces, earlier exports, builds and hidden files such as caches are left
+out. Extracting it anywhere gives a folder that opens as an identical copy of the project. Export
+refuses to overwrite an existing file. Exporting is not building: it saves the project, not the game.
+
+## Building a game
+
+**Run → Build project...** opens the Build Project window, a free-floating window. Its left column
+lists the project's *build profiles*, one per target (a Linux release profile, a debug profile, and
+so on); **New** adds one, **Copy** duplicates the selected one and **Delete** removes it. The right
+column edits the selected profile: its name, platform, architecture (Linux and x86_64 for now),
+configuration (release or debug), build folder (type a path or **Browse...**; inside the project it
+is saved relative to it, `builds` by default) and the window mode (windowed, borderless or
+fullscreen) with its size when windowed. Below those are the game's own details, shared by every
+profile: name (the project's name when empty), description, author, release date (`YYYY-MM-DD`),
+version (such as `1.0.0` or `0.3.1-beta`) and icon (a PNG in the project). Everything is saved in
+the project file as you change it.
+
+**Build** builds the selected profile into `<build folder>/<configuration>/` (both the `release` and
+`debug` folders are created). The result is a game that runs by itself, so the folder can be copied to
+another Linux machine:
+
+- `<Game_Name>`, the game's program, named for the game. Run it from anywhere (`--help` lists a few
+  options; `--frames N` plays N frames, then prints the frame rate and which graphics effects are
+  running, `--capture shot.png` saves the last frame, and `--verify` checks the game's files against
+  their checksums).
+- `game.pak`, the game's files in one archive: the project's scenes, templates, materials, images,
+  sounds and fonts, and what the build made of the rest. Models are imported and project shaders
+  compiled **when the game is built**, so the game starts without doing either, and the model files
+  and shader sources are not shipped.
+- `scripts/`, the project's behaviours compiled for the configuration (release is optimized, debug
+  keeps symbols), `shaders/` and `lib/`, the libraries the program needs that a system may lack (the
+  GPU driver and the C library are never copied, and neither are the model importer or the shader
+  compiler).
+- `build.json`, the settings above, and `icon.png`. The game's window opens as its profile says and
+  takes its title from the game's name.
+
+Only the files the game refers to are packed. Starting from the project file, its scenes and its
+scripts, a file is kept when something kept names it (a scene's mesh or sound, a material's texture
+or shader, a script's string such as a file path or the name of a template to spawn). Scripts are
+read generously, since they build names in code: a string that starts, ends or equals a file's path
+or name keeps that file. If a game still misses a file, turn on **Include unused files** in the
+profile to pack every file in the project.
+
+The game plays the project the way **Run → Run Game** does, without the editor, and applies the
+project's graphics, input and audio settings. The debug configuration prints the game's log to the
+terminal. Building compiles the scripts, so the project's scripts must be trusted first (as for Run
+Game), and the editor waits while it runs. Building again replaces the previous build of that
+configuration, and Relay refuses to clear a folder that is not one of its builds. Only Linux x86_64
+games can be built so far, and they need a machine with a Vulkan GPU driver and a C library at least as
+new as this one's.
 
 ## Graphics settings
 

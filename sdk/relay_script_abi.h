@@ -348,6 +348,9 @@ typedef struct RelayHostApi {
     int (*set_joint_target)(void* context, RelayEntity entity, double target);
     /* 1 when the entity's joint broke under its break force or torque this game. */
     int (*joint_broken)(void* context, RelayEntity entity);
+    /* Frames drawn per second, smoothed over about half a second; 0 until frames are drawn. This is
+     * the display's rate, not the fixed 60 Hz step scripts update at. */
+    double (*render_frame_rate)(void* context);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

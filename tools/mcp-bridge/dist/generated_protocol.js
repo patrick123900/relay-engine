@@ -122,6 +122,30 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             return override(input);
         return invoke("editor.camera.frame", { "entity": input["entity"] });
     });
+    server.registerTool("editor_template_open", {
+        title: "Open template window",
+        description: "Open a project template in the live editor's template window: a floating Hierarchy, viewport and Inspector over a private copy of the template, edited by a person (Save writes the template file). Focuses the window when it is already open. Unavailable without an editor. Agents edit templates by instantiating them in the scene, changing the copy and calling templates.save with replace.",
+        inputSchema: z.object({
+            "name": z.string().max(64).regex(new RegExp("^[A-Za-z0-9_][A-Za-z0-9 _-]*$")).describe("Template name from templates.list, such as Enemy")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["editor_template_open"];
+        if (override)
+            return override(input);
+        return invoke("editor.template.open", { "name": input["name"] });
+    });
+    server.registerTool("editor_template_status", {
+        title: "Inspect template windows",
+        description: "List the live editor's open template windows with their names, whether each has unsaved edits and whether its viewport shows a GPU-rendered picture (otherwise the CPU preview). Unavailable without an editor.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["editor_template_status"];
+        if (override)
+            return override({});
+        return invoke("editor.template.status", {});
+    });
     server.registerTool("render_capture", {
         title: "Capture Relay frame",
         description: "Save the current rendered frame in Relay's captures directory for visual inspection.",
@@ -851,6 +875,21 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             return override(input);
         return invoke("scene.set_parent", { "entity": input["entity"], "parent": input["parent"] });
     });
+    server.registerTool("scene_move_node", {
+        title: "Move node among siblings",
+        description: "Reparent an entity and place it among its new siblings, as the Hierarchy's drag and drop does: in front of the sibling `before`, or last when before is null. before must be a child of parent (or a root node when parent is null). The siblings are renumbered so the order is saved with the scene (interface controls also get their control order). One undoable transaction.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+            "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).nullable(),
+            "before": z.string().regex(new RegExp("^\\d+:\\d+$")).nullable()
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["scene_move_node"];
+        if (override)
+            return override(input);
+        return invoke("scene.move_node", { "entity": input["entity"], "parent": input["parent"], "before": input["before"] });
+    });
     server.registerTool("scene_undo", {
         title: "Undo scene change",
         description: "Undo the most recent scene transaction and restore exact entity generations.",
@@ -982,6 +1021,19 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override(input);
         return invoke("physics.body_status", { "entity": input["entity"] });
+    });
+    server.registerTool("physics_joint_status", {
+        title: "Inspect joint",
+        description: "Read a node's joint during Run Game: whether its constraint exists or has broken, its hinge angle in degrees, slider travel in metres or distance length, and the force (N) and torque (N m) it carried over the last step, which is what break_force and break_torque are compared with.",
+        inputSchema: z.object({
+            "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["physics_joint_status"];
+        if (override)
+            return override(input);
+        return invoke("physics.joint_status", { "entity": input["entity"] });
     });
     server.registerTool("physics_contact_events", {
         title: "Read collision contacts",
@@ -1124,12 +1176,12 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("scene_set_joint", {
         title: "Configure joint",
-        description: "Add, edit or remove an undoable joint linking this node's physics body to another node's body, or to the world when connected is empty, during Run Game. Types: fixed (weld), point (ball and socket), hinge (turns about axis, optional angle limits in degrees with min in [-180, 0] and max in [0, 180], optional motor), slider (moves along axis, optional travel limits in metres with min <= 0 <= max, optional motor) and distance (rope or spring between anchor and connected_anchor; limits are lengths, otherwise the starting length is kept). Anchor and axis are in this node's local space; connected_anchor is in the connected node's space, or world space for the world. At least one body must be dynamic. Joined bodies do not collide unless collide_connected is set. Changing type resets the limits to that type's defaults unless limits are given too.",
+        description: "Add, edit or remove an undoable joint linking this node's physics body to another node's body, or to the world when connected is empty, during Run Game. Types: fixed (weld), point (ball and socket), hinge (turns about axis, optional angle limits in degrees with min in [-180, 0] and max in [0, 180], optional motor), slider (moves along axis, optional travel limits in metres with min <= 0 <= max, optional motor) distance (rope or spring between anchor and connected_anchor; limits are lengths, otherwise the starting length is kept), cone (ball and socket whose axis swings within swingLimit degrees of its start, for ragdoll shoulders and hips) and swing_twist (cone with a second angle swingLimitPlane and, with limits, twist limitMin..limitMax degrees). Hinge and slider motors are velocity motors, or servos that hold motorTarget when motorMode is position. A joint carrying more than breakForce newtons or breakTorque newton metres in a step breaks until the game stops. Anchor and axis are in this node's local space; connected_anchor is in the connected node's space, or world space for the world. At least one body must be dynamic. Joined bodies do not collide unless collide_connected is set. Changing type resets the limits to that type's defaults unless limits are given too.",
         inputSchema: z.object({
             "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
             "attached": z.boolean().optional(),
             "enabled": z.boolean().optional(),
-            "type": z.enum(["fixed", "point", "hinge", "slider", "distance"]).optional(),
+            "type": z.enum(["fixed", "point", "hinge", "slider", "distance", "cone", "swing_twist"]).optional(),
             "connected": z.string().regex(new RegExp("^(\\d+:\\d+)?$")).optional().describe("Handle of the node to join; empty for the world"),
             "anchorX": z.number().finite().min(-1000000).max(1000000).optional(),
             "anchorY": z.number().finite().min(-1000000).max(1000000).optional(),
@@ -1148,6 +1200,14 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "motorForce": z.number().finite().min(0).max(1000000000).optional().describe("Maximum torque (N m) for hinges, force (N) for sliders"),
             "springFrequency": z.number().finite().min(0).max(1000).optional().describe("Distance joints: spring frequency in Hz; 0 is rigid"),
             "springDamping": z.number().finite().min(0).max(100).optional(),
+            "motorMode": z.enum(["velocity", "position"]).optional().describe("Velocity motors spin at motorSpeed; position motors are servos that hold motorTarget"),
+            "motorTarget": z.number().finite().min(-1000000).max(1000000).optional().describe("Servo target: degrees for hinges, metres for sliders, clamped to the limits"),
+            "motorFrequency": z.number().finite().min(0).max(1000).optional().describe("Servo spring stiffness in Hz"),
+            "motorDamping": z.number().finite().min(0).max(100).optional().describe("Servo damping ratio"),
+            "swingLimit": z.number().finite().min(0).max(180).optional().describe("Cone and swing_twist: half cone angle in degrees (swing_twist: about the plane axis perpendicular to axis)"),
+            "swingLimitPlane": z.number().finite().min(0).max(180).optional().describe("swing_twist: half cone angle in degrees in the other plane"),
+            "breakForce": z.number().finite().min(0).max(1000000000000).optional().describe("Newtons the joint can carry in one step before it breaks for the rest of the game; 0 never breaks"),
+            "breakTorque": z.number().finite().min(0).max(1000000000000).optional().describe("Newton metres the joint can carry in one step before it breaks; 0 never breaks"),
             "collideConnected": z.boolean().optional(),
             "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
         }),
@@ -1156,7 +1216,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         const override = overrides["scene_set_joint"];
         if (override)
             return override(input);
-        return invoke("scene.set_joint", { "entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "connected": input["connected"], "anchor_x": input["anchorX"], "anchor_y": input["anchorY"], "anchor_z": input["anchorZ"], "axis_x": input["axisX"], "axis_y": input["axisY"], "axis_z": input["axisZ"], "connected_anchor_x": input["connectedAnchorX"], "connected_anchor_y": input["connectedAnchorY"], "connected_anchor_z": input["connectedAnchorZ"], "limits": input["limits"], "limit_min": input["limitMin"], "limit_max": input["limitMax"], "motor": input["motor"], "motor_speed": input["motorSpeed"], "motor_force": input["motorForce"], "spring_frequency": input["springFrequency"], "spring_damping": input["springDamping"], "collide_connected": input["collideConnected"], "gesture": input["gesture"] });
+        return invoke("scene.set_joint", { "entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "connected": input["connected"], "anchor_x": input["anchorX"], "anchor_y": input["anchorY"], "anchor_z": input["anchorZ"], "axis_x": input["axisX"], "axis_y": input["axisY"], "axis_z": input["axisZ"], "connected_anchor_x": input["connectedAnchorX"], "connected_anchor_y": input["connectedAnchorY"], "connected_anchor_z": input["connectedAnchorZ"], "limits": input["limits"], "limit_min": input["limitMin"], "limit_max": input["limitMax"], "motor": input["motor"], "motor_speed": input["motorSpeed"], "motor_force": input["motorForce"], "spring_frequency": input["springFrequency"], "spring_damping": input["springDamping"], "motor_mode": input["motorMode"], "motor_target": input["motorTarget"], "motor_frequency": input["motorFrequency"], "motor_damping": input["motorDamping"], "swing_limit": input["swingLimit"], "swing_limit_plane": input["swingLimitPlane"], "break_force": input["breakForce"], "break_torque": input["breakTorque"], "collide_connected": input["collideConnected"], "gesture": input["gesture"] });
     });
     server.registerTool("scene_set_audio_source", {
         title: "Configure audio source",
@@ -1395,7 +1455,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("scene_set_script_property", {
         title: "Set script property",
-        description: "Store a value for a behaviour property on one script component, or reset it to the code default. Send exactly one of number, boolean, text or vector unless resetting.",
+        description: "Store a value for a behaviour property on one script component, or reset it to the code default. Send exactly one of number, boolean, text, vector, target, asset or component unless resetting; the behaviour's declared type (scripts.status lists each property with its type) decides which. target is a node in the scene as an entity handle (an empty string clears it) for properties declared as relay::Entity or relay::Ref<Behaviour>, and any filter listed with the property (a behaviour, an engine component or a node type) limits what the Inspector offers. asset is a project file path for properties declared as a file kind (audio, template, image, ...). component is an engine component id such as camera. Scripts read node and script references through Entity and Ref<T>, and deleting or copying nodes keeps them valid.",
         inputSchema: z.object({
             "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
             "index": z.number().int().min(0).max(31).describe("Position among the node's script components, from zero"),
@@ -1404,6 +1464,9 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "boolean": z.boolean().optional(),
             "text": z.string().max(1024).optional(),
             "vector": z.array(z.number().finite()).min(3).max(3).optional(),
+            "target": z.string().regex(new RegExp("^(\\d+:\\d+)?$")).nullable().optional().describe("Entity handle of the node a node or script reference points at; empty or null for none"),
+            "asset": z.string().max(1024).optional().describe("Project file path for an asset property"),
+            "component": z.string().max(64).optional().describe("Engine component id for a component type property"),
             "reset": z.boolean().default(false),
             "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
         }),
@@ -1412,7 +1475,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         const override = overrides["scene_set_script_property"];
         if (override)
             return override(input);
-        return invoke("scene.set_script_property", { "entity": input["entity"], "index": input["index"], "property": input["property"], "number": input["number"], "boolean": input["boolean"], "text": input["text"], "vector": input["vector"], "reset": input["reset"], "gesture": input["gesture"] });
+        return invoke("scene.set_script_property", { "entity": input["entity"], "index": input["index"], "property": input["property"], "number": input["number"], "boolean": input["boolean"], "text": input["text"], "vector": input["vector"], "target": input["target"], "asset": input["asset"], "component": input["component"], "reset": input["reset"], "gesture": input["gesture"] });
     });
     server.registerTool("nodes_types", {
         title: "List node types",
@@ -1737,9 +1800,9 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("project_create", {
         title: "Create project",
-        description: "Create a folder project (.relayproject) and an empty scene; refuses to overwrite an existing project.",
+        description: "Create a folder project (.relayproject) and an empty scene; refuses to overwrite an existing project. The filename is relative to the workspace; only a person using the editor may give an absolute path.",
         inputSchema: z.object({
-            "filename": z.string().min(1).max(128),
+            "filename": z.string().min(1).max(1024),
             "name": z.string().min(1).max(128)
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
@@ -1751,9 +1814,9 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("project_open", {
         title: "Open project",
-        description: "Open a folder project (.relayproject) and load its startup scene atomically, or clear the scene for an empty project.",
+        description: "Open a folder project (.relayproject) and load its startup scene atomically, or clear the scene for an empty project. The filename is relative to the workspace; only a person using the editor may give an absolute path.",
         inputSchema: z.object({
-            "filename": z.string().min(1).max(128)
+            "filename": z.string().min(1).max(1024)
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
@@ -1835,17 +1898,97 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         return invoke("project.close", {});
     });
     server.registerTool("project_package", {
-        title: "Package project",
-        description: "Export saved project metadata, member scenes and non-hidden assets as a portable uncompressed tar under the project exports directory. Refuses to overwrite; save scene changes first.",
+        title: "Export project",
+        description: "Export the project as a portable uncompressed tar or a zip (chosen by the .tar or .zip extension) for moving it to another machine: project metadata and settings, every scene, template, script, asset and import record. Extracting it gives a folder that opens as an identical project. Private state, captures, traces, earlier exports and builds are left out. Written to the project exports directory unless a directory is given. Refuses to overwrite; save scene changes first.",
         inputSchema: z.object({
-            "filename": z.string().min(5).max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._-]*\\.tar$"))
+            "filename": z.string().min(5).max(128).regex(new RegExp("^[A-Za-z0-9][A-Za-z0-9._-]*\\.(tar|zip)$")),
+            "directory": z.string().max(512).optional().describe("Folder to write the archive to: absolute, or relative to the project; created if missing. Default exports")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["project_package"];
         if (override)
             return override(input);
-        return invoke("project.package", { "filename": input["filename"] });
+        return invoke("project.package", { "filename": input["filename"], "directory": input["directory"] });
+    });
+    server.registerTool("project_build_settings", {
+        title: "Read build settings",
+        description: "Read the project's build settings (settings.build in the .relayproject): the game's name, description, author, release date, version and icon, and its build profiles (one per target: platform, architecture, configuration, build folder, window mode and size) with the active one, the defaults, the accepted values and which profiles have been built.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["project_build_settings"];
+        if (override)
+            return override({});
+        return invoke("project.build_settings", {});
+    });
+    server.registerTool("project_set_build_settings", {
+        title: "Change game build settings",
+        description: "Change the game's identity shared by every build profile, or choose the active profile, and save it in the project file. Omitted settings keep their current values; an empty string clears a text setting.",
+        inputSchema: z.object({
+            "game_name": z.string().max(64).optional().describe("Name the game is shown and built under; empty uses the project name"),
+            "description": z.string().max(1024).optional().describe("Short description of the game"),
+            "author": z.string().max(128).optional().describe("Author or studio"),
+            "release_date": z.string().max(10).optional().describe("Release date written YYYY-MM-DD, or empty"),
+            "version": z.string().max(32).optional().describe("Game version: dotted numbers with an optional suffix, such as 1.0.0 or 0.3.1-beta"),
+            "icon": z.string().max(128).optional().describe("Project-relative PNG used as the game's icon, or empty"),
+            "active_profile": z.string().max(32).optional().describe("Name of the build profile the Build Project window shows and project.build uses")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["project_set_build_settings"];
+        if (override)
+            return override(input);
+        return invoke("project.set_build_settings", { "game_name": input["game_name"], "description": input["description"], "author": input["author"], "release_date": input["release_date"], "version": input["version"], "icon": input["icon"], "active_profile": input["active_profile"] });
+    });
+    server.registerTool("project_set_build_profile", {
+        title: "Change a build profile",
+        description: "Create or change a build profile, the settings for building the game for one target, and save it in the project file. A profile that does not exist is created from the defaults or from copy_from. Omitted settings keep their current values.",
+        inputSchema: z.object({
+            "name": z.string().min(1).max(32).describe("Profile to change; it is created when it does not exist"),
+            "new_name": z.string().min(1).max(32).optional().describe("Rename the profile"),
+            "copy_from": z.string().max(32).optional().describe("When creating the profile, start from this existing profile"),
+            "target_platform": z.enum(["linux"]).optional().describe("Platform to build for"),
+            "architecture": z.enum(["x86_64"]).optional().describe("CPU architecture to build for"),
+            "configuration": z.enum(["release", "debug"]).optional().describe("Build configuration; each has its own folder below the build folder"),
+            "output_directory": z.string().max(512).optional().describe("Folder that holds the release and debug folders: relative to the project, or absolute (default builds)"),
+            "window_mode": z.enum(["windowed", "borderless", "fullscreen"]).optional().describe("How the game's window first opens"),
+            "window_width": z.number().int().min(320).max(16384).optional().describe("Window width in pixels when windowed"),
+            "window_height": z.number().int().min(320).max(16384).optional().describe("Window height in pixels when windowed"),
+            "include_unused_assets": z.boolean().optional().describe("Ship every file in the project instead of only the files the game refers to; for games whose code loads files by names it builds up")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["project_set_build_profile"];
+        if (override)
+            return override(input);
+        return invoke("project.set_build_profile", { "name": input["name"], "new_name": input["new_name"], "copy_from": input["copy_from"], "target_platform": input["target_platform"], "architecture": input["architecture"], "configuration": input["configuration"], "output_directory": input["output_directory"], "window_mode": input["window_mode"], "window_width": input["window_width"], "window_height": input["window_height"], "include_unused_assets": input["include_unused_assets"] });
+    });
+    server.registerTool("project_remove_build_profile", {
+        title: "Remove a build profile",
+        description: "Delete a build profile from the project's settings. The last profile cannot be removed; builds already written are kept.",
+        inputSchema: z.object({
+            "name": z.string().min(1).max(32).describe("Profile to remove")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["project_remove_build_profile"];
+        if (override)
+            return override(input);
+        return invoke("project.remove_build_profile", { "name": input["name"] });
+    });
+    server.registerTool("project_build", {
+        title: "Build project",
+        description: "Build the game for a build profile into <build folder>/<configuration>/ (the release and debug folders are both created), replacing the previous build of that configuration. The result runs on its own: the game's program (named for the game, from relay_player), game.pak (every file the game refers to in one archive, with its models and project shaders already imported and compiled; unreferenced files are left out unless the profile ships every file), scripts/ (the behaviours compiled for the configuration; the project's scripts must be trusted), shaders/, lib/ (libraries the program needs; the model importer and shader compiler are not among them), build.json and icon.png. Linux x86_64 only. Compiling scripts can take a while, and the call returns when the build is done. Save scene changes first.",
+        inputSchema: z.object({
+            "profile": z.string().max(32).optional().describe("Profile to build; default is the active profile")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["project_build"];
+        if (override)
+            return override(input);
+        return invoke("project.build", { "profile": input["profile"] });
     });
     server.registerTool("scene_keyframe_set", {
         title: "Set transform keyframe",

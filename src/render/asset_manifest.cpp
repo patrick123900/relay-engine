@@ -1,3 +1,5 @@
+#include "relay/render/cooked_assets.hpp"
+#include "relay/core/pak.hpp"
 #include "relay/render/asset_manifest.hpp"
 
 #include "relay/core/json.hpp"
@@ -7,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <system_error>
 
@@ -120,19 +123,27 @@ bool ImportManifest::load(const std::filesystem::path& assets_root, std::string&
     entries_.clear();
     const auto path = path_for(assets_root);
     std::error_code code;
-    if (!std::filesystem::exists(path, code)) return true;
-    const auto size = std::filesystem::file_size(path, code);
-    if (code || size > max_manifest_bytes) {
-        error = "import manifest is unreadable or too large";
-        return false;
+    std::string text;
+    if (vfs::packed(path)) {
+        std::string reason;
+        if (!vfs::read_all(path, max_manifest_bytes, text, reason)) {
+            error = "import manifest is unreadable or too large";
+            return false;
+        }
+    } else {
+        if (!std::filesystem::exists(path, code)) return true;
+        const auto size = std::filesystem::file_size(path, code);
+        if (code || size > max_manifest_bytes) {
+            error = "import manifest is unreadable or too large";
+            return false;
+        }
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
+            error = "import manifest could not be opened";
+            return false;
+        }
+        text.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
     }
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        error = "import manifest could not be opened";
-        return false;
-    }
-    const std::string text{std::istreambuf_iterator<char>(input),
-                           std::istreambuf_iterator<char>()};
     JsonParser parser(text);
     const auto document = parser.parse();
     if (!document || document->object() == nullptr) {
@@ -187,8 +198,7 @@ bool ImportManifest::load(const std::filesystem::path& assets_root, std::string&
     return true;
 }
 
-bool ImportManifest::save(const std::filesystem::path& assets_root, std::string& error) const {
-    const auto path = path_for(assets_root);
+std::string ImportManifest::json() const {
     std::ostringstream output;
     output << "{\"version\":" << import_manifest_version << ",\"entries\":[";
     for (std::size_t index = 0; index < entries_.size(); ++index) {
@@ -212,6 +222,16 @@ bool ImportManifest::save(const std::filesystem::path& assets_root, std::string&
         output << '}';
     }
     output << "]}\n";
+    return output.str();
+}
+
+void ImportManifest::keep_sources(const std::set<std::string>& sources) {
+    std::erase_if(entries_, [&](const ImportManifestEntry& entry) { return !sources.contains(entry.source); });
+}
+
+bool ImportManifest::save(const std::filesystem::path& assets_root, std::string& error) const {
+    const auto path = path_for(assets_root);
+    const auto text = json();
 
     // Write beside the target and rename, so an interrupted save cannot truncate a good manifest.
     const auto temporary = temporary_path_for(path);
@@ -221,7 +241,6 @@ bool ImportManifest::save(const std::filesystem::path& assets_root, std::string&
             error = "import manifest could not be written";
             return false;
         }
-        const auto text = output.str();
         stream.write(text.data(), static_cast<std::streamsize>(text.size()));
         if (!stream) {
             error = "import manifest could not be written";
@@ -263,8 +282,21 @@ std::size_t ImportManifest::move_sources(const std::string_view from, const std:
 const std::vector<ImportManifestEntry>& ImportManifest::entries() const { return entries_; }
 
 ImportReloadReport reload_imported_assets(const std::filesystem::path& assets_root,
-                                          AssetRegistry& registry) {
+                                          AssetRegistry& registry,
+                                          const std::set<std::string>* only_sources) {
     ImportReloadReport report;
+    if (const auto cooked_bytes = vfs::packed_name(cooked_models_name)) {
+        CookedModels cooked;
+        std::string cooked_error;
+        if (!parse_cooked_models(*cooked_bytes, cooked, cooked_error)) {
+            ++report.failed;
+            report.messages.push_back(cooked_error);
+            return report;
+        }
+        apply_cooked_models(cooked, registry);
+        report.restored = cooked.models;
+        return report;
+    }
     ImportManifest manifest;
     std::string error;
     if (!manifest.load(assets_root, error)) {
@@ -274,6 +306,7 @@ ImportReloadReport reload_imported_assets(const std::filesystem::path& assets_ro
     }
     const auto entries = manifest.entries();
     for (const auto& entry : entries) {
+        if (only_sources && !only_sources->contains(entry.source)) continue;
         std::string import_error;
         ModelImportSettings settings;
         settings.preset = entry.preset;

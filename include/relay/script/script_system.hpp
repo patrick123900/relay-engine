@@ -107,6 +107,20 @@ inline constexpr std::size_t maximum_script_source_bytes = 256U * 1024U;
 // The starter file for a new behaviour class.
 [[nodiscard]] std::string script_template(std::string_view behaviour);
 
+// What compile_scripts_for_export produced. `library` is empty when the project has no scripts.
+struct ScriptExport {
+    bool succeeded{};
+    std::filesystem::path library;
+    std::uint32_t sources{};
+    std::string error;
+    std::string output;
+    std::vector<ScriptDiagnostic> diagnostics;
+};
+// Compiles the project's scripts into one library for shipping, and waits for it. `debug` keeps
+// symbols and skips optimization; otherwise they are optimized. The library is kept in the
+// project's .relay-cache. The caller decides whether the project may build native code.
+[[nodiscard]] ScriptExport compile_scripts_for_export(const std::filesystem::path& project_root, bool debug);
+
 // Compiles project scripts into a native library in the background, loads it, and drives
 // behaviour instances through Run Game. Everything except the compiler runs on the engine thread.
 class ScriptSystem {
@@ -118,6 +132,9 @@ public:
 
     [[nodiscard]] bool set_trusted(bool trusted, std::string& error);
     [[nodiscard]] bool start_build(std::string& error);
+    // For a built game: loads scripts that were compiled when it was built, instead of building
+    // them, and trusts them. The project must already be open.
+    [[nodiscard]] bool adopt_prebuilt(const std::filesystem::path& library, std::string& error);
     // Adopts finished builds (hot reloading a running game) and notices project changes.
     void poll();
     [[nodiscard]] ScriptStatus status();

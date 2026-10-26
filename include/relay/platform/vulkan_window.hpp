@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace relay {
@@ -76,6 +77,13 @@ public:
     using MaterialPreviewReceiver = std::function<void(const std::string& path, OwnedFrame frame)>;
     void set_material_preview(std::string path, MaterialPreviewReceiver receiver);
     void resize(std::uint32_t width, std::uint32_t height);
+    // For a built game's window: its title, its icon (a PNG file; false when unreadable), how it
+    // is shown ("windowed", "borderless" for fullscreen at the desktop's size, or "fullscreen"),
+    // and whether the pointer is locked to the window and reports only motion.
+    void set_title(const std::string& title);
+    [[nodiscard]] bool set_icon_png(const std::filesystem::path& path);
+    void set_window_mode(std::string_view mode);
+    void set_pointer_locked(bool locked);
     // Turns FidelityFX global illumination on or off. When the device or build cannot provide it,
     // the renderer keeps its analytic sky light and lighting_status_json() says why.
     void set_global_illumination(bool enabled);

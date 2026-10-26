@@ -631,12 +631,12 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scene_paste{{
 }};
 
 constexpr std::array<ProtocolFieldSpec, 2> fields_project_create{{
-    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
+    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 1024U, "", ""},
     {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_project_open{{
-    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
+    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 1024U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_project_add_scene{{
@@ -651,8 +651,41 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_project_set_startup{{
     {"scene_file", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 128U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 1> fields_project_package{{
-    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 5U, 128U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.tar$", ""},
+constexpr std::array<ProtocolFieldSpec, 2> fields_project_package{{
+    {"filename", ProtocolValueType::string, true, false, false, false, 0, 0, 5U, 128U, "^[A-Za-z0-9][A-Za-z0-9._-]*\\.(tar|zip)$", ""},
+    {"directory", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 512U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 7> fields_project_set_build_settings{{
+    {"game_name", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 64U, "", ""},
+    {"description", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 1024U, "", ""},
+    {"author", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "", ""},
+    {"release_date", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 10U, "", ""},
+    {"version", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 32U, "", ""},
+    {"icon", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 128U, "", ""},
+    {"active_profile", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 32U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 11> fields_project_set_build_profile{{
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 32U, "", ""},
+    {"new_name", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 32U, "", ""},
+    {"copy_from", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 32U, "", ""},
+    {"target_platform", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "linux"},
+    {"architecture", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "x86_64"},
+    {"configuration", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "release|debug"},
+    {"output_directory", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 512U, "", ""},
+    {"window_mode", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "windowed|borderless|fullscreen"},
+    {"window_width", ProtocolValueType::integer, false, false, true, true, 320, 16384, 0U, 0U, "", ""},
+    {"window_height", ProtocolValueType::integer, false, false, true, true, 320, 16384, 0U, 0U, "", ""},
+    {"include_unused_assets", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_project_remove_build_profile{{
+    {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 32U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_project_build{{
+    {"profile", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 32U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 12> fields_scene_keyframe_set{{
@@ -857,7 +890,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_audio_set_spatialization{{
     {"mode", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "stereo|binaural"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 172> methods{{
+constexpr std::array<ProtocolMethodSpec, 177> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -984,15 +1017,20 @@ constexpr std::array<ProtocolMethodSpec, 172> methods{{
     {"scene.transform_many", "scene_transform_many", "Transform Many", "Apply a column-major world-space affine delta matrix to selected roots as one undoable gesture.", false, false, false, false, false, fields_scene_transform_many},
     {"scene.paste", "scene_paste", "Paste entities", "Paste the session clipboard as one undoable edit; cameras stay inactive and internal model bindings are remapped.", false, false, false, false, false, fields_scene_paste},
     {"scene.clipboard", "scene_clipboard", "Inspect clipboard", "Read session clipboard root and entity counts.", true, false, false, false, false, no_fields},
-    {"project.create", "project_create", "Create project", "Create a folder project (.relayproject) and an empty scene; refuses to overwrite an existing project.", false, false, false, false, false, fields_project_create},
-    {"project.open", "project_open", "Open project", "Open a folder project (.relayproject) and load its startup scene atomically, or clear the scene for an empty project.", false, false, false, false, false, fields_project_open},
+    {"project.create", "project_create", "Create project", "Create a folder project (.relayproject) and an empty scene; refuses to overwrite an existing project. The filename is relative to the workspace; only a person using the editor may give an absolute path.", false, false, false, false, false, fields_project_create},
+    {"project.open", "project_open", "Open project", "Open a folder project (.relayproject) and load its startup scene atomically, or clear the scene for an empty project. The filename is relative to the workspace; only a person using the editor may give an absolute path.", false, false, false, false, false, fields_project_open},
     {"project.status", "project_status", "Status project", "Inspect the current project, member scene files and startup scene.", true, false, false, false, false, no_fields},
     {"project.list", "project_list", "List project", "List available workspace project files.", true, false, false, false, false, no_fields},
     {"project.add_scene", "project_add_scene", "Add Scene project", "Add an existing valid scene file to the current project; the first scene becomes its startup scene.", false, false, false, false, false, fields_project_add_scene},
     {"project.remove_scene", "project_remove_scene", "Remove Scene project", "Remove scene membership without deleting its file; chooses a remaining startup scene when needed.", false, false, false, false, false, fields_project_remove_scene},
     {"project.set_startup", "project_set_startup", "Set Startup project", "Choose a current project member as the startup scene.", false, false, false, false, false, fields_project_set_startup},
     {"project.close", "project_close", "Close project", "Close project metadata while leaving the current scene intact.", false, false, false, false, false, no_fields},
-    {"project.package", "project_package", "Package project", "Export saved project metadata, member scenes and non-hidden assets as a portable uncompressed tar under the project exports directory. Refuses to overwrite; save scene changes first.", false, false, false, false, false, fields_project_package},
+    {"project.package", "project_package", "Export project", "Export the project as a portable uncompressed tar or a zip (chosen by the .tar or .zip extension) for moving it to another machine: project metadata and settings, every scene, template, script, asset and import record. Extracting it gives a folder that opens as an identical project. Private state, captures, traces, earlier exports and builds are left out. Written to the project exports directory unless a directory is given. Refuses to overwrite; save scene changes first.", false, false, false, false, false, fields_project_package},
+    {"project.build_settings", "project_build_settings", "Read build settings", "Read the project's build settings (settings.build in the .relayproject): the game's name, description, author, release date, version and icon, and its build profiles (one per target: platform, architecture, configuration, build folder, window mode and size) with the active one, the defaults, the accepted values and which profiles have been built.", true, false, false, false, false, no_fields},
+    {"project.set_build_settings", "project_set_build_settings", "Change game build settings", "Change the game's identity shared by every build profile, or choose the active profile, and save it in the project file. Omitted settings keep their current values; an empty string clears a text setting.", false, false, false, false, false, fields_project_set_build_settings},
+    {"project.set_build_profile", "project_set_build_profile", "Change a build profile", "Create or change a build profile, the settings for building the game for one target, and save it in the project file. A profile that does not exist is created from the defaults or from copy_from. Omitted settings keep their current values.", false, false, false, false, false, fields_project_set_build_profile},
+    {"project.remove_build_profile", "project_remove_build_profile", "Remove a build profile", "Delete a build profile from the project's settings. The last profile cannot be removed; builds already written are kept.", false, false, false, false, false, fields_project_remove_build_profile},
+    {"project.build", "project_build", "Build project", "Build the game for a build profile into <build folder>/<configuration>/ (the release and debug folders are both created), replacing the previous build of that configuration. The result runs on its own: the game's program (named for the game, from relay_player), game.pak (every file the game refers to in one archive, with its models and project shaders already imported and compiled; unreferenced files are left out unless the profile ships every file), scripts/ (the behaviours compiled for the configuration; the project's scripts must be trusted), shaders/, lib/ (libraries the program needs; the model importer and shader compiler are not among them), build.json and icon.png. Linux x86_64 only. Compiling scripts can take a while, and the call returns when the build is done. Save scene changes first.", false, false, false, false, false, fields_project_build},
     {"scene.keyframe.set", "scene_keyframe_set", "Set transform keyframe", "Add or update a scene-owned transform keyframe at an exact time. Unspecified transform fields use the current entity transform or existing key. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_keyframe_set},
     {"scene.keyframe.delete", "scene_keyframe_delete", "Delete transform keyframe", "Remove one scene-owned transform keyframe at an exact time as an undoable edit.", false, false, false, false, false, fields_scene_keyframe_delete},
     {"scene.keyframes.playback", "scene_keyframes_playback", "Control transform keyframes", "Set playback, loop, speed, duration or current time for scene-owned transform keys. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_keyframes_playback},

@@ -1,3 +1,4 @@
+#include "relay/core/pak.hpp"
 #include "relay/ui/ui_font.hpp"
 
 #include "relay/scene/project.hpp"
@@ -74,6 +75,14 @@ std::span<const unsigned char> embedded(const std::string_view name) {
 }
 
 bool read_font_file(const std::filesystem::path& path, std::vector<unsigned char>& bytes, std::string& error) {
+    if (const auto packed = vfs::packed(path)) {
+        if (packed->size() > UiFontCache::maximum_font_bytes) {
+            error = "font " + path.filename().string() + " is larger than 32 MiB";
+            return false;
+        }
+        bytes.assign(packed->begin(), packed->end());
+        return true;
+    }
     std::error_code code;
     const auto size = std::filesystem::file_size(path, code);
     if (code || !std::filesystem::is_regular_file(path, code)) {
@@ -212,10 +221,10 @@ std::uint32_t UiFontCache::font(const std::string_view path, const bool bold, st
     if (found != by_path_.end()) {
         auto& existing = *faces_[found->second];
         existing.checked = now;
-        std::error_code code;
-        const auto time = std::filesystem::last_write_time(full_path, code);
-        const auto size = code ? 0U : std::filesystem::file_size(full_path, code);
-        if (!code && time == existing.time && size == existing.size)
+        const auto status = vfs::stamp(full_path);
+        const auto time = status.time;
+        const auto size = status.size;
+        if (status.found && time == existing.time && size == existing.size)
             return existing.valid ? found->second : fail("font " + std::string(path) + " cannot be read");
         // Changed: forget its glyphs (their atlas space stays used until the atlas next fills).
         std::erase_if(glyphs_, [&](const auto& entry) { return entry.first.font == found->second; });
@@ -223,9 +232,9 @@ std::uint32_t UiFontCache::font(const std::string_view path, const bool bold, st
     auto loaded = std::make_unique<Face>();
     loaded->path = std::string(path);
     loaded->checked = now;
-    std::error_code code;
-    loaded->time = std::filesystem::last_write_time(full_path, code);
-    loaded->size = code ? 0U : std::filesystem::file_size(full_path, code);
+    const auto status = vfs::stamp(full_path);
+    loaded->time = status.time;
+    loaded->size = status.size;
     std::string reason;
     const bool read = read_font_file(full_path, loaded->owned, reason);
     if (read && !loaded->load(loaded->owned.data(), loaded->owned.size()))

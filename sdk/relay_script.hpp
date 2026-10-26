@@ -762,6 +762,9 @@ inline const RelayHostApi& api() { return *detail::host(); }
 // Seconds of game time since Run Game, advancing by exactly 1/60 per frame.
 inline double time() { return api().time(api().context); }
 inline std::uint64_t frame() { return api().frame(api().context); }
+// Frames drawn per second, smoothed over about half a second, or 0 before any are drawn. Scripts
+// update at a fixed 60 Hz whatever the display does, so this is the only way to see the display's rate.
+inline double frame_rate() { return api().render_frame_rate(api().context); }
 // First entity with this exact name, or an empty Entity. It scans the scene, so look entities up
 // once in on_start rather than every frame.
 inline Entity find(std::string_view name) {

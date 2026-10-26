@@ -1,3 +1,4 @@
+#include "relay/core/pak.hpp"
 #include "relay/render/sky.hpp"
 
 #include "relay/core/json.hpp"
@@ -44,6 +45,11 @@ std::optional<fs::path> panorama_file(const fs::path& root, const std::string_vi
 
 std::optional<std::string> read_file(const fs::path& path, const std::uintmax_t maximum,
                                      std::string& error) {
+    if (vfs::packed(path)) {
+        std::string text;
+        if (!vfs::read_all(path, maximum, text, error)) return std::nullopt;
+        return text;
+    }
     std::error_code code;
     if (!fs::is_regular_file(path, code)) {
         error = "file not found";
@@ -283,12 +289,10 @@ void compute_sky_panorama_averages(SkyPanorama& panorama) {
 SkyMaterialCache::Stamp SkyMaterialCache::stamp(const std::optional<fs::path>& path) {
     Stamp result;
     if (!path) return result;
-    std::error_code code;
-    if (!fs::is_regular_file(*path, code)) return result;
-    result.time = fs::last_write_time(*path, code);
-    if (code) return {};
-    result.size = fs::file_size(*path, code);
-    if (code) return {};
+    const auto file = vfs::stamp(*path);
+    if (!file.found) return result;
+    result.time = file.time;
+    result.size = file.size;
     result.exists = true;
     return result;
 }

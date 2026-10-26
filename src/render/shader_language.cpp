@@ -1,3 +1,5 @@
+#include "relay/render/cooked_assets.hpp"
+#include "relay/core/pak.hpp"
 #include "relay/render/shader_language.hpp"
 
 #include "relay/scene/project.hpp"
@@ -1125,6 +1127,15 @@ std::optional<std::string> read_shader_file(const fs::path& root, const std::str
         error = "shader path must be a safe project-relative .relay-shader file";
         return std::nullopt;
     }
+    if (vfs::packed(*file)) {
+        std::string text;
+        std::string reason;
+        if (!vfs::read_all(*file, maximum_shader_bytes, text, reason)) {
+            error = std::string{path} + ": " + (reason == "file is too large" ? "shaders may be at most 256 KiB" : reason);
+            return std::nullopt;
+        }
+        return text;
+    }
     std::error_code code;
     if (!fs::is_regular_file(*file, code)) {
         error = std::string{path} + ": file not found";
@@ -1187,16 +1198,30 @@ bool write_shader_file(const fs::path& root, const std::string_view path, const 
 
 std::shared_ptr<const CompiledShader> ShaderLibrary::resolve(const fs::path& root,
                                                              const std::string_view path) {
+    // A game's shaders were compiled when it was built.
+    if (const auto cooked = vfs::packed_name(std::string{cooked_shader_directory} + std::string{path} + ".bin")) {
+        const auto found = cooked_.find(path);
+        if (found != cooked_.end()) return found->second;
+        std::string error;
+        auto shader = std::const_pointer_cast<CompiledShader>(parse_cooked_shader(*cooked, error));
+        if (!shader) {
+            auto failed = std::make_shared<CompiledShader>();
+            failed->path = std::string{path};
+            failed->errors.push_back({0U, error});
+            return failed;
+        }
+        static std::atomic<std::uint64_t> cooked_revision{1ULL << 40U};
+        shader->revision = ++cooked_revision;
+        return cooked_.emplace(std::string{path}, std::move(shader)).first->second;
+    }
     const auto file = valid_shader_path(path) ? workspace_file(root.generic_string(), path, shader_suffix)
                                               : std::nullopt;
     Stamp stamp;
     if (file) {
-        std::error_code code;
-        if (fs::is_regular_file(*file, code)) {
-            stamp.time = fs::last_write_time(*file, code);
-            stamp.size = code ? 0U : fs::file_size(*file, code);
-            stamp.exists = !code;
-        }
+        const auto status = vfs::stamp(*file);
+        stamp.time = status.time;
+        stamp.size = status.size;
+        stamp.exists = status.found;
     }
     const auto preview_found = previews_.find(path);
     const std::optional<std::string> previewed =

@@ -18,3 +18,7 @@ Work in the background and keep the repository suitable for public distribution.
 
 Use [`HANDOFF.md`](HANDOFF.md) for current engineering state and [`docs/protocol.md`](docs/protocol.md)
 for the generated control-protocol reference.
+- Any time a person picks a file or folder, use the operating system's own dialog (the editor's
+  `choose_path` and `choose_folder`, which wrap SDL3's), never a custom browser, and put a Browse
+  button beside every path field. Typed and relative paths stay supported. The project's Asset
+  Browser is only for choosing files that are already inside the project.

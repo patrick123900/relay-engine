@@ -4,6 +4,7 @@
 #include "relay/core/json.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -292,6 +293,7 @@ std::span<const ModelAsset> AssetRegistry::models() const { return models_; }
 bool AssetRegistry::register_model(ModelAsset model) {
     if (model.name.empty() || model.nodes.empty())
         return false;
+    if (recorder_.model) recorder_.model(model);
     if (!find_model(model.name))
         models_.push_back(std::move(model));
     return true;
@@ -303,9 +305,14 @@ bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
                                       std::vector<MaterialAsset> materials,
                                       std::vector<TextureAsset> textures) {
     if (vertices.empty() || indices_to_add.empty() || meshes.empty()) return false;
+    std::optional<ImportBatch> recorded;
+    if (recorder_.batch) recorded = ImportBatch{vertices, indices_to_add, meshes, materials, textures};
     if (std::all_of(meshes.begin(), meshes.end(), [this](const MeshAsset& mesh) {
             return find_mesh(mesh.name) != nullptr;
-        })) return true;
+        })) {
+        if (recorded) recorder_.batch(*recorded);
+        return true;
+    }
     if (vertices_.size() + vertices.size() > 16'000'000U ||
         indices_.size() + indices_to_add.size() > 32'000'000U)
         return false;
@@ -357,6 +364,7 @@ bool AssetRegistry::register_imported(std::vector<MeshVertex> vertices,
     indices_.insert(indices_.end(), indices_to_add.begin(), indices_to_add.end());
     recompute_bounds(first_new_mesh);
     ++revision_;
+    if (recorded) recorder_.batch(*recorded);
     return true;
 }
 

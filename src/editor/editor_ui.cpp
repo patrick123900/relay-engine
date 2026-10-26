@@ -602,6 +602,10 @@ struct EditorUi::Impl {
     JsonValue project_status;
     std::vector<std::string> project_files;
     std::array<char, 129> project_name{"My project"};
+    // New project: the folder the project's own folder is made in (workspace-relative or absolute).
+    std::array<char, 513> project_location{"projects"};
+    // A file picked with Browse that lies outside where it must be; it is copied in on Continue.
+    std::string pick_external;
     std::string pending_scene_filename, pending_project_filename;
     std::vector<std::string> mesh_names;
     std::vector<std::string> material_names;
@@ -703,7 +707,6 @@ struct EditorUi::Impl {
     ImVec2 viewport_min{}, viewport_max{};
 
     std::array<char, 129> scene_filename{"main.relay.json"};
-    std::array<char, 129> package_filename{"project.tar"};
     // The scene's current content revision and the one last written to or read from a file. They
     // only differ when there is unsaved authoring work, because undoing back to a saved state
     // restores that state's revision. Playback time never enters the history and so never counts.
@@ -771,6 +774,28 @@ struct EditorUi::Impl {
     std::array<char, 129> node_name{};
     std::string node_selected{"Node"}, node_parent;
     bool open_node_window{}, node_as_child{};
+    // File > Export project: a floating window that saves the project as one archive.
+    bool export_open{};
+    bool export_zip{};
+    std::array<char, 129> export_name{};
+    std::array<char, 513> export_directory{};
+    // Run > Build Project: build.settings from project.build_settings. The text fields are held in
+    // buffers that are saved when an edit ends, and reloaded when the profile or project changes.
+    bool build_open{};
+    JsonValue build_status;
+    std::string build_loaded_for;
+    std::array<char, 33> build_profile_name{}, build_version{};
+    std::array<char, 65> build_game_name{};
+    std::array<char, 1025> build_description{};
+    std::array<char, 129> build_author{};
+    std::array<char, 513> build_output{};
+    std::array<char, 11> build_release_date{};
+    int build_width{1280}, build_height{720};
+    std::string build_result;
+    bool build_failed{};
+    // Saving reloads build_status, which the window is reading through pointers while it draws, so
+    // edits wait here until the frame's widgets are done.
+    std::vector<std::function<void()>> build_deferred;
     // Game Configuration window. The input page edits a working copy and saves each change.
     bool game_config_open{};
     int game_config_page{};
@@ -8597,6 +8622,7 @@ struct EditorUi::Impl {
             ImGui::TextDisabled("Folder: %s", string_or(*project, "root").c_str());
             if (ImGui::Button("Add existing scene"))
                 file_dialog(FileAction::add_project_scene, scene_filename.data());
+            note_item("project:add_scene");
             ImGui::SameLine();
             if (ImGui::Button("New scene")) discarding_action(PendingAction::new_scene);
             ImGui::TextDisabled("Saving a scene adds it to this project.");
@@ -8622,11 +8648,8 @@ struct EditorUi::Impl {
                     }
                 }
             ImGui::Separator();
-            ImGui::InputText("Package file", package_filename.data(), package_filename.size());
-            if (ImGui::Button("Export saved project"))
-                (void)mutate("project.package", "\"filename\":\"" +
-                             json_escape(package_filename.data()) + "\"",
-                             "Project package saved under exports");
+            if (ImGui::Button("Export project..."))
+                begin_export_project();
             ImGui::TextDisabled("Save scene changes before exporting. Existing packages are kept.");
         } else ImGui::TextDisabled("No project open. Scene files can still be edited.");
         ImGui::Separator();
@@ -8735,9 +8758,173 @@ struct EditorUi::Impl {
         file_action = action;
         open_file_dialog = true;
         dialog_error.clear();
+        pick_external.clear();
         const auto length = std::min(filename.size(), action_filename.size() - 1);
         std::copy_n(filename.begin(), length, action_filename.begin());
         action_filename[length] = '\0';
+    }
+
+    std::filesystem::path scenes_directory_path() const {
+        const auto* project = active_project();
+        std::error_code ec;
+        return std::filesystem::absolute(project ? std::filesystem::path{string_or(*project, "root")} / "scenes"
+                                                 : std::filesystem::path{"scenes"}, ec).lexically_normal();
+    }
+
+    // The name of a project folder made from a project's name: letters and digits, dashes between.
+    static std::string folder_name_for(const std::string& name) {
+        std::string slug;
+        for (const char c : name) {
+            if (std::isalnum(static_cast<unsigned char>(c))) slug += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            else if (!slug.empty() && slug.back() != '-') slug += '-';
+        }
+        while (!slug.empty() && slug.back() == '-') slug.pop_back();
+        return slug.empty() ? "project" : slug;
+    }
+
+    // Files a model refers to that the importer will want beside it: a glTF's buffers and images
+    // ("uri"), an OBJ's material library.
+    static std::vector<std::string> model_companions(const std::filesystem::path& model) {
+        std::vector<std::string> names;
+        std::error_code ec;
+        const auto extension = model.extension().string();
+        if (!std::filesystem::is_regular_file(model, ec) || std::filesystem::file_size(model, ec) > 64U * 1024U * 1024U) return names;
+        std::ifstream stream(model, std::ios::binary);
+        const std::string text{std::istreambuf_iterator<char>(stream), {}};
+        const auto take = [&](std::string name) {
+            if (name.empty() || name.rfind("data:", 0) == 0 || name.find("..") != std::string::npos ||
+                std::filesystem::path{name}.is_absolute())
+                return;
+            for (auto& c : name)
+                if (c == '%') return; // Percent-encoded names are left to the person.
+            names.push_back(std::move(name));
+        };
+        if (extension == ".gltf") {
+            for (std::size_t at = text.find("\"uri\""); at != std::string::npos; at = text.find("\"uri\"", at + 5)) {
+                const auto quote = text.find('"', text.find(':', at) + 1U);
+                const auto end = quote == std::string::npos ? quote : text.find('"', quote + 1U);
+                if (end != std::string::npos) take(text.substr(quote + 1U, end - quote - 1U));
+            }
+        } else if (extension == ".obj") {
+            std::istringstream lines(text);
+            for (std::string line; std::getline(lines, line);)
+                if (line.rfind("mtllib ", 0) == 0) {
+                    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                    take(line.substr(7));
+                }
+        }
+        return names;
+    }
+
+    // Copies a file picked outside the project into `folder` (made if needed) under a name that is
+    // not taken, with the files a model needs beside it. Returns the file's name there.
+    std::string copy_picked_file(const std::filesystem::path& source, const std::filesystem::path& folder,
+                                 const bool companions, std::string& problem) {
+        std::error_code ec;
+        std::filesystem::create_directories(folder, ec);
+        if (ec) {
+            problem = "cannot create " + folder.string();
+            return {};
+        }
+        auto name = source.filename().string();
+        for (int n = 2; std::filesystem::exists(folder / name, ec); ++n)
+            name = source.stem().string() + "-" + std::to_string(n) + source.extension().string();
+        std::filesystem::copy_file(source, folder / name, std::filesystem::copy_options::none, ec);
+        if (ec) {
+            problem = "cannot copy " + source.string() + ": " + ec.message();
+            return {};
+        }
+        if (companions)
+            for (const auto& companion : model_companions(source)) {
+                const auto from = source.parent_path() / companion;
+                const auto to = folder / companion;
+                if (!std::filesystem::is_regular_file(from, ec) || std::filesystem::exists(to, ec)) continue;
+                std::filesystem::create_directories(to.parent_path(), ec);
+                std::filesystem::copy_file(from, to, std::filesystem::copy_options::none, ec);
+            }
+        return name;
+    }
+
+    // Browse beside the file name field of a project, scene or model action.
+    void browse_for_action() {
+        EditorUi::FileDialogRequest request;
+        const auto scenes = scenes_directory_path();
+        std::error_code ec;
+        const auto assets = std::filesystem::absolute(assets_root, ec).lexically_normal();
+        switch (file_action) {
+        case FileAction::open_project: {
+            request.title = "Open project";
+            const auto current = std::filesystem::absolute(action_filename.data(), ec);
+            request.start = std::filesystem::is_directory(current.parent_path(), ec)
+                                ? current.parent_path().string()
+                                : std::filesystem::absolute("projects", ec).string();
+            request.filters = {{"Relay projects", "relayproject"}, {"All files", "*"}};
+            choose_path(request, [this](const std::string& path) {
+                std::snprintf(action_filename.data(), action_filename.size(), "%s", workspace_path(path).c_str());
+                pick_external.clear();
+                dialog_error.clear();
+            });
+            break;
+        }
+        case FileAction::open:
+        case FileAction::save_as: {
+            const bool saving = file_action == FileAction::save_as;
+            request.kind = saving ? EditorUi::FileDialogRequest::Kind::save_file : EditorUi::FileDialogRequest::Kind::open_file;
+            request.title = saving ? "Save scene as" : "Open scene";
+            request.start = scenes.string();
+            request.default_name = saving ? std::string{action_filename.data()} : std::string{};
+            request.filters = {{"Relay scenes", "json"}, {"All files", "*"}};
+            choose_path(request, [this, scenes](const std::string& path) {
+                const auto relative = std::filesystem::path{path}.lexically_normal().lexically_relative(scenes);
+                if (relative.empty() || *relative.begin() == "..") {
+                    dialog_error = "A scene has to be in the project's scenes folder: " + scenes.string();
+                    return;
+                }
+                std::snprintf(action_filename.data(), action_filename.size(), "%s", relative.generic_string().c_str());
+                dialog_error.clear();
+            });
+            break;
+        }
+        case FileAction::add_project_scene: {
+            request.title = "Add an existing scene";
+            request.start = scenes.string();
+            request.filters = {{"Relay scenes", "json"}, {"All files", "*"}};
+            choose_path(request, [this, scenes](const std::string& path) {
+                const auto relative = std::filesystem::path{path}.lexically_normal().lexically_relative(scenes);
+                if (relative.empty() || *relative.begin() == "..") {
+                    // A scene from elsewhere is copied into the project's scenes folder.
+                    pick_external = path;
+                    std::snprintf(action_filename.data(), action_filename.size(), "%s",
+                                  std::filesystem::path{path}.filename().string().c_str());
+                } else {
+                    pick_external.clear();
+                    std::snprintf(action_filename.data(), action_filename.size(), "%s", relative.generic_string().c_str());
+                }
+                dialog_error.clear();
+            });
+            break;
+        }
+        case FileAction::import: {
+            request.title = "Import a model";
+            request.start = assets.string();
+            request.filters = {{"3D models", "glb;gltf;obj;fbx;dae;blend"}, {"All files", "*"}};
+            choose_path(request, [this, assets](const std::string& path) {
+                const auto relative = std::filesystem::path{path}.lexically_normal().lexically_relative(assets);
+                if (relative.empty() || *relative.begin() == "..") {
+                    // A model from elsewhere is copied into the project, with what it refers to.
+                    pick_external = path;
+                    std::snprintf(action_filename.data(), action_filename.size(), "%s",
+                                  ("models/" + std::filesystem::path{path}.filename().string()).c_str());
+                } else {
+                    pick_external.clear();
+                    std::snprintf(action_filename.data(), action_filename.size(), "%s", relative.generic_string().c_str());
+                }
+                dialog_error.clear();
+            });
+            break;
+        }
+        default: break;
+        }
     }
 
     std::string create_node(const char* name, const char* component = nullptr,
@@ -8770,9 +8957,13 @@ struct EditorUi::Impl {
     void draw_menu_bar() {
         if (!ImGui::BeginMainMenuBar())
             return;
-        if (ImGui::BeginMenu("File")) {
+        const bool file_menu = ImGui::BeginMenu("File");
+        note_item("menu:file");
+        if (file_menu) {
             if (ImGui::MenuItem("New project...")) discarding_action(PendingAction::new_project);
+            note_item("menu:file:new_project");
             if (ImGui::MenuItem("Open project...")) discarding_action(PendingAction::open_project);
+            note_item("menu:file:open_project");
             if (ImGui::MenuItem("Project browser")) panel_open[7] = true;
             if (ImGui::MenuItem("Close project", nullptr, false, active_project() != nullptr))
                 if (mutate("project.close", {}, "Project closed")) project_status = JsonValue{};
@@ -8788,7 +8979,10 @@ struct EditorUi::Impl {
             ImGui::Separator();
             if (ImGui::MenuItem("Import model..."))
                 file_dialog(FileAction::import, model_filename.data());
-            future_action("Export project...");
+            note_item("menu:file:import_model");
+            if (ImGui::MenuItem("Export project...", nullptr, false, active_project() != nullptr))
+                begin_export_project();
+            note_item("menu:file:export_project");
             ImGui::Separator();
             if (ImGui::MenuItem("Quit"))
                 discarding_action(PendingAction::quit);
@@ -8854,7 +9048,9 @@ struct EditorUi::Impl {
             future_action("Lighting debug");
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Run")) {
+        const bool run_menu = ImGui::BeginMenu("Run");
+        note_item("menu:run");
+        if (run_menu) {
             const auto* status = runtime_status.object();
             const bool game = status && string_or(*status, "mode") == "game";
             const bool paused = status && boolean_or(*status, "paused", false);
@@ -8871,7 +9067,9 @@ struct EditorUi::Impl {
             ImGui::EndDisabled();
             ImGui::Separator();
             future_action("Run standalone game");
-            future_action("Build project...");
+            if (ImGui::MenuItem("Build project..."))
+                open_build_window();
+            note_item("menu:run:build_project");
             ImGui::EndMenu();
         }
         const bool tools_menu = ImGui::BeginMenu("Tools");
@@ -10354,6 +10552,638 @@ struct EditorUi::Impl {
         draw_bar(origin.y + bar + 2.0F * ui_scale, right_db);
     }
 
+    template <std::size_t N>
+    static void fill_buffer(std::array<char, N>& buffer, const std::string& text) {
+        std::snprintf(buffer.data(), buffer.size(), "%s", text.c_str());
+    }
+
+    std::filesystem::path project_root_path() const {
+        const auto* project = active_project();
+        std::error_code ec;
+        return std::filesystem::absolute(project ? string_or(*project, "root") : std::string{"."}, ec)
+            .lexically_normal();
+    }
+
+    // ---- System file dialogs --------------------------------------------------------------
+    // Every file or folder the person picks goes through the operating system's own dialog. The
+    // answer arrives on another thread, so it waits in a mailbox that the next frame empties.
+
+    struct DialogMailbox {
+        std::mutex mutex;
+        std::deque<std::function<void()>> ready;
+    };
+    std::shared_ptr<DialogMailbox> dialog_mailbox = std::make_shared<DialogMailbox>();
+    EditorUi::FileDialogHandler file_dialog_handler;
+    bool file_dialog_busy{};
+
+    [[nodiscard]] bool file_dialog_available() const {
+        return static_cast<bool>(file_dialog_handler) || (sdl_window != nullptr && !headless);
+    }
+
+    struct SdlDialog {
+        EditorUi::FileDialogDone done;
+        std::vector<std::string> names, patterns;
+        std::vector<SDL_DialogFileFilter> filters;
+        std::string start;
+    };
+
+    static void SDLCALL sdl_dialog_finished(void* user, const char* const* files, int) {
+        std::unique_ptr<SdlDialog> dialog(static_cast<SdlDialog*>(user));
+        std::optional<std::string> path;
+        if (files != nullptr && files[0] != nullptr) path = std::string{files[0]};
+        dialog->done(std::move(path));
+    }
+
+    void show_system_dialog(const EditorUi::FileDialogRequest& request, EditorUi::FileDialogDone done) {
+        auto* dialog = new SdlDialog{std::move(done), {}, {}, {}, request.start};
+        for (const auto& [label, extensions] : request.filters) {
+            dialog->names.push_back(label);
+            dialog->patterns.push_back(extensions);
+        }
+        for (std::size_t i = 0; i < dialog->names.size(); ++i)
+            dialog->filters.push_back({dialog->names[i].c_str(), dialog->patterns[i].c_str()});
+        const char* start = dialog->start.empty() ? nullptr : dialog->start.c_str();
+        const auto count = static_cast<int>(dialog->filters.size());
+        switch (request.kind) {
+        case EditorUi::FileDialogRequest::Kind::open_file:
+            SDL_ShowOpenFileDialog(sdl_dialog_finished, dialog, sdl_window, dialog->filters.data(), count, start, false);
+            break;
+        case EditorUi::FileDialogRequest::Kind::save_file: {
+            if (!request.default_name.empty()) {
+                // The save dialog takes one location: the folder and the name offered in it.
+                dialog->start = (std::filesystem::path{request.start} / request.default_name).string();
+                start = dialog->start.c_str();
+            }
+            SDL_ShowSaveFileDialog(sdl_dialog_finished, dialog, sdl_window, dialog->filters.data(), count, start);
+            break;
+        }
+        case EditorUi::FileDialogRequest::Kind::open_folder:
+            SDL_ShowOpenFolderDialog(sdl_dialog_finished, dialog, sdl_window, start, false);
+            break;
+        }
+    }
+
+    // Opens the system dialog. `chosen` runs on a later frame with the absolute path, and not at all
+    // when the dialog is cancelled. One dialog at a time.
+    void choose_path(EditorUi::FileDialogRequest request, std::function<void(const std::string&)> chosen) {
+        if (!file_dialog_available() || file_dialog_busy) return;
+        file_dialog_busy = true;
+        auto mailbox = dialog_mailbox;
+        EditorUi::FileDialogDone done = [this, mailbox, chosen = std::move(chosen)](std::optional<std::string> path) {
+            std::lock_guard lock(mailbox->mutex);
+            mailbox->ready.push_back([this, chosen, path = std::move(path)] {
+                file_dialog_busy = false;
+                if (path && !path->empty()) chosen(*path);
+            });
+        };
+        if (file_dialog_handler) file_dialog_handler(request, std::move(done));
+        else show_system_dialog(request, std::move(done));
+    }
+
+    void choose_folder(std::string title, std::string start, std::function<void(const std::string&)> chosen) {
+        EditorUi::FileDialogRequest request;
+        request.kind = EditorUi::FileDialogRequest::Kind::open_folder;
+        request.title = std::move(title);
+        request.start = std::move(start);
+        choose_path(std::move(request), std::move(chosen));
+    }
+
+    void drain_dialog_results() {
+        std::deque<std::function<void()>> ready;
+        {
+            std::lock_guard lock(dialog_mailbox->mutex);
+            ready.swap(dialog_mailbox->ready);
+        }
+        for (auto& action : ready) action();
+    }
+
+    // A path for the project's own fields: relative to the workspace when it lies inside it (the
+    // form Relay saves and agents use), else absolute.
+    static std::string workspace_path(const std::filesystem::path& path) {
+        std::error_code ec;
+        const auto relative = path.lexically_normal().lexically_relative(std::filesystem::current_path(ec));
+        if (!ec && !relative.empty() && relative != "." && *relative.begin() != ".." && !relative.is_absolute())
+            return relative.generic_string();
+        return path.lexically_normal().generic_string();
+    }
+
+    // A path field with a Browse button, laid out like the other form rows.
+    void folder_row(const char* label, const char* id, char* buffer, const std::size_t size,
+                    const char* hint, const std::function<void()>& browse,
+                    const std::function<void()>& committed) {
+        inspector_field_label(label);
+        const float button = 86.0F * ui_scale;
+        ImGui::SetNextItemWidth(-(button + ImGui::GetStyle().ItemSpacing.x));
+        ImGui::InputTextWithHint((std::string("##") + id).c_str(), hint, buffer, size);
+        note_item(id);
+        if (ImGui::IsItemDeactivatedAfterEdit() && committed) committed();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!file_dialog_available() || file_dialog_busy);
+        if (ImGui::Button("Browse...", ImVec2(button, 0.0F))) browse();
+        ImGui::EndDisabled();
+        if (!file_dialog_available() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("The system file dialog is not available in this session. Type a path instead.");
+        note_item(std::string(id) + ":browse");
+    }
+
+    // A chosen absolute folder is kept relative when it lies inside the project.
+    std::string folder_setting(const std::string& chosen) const {
+        const auto root = project_root_path();
+        const auto relative = std::filesystem::path{chosen}.lexically_relative(root);
+        if (!relative.empty() && relative != "." && *relative.begin() != "..") return relative.generic_string();
+        return chosen;
+    }
+
+    // A floating tool window: centred the first time, never docked into the editor's layout.
+    bool begin_tool_window(const char* title, bool* open, const ImVec2 size) {
+        const auto* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_FirstUseEver, ImVec2(0.5F, 0.5F));
+        ImGui::SetNextWindowSize(ImVec2(size.x * ui_scale, size.y * ui_scale), ImGuiCond_FirstUseEver);
+        return ImGui::Begin(title, open, ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse);
+    }
+
+    // ---- Export project ------------------------------------------------------------------
+
+    // The default archive name: the project's file name reduced to what project.package accepts.
+    void begin_export_project() {
+        const auto* project = active_project();
+        if (!project) return;
+        std::string stem = std::filesystem::path(string_or(*project, "filename")).stem().string();
+        for (auto& c : stem)
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') c = '-';
+        if (stem.empty() || stem.front() == '-') stem = "project" + stem;
+        std::snprintf(export_name.data(), export_name.size(), "%s%s", stem.c_str(),
+                      export_zip ? ".zip" : ".tar");
+        export_open = true;
+        ImGui::SetWindowFocus("Export Project");
+    }
+
+    // File > Export project: save the project as one archive to move to another machine.
+    void draw_export_window() {
+        if (!export_open) return;
+        const auto& palette = editor_palette();
+        const bool visible = begin_tool_window("Export Project", &export_open, ImVec2(600.0F, 420.0F));
+        note_item("export:window");
+        if (!visible) {
+            ImGui::End();
+            return;
+        }
+        const auto* project = active_project();
+        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
+        ImGui::TextWrapped("Saves the whole project as one file to copy to another machine and keep "
+                           "working on. Extract it and it opens as an identical copy: scenes, assets, "
+                           "templates, scripts and settings. To make the game itself, use Run > Build "
+                           "project instead.");
+        ImGui::PopStyleColor();
+
+        ImGui::SeparatorText("Archive");
+        const auto set_extension = [&](const bool zip) {
+            std::string name = export_name.data();
+            for (const std::string_view extension : {".tar", ".zip"})
+                if (name.ends_with(extension)) name.resize(name.size() - extension.size());
+            std::snprintf(export_name.data(), export_name.size(), "%s%s", name.c_str(), zip ? ".zip" : ".tar");
+        };
+        inspector_field_label("Format");
+        if (ImGui::RadioButton("Zip (.zip)", export_zip)) { export_zip = true; set_extension(true); }
+        note_item("export:zip");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Tar (.tar)", !export_zip)) { export_zip = false; set_extension(false); }
+        note_item("export:tar");
+        inspector_field_label("File name");
+        ImGui::InputText("##export_name", export_name.data(), export_name.size());
+        note_item("export:name");
+        const std::string name = export_name.data();
+        const bool named = name.size() > 4 && (name.ends_with(".tar") || name.ends_with(".zip"));
+
+        ImGui::SeparatorText("Destination");
+        const auto project_root = project_root_path();
+        const std::string directory = export_directory.data();
+        const auto chosen_directory = [&] {
+            if (directory.empty()) return project_root / "exports";
+            const std::filesystem::path path{directory};
+            return path.is_absolute() ? path : project_root / path;
+        }();
+        folder_row("Save to", "export:directory", export_directory.data(), export_directory.size(),
+                   "exports (inside the project)",
+                   [this, start = chosen_directory.string()] {
+                       choose_folder("Choose where to save the export", start,
+                                          [this](const std::string& chosen) { fill_buffer(export_directory, chosen); });
+                   },
+                   nullptr);
+        ImGui::TextColored(editor_color(palette.text_faint), "Will be written to %s",
+                           (chosen_directory / name).generic_string().c_str());
+        if (scene_modified())
+            ImGui::TextColored(editor_color(palette.warning),
+                               "This scene has unsaved changes, which the export will not include.");
+        else if (!named)
+            ImGui::TextColored(editor_color(palette.warning), "The file name must end in .tar or .zip.");
+
+        const float button = 120.0F * ui_scale;
+        const float bottom = ImGui::GetWindowHeight() - ImGui::GetFrameHeight() - ImGui::GetStyle().WindowPadding.y;
+        ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY() + ImGui::GetStyle().ItemSpacing.y, bottom));
+        ImGui::Separator();
+        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 2.0F * button - ImGui::GetStyle().ItemSpacing.x -
+                             ImGui::GetStyle().WindowPadding.x);
+        if (ImGui::Button("Cancel", ImVec2(button, 0.0F))) export_open = false;
+        note_item("export:cancel");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!named || project == nullptr);
+        if (ImGui::Button("Export", ImVec2(button, 0.0F))) {
+            std::string fields = "\"filename\":\"" + json_escape(name) + "\"";
+            if (!directory.empty()) fields += ",\"directory\":\"" + json_escape(directory) + "\"";
+            if (const auto result = call("project.package", fields)) {
+                const auto* object = result->object();
+                set_status("Exported project to " + (object ? string_or(*object, "filename") : name), false);
+                export_open = false;
+            }
+        }
+        note_item("export:confirm");
+        ImGui::EndDisabled();
+        ImGui::End();
+    }
+
+    // ---- Build project -------------------------------------------------------------------
+
+    void refresh_build_status() {
+        if (auto status = call("project.build_settings")) build_status = std::move(*status);
+    }
+
+    const JsonValue::Object* build_settings_object() const {
+        const auto* status = build_status.object();
+        const auto* value = status ? field(*status, "settings") : nullptr;
+        return value ? value->object() : nullptr;
+    }
+
+    const JsonValue::Object* build_profile_object(const std::string& name) const {
+        const auto* settings = build_settings_object();
+        const auto* list_value = settings ? field(*settings, "profiles") : nullptr;
+        if (const auto* list = list_value ? list_value->array() : nullptr)
+            for (const auto& entry : *list)
+                if (const auto* object = entry.object(); object && string_or(*object, "name") == name)
+                    return object;
+        return nullptr;
+    }
+
+    std::string active_build_profile() const {
+        const auto* settings = build_settings_object();
+        return settings ? string_or(*settings, "active_profile") : std::string{};
+    }
+
+    // Copies the saved settings into the edit buffers.
+    void load_build_edit() {
+        refresh_build_status();
+        const auto* settings = build_settings_object();
+        if (!settings) return;
+        fill_buffer(build_game_name, string_or(*settings, "game_name"));
+        fill_buffer(build_description, string_or(*settings, "description"));
+        fill_buffer(build_author, string_or(*settings, "author"));
+        fill_buffer(build_release_date, string_or(*settings, "release_date"));
+        fill_buffer(build_version, string_or(*settings, "version", "1.0.0"));
+        const auto active = active_build_profile();
+        if (const auto* profile = build_profile_object(active)) {
+            fill_buffer(build_profile_name, active);
+            fill_buffer(build_output, string_or(*profile, "output_directory", "builds"));
+            build_width = static_cast<int>(number_or(*profile, "window_width", 1280.0));
+            build_height = static_cast<int>(number_or(*profile, "window_height", 720.0));
+        }
+        const auto* project = active_project();
+        build_loaded_for = (project ? string_or(*project, "filename") : std::string{}) + "|" + active;
+    }
+
+    void open_build_window() {
+        build_open = true;
+        build_result.clear();
+        build_deferred.clear();
+        load_build_edit();
+        ImGui::SetWindowFocus("Build Project");
+    }
+
+    void defer_build(std::function<void()> work) { build_deferred.push_back(std::move(work)); }
+
+    void save_build_game(const char* key, const std::string& value) {
+        defer_build([this, key = std::string{key}, value] {
+            if (call("project.set_build_settings", "\"" + key + "\":\"" + json_escape(value) + "\"")) refresh_build_status();
+        });
+    }
+
+    // Saves one field of the active profile; `raw` is JSON for numbers and a quoted string otherwise.
+    void save_build_profile(const char* key, const std::string& raw) {
+        defer_build([this, key = std::string{key}, raw] {
+            const auto name = active_build_profile();
+            if (call("project.set_build_profile", "\"name\":\"" + json_escape(name) + "\",\"" + key + "\":" + raw))
+                load_build_edit();
+        });
+    }
+    void save_build_profile_text(const char* key, const std::string& value) {
+        save_build_profile(key, "\"" + json_escape(value) + "\"");
+    }
+
+    void select_build_profile(const std::string& name) {
+        defer_build([this, name] {
+            if (call("project.set_build_settings", "\"active_profile\":\"" + json_escape(name) + "\"")) {
+                build_result.clear();
+                load_build_edit();
+            }
+        });
+    }
+
+    std::string unused_profile_name(const std::string& base) const {
+        std::string name = base.substr(0, 28);
+        for (int n = 2; build_profile_object(name); ++n) name = base.substr(0, 28) + " " + std::to_string(n);
+        return name;
+    }
+
+    static std::string capitalised(std::string text) {
+        if (!text.empty()) text.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(text.front())));
+        return text;
+    }
+
+    // The left column: one entry per build profile, with add, duplicate and delete below.
+    void draw_build_profile_list() {
+        const auto& palette = editor_palette();
+        const auto* settings = build_settings_object();
+        const auto active = active_build_profile();
+        ImGui::TextColored(editor_color(palette.text_dim), "BUILD PROFILES");
+        ImGui::Spacing();
+        const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+        ImGui::BeginChild("##build_profile_list", ImVec2(0.0F, -footer));
+        const auto* list_value = settings ? field(*settings, "profiles") : nullptr;
+        const auto* list = list_value ? list_value->array() : nullptr;
+        std::size_t count = 0;
+        if (list)
+            for (const auto& entry : *list) {
+                const auto* profile = entry.object();
+                if (!profile) continue;
+                ++count;
+                const auto name = string_or(*profile, "name");
+                const std::string detail = capitalised(string_or(*profile, "target_platform")) + "  ·  " +
+                                           string_or(*profile, "architecture") + "  ·  " +
+                                           capitalised(string_or(*profile, "configuration"));
+                ImGui::PushID(name.c_str());
+                const float height = ImGui::GetTextLineHeight() * 2.0F + ImGui::GetStyle().FramePadding.y * 3.0F;
+                const bool selected = name == active;
+                if (ImGui::Selectable("##profile", selected, 0, ImVec2(0.0F, height)) && !selected)
+                    select_build_profile(name);
+                note_item("build:profile:" + name);
+                const auto low = ImGui::GetItemRectMin();
+                auto* draw = ImGui::GetWindowDrawList();
+                const float pad = ImGui::GetStyle().FramePadding.y + 1.0F * ui_scale;
+                draw->AddText(ImVec2(low.x + 10.0F * ui_scale, low.y + pad), ImGui::GetColorU32(ImGuiCol_Text), name.c_str());
+                draw->AddText(ImVec2(low.x + 10.0F * ui_scale, low.y + pad + ImGui::GetTextLineHeight() + 1.0F * ui_scale),
+                              ImGui::GetColorU32(editor_color(palette.text_faint)), detail.c_str());
+                ImGui::PopID();
+            }
+        ImGui::EndChild();
+        const float third = (ImGui::GetContentRegionAvail().x - 2.0F * ImGui::GetStyle().ItemSpacing.x) / 3.0F;
+        if (ImGui::Button("New", ImVec2(third, 0.0F))) {
+            const auto name = unused_profile_name("New profile");
+            defer_build([this, name] {
+                if (call("project.set_build_profile", "\"name\":\"" + json_escape(name) + "\"")) {
+                    if (call("project.set_build_settings", "\"active_profile\":\"" + json_escape(name) + "\"")) {
+                        build_result.clear();
+                        load_build_edit();
+                    }
+                }
+            });
+        }
+        note_item("build:add");
+        ImGui::SameLine();
+        if (ImGui::Button("Copy", ImVec2(third, 0.0F))) {
+            const auto name = unused_profile_name(active + " copy");
+            defer_build([this, name, active] {
+                if (call("project.set_build_profile", "\"name\":\"" + json_escape(name) + "\",\"copy_from\":\"" +
+                                                          json_escape(active) + "\"")) {
+                    if (call("project.set_build_settings", "\"active_profile\":\"" + json_escape(name) + "\"")) {
+                        build_result.clear();
+                        load_build_edit();
+                    }
+                }
+            });
+        }
+        note_item("build:duplicate");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(count < 2);
+        if (ImGui::Button("Delete", ImVec2(-FLT_MIN, 0.0F))) {
+            defer_build([this, active] {
+                if (call("project.remove_build_profile", "\"name\":\"" + json_escape(active) + "\"")) {
+                    build_result.clear();
+                    load_build_edit();
+                }
+            });
+        }
+        note_item("build:delete");
+        ImGui::EndDisabled();
+    }
+
+    // The right column: the active profile's fields, then the game's own details.
+    void draw_build_profile_fields() {
+        const auto& palette = editor_palette();
+        const auto* settings = build_settings_object();
+        const auto* status = build_status.object();
+        const auto active = active_build_profile();
+        const auto* profile = build_profile_object(active);
+        if (!settings || !profile) {
+            ImGui::TextColored(editor_color(palette.text_faint), "No build settings");
+            return;
+        }
+        const auto text_row = [&](const char* label, char* buffer, const std::size_t size, const char* hint,
+                                  const char* id, const std::function<void()>& save) {
+            inspector_field_label(label);
+            ImGui::InputTextWithHint((std::string("##") + id).c_str(), hint, buffer, size);
+            note_item(id);
+            if (ImGui::IsItemDeactivatedAfterEdit()) save();
+        };
+        const auto choice_row = [&](const char* label, const char* key, const char* list_key, const char* id) {
+            const auto current = string_or(*profile, key);
+            if (inspector_begin_combo(label, capitalised(current).c_str())) {
+                const auto* list_value = status ? field(*status, list_key) : nullptr;
+                if (const auto* list = list_value ? list_value->array() : nullptr)
+                    for (const auto& item : *list)
+                        if (const auto* name = item.string()) {
+                            if (ImGui::Selectable(capitalised(*name).c_str(), *name == current) && *name != current)
+                                save_build_profile_text(key, *name);
+                            note_item(std::string(id) + ":" + *name);
+                        }
+                ImGui::EndCombo();
+            }
+            note_item(id);
+        };
+
+        ImGui::SeparatorText("Profile");
+        text_row("Name", build_profile_name.data(), build_profile_name.size(), "Profile name", "build:profile_name",
+                 [&] { save_build_profile_text("new_name", build_profile_name.data()); });
+        choice_row("Platform", "target_platform", "platforms", "build:platform");
+        choice_row("Architecture", "architecture", "architectures", "build:architecture");
+        choice_row("Configuration", "configuration", "configurations", "build:configuration");
+
+        ImGui::SeparatorText("Output");
+        const auto output_start = [&] {
+            const std::filesystem::path path{std::string{build_output.data()}};
+            return (path.is_absolute() ? path : project_root_path() / path).string();
+        };
+        folder_row("Build folder", "build:output", build_output.data(), build_output.size(), "builds",
+                   [this, start = output_start()] {
+                       choose_folder("Choose the build folder", start, [this](const std::string& chosen) {
+                           const auto setting = folder_setting(chosen);
+                           fill_buffer(build_output, setting);
+                           save_build_profile_text("output_directory", setting);
+                       });
+                   },
+                   [&] { save_build_profile_text("output_directory", build_output.data()); });
+        const auto* builds_value = status ? field(*status, "builds") : nullptr;
+        if (const auto* builds = builds_value ? builds_value->array() : nullptr)
+            for (const auto& entry : *builds)
+                if (const auto* item = entry.object(); item && string_or(*item, "profile") == active) {
+                    const bool built = boolean_or(*item, "built", false);
+                    ImGui::TextColored(editor_color(palette.text_faint), "Writes to %s",
+                                       string_or(*item, "directory").c_str());
+                    ImGui::TextColored(editor_color(built ? palette.success : palette.text_faint), "%s",
+                                       built ? "Built" : "Not built yet");
+                }
+
+        bool include_unused = boolean_or(*profile, "include_unused_assets", false);
+        if (inspector_checkbox("Include unused files", &include_unused)) {
+            save_build_profile("include_unused_assets", include_unused ? "true" : "false");
+        }
+        note_item("build:include_unused");
+        ImGui::TextColored(editor_color(palette.text_faint), "%s",
+                           "A build ships only the files the game refers to. Turn this on if its code loads "
+                           "files by names it builds up.");
+
+        ImGui::SeparatorText("Window");
+        choice_row("Window mode", "window_mode", "window_modes", "build:window_mode");
+        const bool windowed = string_or(*profile, "window_mode", "windowed") == "windowed";
+        ImGui::BeginDisabled(!windowed);
+        const auto size_row = [&](const char* label, const char* key, int& value, const char* id) {
+            inspector_field_label(label);
+            ImGui::InputInt((std::string("##") + id).c_str(), &value, 0, 0);
+            note_item(id);
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                value = std::clamp(value, static_cast<int>(minimum_window_size), static_cast<int>(maximum_window_size));
+                save_build_profile(key, std::to_string(value));
+            }
+        };
+        size_row("Width", "window_width", build_width, "build:window_width");
+        size_row("Height", "window_height", build_height, "build:window_height");
+        ImGui::EndDisabled();
+        if (!windowed)
+            ImGui::TextColored(editor_color(palette.text_faint),
+                               "Borderless and fullscreen use the desktop's size.");
+
+        ImGui::SeparatorText("Game (shared by every profile)");
+        const auto* project = active_project();
+        const std::string default_name = project ? string_or(*project, "name") : std::string{};
+        text_row("Name", build_game_name.data(), build_game_name.size(), default_name.c_str(), "build:game_name",
+                 [&] { save_build_game("game_name", build_game_name.data()); });
+        inspector_field_label("Description");
+        ImGui::InputTextMultiline("##build_description", build_description.data(), build_description.size(),
+                                  ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 4.5F));
+        note_item("build:description");
+        if (ImGui::IsItemDeactivatedAfterEdit()) save_build_game("description", build_description.data());
+        text_row("Author", build_author.data(), build_author.size(), "Your name or studio", "build:author",
+                 [&] { save_build_game("author", build_author.data()); });
+        text_row("Release date", build_release_date.data(), build_release_date.size(), "YYYY-MM-DD",
+                 "build:release_date", [&] { save_build_game("release_date", build_release_date.data()); });
+        text_row("Version", build_version.data(), build_version.size(), "1.0.0", "build:version",
+                 [&] { save_build_game("version", build_version.data()); });
+        const std::string icon = string_or(*settings, "icon");
+        asset_field("Icon", icon, "build:icon",
+                    [this, icon] {
+                        AssetPick pick;
+                        pick.key = "build:icon";
+                        pick.title = "Choose the game's icon";
+                        pick.current = icon;
+                        pick.kinds = {"image"};
+                        pick.accepts = [](const std::string& path) {
+                            std::string lowered = path;
+                            std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+                                return static_cast<char>(std::tolower(c));
+                            });
+                            return lowered.ends_with(".png");
+                        };
+                        pick.what = "a PNG image";
+                        pick.choices.push_back({"", "Default: the Relay icon", AssetIcon::image, "", "", std::nullopt});
+                        pick.choose = [this](const std::string& path) { save_build_game("icon", path); };
+                        return pick;
+                    },
+                    "Default: the Relay icon", AssetIcon::image);
+    }
+
+    // Run > Build Project: profiles on the left, the selected profile's fields on the right, and a
+    // Build button below. Every change is saved at once, like the Game Configuration pages.
+    void draw_build_window() {
+        if (!build_open) return;
+        const auto& palette = editor_palette();
+        const bool visible = begin_tool_window("Build Project", &build_open, ImVec2(980.0F, 680.0F));
+        note_item("build:window");
+        if (!visible) {
+            ImGui::End();
+            return;
+        }
+        const auto* project = active_project();
+        const std::string expected = (project ? string_or(*project, "filename") : std::string{}) + "|" + active_build_profile();
+        if (expected != build_loaded_for) load_build_edit();
+        const auto* runtime = runtime_status.object();
+        const bool game = runtime && string_or(*runtime, "mode") == "game";
+        if (!project) ImGui::TextColored(editor_color(palette.warning), "Open a project to build it.");
+        if (status_is_error && (status_message.starts_with("project.set_build_settings") ||
+                                status_message.starts_with("project.set_build_profile"))) {
+            const auto colon = status_message.find(": ");
+            ImGui::TextColored(editor_color(palette.warning), "Not saved: %s",
+                               colon == std::string::npos ? status_message.c_str() : status_message.c_str() + colon + 2);
+        }
+        const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0F + ImGui::GetStyle().ItemSpacing.y * 3.0F;
+        ImGui::BeginDisabled(project == nullptr);
+        if (ImGui::BeginChild("##build_left", ImVec2(230.0F * ui_scale, -footer), ImGuiChildFlags_Borders))
+            draw_build_profile_list();
+        ImGui::EndChild();
+        ImGui::SameLine();
+        if (ImGui::BeginChild("##build_right", ImVec2(0.0F, -footer), ImGuiChildFlags_Borders))
+            draw_build_profile_fields();
+        ImGui::EndChild();
+        ImGui::EndDisabled();
+        {
+            auto work = std::move(build_deferred);
+            build_deferred.clear();
+            for (auto& edit : work) edit();
+        }
+
+        if (scene_modified())
+            ImGui::TextColored(editor_color(palette.warning), "This scene has unsaved changes, which the build will not include.");
+        else if (game)
+            ImGui::TextColored(editor_color(palette.warning), "Stop the game before building.");
+        else if (!build_result.empty() && !build_failed)
+            ImGui::TextColored(editor_color(palette.success), "%s", build_result.c_str());
+        else
+            ImGui::TextColored(editor_color(palette.text_faint),
+                               "Builds the game: its program, content, compiled scripts and shaders, in the build folder.");
+        const auto active = active_build_profile();
+        const std::string label = "Build " + active;
+        const float button = std::max(180.0F * ui_scale, ImGui::CalcTextSize(label.c_str()).x + 40.0F * ui_scale);
+        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - button - ImGui::GetStyle().WindowPadding.x);
+        ImGui::BeginDisabled(game || project == nullptr);
+        ImGui::PushStyleColor(ImGuiCol_Button, palette.accent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, palette.accent_hovered);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, palette.accent_active);
+        if (ImGui::Button((label + "##build").c_str(), ImVec2(button, 0.0F))) {
+            build_failed = true;
+            build_result.clear();
+            if (const auto result = call("project.build", "\"profile\":\"" + json_escape(active) + "\"")) {
+                const auto* object = result->object();
+                build_failed = false;
+                if (object)
+                    build_result = "Built " + std::to_string(static_cast<std::uint64_t>(number_or(*object, "files", 0.0))) +
+                                   " project files into " + string_or(*object, "directory");
+                set_status(build_result, false);
+                refresh_build_status();
+            }
+        }
+        ImGui::PopStyleColor(3);
+        note_item("build:build");
+        ImGui::EndDisabled();
+        ImGui::End();
+    }
+
     // Project-wide game settings, one page per area. Input is the first; others follow.
     void draw_game_config() {
         if (!game_config_open) {
@@ -10503,18 +11333,63 @@ struct EditorUi::Impl {
             const auto root = project ? string_or(*project, "root") : std::string{};
             const auto directory = (scene_action || file_action == FileAction::add_project_scene)
                 ? (root.empty() ? "scenes/" : root + "/scenes/")
-                : project_action ? std::string("workspace (relative path)")
+                : project_action ? std::string("any folder, or a path in the workspace")
                 : file_action == FileAction::import ? assets_root : std::string("captures/");
             ImGui::TextDisabled("Folder: %s", directory.c_str());
-            ImGui::SetNextItemWidth(360.0F * ui_scale);
-            if (ImGui::IsWindowAppearing())
-                ImGui::SetKeyboardFocusHere();
-            const bool submitted =
-                ImGui::InputText("Filename", action_filename.data(), action_filename.size(),
-                                 ImGuiInputTextFlags_EnterReturnsTrue);
-            if (file_action == FileAction::new_project)
+            bool submitted = false;
+            const float browse_width = 90.0F * ui_scale;
+            const bool can_browse = file_dialog_available() && !file_dialog_busy;
+            const auto browse_button = [&](const char* key) {
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!can_browse);
+                const bool pressed = ImGui::Button("Browse...", ImVec2(browse_width, 0.0F));
+                ImGui::EndDisabled();
+                note_item(key);
+                if (!file_dialog_available() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("The system file dialog is not available in this session. Type a path instead.");
+                return pressed;
+            };
+            if (file_action == FileAction::new_project) {
+                if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+                ImGui::SetNextItemWidth(360.0F * ui_scale);
                 ImGui::InputText("Project name", project_name.data(), project_name.size());
-            if (project_action) ImGui::TextDisabled("Use a workspace-relative path, e.g. projects/my-project/project.relayproject.");
+                note_item("dialog:project:name");
+                ImGui::SetNextItemWidth(360.0F * ui_scale - browse_width - ImGui::GetStyle().ItemSpacing.x);
+                ImGui::InputText("Location", project_location.data(), project_location.size());
+                note_item("dialog:project:location");
+                if (browse_button("dialog:project:browse")) {
+                    std::error_code ec;
+                    std::string start = project_location.data();
+                    if (!std::filesystem::is_directory(start, ec)) start = ".";
+                    choose_folder("Choose where to create the project", std::filesystem::absolute(start, ec).string(),
+                                  [this](const std::string& path) {
+                                      std::snprintf(project_location.data(), project_location.size(), "%s",
+                                                    workspace_path(path).c_str());
+                                  });
+                }
+                std::string location = project_location.data();
+                while (location.size() > 1U && (location.back() == '/' || location.back() == '\\')) location.pop_back();
+                const auto filename = (location.empty() ? std::string{} : location + "/") +
+                                      folder_name_for(project_name.data()) + "/project.relayproject";
+                std::snprintf(action_filename.data(), action_filename.size(), "%s", filename.c_str());
+                ImGui::TextDisabled("Creates %s", action_filename.data());
+            } else {
+                if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+                const bool browsable = project_action || file_action == FileAction::open ||
+                                       file_action == FileAction::save_as || file_action == FileAction::import ||
+                                       file_action == FileAction::add_project_scene;
+                ImGui::SetNextItemWidth(browsable ? 360.0F * ui_scale - browse_width - ImGui::GetStyle().ItemSpacing.x
+                                                  : 360.0F * ui_scale);
+                submitted = ImGui::InputText("Filename", action_filename.data(), action_filename.size(),
+                                             ImGuiInputTextFlags_EnterReturnsTrue);
+                note_item("dialog:file:name");
+                if (ImGui::IsItemEdited()) pick_external.clear();
+                if (browsable && browse_button("dialog:file:browse")) browse_for_action();
+                if (!pick_external.empty())
+                    ImGui::TextDisabled("Will be copied into the project from %s", pick_external.c_str());
+            }
+            if (project_action && file_action == FileAction::open_project)
+                ImGui::TextDisabled("Type a path (relative paths start in the workspace) or press Browse.");
             if (file_action == FileAction::screenshot || file_action == FileAction::recording)
                 ImGui::TextDisabled("Source: real Vulkan GPU; editor panels are excluded.");
             if (!dialog_error.empty())
@@ -10525,9 +11400,32 @@ struct EditorUi::Impl {
                 boolean_or(*runtime_status.object(), "paused", false))
                 ImGui::TextWrapped(
                     "Simulation is paused. Resume from Run or step frames to feed the recording.");
-            if (ImGui::Button("Continue") || submitted) {
-                const auto filename = json_escape(action_filename.data());
+            const bool continued = ImGui::Button("Continue");
+            note_item("dialog:file:continue");
+            if (continued || submitted) {
                 bool success = false;
+                bool copied = true;
+                if (!pick_external.empty()) {
+                    // A picked file outside the project comes in first: scenes into scenes/, models into models/.
+                    std::string problem;
+                    const auto source = std::filesystem::path{pick_external};
+                    std::string name;
+                    if (file_action == FileAction::add_project_scene)
+                        name = copy_picked_file(source, scenes_directory_path(), false, problem);
+                    else if (file_action == FileAction::import)
+                        name = "models/" + copy_picked_file(source, std::filesystem::absolute(assets_root) / "models", true, problem);
+                    if (name.empty() || name == "models/") {
+                        copied = false;
+                        dialog_error = problem.empty() ? "cannot copy the file into the project" : problem;
+                    } else {
+                        std::snprintf(action_filename.data(), action_filename.size(), "%s", name.c_str());
+                        pick_external.clear();
+                    }
+                }
+                const auto filename = json_escape(action_filename.data());
+                if (!copied) {
+                    // The error is shown below; the dialog stays open.
+                } else {
                 if (project_action) {
                     success = open_or_create_project(file_action == FileAction::new_project, action_filename.data());
                 } else if (file_action == FileAction::add_project_scene) {
@@ -10553,10 +11451,13 @@ struct EditorUi::Impl {
                     ImGui::CloseCurrentPopup();
                 else
                     dialog_error = status_message;
+                }
             }
             ImGui::SameLine();
-            if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+            if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                pick_external.clear();
                 ImGui::CloseCurrentPopup();
+            }
             ImGui::EndPopup();
         }
         if (show_help) {
@@ -14195,6 +15096,10 @@ void EditorUi::set_ide_handler(IdeHandler handler) {
     impl_->ide_launcher = std::move(handler);
 }
 
+void EditorUi::set_file_dialog_handler(FileDialogHandler handler) {
+    impl_->file_dialog_handler = std::move(handler);
+}
+
 void EditorUi::set_file_browser_handler(FileBrowserHandler handler) {
     impl_->file_browser = std::move(handler);
 }
@@ -14367,6 +15272,7 @@ bool EditorUi::handle_event(const void* const sdl_event) {
 
 void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     if (!impl_->vulkan_backend_started && !impl_->headless) return;
+    impl_->drain_dialog_results();
 
     impl_->preview_request = std::exchange(impl_->preview_wanted, {});
     // Thumbnails take the renderer's material preview when the Inspector does not need it.
@@ -14630,6 +15536,8 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     }
     impl_->draw_dialogs();
     impl_->draw_game_config();
+    impl_->draw_build_window();
+    impl_->draw_export_window();
     impl_->draw_editor_preferences();
     impl_->draw_asset_browser();
     impl_->draw_template_windows();

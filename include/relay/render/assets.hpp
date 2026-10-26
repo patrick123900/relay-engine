@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 #include <filesystem>
+#include <functional>
 #include <map>
 
 namespace relay {
@@ -149,6 +150,23 @@ struct TextureAsset {
     TextureWrap wrap_v{TextureWrap::repeat};
 };
 
+// One model's worth of mesh, material and texture data as the importer hands it to the registry,
+// before the registry places it after what it already holds.
+struct ImportBatch {
+    std::vector<MeshVertex> vertices;
+    std::vector<std::uint32_t> indices;
+    std::vector<MeshAsset> meshes;
+    std::vector<MaterialAsset> materials;
+    std::vector<TextureAsset> textures;
+};
+
+// Called for everything an importer registers, in order, so a build can write it down and a game
+// can register the same data again without the importer.
+struct AssetRecorder {
+    std::function<void(const ImportBatch&)> batch;
+    std::function<void(const ModelAsset&)> model;
+};
+
 // Owns every mesh, material and texture a renderer may draw. An instance starts populated with
 // Relay's built-in assets; imported content is appended. Registries are independent, so tests and
 // future multi-project hosts can hold several without sharing mutable state.
@@ -198,6 +216,7 @@ public:
     void set_shader_materials(ShaderMaterials materials, const void* owner = nullptr);
     // Drops what `owner` registered, when its engine goes away.
     void forget_owner(const void* owner);
+    void set_recorder(AssetRecorder recorder) { recorder_ = std::move(recorder); }
     [[nodiscard]] std::shared_ptr<const ResolvedShaderMaterial> shader_material(std::string_view path) const;
 
 private:
@@ -212,6 +231,7 @@ private:
     std::map<const void*, std::shared_ptr<const ResolvedSkyMaterial>> sky_materials_;
     std::map<const void*, ShaderMaterials> shader_materials_;
     std::uint64_t revision_{1U};
+    AssetRecorder recorder_;
 };
 
 struct ModelImportResult {

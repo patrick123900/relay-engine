@@ -22,6 +22,7 @@
 #include "relay/script/script_system.hpp"
 #include "relay/ui/ui_system.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -85,6 +86,8 @@ public:
     [[nodiscard]] VideoStatus video_status() const;
     void record_render_performance(double gpu_milliseconds, std::uint32_t draw_calls,
                                    std::uint32_t resource_count);
+    // Drawn frames per second, smoothed over about half a second; zero before frames are drawn.
+    [[nodiscard]] double render_frame_rate() const { return render_frame_rate_; }
     [[nodiscard]] PerformanceSnapshot performance(std::uint64_t after_frame = 0) const;
     [[nodiscard]] bool start_trace(const std::filesystem::path& path, std::string& error);
     [[nodiscard]] bool stop_trace(std::string& error);
@@ -137,6 +140,9 @@ public:
     [[nodiscard]] GraphicsSettings graphics_settings() const;
     // Saves graphics settings in the open project. The renderer picks them up on its next frame.
     [[nodiscard]] bool set_graphics_settings(const GraphicsSettings& settings, std::string& error);
+    // settings.build of the open project, or the defaults. Saving needs an open project.
+    [[nodiscard]] BuildSettings build_settings() const;
+    [[nodiscard]] bool set_build_settings(const BuildSettings& settings, std::string& error);
     // The state before the latest game step, blended `alpha` of the way to the current one, for
     // drawing between steps. Null outside a running, unpaused game or before its first step.
     [[nodiscard]] const RenderInterpolation* render_interpolation(double alpha);
@@ -182,6 +188,8 @@ private:
     CaptureQueue capture_queue_;
     VideoRecorder video_{capture_queue_};
     PerformanceTracker performance_;
+    double render_frame_rate_{};
+    std::chrono::steady_clock::time_point last_render_{};
     TraceRecorder trace_;
     std::deque<std::string> recent_input_events_;
     bool running_{true};

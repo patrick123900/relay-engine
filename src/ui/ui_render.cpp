@@ -1,3 +1,4 @@
+#include "relay/core/pak.hpp"
 #include "relay/ui/ui_render.hpp"
 
 #include "relay/render/image_decode.hpp"
@@ -196,9 +197,10 @@ std::shared_ptr<const UiTexture> UiImageCache::image(const std::string_view path
     // Project paths only: no traversal, hidden folders or symbolic links out of the project.
     const auto checked = workspace_file(root_.generic_string(), path, "");
     const auto full_path = checked.value_or(std::filesystem::path{});
-    std::error_code code;
-    const auto time = std::filesystem::last_write_time(full_path, code);
-    const auto size = code ? 0U : std::filesystem::file_size(full_path, code);
+    const auto file = vfs::stamp(full_path);
+    const std::error_code code = file.found ? std::error_code{} : std::make_error_code(std::errc::no_such_file_or_directory);
+    const auto time = file.time;
+    const auto size = file.size;
     if (found != entries_.end()) {
         found->second.checked = now;
         if (!code && time == found->second.time && size == found->second.size) return report(found->second);
@@ -217,7 +219,7 @@ std::shared_ptr<const UiTexture> UiImageCache::image(const std::string_view path
         entry.error = "not a project file";
         return report(entry);
     }
-    if (code || !std::filesystem::is_regular_file(full_path, code)) {
+    if (code) {
         entry.error = "cannot read the file";
         return report(entry);
     }
@@ -226,11 +228,18 @@ std::shared_ptr<const UiTexture> UiImageCache::image(const std::string_view path
         return report(entry);
     }
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
-    std::ifstream stream(full_path, std::ios::binary);
-    stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    bool read = false;
+    if (const auto packed = vfs::packed(full_path)) {
+        bytes.assign(packed->begin(), packed->end());
+        read = true;
+    } else {
+        std::ifstream stream(full_path, std::ios::binary);
+        stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        read = static_cast<bool>(stream);
+    }
     TextureAsset decoded;
     std::string reason;
-    if (!stream || !decode_image_rgba(bytes, full_path.extension().string(), decoded, reason)) {
+    if (!read || !decode_image_rgba(bytes, full_path.extension().string(), decoded, reason)) {
         entry.error = reason.empty() ? "cannot decode the image" : reason;
         return report(entry);
     }

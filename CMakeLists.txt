@@ -125,7 +125,12 @@ add_custom_command(
     COMMENT "Embedding shader include files"
     VERBATIM)
 
-add_library(relay_engine
+# The engine is built twice from the same objects. relay_engine is the editor's: it imports models
+# with Assimp and compiles project shaders with glslang. relay_engine_runtime is a built game's:
+# those two files are compiled without their libraries, so the game neither links nor ships them,
+# and reads models and shaders that a build cooked instead.
+set(RELAY_ENGINE_IMPORTER_SOURCES src/render/model_import.cpp src/render/shader_language.cpp)
+add_library(relay_engine_common OBJECT
     src/audio/audio_clip.cpp
     src/audio/audio_effects.cpp
     src/audio/audio_mixer.cpp
@@ -140,6 +145,7 @@ add_library(relay_engine
     src/core/hash.cpp
     src/core/input.cpp
     src/core/log.cpp
+    src/core/pak.cpp
     src/core/process.cpp
     src/physics/collision.cpp
     src/physics/jolt_world.cpp
@@ -150,16 +156,15 @@ add_library(relay_engine
     src/particles/particle_system.cpp
     src/render/software_renderer.cpp
     src/render/asset_manifest.cpp
+    src/render/cooked_assets.cpp
     src/render/asset_thumbnail.cpp
     src/render/scene_preview.cpp
     src/control/template_session.cpp
     src/render/assets.cpp
     src/render/blender_adapter.cpp
     src/render/image_decode.cpp
-    src/render/model_import.cpp
     src/render/scene_render.cpp
     src/render/sky.cpp
-    src/render/shader_language.cpp
     src/render/materials.cpp
     src/render/shader_graph.cpp
     ${RELAY_EMBEDDED_SHADER_SOURCES}
@@ -174,7 +179,10 @@ add_library(relay_engine
     src/scene/templates.cpp
     src/scene/node_types.cpp
     src/scene/project.cpp
+    src/scene/build_settings.cpp
+    src/scene/asset_references.cpp
     src/scene/project_package.cpp
+    src/scene/project_build.cpp
     src/scene/project_files.cpp
     src/scene/scene_edit.cpp
     src/scene/scene_history.cpp
@@ -187,24 +195,34 @@ add_library(relay_engine
     src/ui/ui_system.cpp
     ${RELAY_EMBEDDED_FILES}
 )
+add_library(relay_engine STATIC $<TARGET_OBJECTS:relay_engine_common> ${RELAY_ENGINE_IMPORTER_SOURCES})
+add_library(relay_engine_runtime STATIC $<TARGET_OBJECTS:relay_engine_common> ${RELAY_ENGINE_IMPORTER_SOURCES})
+set(RELAY_ENGINE_TARGETS relay_engine_common relay_engine relay_engine_runtime)
 add_library(Relay::Engine ALIAS relay_engine)
-target_link_libraries(relay_engine PRIVATE Jolt relay_miniaudio relay_stb_truetype ${CMAKE_DL_LIBS})
+add_library(Relay::EngineRuntime ALIAS relay_engine_runtime)
+foreach(_target IN LISTS RELAY_ENGINE_TARGETS)
+    target_link_libraries(${_target} PRIVATE Jolt relay_miniaudio relay_stb_truetype ${CMAKE_DL_LIBS})
+endforeach()
 # Project scripts compile with the same compiler as Relay unless RELAY_SCRIPT_COMPILER overrides it.
-target_compile_definitions(relay_engine PRIVATE
-    RELAY_SCRIPT_DEFAULT_COMPILER="${CMAKE_CXX_COMPILER}"
-    RELAY_SCRIPT_DEFAULT_SDK_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sdk")
-add_dependencies(relay_engine relay_protocol_codegen_check)
-
-target_compile_features(relay_engine PUBLIC cxx_std_20)
-target_include_directories(relay_engine
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
-)
+foreach(_target IN LISTS RELAY_ENGINE_TARGETS)
+    target_compile_definitions(${_target} PRIVATE
+        RELAY_SCRIPT_DEFAULT_COMPILER="${CMAKE_CXX_COMPILER}"
+        RELAY_SCRIPT_DEFAULT_SDK_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sdk"
+        RELAY_PLAYER_DEFAULT_PATH="${CMAKE_CURRENT_BINARY_DIR}/relay_player")
+    add_dependencies(${_target} relay_protocol_codegen_check)
+    target_compile_features(${_target} PUBLIC cxx_std_20)
+    target_include_directories(${_target}
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+    )
+endforeach()
 
 find_program(RELAY_FFMPEG ffmpeg)
 if(RELAY_FFMPEG)
-    target_compile_definitions(relay_engine PRIVATE RELAY_FFMPEG_PATH="${RELAY_FFMPEG}")
+    foreach(_target IN LISTS RELAY_ENGINE_TARGETS)
+        target_compile_definitions(${_target} PRIVATE RELAY_FFMPEG_PATH="${RELAY_FFMPEG}")
+    endforeach()
 endif()
 
 find_package(assimp CONFIG QUIET)
@@ -227,14 +245,18 @@ endif()
 
 find_package(PNG QUIET)
 if(TARGET PNG::PNG)
-    target_link_libraries(relay_engine PRIVATE PNG::PNG)
-    target_compile_definitions(relay_engine PRIVATE RELAY_HAS_PNG=1)
+    foreach(_target IN LISTS RELAY_ENGINE_TARGETS)
+        target_link_libraries(${_target} PRIVATE PNG::PNG)
+        target_compile_definitions(${_target} PRIVATE RELAY_HAS_PNG=1)
+    endforeach()
 endif()
 
 find_package(JPEG QUIET)
 if(TARGET JPEG::JPEG)
-    target_link_libraries(relay_engine PRIVATE JPEG::JPEG)
-    target_compile_definitions(relay_engine PRIVATE RELAY_HAS_JPEG=1)
+    foreach(_target IN LISTS RELAY_ENGINE_TARGETS)
+        target_link_libraries(${_target} PRIVATE JPEG::JPEG)
+        target_compile_definitions(${_target} PRIVATE RELAY_HAS_JPEG=1)
+    endforeach()
 endif()
 
 function(relay_enable_warnings target)
@@ -244,7 +266,9 @@ function(relay_enable_warnings target)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
 endfunction()
-relay_enable_warnings(relay_engine)
+foreach(_target IN LISTS RELAY_ENGINE_TARGETS)
+    relay_enable_warnings(${_target})
+endforeach()
 
 find_package(Vulkan QUIET)
 if(NOT TARGET Vulkan::Vulkan)
@@ -271,15 +295,19 @@ if(TARGET Vulkan::Vulkan)
         )
         FetchContent_MakeAvailable(VulkanHeaders)
     endif()
-    target_link_libraries(relay_engine PRIVATE Vulkan::Vulkan)
-    if(TARGET Vulkan::Headers)
-        target_link_libraries(relay_engine PRIVATE Vulkan::Headers)
-    endif()
-    target_compile_definitions(relay_engine PRIVATE RELAY_HAS_VULKAN=1)
+    foreach(_target IN LISTS RELAY_ENGINE_TARGETS)
+        target_link_libraries(${_target} PRIVATE Vulkan::Vulkan)
+        if(TARGET Vulkan::Headers)
+            target_link_libraries(${_target} PRIVATE Vulkan::Headers)
+        endif()
+        target_compile_definitions(${_target} PRIVATE RELAY_HAS_VULKAN=1)
+    endforeach()
 endif()
 
 if(WIN32)
-    target_link_libraries(relay_engine PRIVATE ws2_32 psapi)
+    foreach(_target IN LISTS RELAY_ENGINE_TARGETS)
+        target_link_libraries(${_target} PRIVATE ws2_32 psapi)
+    endforeach()
 endif()
 
 add_executable(relay_demo apps/relay_demo/main.cpp)
@@ -466,6 +494,7 @@ if(RELAY_ENABLE_SDL)
                                                   src/platform/vulkan_ray_tracing.cpp)
                 target_link_libraries(relay_demo PRIVATE relay_fidelityfx)
                 target_compile_definitions(relay_demo PRIVATE RELAY_HAS_FIDELITYFX=1)
+                set(RELAY_PLAYER_USES_FIDELITYFX ON)
             elseif(RELAY_ENABLE_FIDELITYFX)
                 message(STATUS "FidelityFX disabled: glslangValidator was not found")
             endif()
@@ -494,6 +523,50 @@ if(RELAY_ENABLE_SDL)
                 RELAY_REFLECTION_TRACE_PATH="${RELAY_reflection_trace_SHADER}"
                 RELAY_REFLECTION_ARGUMENTS_PATH="${RELAY_reflection_arguments_SHADER}"
             )
+
+            # The player runs a game that Run > Build project made; the build copies it into the
+            # build folder with its shaders and libraries. $ORIGIN lets it find lib/ beside itself, and
+            # the old-style RPATH reaches the libraries those libraries need as well.
+            add_executable(relay_player apps/relay_player/main.cpp src/platform/vulkan_window.cpp
+                src/platform/sdl_input.cpp src/platform/window_icon.cpp)
+            target_link_libraries(relay_player PRIVATE Relay::EngineRuntime SDL3::SDL3 Vulkan::Vulkan)
+            if(TARGET Vulkan::Headers)
+                target_link_libraries(relay_player PRIVATE Vulkan::Headers)
+            endif()
+            add_dependencies(relay_player relay_shaders)
+            relay_enable_warnings(relay_player)
+            target_compile_definitions(relay_player PRIVATE RELAY_HAS_SDL3=1)
+            target_compile_definitions(relay_player PRIVATE
+                RELAY_HAS_VULKAN_WINDOW=1
+                RELAY_VERTEX_SHADER_PATH="${RELAY_VERTEX_SHADER}"
+                RELAY_FRAGMENT_SHADER_PATH="${RELAY_FRAGMENT_SHADER}"
+                RELAY_TONE_VERTEX_PATH="${RELAY_TONE_VERTEX}"
+                RELAY_TONE_FRAGMENT_PATH="${RELAY_TONE_FRAGMENT}"
+                RELAY_UI_VERTEX_PATH="${RELAY_SHADER_OUTPUT_DIR}/ui.vert.spv"
+                RELAY_UI_FRAGMENT_PATH="${RELAY_SHADER_OUTPUT_DIR}/ui.frag.spv"
+                RELAY_SHADOW_VERTEX_PATH="${RELAY_SHADOW_VERTEX}"
+                RELAY_SHADOW_FRAGMENT_PATH="${RELAY_SHADOW_FRAGMENT}"
+                RELAY_GRID_VERTEX_PATH="${RELAY_GRID_vert}"
+                RELAY_GRID_FRAGMENT_PATH="${RELAY_GRID_frag}"
+                RELAY_SELECTION_VERTEX_PATH="${RELAY_SELECTION_vert}"
+                RELAY_SELECTION_FRAGMENT_PATH="${RELAY_SELECTION_frag}"
+                RELAY_GI_COMPOSITE_FRAGMENT_PATH="${RELAY_GI_COMPOSITE_FRAGMENT}"
+                RELAY_SKY_FRAGMENT_PATH="${RELAY_SKY_FRAGMENT}"
+                RELAY_PARTICLE_VERTEX_PATH="${RELAY_PARTICLE_vert}"
+                RELAY_PARTICLE_FRAGMENT_PATH="${RELAY_PARTICLE_frag}"
+                RELAY_REFLECTION_TRACE_PATH="${RELAY_reflection_trace_SHADER}"
+                RELAY_REFLECTION_ARGUMENTS_PATH="${RELAY_reflection_arguments_SHADER}"
+            )
+            if(RELAY_PLAYER_USES_FIDELITYFX)
+                target_sources(relay_player PRIVATE src/platform/vulkan_lighting.cpp
+                                                    src/platform/vulkan_ray_tracing.cpp)
+                target_link_libraries(relay_player PRIVATE relay_fidelityfx)
+                target_compile_definitions(relay_player PRIVATE RELAY_HAS_FIDELITYFX=1)
+            endif()
+            if(UNIX AND NOT APPLE)
+                set_target_properties(relay_player PROPERTIES BUILD_RPATH "\$ORIGIN/lib")
+                target_link_options(relay_player PRIVATE LINKER:--disable-new-dtags)
+            endif()
 
             if(RELAY_ENABLE_EDITOR_UI)
                 # Dear ImGui is pinned to a tagged release rather than the untagged docking branch, so
@@ -636,6 +709,17 @@ if(RELAY_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/lighting_render_tests.py"
                     "$<TARGET_FILE:relay_demo>")
         set_tests_properties(relay_lighting_render_tests PROPERTIES TIMEOUT 900)
+    endif()
+    if(TARGET relay_player)
+        # Builds the demo into a game and runs it offscreen, from where it was built and from a moved copy.
+        add_executable(relay_game_build_tests tests/game_build_tests.cpp)
+        target_link_libraries(relay_game_build_tests PRIVATE Relay::Engine)
+        add_dependencies(relay_game_build_tests relay_player)
+        target_compile_definitions(relay_game_build_tests PRIVATE
+            RELAY_DEMO_DIRECTORY="${CMAKE_CURRENT_SOURCE_DIR}/examples/demo")
+        relay_enable_warnings(relay_game_build_tests)
+        add_test(NAME relay_game_build_tests COMMAND relay_game_build_tests)
+        set_tests_properties(relay_game_build_tests PROPERTIES TIMEOUT 900)
     endif()
     if(TARGET relay_imgui)
         add_executable(relay_editor_headless_tests tests/editor_headless_tests.cpp

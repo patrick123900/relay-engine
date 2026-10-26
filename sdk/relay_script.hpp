@@ -312,6 +312,15 @@ public:
         return api().set_joint_motor(api().context, handle_, 1, speed) != 0;
     }
     bool stop_joint_motor() const { return api().set_joint_motor(api().context, handle_, 0, 0.0) != 0; }
+    // Makes this entity's hinge (degrees) or slider (metres) a servo that holds `target`, clamped
+    // to its limits, with the spring frequency, damping and motor force set in the editor. Call it
+    // again to move the target. False without a hinge or slider joint.
+    bool set_joint_target(double target) const {
+        return api().set_joint_target(api().context, handle_, target) != 0;
+    }
+    // True once this entity's joint broke under its break force or torque. It stays broken until
+    // the game stops.
+    [[nodiscard]] bool joint_broken() const { return api().joint_broken(api().context, handle_) != 0; }
 
     // Plays this entity's audio source from the start, as set up in the Inspector, restarting it
     // if it is already playing. `volume_db` is added to the authored volume and `pitch` multiplies
@@ -691,6 +700,13 @@ struct CharacterSettings {
     double push_force = 100.0;       // The most force it pushes dynamic bodies with.
     double stick_distance = 0.5;     // How far down it follows ground it walks off; 0 turns it off.
     std::uint32_t layer_mask = 0xffffffffu; // Colliders on these layers stop it.
+    // Inner body: a kinematic capsule that follows the character so that rays, overlaps, shape
+    // casts and dynamic bodies see it (the character alone collides outward only). `layer` and
+    // `mask` work like a collider's.
+    bool inner_body = false;
+    std::uint32_t layer = 1u;
+    std::uint32_t mask = 0xffffffffu;
+    double inner_padding = 0.02; // Metres the inner capsule is inset from the character's.
 };
 
 struct CharacterState {
@@ -704,7 +720,9 @@ struct CharacterState {
 inline bool Entity::make_character(const CharacterSettings& settings) const {
     const RelayCharacterSettings raw{settings.radius, settings.height, settings.step_height,
                                      settings.max_slope_degrees, settings.mass, settings.push_force,
-                                     settings.stick_distance, settings.layer_mask};
+                                     settings.stick_distance, settings.layer_mask,
+                                     settings.inner_body ? 1 : 0, settings.layer, settings.mask,
+                                     settings.inner_padding};
     return api().character_set(api().context, handle_, &raw) == 1;
 }
 inline std::optional<CharacterState> Entity::move_character(Vec3 velocity, double dt) const {

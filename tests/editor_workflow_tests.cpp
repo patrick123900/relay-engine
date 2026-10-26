@@ -609,6 +609,22 @@ void demo_project() {
     check(turned && std::abs(*turned) > 60.0, "the demo spinner's motor turns it");
     const auto stretch = engine.physics().joint_position(engine.scene(), bungee);
     check(stretch && *stretch < 2.2, "the demo bungee ball is held on its spring");
+    // The newer joints: a ragdoll arm that keeps within its limits and a rope that snaps when hit.
+    const auto upper = named("Upper arm"), lower = named("Lower arm"), crate = named("Hanging crate");
+    check(upper.valid() && lower.valid() && crate.valid() && named("Servo gate").valid() &&
+              engine.scene().get(upper)->joint->type == relay::Joint::Type::swing_twist &&
+              engine.scene().get(named("Servo gate"))->joint->motor_mode == relay::Joint::MotorMode::position &&
+              engine.scene().get(named("Servo gate"))->scripts.empty(),
+          "the demo has a servo gate, a ragdoll arm and a breakable rope");
+    check(position(upper).y < 4.2 && position(upper).y > 3.2 && position(lower).y > 2.5,
+          "the demo's ragdoll arm droops within its swing limits");
+    const auto rope = engine.physics().joint_state(engine.scene(), crate);
+    check(rope && rope->active && !rope->broken && position(crate).y > 2.5,
+          "the demo's hanging crate holds its own weight");
+    check(engine.physics().apply_impulse(engine.scene(), crate, {8, 0, 0}), "hit the hanging crate");
+    engine.step(10);
+    const auto snapped = engine.physics().joint_state(engine.scene(), crate);
+    check(snapped && snapped->broken, "a hard enough hit snaps the demo's rope");
     check(engine.stop_game(), "demo game session stops");
 }
 } // namespace
@@ -1377,6 +1393,110 @@ void joints() {
           "joints between entities spawned during the game work");
     check(engine.stop_game() && scene.contains(frame) && at(pendulum).x == 1.0,
           "Stop Game restores the authored joint scene");
+}
+
+// Servo motors, breakable joints and the ragdoll joint types.
+void joints_advanced() {
+    relay::Engine engine({64, 48, 1.0 / 60.0, 0x52454c4159ULL, true});
+    relay::ControlProtocol protocol(engine);
+    auto& scene = engine.scene();
+    const auto body = [&](const char* name, const relay::Vec3 position, const double mass = 1.0,
+                          const double gravity = 1.0, const relay::Vec3 half = {0.25, 0.25, 0.25}) {
+        const auto entity = scene.create(name);
+        (void)scene.set_transform(entity, {position, {}, {1, 1, 1}});
+        relay::BoxCollider box;
+        box.half_extents = half;
+        (void)scene.set_collider(entity, box);
+        relay::PhysicsBody physics;
+        physics.type = relay::PhysicsBody::Type::dynamic;
+        physics.mass = mass;
+        physics.gravity_scale = gravity;
+        (void)scene.set_physics_body(entity, physics);
+        return entity;
+    };
+    const auto joint = [&](const relay::Entity entity, const std::string& fields, const bool ok = true) {
+        return request(protocol, "scene.set_joint", "\"entity\":\"" + entity.to_string() + "\"," + fields, ok);
+    };
+    const auto at = [&](const relay::Entity entity) { return scene.get(entity)->transform.position; };
+
+    // Rules: unknown modes and out-of-range angles are refused, the new types are accepted.
+    const auto probe = body("Probe", {-10, 5, 0});
+    joint(probe, "\"type\":\"cone\"");
+    joint(probe, "\"swing_limit\":200", false);
+    joint(probe, "\"motor_mode\":\"turbo\"", false);
+    joint(probe, "\"break_force\":-1", false);
+    joint(probe, "\"type\":\"swing_twist\",\"limits\":true,\"limit_min\":-20,\"limit_max\":30,\"swing_limit_plane\":10");
+    joint(probe, "\"type\":\"hinge\",\"motor\":true,\"motor_mode\":\"position\",\"motor_target\":25,"
+                 "\"motor_frequency\":2,\"motor_damping\":0.7,\"break_force\":900,\"break_torque\":400");
+    const auto expected = *scene.get(probe)->joint;
+    check(expected.motor_mode == relay::Joint::MotorMode::position && expected.motor_target == 25.0 &&
+              expected.break_force == 900.0 && expected.break_torque == 400.0 && expected.swing_limit_plane == 10.0,
+          "scene.set_joint edits servo, swing and break fields");
+
+    // Servos.
+    const auto servo = body("Servo", {1, 5, 0}, 1.0, 0.0, {1, 0.1, 0.1});
+    joint(servo, "\"type\":\"hinge\",\"anchor_x\":-1,\"axis_x\":0,\"axis_y\":0,\"axis_z\":1,\"motor\":true,"
+                 "\"motor_mode\":\"position\",\"motor_target\":40,\"motor_force\":100000");
+    const auto slide = body("Slide servo", {11, 5, 0}, 1.0, 0.0);
+    joint(slide, "\"type\":\"slider\",\"axis_x\":1,\"axis_y\":0,\"axis_z\":0,\"motor\":true,"
+                 "\"motor_mode\":\"position\",\"motor_target\":0.6,\"motor_force\":100000");
+    // Breakable joints: a 10 kg weight hangs about 98 N from each.
+    const auto fragile = body("Fragile", {21, 5, 0}, 10.0);
+    joint(fragile, "\"type\":\"point\",\"anchor_y\":1,\"break_force\":40");
+    const auto sturdy = body("Sturdy", {31, 5, 0}, 10.0);
+    joint(sturdy, "\"type\":\"point\",\"anchor_y\":1,\"break_force\":2000");
+    // Ragdoll joints: each hangs sideways from a pivot one metre away and may droop 25 degrees.
+    const auto cone = body("Cone", {41, 5, 0});
+    joint(cone, "\"type\":\"cone\",\"anchor_x\":-1,\"axis_x\":1,\"axis_y\":0,\"axis_z\":0,\"swing_limit\":25");
+    const auto twisting = body("Swing twist", {51, 5, 0});
+    joint(twisting, "\"type\":\"swing_twist\",\"anchor_x\":-1,\"axis_x\":1,\"axis_y\":0,\"axis_z\":0,"
+                    "\"swing_limit\":25,\"swing_limit_plane\":25,\"limits\":true,\"limit_min\":-10,\"limit_max\":10");
+    const auto free = body("Free", {61, 5, 0});
+    joint(free, "\"type\":\"point\",\"anchor_x\":-1");
+
+    // The scene file keeps every new field.
+    relay::Scene saved;
+    saved.restore_state(scene.capture_state());
+    std::string error;
+    check(relay::save_scene_file_atomic(saved, "joints_advanced.relay.json", error), "save the advanced joints");
+    const auto loaded = relay::load_scene_file("joints_advanced.relay.json");
+    check(loaded && loaded.source_version == relay::scene_file_version &&
+              loaded.state->slots[probe.index].record.joint == scene.get(probe)->joint &&
+              loaded.state->slots[twisting.index].record.joint == scene.get(twisting)->joint,
+          "scene files save servo, swing and break fields");
+
+    check(engine.run_game(), "the advanced joint scene runs");
+    engine.step(120);
+    const auto angle = engine.physics().joint_position(scene, servo);
+    check(angle && std::abs(*angle - 40.0) < 2.0, "a hinge servo holds its target angle");
+    check(engine.physics().set_joint_target(scene, servo, -15.0), "a servo's target can change at runtime");
+    engine.step(120);
+    const auto moved = engine.physics().joint_position(scene, servo);
+    check(moved && std::abs(*moved + 15.0) < 2.0, "a hinge servo follows a new target");
+    const auto travel = engine.physics().joint_position(scene, slide);
+    check(travel && std::abs(*travel - 0.6) < 0.03, "a slider servo holds its target travel");
+    check(!engine.physics().set_joint_target(scene, fragile, 1.0), "point joints are not servos");
+
+    const auto broken = engine.physics().joint_state(scene, fragile);
+    check(broken && broken->broken && !broken->active && at(fragile).y < 3.0,
+          "a joint carrying more than its break force breaks and drops its body");
+    const auto holding = engine.physics().joint_state(scene, sturdy);
+    check(holding && holding->active && !holding->broken && holding->force > 60.0 && holding->force < 400.0 &&
+              at(sturdy).y > 3.9,
+          "a joint under its break force holds and reports the force it carries");
+    const auto status = request(protocol, "physics.joint_status", "\"entity\":\"" + fragile.to_string() + '"');
+    check(relay::field(*status.object(), "broken")->boolean() && *relay::field(*status.object(), "broken")->boolean(),
+          "physics.joint_status reports a broken joint");
+    engine.step(60);
+    check(engine.physics().joint_state(scene, fragile)->broken, "a broken joint stays broken");
+
+    const double cone_drop = 5.0 - at(cone).y, twist_drop = 5.0 - at(twisting).y, free_drop = 5.0 - at(free).y;
+    check(cone_drop > 0.3 && cone_drop < 0.55, "a cone joint stops its body swinging past the cone angle");
+    check(twist_drop > 0.3 && twist_drop < 0.55, "a swing twist joint limits its swing");
+    check(free_drop > 0.8, "a point joint swings further than the same body on a cone");
+    check(engine.stop_game(), "the advanced joint scene stops");
+    check(!scene.get(fragile)->joint->enabled || scene.get(fragile)->joint->break_force == 40.0,
+          "Stop Game keeps the authored joint");
 }
 
 // Writes 16-bit PCM WAV: `channels` interleaved, each sample from `wave(frame, channel)`.
@@ -2939,6 +3059,7 @@ int main() {
         demo_first_person_template();
         first_person_migration();
         joints();
+        joints_advanced();
         audio();
         audio_effects();
         audio_music_and_streams();

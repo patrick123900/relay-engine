@@ -138,7 +138,12 @@ struct PhysicsBody {
 // Run Game. Anchor and axis are in this node's local space, captured when the game starts. At least
 // one of the two bodies must be dynamic for the joint to do anything.
 struct Joint {
-    enum class Type : std::uint8_t { fixed, point, hinge, slider, distance } type{Type::hinge};
+    // cone and swing_twist are ragdoll joints: a ball and socket whose twist axis (`axis`) may
+    // swing inside a cone (`swing_limit`; swing_twist: an elliptical cone with the two half angles
+    // `swing_limit` about the plane axis and `swing_limit_plane`) and, for swing_twist, twist
+    // within limit_min..limit_max when `limits` is on.
+    enum class Type : std::uint8_t { fixed, point, hinge, slider, distance, cone, swing_twist } type{Type::hinge};
+    enum class MotorMode : std::uint8_t { velocity, position };
     Entity connected{};      // Invalid means the world.
     Vec3 anchor{};           // Pivot, in this node's local space.
     Vec3 axis{0.0, 1.0, 0.0}; // Hinge or slider axis, in this node's local space.
@@ -155,6 +160,20 @@ struct Joint {
     bool motor{};
     double motor_speed{90.0};
     double motor_force{1000.0};
+    // A position motor is a servo: it holds motor_target (degrees for hinges, metres for sliders,
+    // clamped to the limits) as a spring of motor_frequency Hz and motor_damping, within
+    // motor_force.
+    MotorMode motor_mode{MotorMode::velocity};
+    double motor_target{};
+    double motor_frequency{4.0};
+    double motor_damping{1.0};
+    // Cone and swing_twist: half angles in degrees, 0 to 180.
+    double swing_limit{45.0};
+    double swing_limit_plane{45.0};
+    // The joint breaks for the rest of the game when the force (N) or torque (N m) it carries in
+    // a step exceeds these; 0 never breaks.
+    double break_force{};
+    double break_torque{};
     // Distance: a spring of this frequency (Hz) and damping ratio holds the limits; 0 is rigid.
     double spring_frequency{};
     double spring_damping{0.5};

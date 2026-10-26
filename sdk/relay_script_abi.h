@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define RELAY_SCRIPT_ABI_VERSION 1u
+#define RELAY_SCRIPT_ABI_VERSION 2u
 #define RELAY_SCRIPT_ENTRY_SYMBOL "relay_script_module_v1"
 #define RELAY_SCRIPT_ERROR_CAPACITY 512u
 
@@ -122,6 +122,10 @@ typedef struct RelayCharacterSettings {
     double push_force;
     double stick_distance;
     uint32_t layer_mask;
+    int inner_body;
+    uint32_t layer;
+    uint32_t mask;
+    double inner_padding;
 } RelayCharacterSettings;
 
 typedef struct RelayCharacterState {
@@ -340,6 +344,10 @@ typedef struct RelayHostApi {
                           RelayCharacterState* state);
     int (*character_get)(void* context, RelayEntity entity, RelayCharacterState* state);
     int (*character_remove)(void* context, RelayEntity entity);
+    /* Turns the entity's hinge or slider into a servo holding `target` degrees or metres. */
+    int (*set_joint_target)(void* context, RelayEntity entity, double target);
+    /* 1 when the entity's joint broke under its break force or torque this game. */
+    int (*joint_broken)(void* context, RelayEntity entity);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

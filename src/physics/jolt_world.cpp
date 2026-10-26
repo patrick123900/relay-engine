@@ -28,6 +28,8 @@
 #include <Jolt/Physics/Constraints/DistanceConstraint.h>
 #include <Jolt/Physics/Constraints/FixedConstraint.h>
 #include <Jolt/Physics/Constraints/HingeConstraint.h>
+#include <Jolt/Physics/Constraints/ConeConstraint.h>
+#include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/Constraints/PointConstraint.h>
 #include <Jolt/Physics/Constraints/SliderConstraint.h>
 
@@ -107,9 +109,25 @@ bool related(const Scene& scene, Entity first, Entity second) {
     return false;
 }
 
+// Collision layer and mask of a body's entity: a character's inner body, else its collider.
+struct BodyLayers {
+    std::uint32_t layer{};
+    std::uint32_t mask{};
+};
+using InnerLayers = std::map<Entity, BodyLayers>;
+
+std::optional<BodyLayers> body_layers(const Scene& scene, const InnerLayers& inner, const Entity entity,
+                                      const bool enabled_only) {
+    if (const auto found = inner.find(entity); found != inner.end()) return found->second;
+    const auto* record = scene.get(entity);
+    if (!record || !record->collider || (enabled_only && !record->collider->enabled)) return std::nullopt;
+    return BodyLayers{record->collider->layer, record->collider->mask};
+}
+
 class ContactFilter final : public JPH::ContactListener {
 public:
     const Scene* scene{};
+    const InnerLayers* inner{};
     std::map<JPH::BodyID, Entity> entities;
     std::map<std::pair<Entity, Entity>, unsigned> active_pairs;
     std::vector<ContactEvent> pending;
@@ -124,11 +142,9 @@ public:
         if (!scene) return JPH::ValidateResult::AcceptAllContactsForThisBodyPair;
         const auto first_entity = from_user_data(first.GetUserData());
         const auto second_entity = from_user_data(second.GetUserData());
-        const auto* a = scene->get(first_entity);
-        const auto* b = scene->get(second_entity);
-        if (!a || !b || !a->collider || !b->collider ||
-            !(a->collider->layer & b->collider->mask) ||
-            !(b->collider->layer & a->collider->mask) ||
+        const auto a = body_layers(*scene, *inner, first_entity, false);
+        const auto b = body_layers(*scene, *inner, second_entity, false);
+        if (!a || !b || !(a->layer & b->mask) || !(b->layer & a->mask) ||
             related(*scene, first_entity, second_entity) ||
             joined.contains(std::minmax(first_entity, second_entity)))
             return JPH::ValidateResult::RejectAllContactsForThisBodyPair;
@@ -386,20 +402,21 @@ std::optional<Vec3> local_position_in_parent(const Scene& scene, const EntityRec
                 dot(relative, cross(axes[0], axes[1])) / determinant};
 }
 
-// What a character collides with: enabled colliders on its layers, other than its own node and the
-// nodes it is attached to or carries.
+// What a character collides with: enabled colliders (and other characters' inner bodies) on its
+// layers, other than its own node and the nodes it is attached to or carries.
 class CharacterBodyFilter final : public JPH::BodyFilter {
 public:
-    CharacterBodyFilter(const Scene& scene, const std::uint32_t mask, const Entity self)
-        : scene_(scene), mask_(mask), self_(self) {}
+    CharacterBodyFilter(const Scene& scene, const InnerLayers& inner, const std::uint32_t mask,
+                        const Entity self)
+        : scene_(scene), inner_(inner), mask_(mask), self_(self) {}
     bool ShouldCollideLocked(const JPH::Body& body) const override {
         const auto entity = from_user_data(body.GetUserData());
-        const auto* record = scene_.get(entity);
-        return record && record->collider && record->collider->enabled &&
-               (record->collider->layer & mask_) && !related(scene_, entity, self_);
+        const auto layers = body_layers(scene_, inner_, entity, true);
+        return layers && (layers->layer & mask_) && !related(scene_, entity, self_);
     }
 private:
     const Scene& scene_;
+    const InnerLayers& inner_;
     std::uint32_t mask_;
     Entity self_;
 };
@@ -410,6 +427,10 @@ struct JointEntry {
     JPH::Ref<JPH::TwoBodyConstraint> constraint;
     Joint::Type type{};
     bool ignores_contacts{};
+    double break_force{}; // Newtons and newton metres; 0 never breaks.
+    double break_torque{};
+    double force{};       // What the constraint carried over the last step.
+    double torque{};
 };
 
 class JoltState {
@@ -417,6 +438,7 @@ public:
     explicit JoltState(const AssetRegistry* assets) : jobs_(JPH::cMaxPhysicsJobs), assets_(assets) {
         system_.Init(4096, 0, 16384, 8192, broad_layers_, broad_filter_, pair_filter_);
         system_.SetContactListener(&contact_filter_);
+        contact_filter_.inner = &inner_;
     }
     ~JoltState() {
         for (const auto& joint : joints_) system_.RemoveConstraint(joint.constraint);
@@ -426,6 +448,12 @@ public:
             (void)entity;
             api.RemoveBody(id);
             api.DestroyBody(id);
+        }
+        for (const auto& [entity, entry] : characters_) {
+            (void)entity;
+            if (entry.inner.IsInvalid()) continue;
+            api.RemoveBody(entry.inner);
+            api.DestroyBody(entry.inner);
         }
     }
 
@@ -466,7 +494,14 @@ public:
             remove_constraint(joint);
             return true;
         });
-        std::erase_if(characters_, [&](const auto& entry) { return !scene.contains(entry.first); });
+        for (auto it = characters_.begin(); it != characters_.end();) {
+            if (scene.contains(it->first)) {
+                ++it;
+                continue;
+            }
+            destroy_inner_body(it->first, it->second);
+            it = characters_.erase(it);
+        }
         for (auto it = bodies_.begin(); it != bodies_.end();) {
             if (scene.contains(it->first)) {
                 ++it;
@@ -558,7 +593,7 @@ public:
     // positions and motor speeds describe the node's motion about its axis.
     void add_joint(const Scene& scene, const Entity owner) {
         const auto* record = scene.get(owner);
-        if (!record || !record->joint || !record->joint->enabled) return;
+        if (!record || !record->joint || !record->joint->enabled || broken_.contains(owner)) return;
         const auto& joint = *record->joint;
         const auto body = bodies_.find(owner);
         if (body == bodies_.end()) return;
@@ -603,6 +638,8 @@ public:
                 hinge->mLimitsMax = static_cast<float>(joint.limit_max) * degrees;
             }
             hinge->mMotorSettings.SetTorqueLimit(static_cast<float>(joint.motor_force));
+            hinge->mMotorSettings.mSpringSettings.mFrequency = static_cast<float>(joint.motor_frequency);
+            hinge->mMotorSettings.mSpringSettings.mDamping = static_cast<float>(joint.motor_damping);
             settings = hinge;
             break;
         }
@@ -616,7 +653,31 @@ public:
                 slider->mLimitsMax = static_cast<float>(joint.limit_max);
             }
             slider->mMotorSettings.SetForceLimit(static_cast<float>(joint.motor_force));
+            slider->mMotorSettings.mSpringSettings.mFrequency = static_cast<float>(joint.motor_frequency);
+            slider->mMotorSettings.mSpringSettings.mDamping = static_cast<float>(joint.motor_damping);
             settings = slider;
+            break;
+        }
+        case Joint::Type::cone: {
+            auto cone = new JPH::ConeConstraintSettings;
+            cone->mPoint1 = cone->mPoint2 = anchor;
+            cone->mTwistAxis1 = cone->mTwistAxis2 = axis;
+            cone->mHalfConeAngle = std::clamp(static_cast<float>(joint.swing_limit) * degrees, 0.0f,
+                                              static_cast<float>(JPH::JPH_PI));
+            settings = cone;
+            break;
+        }
+        case Joint::Type::swing_twist: {
+            auto swing = new JPH::SwingTwistConstraintSettings;
+            swing->mPosition1 = swing->mPosition2 = anchor;
+            swing->mTwistAxis1 = swing->mTwistAxis2 = axis;
+            swing->mPlaneAxis1 = swing->mPlaneAxis2 = normal;
+            const auto pi = static_cast<float>(JPH::JPH_PI);
+            swing->mNormalHalfConeAngle = std::clamp(static_cast<float>(joint.swing_limit) * degrees, 0.001f, pi);
+            swing->mPlaneHalfConeAngle = std::clamp(static_cast<float>(joint.swing_limit_plane) * degrees, 0.001f, pi);
+            swing->mTwistMinAngle = joint.limits ? static_cast<float>(joint.limit_min) * degrees : -pi;
+            swing->mTwistMaxAngle = joint.limits ? static_cast<float>(joint.limit_max) * degrees : pi;
+            settings = swing;
             break;
         }
         case Joint::Type::distance: {
@@ -643,12 +704,15 @@ public:
             api.CreateConstraint(settings.GetPtr(), partner, body->second);
         if (!constraint) return;
         JointEntry entry{owner, joint.connected, constraint, joint.type,
-                         !joint.collide_connected && joint.connected.valid()};
+                         !joint.collide_connected && joint.connected.valid(),
+                         joint.break_force, joint.break_torque};
         if (entry.ignores_contacts)
             contact_filter_.joined.insert(std::minmax(owner, joint.connected));
         system_.AddConstraint(constraint);
         joints_.push_back(std::move(entry));
-        set_motor(joints_.back(), joint.motor, joint.motor_speed);
+        if (joint.motor && joint.motor_mode == Joint::MotorMode::position)
+            set_target(joints_.back(), joint.motor_target);
+        else set_motor(joints_.back(), joint.motor, joint.motor_speed);
         api.ActivateBody(body->second);
         if (!partner.IsInvalid()) api.ActivateBody(partner);
     }
@@ -681,6 +745,85 @@ public:
             return true;
         }
         return false;
+    }
+
+    // Holds a hinge (degrees) or slider (metres) at `target` with its servo spring.
+    static bool set_target(const JointEntry& joint, const double target) {
+        if (joint.type == Joint::Type::hinge) {
+            auto& hinge = static_cast<JPH::HingeConstraint&>(*joint.constraint);
+            hinge.SetMotorState(JPH::EMotorState::Position);
+            hinge.SetTargetAngle(static_cast<float>(std::clamp(target, -180.0, 180.0) * JPH::JPH_PI / 180.0));
+            return true;
+        }
+        if (joint.type == Joint::Type::slider) {
+            auto& slider = static_cast<JPH::SliderConstraint&>(*joint.constraint);
+            slider.SetMotorState(JPH::EMotorState::Position);
+            slider.SetTargetPosition(static_cast<float>(target));
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool broken(const Entity owner) const { return broken_.contains(owner); }
+
+    // Impulses (N s, N m s) the constraint applied over the last step.
+    static std::pair<double, double> joint_impulses(const JointEntry& entry) {
+        const auto length = [](const auto& value) { return static_cast<double>(value.LengthSq()); };
+        const auto combine = [](std::initializer_list<double> squares) {
+            double sum = 0.0;
+            for (const auto value : squares) sum += value;
+            return std::sqrt(sum);
+        };
+        const auto square = [](const double value) { return value * value; };
+        switch (entry.type) {
+        case Joint::Type::fixed: {
+            const auto& c = static_cast<const JPH::FixedConstraint&>(*entry.constraint);
+            return {c.GetTotalLambdaPosition().Length(), c.GetTotalLambdaRotation().Length()};
+        }
+        case Joint::Type::point:
+            return {static_cast<const JPH::PointConstraint&>(*entry.constraint).GetTotalLambdaPosition().Length(), 0.0};
+        case Joint::Type::hinge: {
+            const auto& c = static_cast<const JPH::HingeConstraint&>(*entry.constraint);
+            return {c.GetTotalLambdaPosition().Length(),
+                    combine({length(c.GetTotalLambdaRotation()), square(c.GetTotalLambdaRotationLimits()),
+                             square(c.GetTotalLambdaMotor())})};
+        }
+        case Joint::Type::slider: {
+            const auto& c = static_cast<const JPH::SliderConstraint&>(*entry.constraint);
+            return {combine({length(c.GetTotalLambdaPosition()), square(c.GetTotalLambdaPositionLimits()),
+                             square(c.GetTotalLambdaMotor())}),
+                    c.GetTotalLambdaRotation().Length()};
+        }
+        case Joint::Type::distance:
+            return {std::abs(static_cast<const JPH::DistanceConstraint&>(*entry.constraint).GetTotalLambdaPosition()), 0.0};
+        case Joint::Type::cone: {
+            const auto& c = static_cast<const JPH::ConeConstraint&>(*entry.constraint);
+            return {c.GetTotalLambdaPosition().Length(), std::abs(c.GetTotalLambdaRotation())};
+        }
+        case Joint::Type::swing_twist: {
+            const auto& c = static_cast<const JPH::SwingTwistConstraint&>(*entry.constraint);
+            return {c.GetTotalLambdaPosition().Length(),
+                    combine({square(c.GetTotalLambdaTwist()), square(c.GetTotalLambdaSwingY()),
+                             square(c.GetTotalLambdaSwingZ()), static_cast<double>(c.GetTotalLambdaMotor().LengthSq())})};
+        }
+        }
+        return {};
+    }
+
+    // Records each joint's load over the step and breaks the ones carrying more than they may.
+    void update_joint_loads(const double seconds) {
+        if (seconds <= 0.0) return;
+        std::erase_if(joints_, [&](JointEntry& entry) {
+            const auto [force, torque] = joint_impulses(entry);
+            entry.force = force / seconds;
+            entry.torque = torque / seconds;
+            if ((entry.break_force <= 0.0 || entry.force <= entry.break_force) &&
+                (entry.break_torque <= 0.0 || entry.torque <= entry.break_torque))
+                return false;
+            broken_.insert(entry.owner);
+            remove_constraint(entry);
+            return true;
+        });
     }
 
     [[nodiscard]] const JointEntry* joint(const Entity owner) const {
@@ -779,6 +922,7 @@ public:
             RELAY_PROFILE_SCOPE("Jolt update");
             system_.Update(static_cast<float>(seconds), 1, &allocator_, &jobs_);
         }
+        update_joint_loads(seconds);
         for (const auto& pair : contact_filter_.held)
             contact_filter_.pending.push_back({0, pair.first, pair.second, false});
         contact_filter_.held.clear();
@@ -847,6 +991,8 @@ public:
         if (!finite(s.push_force) || s.push_force < 0.0 || s.push_force > 1e9) return "push force must not be negative";
         if (!finite(s.stick_distance) || s.stick_distance < 0.0 || s.stick_distance > 10.0)
             return "stick distance must be between 0 and 10 metres";
+        if (!finite(s.inner_padding) || s.inner_padding < 0.0 || s.inner_padding >= s.radius)
+            return "inner padding must be at least 0 and less than the radius";
         return {};
     }
 
@@ -892,7 +1038,8 @@ public:
                                                         JPH::Quat::sIdentity(), entity.packed(), &system_);
             entry.written = pose->position;
             entry.settings = s;
-            characters_.emplace(entity, std::move(entry));
+            auto& added = characters_.emplace(entity, std::move(entry)).first->second;
+            sync_inner_body(entity, added);
             result.ok = true;
             return result;
         }
@@ -903,7 +1050,7 @@ public:
             // Only the shape's volume can collide with something, so it is tested in place, with the
             // node's own position as the character's if a script moved it.
             adopt_teleport(entry, pose->position);
-            const CharacterBodyFilter filter(scene, s.layer_mask, entity);
+            const CharacterBodyFilter filter(scene, inner_, s.layer_mask, entity);
             if (!character.SetShape(shape.GetPtr(), 1.5f * system_.GetPhysicsSettings().mPenetrationSlop,
                                     system_.GetDefaultBroadPhaseLayerFilter(Layers::moving),
                                     system_.GetDefaultLayerFilter(Layers::moving), filter, {}, allocator_)) {
@@ -916,6 +1063,7 @@ public:
         character.SetMass(static_cast<float>(s.mass));
         character.SetMaxStrength(static_cast<float>(s.push_force));
         entry.settings = s;
+        sync_inner_body(entity, entry);
         result.ok = true;
         return result;
     }
@@ -928,7 +1076,7 @@ public:
         auto& entry = found->second;
         auto& character = *entry.character;
         adopt_teleport(entry, pose->position);
-        const CharacterBodyFilter filter(scene, entry.settings.layer_mask, entity);
+        const CharacterBodyFilter filter(scene, inner_, entry.settings.layer_mask, entity);
         const auto before = character.GetPosition();
         const auto& settings = entry.settings;
 
@@ -952,6 +1100,9 @@ public:
 
         const auto after = from_jolt(character.GetPosition());
         entry.written = after;
+        if (!entry.inner.IsInvalid())
+            system_.GetBodyInterface().MoveKinematic(entry.inner, character.GetPosition(), JPH::Quat::sIdentity(),
+                                                     static_cast<float>(seconds));
         if (auto* record = scene.get(entity)) {
             if (const auto local = local_position_in_parent(scene, *record, after)) {
                 auto transform = record->transform;
@@ -971,7 +1122,14 @@ public:
         return describe(entity, found->second);
     }
 
-    bool remove_character(const Entity entity) { return characters_.erase(entity) != 0U; }
+    bool remove_character(const Entity entity) {
+        const auto found = characters_.find(entity);
+        if (found == characters_.end()) return false;
+        destroy_inner_body(entity, found->second);
+        characters_.erase(found);
+        return true;
+    }
+    [[nodiscard]] const InnerLayers& inner_layers() const { return inner_; }
 
     [[nodiscard]] std::optional<JPH::BodyID> body(Entity entity) const {
         const auto found = bodies_.find(entity);
@@ -994,16 +1152,76 @@ private:
         JPH::Ref<JPH::CharacterVirtual> character;
         CharacterSettings settings;
         Vec3 written; // The world position last given to the node, to notice scripts moving it.
+        JPH::BodyID inner; // The kinematic inner body, when the settings ask for one.
     };
 
+    // The inner body is an upright capsule inset by `inner_padding`, so it stays clear of the
+    // character's own contact tolerance.
+    static JPH::ShapeRefC inner_shape(const CharacterSettings& s) {
+        CharacterSettings inset = s;
+        inset.radius = std::max(s.radius - s.inner_padding, 0.01);
+        inset.height = std::max(s.height - 2.0 * s.inner_padding, inset.radius * 2.0);
+        return character_shape(inset);
+    }
+
+    // Brings the inner body in line with the settings: created, reshaped, moved to the character
+    // or removed.
+    void sync_inner_body(const Entity entity, CharacterEntry& entry) {
+        auto& api = system_.GetBodyInterface();
+        if (!entry.settings.inner_body) {
+            destroy_inner_body(entity, entry);
+            return;
+        }
+        inner_[entity] = {entry.settings.layer, entry.settings.mask};
+        const auto shape = inner_shape(entry.settings);
+        if (entry.inner.IsInvalid()) {
+            JPH::BodyCreationSettings settings(shape.GetPtr(), entry.character->GetPosition(),
+                                               JPH::Quat::sIdentity(), JPH::EMotionType::Kinematic, Layers::moving);
+            settings.mUserData = entity.packed();
+            settings.mAllowSleeping = false;
+            entry.inner = api.CreateAndAddBody(settings, JPH::EActivation::Activate);
+            if (!entry.inner.IsInvalid()) contact_filter_.entities.emplace(entry.inner, entity);
+            else inner_.erase(entity);
+            return;
+        }
+        api.SetShape(entry.inner, shape.GetPtr(), true, JPH::EActivation::Activate);
+        api.SetPositionAndRotation(entry.inner, entry.character->GetPosition(), JPH::Quat::sIdentity(),
+                                   JPH::EActivation::Activate);
+    }
+
+    // Removes the inner body and ends the contacts it had, so no event stream keeps a pair whose
+    // body is gone as touching.
+    void destroy_inner_body(const Entity entity, CharacterEntry& entry) {
+        inner_.erase(entity);
+        if (entry.inner.IsInvalid()) return;
+        auto& api = system_.GetBodyInterface();
+        api.RemoveBody(entry.inner);
+        api.DestroyBody(entry.inner);
+        contact_filter_.entities.erase(entry.inner);
+        entry.inner = JPH::BodyID();
+        auto& pairs = contact_filter_.active_pairs;
+        for (auto pair = pairs.begin(); pair != pairs.end();) {
+            if (pair->first.first != entity && pair->first.second != entity) {
+                ++pair;
+                continue;
+            }
+            contact_filter_.pending.push_back({0, pair->first.first, pair->first.second, false});
+            pair = pairs.erase(pair);
+        }
+    }
+
     // A script that set the node's position since the last move has teleported the character.
-    static void adopt_teleport(CharacterEntry& entry, const Vec3 node_position) {
+    void adopt_teleport(CharacterEntry& entry, const Vec3 node_position) {
         const auto moved = [](const double a, const double b) { return std::abs(a - b) > 1e-5; };
         if (!moved(node_position.x, entry.written.x) && !moved(node_position.y, entry.written.y) &&
             !moved(node_position.z, entry.written.z)) return;
         entry.character->SetPosition(to_jolt_position(node_position));
         entry.character->SetLinearVelocity(JPH::Vec3::sZero());
         entry.written = node_position;
+        // The inner body jumps with it rather than sweeping through whatever lies between.
+        if (!entry.inner.IsInvalid())
+            system_.GetBodyInterface().SetPositionAndRotation(entry.inner, to_jolt_position(node_position),
+                                                              JPH::Quat::sIdentity(), JPH::EActivation::Activate);
     }
 
     static CharacterState describe(const Entity, const CharacterEntry& entry) {
@@ -1029,7 +1247,9 @@ private:
     std::map<Entity, JPH::BodyID> bodies_;
     std::map<Entity, std::size_t> mesh_triangles_; // Budget taken by each triangle-mesh body.
     std::vector<JointEntry> joints_;
+    std::set<Entity> broken_; // Joints that broke this game; they stay gone until it stops.
     std::map<Entity, CharacterEntry> characters_;
+    InnerLayers inner_;
     std::deque<ContactEvent> events_;
     std::uint64_t latest_sequence_{};
     const AssetRegistry* assets_{};
@@ -1063,8 +1283,8 @@ void cast_ray(JoltState& state, const Scene& scene, const Vec3 origin, const Vec
     float nearest = std::numeric_limits<float>::infinity();
     for (const auto& hit : hits.mHits) {
         const auto entity = from_user_data(state.system().GetBodyInterface().GetUserData(hit.mBodyID));
-        const auto* record = scene.get(entity);
-        if (!record || !record->collider || !(record->collider->layer & layer_mask) ||
+        const auto layers = body_layers(scene, state.inner_layers(), entity, false);
+        if (!layers || !(layers->layer & layer_mask) ||
             hit.mFraction >= nearest || (ignore.valid() && entity == ignore)) continue;
         JPH::BodyLockRead lock(state.system().GetBodyLockInterface(), hit.mBodyID);
         if (!lock.Succeeded()) continue;
@@ -1083,16 +1303,16 @@ void cast_ray(JoltState& state, const Scene& scene, const Vec3 origin, const Vec
 // Enabled colliders on `mask` layers, except `ignore`, for game queries.
 class SceneBodyFilter final : public JPH::BodyFilter {
 public:
-    SceneBodyFilter(const Scene& scene, const std::uint32_t mask, const Entity ignore)
-        : scene_(scene), mask_(mask), ignore_(ignore) {}
+    SceneBodyFilter(const Scene& scene, const InnerLayers& inner, const std::uint32_t mask, const Entity ignore)
+        : scene_(scene), inner_(inner), mask_(mask), ignore_(ignore) {}
     bool ShouldCollideLocked(const JPH::Body& body) const override {
         const auto entity = from_user_data(body.GetUserData());
-        const auto* record = scene_.get(entity);
-        return record && record->collider && record->collider->enabled &&
-               (record->collider->layer & mask_) && !(ignore_.valid() && entity == ignore_);
+        const auto layers = body_layers(scene_, inner_, entity, true);
+        return layers && (layers->layer & mask_) && !(ignore_.valid() && entity == ignore_);
     }
 private:
     const Scene& scene_;
+    const InnerLayers& inner_;
     std::uint32_t mask_;
     Entity ignore_;
 };
@@ -1160,9 +1380,8 @@ void collect_overlaps(JoltState& state, const Scene& scene, const JPH::Shape& sh
     std::set<Entity> unique;
     for (const auto& hit : hits.mHits) {
         const auto other = from_user_data(api.GetUserData(hit.mBodyID2));
-        const auto* record = scene.get(other);
-        if (other == ignore || !record || !record->collider || !record->collider->enabled ||
-            !(record->collider->layer & mask) || (layer && !(*layer & record->collider->mask)))
+        const auto layers = body_layers(scene, state.inner_layers(), other, true);
+        if (other == ignore || !layers || !(layers->layer & mask) || (layer && !(*layer & layers->mask)))
             continue;
         unique.insert(other);
     }
@@ -1319,6 +1538,33 @@ std::optional<double> PhysicsWorld::joint_position(const Scene& scene, const Ent
     default: return std::nullopt;
     }
 }
+std::optional<JointState> PhysicsWorld::joint_state(const Scene& scene, const Entity entity) {
+    if (!scene.contains(entity)) return std::nullopt;
+    ensure_built(scene);
+    JointState state;
+    if (impl_->state->broken(entity)) {
+        state.broken = true;
+        return state;
+    }
+    const auto* joint = impl_->state->joint(entity);
+    if (!joint) return std::nullopt;
+    state.active = true;
+    state.position = joint_position(scene, entity);
+    state.force = joint->force;
+    state.torque = joint->torque;
+    return state;
+}
+bool PhysicsWorld::set_joint_target(const Scene& scene, const Entity entity, const double target) {
+    if (!scene.contains(entity) || !std::isfinite(target) || std::abs(target) > 1e6) return false;
+    ensure_built(scene);
+    const auto* joint = impl_->state->joint(entity);
+    if (!joint || !JoltState::set_target(*joint, target)) return false;
+    auto& api = impl_->state->system().GetBodyInterface();
+    api.ActivateBody(joint->constraint->GetBody2()->GetID());
+    if (joint->constraint->GetBody1() != &JPH::Body::sFixedToWorld)
+        api.ActivateBody(joint->constraint->GetBody1()->GetID());
+    return true;
+}
 bool PhysicsWorld::set_joint_motor(const Scene& scene, const Entity entity, const bool on,
                                    const double speed) {
     if (!scene.contains(entity) || !std::isfinite(speed) || std::abs(speed) > 1e6) return false;
@@ -1435,7 +1681,7 @@ CollisionRaycast PhysicsWorld::shape_cast(const Scene& scene, const CollisionSha
     settings.mBackFaceModeConvex = JPH::EBackFaceMode::CollideWithBackFaces;
     settings.mReturnDeepestPoint = true;
     JPH::ClosestHitCollisionCollector<JPH::CastShapeCollector> hit;
-    const SceneBodyFilter filter(scene, layer_mask, ignore);
+    const SceneBodyFilter filter(scene, state.inner_layers(), layer_mask, ignore);
     state.system().GetNarrowPhaseQuery().CastShape(cast, settings, to_jolt_position(origin), hit, {}, {},
                                                     filter);
     if (!hit.HadHit()) return result;
@@ -1552,10 +1798,10 @@ CollisionOverlaps collision_overlaps(const Scene& scene, Entity entity,
     std::set<Entity> unique;
     for (const auto& hit : hits.mHits) {
         const auto other = from_user_data(api.GetUserData(hit.mBodyID2));
-        const auto* record = scene.get(other);
-        if (other == entity || !record || !record->collider ||
-            !(target->collider->layer & record->collider->mask) ||
-            !(record->collider->layer & target->collider->mask)) continue;
+        const auto layers = body_layers(scene, state.inner_layers(), other, false);
+        if (other == entity || !layers ||
+            !(target->collider->layer & layers->mask) ||
+            !(layers->layer & target->collider->mask)) continue;
         unique.insert(other);
     }
     for (const auto other : unique) {

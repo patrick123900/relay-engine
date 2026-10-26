@@ -1331,6 +1331,23 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "physics_joint_status",
+    {
+      title: "Inspect joint",
+      description: "Read a node's joint during Run Game: whether its constraint exists or has broken, its hinge angle in degrees, slider travel in metres or distance length, and the force (N) and torque (N m) it carried over the last step, which is what break_force and break_torque are compared with.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$"))
+      }),
+      annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["physics_joint_status"];
+        if (override) return override(input as JsonObject);
+        return invoke("physics.joint_status", {"entity": input["entity"]});
+      },
+  );
+
+  server.registerTool(
     "physics_contact_events",
     {
       title: "Read collision contacts",
@@ -1513,12 +1530,12 @@ export function registerGeneratedTools(
     "scene_set_joint",
     {
       title: "Configure joint",
-      description: "Add, edit or remove an undoable joint linking this node's physics body to another node's body, or to the world when connected is empty, during Run Game. Types: fixed (weld), point (ball and socket), hinge (turns about axis, optional angle limits in degrees with min in [-180, 0] and max in [0, 180], optional motor), slider (moves along axis, optional travel limits in metres with min <= 0 <= max, optional motor) and distance (rope or spring between anchor and connected_anchor; limits are lengths, otherwise the starting length is kept). Anchor and axis are in this node's local space; connected_anchor is in the connected node's space, or world space for the world. At least one body must be dynamic. Joined bodies do not collide unless collide_connected is set. Changing type resets the limits to that type's defaults unless limits are given too.",
+      description: "Add, edit or remove an undoable joint linking this node's physics body to another node's body, or to the world when connected is empty, during Run Game. Types: fixed (weld), point (ball and socket), hinge (turns about axis, optional angle limits in degrees with min in [-180, 0] and max in [0, 180], optional motor), slider (moves along axis, optional travel limits in metres with min <= 0 <= max, optional motor) distance (rope or spring between anchor and connected_anchor; limits are lengths, otherwise the starting length is kept), cone (ball and socket whose axis swings within swingLimit degrees of its start, for ragdoll shoulders and hips) and swing_twist (cone with a second angle swingLimitPlane and, with limits, twist limitMin..limitMax degrees). Hinge and slider motors are velocity motors, or servos that hold motorTarget when motorMode is position. A joint carrying more than breakForce newtons or breakTorque newton metres in a step breaks until the game stops. Anchor and axis are in this node's local space; connected_anchor is in the connected node's space, or world space for the world. At least one body must be dynamic. Joined bodies do not collide unless collide_connected is set. Changing type resets the limits to that type's defaults unless limits are given too.",
       inputSchema: z.object({
         "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
         "attached": z.boolean().optional(),
         "enabled": z.boolean().optional(),
-        "type": z.enum(["fixed", "point", "hinge", "slider", "distance"]).optional(),
+        "type": z.enum(["fixed", "point", "hinge", "slider", "distance", "cone", "swing_twist"]).optional(),
         "connected": z.string().regex(new RegExp("^(\\d+:\\d+)?$")).optional().describe("Handle of the node to join; empty for the world"),
         "anchorX": z.number().finite().min(-1000000).max(1000000).optional(),
         "anchorY": z.number().finite().min(-1000000).max(1000000).optional(),
@@ -1537,6 +1554,14 @@ export function registerGeneratedTools(
         "motorForce": z.number().finite().min(0).max(1000000000).optional().describe("Maximum torque (N m) for hinges, force (N) for sliders"),
         "springFrequency": z.number().finite().min(0).max(1000).optional().describe("Distance joints: spring frequency in Hz; 0 is rigid"),
         "springDamping": z.number().finite().min(0).max(100).optional(),
+        "motorMode": z.enum(["velocity", "position"]).optional().describe("Velocity motors spin at motorSpeed; position motors are servos that hold motorTarget"),
+        "motorTarget": z.number().finite().min(-1000000).max(1000000).optional().describe("Servo target: degrees for hinges, metres for sliders, clamped to the limits"),
+        "motorFrequency": z.number().finite().min(0).max(1000).optional().describe("Servo spring stiffness in Hz"),
+        "motorDamping": z.number().finite().min(0).max(100).optional().describe("Servo damping ratio"),
+        "swingLimit": z.number().finite().min(0).max(180).optional().describe("Cone and swing_twist: half cone angle in degrees (swing_twist: about the plane axis perpendicular to axis)"),
+        "swingLimitPlane": z.number().finite().min(0).max(180).optional().describe("swing_twist: half cone angle in degrees in the other plane"),
+        "breakForce": z.number().finite().min(0).max(1000000000000).optional().describe("Newtons the joint can carry in one step before it breaks for the rest of the game; 0 never breaks"),
+        "breakTorque": z.number().finite().min(0).max(1000000000000).optional().describe("Newton metres the joint can carry in one step before it breaks; 0 never breaks"),
         "collideConnected": z.boolean().optional(),
         "gesture": z.number().int().min(0).max(4294967295).optional().describe("Shared token for updates in one inspector drag; zero creates a separate undo entry")
       }),
@@ -1545,7 +1570,7 @@ export function registerGeneratedTools(
     async (input) => {
         const override = overrides["scene_set_joint"];
         if (override) return override(input as JsonObject);
-        return invoke("scene.set_joint", {"entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "connected": input["connected"], "anchor_x": input["anchorX"], "anchor_y": input["anchorY"], "anchor_z": input["anchorZ"], "axis_x": input["axisX"], "axis_y": input["axisY"], "axis_z": input["axisZ"], "connected_anchor_x": input["connectedAnchorX"], "connected_anchor_y": input["connectedAnchorY"], "connected_anchor_z": input["connectedAnchorZ"], "limits": input["limits"], "limit_min": input["limitMin"], "limit_max": input["limitMax"], "motor": input["motor"], "motor_speed": input["motorSpeed"], "motor_force": input["motorForce"], "spring_frequency": input["springFrequency"], "spring_damping": input["springDamping"], "collide_connected": input["collideConnected"], "gesture": input["gesture"]});
+        return invoke("scene.set_joint", {"entity": input["entity"], "attached": input["attached"], "enabled": input["enabled"], "type": input["type"], "connected": input["connected"], "anchor_x": input["anchorX"], "anchor_y": input["anchorY"], "anchor_z": input["anchorZ"], "axis_x": input["axisX"], "axis_y": input["axisY"], "axis_z": input["axisZ"], "connected_anchor_x": input["connectedAnchorX"], "connected_anchor_y": input["connectedAnchorY"], "connected_anchor_z": input["connectedAnchorZ"], "limits": input["limits"], "limit_min": input["limitMin"], "limit_max": input["limitMax"], "motor": input["motor"], "motor_speed": input["motorSpeed"], "motor_force": input["motorForce"], "spring_frequency": input["springFrequency"], "spring_damping": input["springDamping"], "motor_mode": input["motorMode"], "motor_target": input["motorTarget"], "motor_frequency": input["motorFrequency"], "motor_damping": input["motorDamping"], "swing_limit": input["swingLimit"], "swing_limit_plane": input["swingLimitPlane"], "break_force": input["breakForce"], "break_torque": input["breakTorque"], "collide_connected": input["collideConnected"], "gesture": input["gesture"]});
       },
   );
 

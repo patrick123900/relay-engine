@@ -679,6 +679,29 @@ public:
 };
 RELAY_BEHAVIOUR(Crank)
 
+// Holds its hinge at 30 degrees as a servo; reports the angle later.
+class Servoer : public relay::Behaviour {
+public:
+    void on_start() override {
+        relay::world::log(std::string{"servo target "} + (self().set_joint_target(30.0) ? "set" : "missing"));
+    }
+    void on_update(double) override {
+        if (relay::world::frame() != 100) return;
+        const auto angle = self().joint_position();
+        relay::world::log("servo at " + (angle ? std::to_string(static_cast<int>(*angle + 0.5)) : std::string{"?"}));
+    }
+};
+RELAY_BEHAVIOUR(Servoer)
+
+// Reports whether its own joint broke under the weight it hangs.
+class Watcher : public relay::Behaviour {
+public:
+    void on_update(double) override {
+        if (relay::world::frame() == 60) relay::world::log(std::string{"joint "} + (self().joint_broken() ? "broken late" : "never broke"));
+    }
+};
+RELAY_BEHAVIOUR(Watcher)
+
 class Spawner : public relay::Behaviour {
 public:
     void on_start() override {
@@ -783,6 +806,31 @@ void spawning(relay::Engine& engine, relay::ControlProtocol& protocol) {
     hinge.motor_force = 1e6;
     expect(scene.set_joint(crank, hinge) && ok(add_script(protocol, crank, "Crank")),
            "attach the crank's hinge and script");
+    const auto servo = scene.create("Servo");
+    (void)scene.set_transform(servo, {{-20, 3, 0}, {}, {1, 1, 1}});
+    (void)scene.set_collider(servo, bar);
+    relay::PhysicsBody floating;
+    floating.gravity_scale = 0.0;
+    (void)scene.set_physics_body(servo, floating);
+    relay::Joint servo_joint;
+    servo_joint.axis = {0, 0, 1};
+    servo_joint.motor = true;
+    servo_joint.motor_mode = relay::Joint::MotorMode::position;
+    servo_joint.motor_force = 1e6;
+    expect(scene.set_joint(servo, servo_joint) && ok(add_script(protocol, servo, "Servoer")),
+           "attach the servo's hinge and script");
+    const auto weak = scene.create("Weak link");
+    (void)scene.set_transform(weak, {{-30, 3, 0}, {}, {1, 1, 1}});
+    (void)scene.set_collider(weak, box);
+    relay::PhysicsBody heavy;
+    heavy.mass = 20.0;
+    (void)scene.set_physics_body(weak, heavy);
+    relay::Joint weak_joint;
+    weak_joint.type = relay::Joint::Type::point;
+    weak_joint.anchor = {0, 1, 0};
+    weak_joint.break_force = 20.0;
+    expect(scene.set_joint(weak, weak_joint) && ok(add_script(protocol, weak, "Watcher")),
+           "attach the breakable joint and its script");
     const auto spawner = scene.create("Spawner");
     expect(ok(add_script(protocol, spawner, "Spawner")), "attach the spawner");
     const auto authored = scene.entities().size();
@@ -842,9 +890,15 @@ void spawning(relay::Engine& engine, relay::ControlProtocol& protocol) {
                named(engine, "Bullet") == 0U && !scene.contains(bullet),
            "behaviours destroy their own entity after on_destroy");
     const auto instances_after = request(protocol, "scripts.status");
-    // Pad, Crank and Spawner remain.
-    expect(instances_after.find("\"instances\":3") != std::string::npos,
+    // Pad, Crank, Servoer, Watcher and Spawner remain.
+    expect(instances_after.find("\"instances\":5") != std::string::npos,
            "destroyed entities' script instances are removed: " + instances_after.substr(0, 300));
+
+    engine.step(70);
+    expect(logged(engine, "servo target set") && logged(engine, "servo at 30"),
+           "a script turns a hinge into a servo and it holds the target");
+    expect(logged(engine, "joint broken late"),
+           "a script sees its joint break under load");
 
     expect(engine.stop_game() && scene.entities().size() == authored && scene.contains(crate) &&
                named(engine, "Bullets") == 0U,
@@ -1535,15 +1589,26 @@ public:
         relay::CharacterSettings settings;
         if (name == "Crouching") settings.height = 1.0;
         if (name == "Bad") settings.height = 0.2;
+        if (name == "Solid") {
+            settings.inner_body = true;
+            settings.layer = 4u;
+        }
+        if (name == "Padded") {
+            settings.inner_body = true;
+            settings.inner_padding = 0.5;
+        }
         const bool made = self().make_character(settings);
+        if (name == "Padded") relay::world::log("padded " + std::string(made ? "accepted" : "refused"));
         if (name == "Bad") relay::world::log("bad settings " + std::string(made ? "accepted" : "refused"));
         direction = name == "Crouching" ? 0.0 : 1.0;
-        if (name == "Idle" || name == "Jumper" || name == "Bad") direction = 0.0;
+        if (name == "Idle" || name == "Jumper" || name == "Bad" || name == "Solid" || name == "Ghost" ||
+            name == "Padded") direction = 0.0;
     }
     void on_update(double dt) override {
         ++frames;
         const auto name = self().name();
         if (name == "Crouching") crouching(dt);
+        if (name == "Solid" || name == "Ghost") probe(name);
         if (name == "Teleporter" && frames == 30) self().set_position({20, 0, -10});
         if (name == "Jumper" && frames == 30) vy = 5.0;
         if (name == "Idle" && frames == 70) relay::world::log("removed " + std::string(self().remove_character() ? "yes" : "no"));
@@ -1562,6 +1627,17 @@ public:
                               (state->ground ? state->ground.name() : "none") + " apex " + centi(apex));
     }
 private:
+    // Rays from a metre and a half away along +x, over every layer and then without the inner
+    // body's layer.
+    void probe(const std::string& name) {
+        if (frames != 40) return;
+        const auto origin = self().world_position();
+        const relay::Vec3 from{origin.x - 3.0, origin.y + 0.9, origin.z};
+        const auto all = relay::world::raycast(from, {1, 0, 0}, 10.0);
+        const auto others = relay::world::raycast(from, {1, 0, 0}, 10.0, 0xfffffffbu);
+        relay::world::log(name + " probe " + (all ? all->entity.name() : "none") + " " +
+                          (others ? others->entity.name() : "none"));
+    }
     // Crouch under the ceiling, try to stand there, walk out, stand.
     void crouching(double dt) {
         direction = frames < 70 ? 1.0 : frames >= 80 && frames < 150 ? -1.0 : 0.0;
@@ -1630,6 +1706,17 @@ void character_scripts(relay::Engine& engine, relay::ControlProtocol& protocol) 
     walker("Jumper", {0, 0.5, -20});
     walker("Idle", {0, 0, -30});
     walker("Bad", {0, 0, -40});
+    walker("Solid", {0, 0, 60});
+    walker("Ghost", {0, 0, 70});
+    walker("Padded", {0, 0, 75});
+    const auto roof = [&](const char* name, relay::Vec3 at) {
+        const auto entity = slab(name, at, {1, 0.25, 1});
+        relay::PhysicsBody dropped;
+        dropped.mass = 2.0;
+        (void)scene.set_physics_body(entity, dropped);
+        return entity;
+    };
+    const auto on_solid = roof("OnSolid", {0, 4, 60});
     expect(engine.run_game(), "the character course runs");
     engine.step(200);
     const auto centi_log = [&](const std::string& name, std::string& rest) {
@@ -1671,6 +1758,13 @@ void character_scripts(relay::Engine& engine, relay::ControlProtocol& protocol) 
            "removing a character stops it moving");
     expect(logged(engine, "bad settings refused") && logged(engine, "character: height must be at least twice the radius"),
            "bad character settings are refused with a reason");
+    expect(logged(engine, "Solid probe Solid none"),
+           "an inner body is hit by rays on its layer and not by rays that exclude the layer");
+    expect(logged(engine, "Ghost probe none none"), "a character without an inner body is invisible to rays");
+    expect(scene.get(on_solid)->transform.position.y > 1.5,
+           "a crate dropped on an inner body lands on it: " + std::to_string(scene.get(on_solid)->transform.position.y));
+    expect(logged(engine, "padded refused") && logged(engine, "character: inner padding"),
+           "an inner padding as wide as the radius is refused");
     expect(engine.stop_game(), "the character course stops");
     scene.restore_state(earlier);
 }

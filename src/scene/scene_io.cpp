@@ -766,6 +766,22 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                     result.error = "invalid joint";
                     return result;
                 }
+                if (result.source_version >= 29U) {
+                    const auto* mode = field(*object, "motor_mode");
+                    const bool position = mode && mode->string() && *mode->string() == "position";
+                    if (!mode || !mode->string() || (!position && *mode->string() != "velocity") ||
+                        !number("motor_target", joint.motor_target) ||
+                        !number("motor_frequency", joint.motor_frequency) ||
+                        !number("motor_damping", joint.motor_damping) ||
+                        !number("swing_limit", joint.swing_limit) ||
+                        !number("swing_limit_plane", joint.swing_limit_plane) ||
+                        !number("break_force", joint.break_force) ||
+                        !number("break_torque", joint.break_torque)) {
+                        result.error = "version 29 joint requires its servo, swing and break fields";
+                        return result;
+                    }
+                    joint.motor_mode = position ? Joint::MotorMode::position : Joint::MotorMode::velocity;
+                }
                 joint.type = *parsed_type;
                 // Values are checked here; the connected node once every entity is loaded.
                 Scene validator;

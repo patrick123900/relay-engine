@@ -9,10 +9,10 @@ overview for visitors. Protocol details belong in [`docs/protocol.md`](docs/prot
 
 - C++20 engine/editor with SDL3, Dear ImGui, ImGuizmo, Vulkan, and a deterministic CPU renderer.
 - External TypeScript agent bridge using Codex App Server and generated MCP tools.
-- Protocol schema v54: 170 native methods. Scene v28, project v2, import manifest v3.
+- Protocol schema v56: 172 native methods. Scene v29, project v2, import manifest v3.
 - Linux/RADV is the verified graphics path. The project is experimental and pre-1.0.
 - HDR rendering, bounded asynchronous uploads, transform keyframes, box/sphere/capsule/convex/mesh
-  colliders, Jolt body simulation with fixed/point/hinge/slider/distance joints, a Unity-style
+  colliders, Jolt body simulation with fixed/point/hinge/slider/distance/cone/swing-twist joints (servo motors, breakable), a Unity-style
   component model with derived node types and templates/prefabs shown in the node type tree, native
   C++ gameplay scripts, per-project input mapping, a scripted first person controller template in
   the demo project, portable project export, and FidelityFX global illumination and hardware ray
@@ -178,8 +178,13 @@ without blocking simultaneous human editing.
   `examples/demo/demo.relayproject` when the UI editor starts from the repository root, unless
   `RELAY_OPEN_DEMO_PROJECT=0`. Smoke tests set that override. `tools/generate_demo_project.py`
   writes `models/primitives.glb` and runs `relay_build_demo_project`, which authors the showcase
-  scene through the trusted protocol; commit the regenerated project, including
-  `.relay-imports.json`. `relay_workflow_tests` opens the committed demo, resolves every asset,
+  scene through the trusted protocol. The committed showcase holds hand-authored additions the
+  generator does not build (the shader showcase with plasma orbs and bloom, the motion blur, the
+  project's graphics settings), so do not commit a regenerated project over it without merging
+  those back; regenerating wipes them: the joints row behind the playground (Servo gate,
+  Arm beam, Upper arm, Lower arm, Rope beam, Hanging crate) was merged into the committed scene
+  by hand from a generated copy, and `build_demo_project.cpp` still builds them for a fresh
+  project. `relay_workflow_tests` opens the committed demo, resolves every asset,
   builds every collider, and simulates it.
 - Importer fixtures live in `tests/fixtures/models/`. Without a project, the protocol still uses
   the ignored scratch folder `assets/`; the desktop smoke launcher copies the fixtures there.
@@ -225,6 +230,22 @@ without blocking simultaneous human editing.
   begin/end events in a bounded, sequence-cursor stream exposed by `physics.contact_events`.
   The stream resets on Run Game and Stop Game, and reports the oldest retained sequence for
   detecting missed events.
+- Scene v29 grew the joint (protocol v56): types `cone` and `swing_twist` (ragdoll joints: `axis`
+  is the twist axis, `swing_limit` and `swing_limit_plane` half angles in degrees; swing_twist
+  also uses `limits`/`limit_min`/`limit_max` as twist limits), servo motors (`motor_mode`
+  `position`, `motor_target`, `motor_frequency`, `motor_damping` through Jolt's position motor
+  and its spring settings; hinge degrees, slider metres) and breakable joints (`break_force`,
+  `break_torque`, N and N m). `JoltState::update_joint_loads` reads each constraint's total
+  lambda after every step (`joint_impulses`, divided by the step) and removes a joint over its
+  limit; the owner goes into `broken_`, which `add_joint` respects, until the game stops.
+  `PhysicsWorld::joint_state` and `set_joint_target`, the protocol's `physics.joint_status`
+  (exists, broken, position, force, torque) and the script calls `set_joint_target` and
+  `joint_broken` expose it. Scene files before v29 load with the new fields at their defaults.
+  The Inspector's Joint section has the types, swing and twist fields, the motor mode, break
+  fields and **Edit anchors in viewport**, which makes `draw_gizmo` hand the selection to
+  `draw_joint_anchor_gizmos`: a translate gizmo on the anchor (and a distance joint's far end)
+  written through `scene.set_joint` as one undo gesture; it has no headless coverage beyond the
+  checkbox, and has not been dragged on a desktop. Cone and swing_twist have no motors.
 - Scene v17 adds an optional `joint` component (`Joint` in `scene.hpp`, component id `joint`,
   protocol `scene.set_joint`): type fixed/point/hinge/slider/distance, `connected` entity
   (invalid = world), local `anchor` and `axis`, `connected_anchor` (distance joints; the
@@ -820,7 +841,14 @@ Phase 3:
   stick to floor, ground velocity added while supported). Crouching is `set_character` with a new
   height, which `SetShape`-tests for room and reports `blocked`. A script that writes the node's
   position is noticed by comparing it with `CharacterEntry::written`. Characters die with the
-  Jolt state and with their entity (`remove_missing_bodies`); there is no inner body.
+  Jolt state and with their entity (`remove_missing_bodies`). Settings may ask for an inner body
+  (`inner_body`, `layer`, `mask`, `inner_padding`): a kinematic capsule on `Layers::moving`, user
+  data the node, kept in `CharacterEntry::inner`, moved with `MoveKinematic` after each move and
+  placed directly on teleports, reshaped with `SetShape`, and removed with the character or when
+  the setting goes off. Its layer and mask are in `JoltState::inner_`; `body_layers()` gives a
+  body's layers from the inner map or the node's collider, and contact validation, raycasts,
+  overlaps, shape casts and the character filter all use it, so they see inner bodies. The script
+  ABI is version 2 (`RelayCharacterSettings` grew).
   Collider, physics body, joint and keyframe presence changes, a renderer change under a collider,
   scale writes and reparenting call `PhysicsWorld::rebuild_bodies`, which recreates the bodies from
   the scene, keeps dynamic velocities, recreates joints on or to them from the current poses, and
@@ -1338,7 +1366,8 @@ Phase 3:
 8. The demo's first person controller is a kinematic character (`make_character`/`move_character`):
    it steps up stairs, refuses steep slopes, crouches under ceilings (`crouch` action, default
    Left Ctrl / C / gamepad B), and has gravity, coyote time and a jump buffer in the script. It has
-   no collider or inner body, so thrown bodies and raycasts pass through it. It reads move_x,
+   no collider and does not ask for an inner body, so thrown bodies and raycasts pass through it
+   (scripts opt in with `CharacterSettings::inner_body`). It reads move_x,
    move_y, look_x, look_y, jump, sprint and crouch, and shoots on fire. It has simulated-input
    coverage through the compiled script (standing, walking, mouse turn, sprint, crouch, jump,
    shooting, camera switch and restore). The earlier rigid-body version was play-tested on a Linux
@@ -1449,11 +1478,14 @@ Phase 3:
 
 ## Next priorities
 
-1. Add more example controllers (third-person, orbit) beside it. The character has no inner body, so thrown
-   dynamic bodies and raycasts pass through it; add one (`mInnerBodyShape`) if games need to
-   shoot or be hit by physics objects.
-2. Grow joints where games need them: breakable joints, cone/swing-twist limits for ragdolls,
-   hinge target angles (servo motors), and editing joint anchors with a viewport gizmo.
+1. Keep the character controller project agnostic: every behaviour a game might need (inner body,
+   layers, shape, step and slope limits) is a `CharacterSettings` field, and example controllers
+   are secondary. Candidates: other shapes than the upright capsule, a settable up direction,
+   moving the inner body by the character's own velocity for better pushes, and a Jolt inner
+   body that is a real `CharacterVirtual` inner body for character-versus-character pushing.
+2. Grow joints where games need them: swing-twist motors (drive a ragdoll to a pose), a `joint_broken`
+   event or callback instead of polling, an axis gizmo and cone drawing in the viewport, and
+   re-attaching a broken joint from a script.
 
 Deferred:
 

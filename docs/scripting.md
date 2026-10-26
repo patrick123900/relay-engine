@@ -247,7 +247,7 @@ void on_contact_begin(relay::Entity other) override {
 - `set_field("<component>.<field>", value)` changes one field, named as the scene stores it:
   `collider.radius`, `collider.layer`, `collider.mask`, `physics_body.type` (`"static"` or
   `"dynamic"`), `physics_body.mass`, `light.color`, `light.intensity`, `camera.field_of_view_y_degrees`,
-  `mesh_renderer.material`, `joint.limit_max`, `audio_source.volume_db`, `keyframes.playing` and the
+  `mesh_renderer.material`, `joint.limit_max`, `joint.motor_target`, `joint.break_force`, `audio_source.volume_db`, `keyframes.playing` and the
   rest of the camera, renderer, light, collider, physics body, joint, audio source and keyframe
   fields. `field_numbers` and `field_text` read them back. Interface controls use `set_ui` and
   particle emitters `set_particles`. A value the Inspector would refuse is refused with a log
@@ -336,8 +336,8 @@ Settings (metres, degrees, kilograms, newtons): `radius`, `height` (feet to head
 (about the tallest step it walks up; a rounded body may climb a little higher), `max_slope_degrees`,
 `mass` (the weight it presses onto what it stands on), `push_force` (how hard it shoves dynamic
 bodies; a 100 N character moves a few kilograms but not a stack of crates), `stick_distance` (how
-far down it follows ground it walks off, so it hugs ramps and stairs instead of hopping) and
-`layer_mask` (colliders on those layers stop it).
+far down it follows ground it walks off, so it hugs ramps and stairs instead of hopping),
+`layer_mask` (colliders on those layers stop it) and the inner body settings below.
 
 **Crouching** is `make_character` again with a smaller `height`; the feet stay put. Standing back up
 returns `false` when something is in the way, and the character stays crouched, so a script keeps
@@ -348,8 +348,19 @@ settings.height = crouch_held ? 1.0 : 1.8;
 if (!self().make_character(settings)) { /* no room to stand yet */ }
 ```
 
-Characters collide with enabled colliders on their `layer_mask`, but they have no collider of their
-own: raycasts, overlaps and dynamic bodies pass through them.
+Characters collide with enabled colliders on their `layer_mask`. By default they have no body of
+their own, so raycasts, overlaps, shape casts and dynamic bodies pass through them.
+
+**Inner body.** Set `inner_body = true` and the character gets a kinematic capsule that follows it
+(inset by `inner_padding`, 2 cm by default, so it never fights the character). Rays, overlaps and
+shape casts hit it, dynamic bodies land on it and are pushed by it, and contacts with it are
+reported for the node. It uses `layer` (default 1) and `mask` (default all) like a collider, so a
+game can put players on their own layer, shoot only some of them, or let a camera's shape cast skip
+the character with a `layer_mask` that leaves its layer out; a query's `ignore` entity skips it too.
+Other characters' inner bodies also stop a character whose `layer_mask` includes their layer.
+Changing the settings reshapes, moves or removes the body; `remove_character` removes it. A third
+person camera needs nothing more than this: cast a sphere from the character towards the desired
+camera position with the character ignored, and place the camera where it stops.
 
 ## Joints
 
@@ -369,6 +380,11 @@ void on_update(double) override {
   right-hand rule about the joint's axis.
 - `entity.set_joint_motor(speed)` drives a hinge (degrees per second) or slider (metres per
   second) up to the motor force set in the Inspector; `stop_joint_motor()` lets it move freely.
+- `entity.set_joint_target(target)` turns a hinge or slider into a servo that holds `target`
+  degrees or metres (clamped to its limits) with the stiffness and damping set in the Inspector;
+  call it again to move the target.
+- `entity.joint_broken()` is true once the joint broke under its break force or torque (set in
+  the Inspector); it stays broken until the game stops.
 - Entities spawned with joints, from templates or clones, join their partners at once. Destroying
   a node releases the bodies joined to it.
 

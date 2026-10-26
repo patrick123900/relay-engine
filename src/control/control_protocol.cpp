@@ -1567,6 +1567,26 @@ std::string ControlProtocol::handle(const std::string_view request) {
         output << '}';
         return response_prefix(id) + output.str() + '}';
     }
+    if (method == "physics.joint_status") {
+        const auto entity = Entity::parse(string_field(request, "entity"));
+        if (!entity || !engine_.scene().contains(*entity))
+            return error_response(id, "invalid or stale entity");
+        if (!engine_.scene().get(*entity)->joint) return error_response(id, "entity has no joint");
+        const auto state = engine_.status().mode == RuntimeMode::game
+            ? engine_.physics().joint_state(engine_.scene(), *entity) : std::nullopt;
+        std::ostringstream output;
+        output << std::setprecision(std::numeric_limits<double>::max_digits10) << "{\"running\":"
+               << (state ? "true" : "false");
+        if (state) {
+            output << ",\"active\":" << (state->active ? "true" : "false")
+                   << ",\"broken\":" << (state->broken ? "true" : "false") << ",\"position\":";
+            if (state->position) output << *state->position;
+            else output << "null";
+            output << ",\"force\":" << state->force << ",\"torque\":" << state->torque;
+        }
+        output << '}';
+        return response_prefix(id) + output.str() + '}';
+    }
     if (method == "physics.contact_events") {
         const auto events = engine_.physics().contact_events(unsigned_field(request, "after", 0));
         std::ostringstream output;
@@ -2168,6 +2188,19 @@ std::string ControlProtocol::handle(const std::string_view request) {
             number("motor_force", joint->motor_force);
             number("spring_frequency", joint->spring_frequency);
             number("spring_damping", joint->spring_damping);
+            number("motor_target", joint->motor_target);
+            number("motor_frequency", joint->motor_frequency);
+            number("motor_damping", joint->motor_damping);
+            number("swing_limit", joint->swing_limit);
+            number("swing_limit_plane", joint->swing_limit_plane);
+            number("break_force", joint->break_force);
+            number("break_torque", joint->break_torque);
+            if (const auto mode = optional_string_field(request, "motor_mode")) {
+                if (*mode != "velocity" && *mode != "position")
+                    return error_response(id, "motor_mode must be velocity or position");
+                joint->motor_mode = *mode == "position" ? Joint::MotorMode::position
+                                                        : Joint::MotorMode::velocity;
+            }
             joint->limits = boolean_field(request, "limits", joint->limits);
             joint->motor = boolean_field(request, "motor", joint->motor);
             joint->collide_connected =

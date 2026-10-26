@@ -666,6 +666,9 @@ struct EditorUi::Impl {
     EditorFonts fonts;
     float ui_scale{1.0F};
     bool gizmo_active{false};
+    bool joint_anchor_editing{false}; // The viewport gizmo moves the selected joint's anchors.
+    std::uint64_t joint_gizmo_gesture{0};
+    int joint_gizmo_active{0}; // 1 while the anchor handle is dragged, 2 for the other end.
     // A fresh token per drag. Updates sharing it collapse into one undo entry; a new drag must not
     // fold into an earlier, unrelated edit of the same entity. Every kind of drag draws its token
     // from one counter, so a gizmo drag and an inspector drag can never share a token.
@@ -3487,7 +3490,7 @@ struct EditorUi::Impl {
                 for (const Vec3 direction : {Vec3{cross, 0, 0}, Vec3{0, cross, 0}, Vec3{0, 0, cross}})
                     segment(add(anchor, scaled(direction, -1.0)), add(anchor, direction));
                 const auto type = string_or(joint, "type");
-                if (type == "hinge" || type == "slider")
+                if (type == "hinge" || type == "slider" || type == "cone" || type == "swing_twist")
                     segment(add(anchor, scaled(axis, -0.4)), add(anchor, scaled(axis, 0.4)));
                 if (read_vector(field(joint, "partner"), partner)) segment(anchor, partner);
         };
@@ -4207,6 +4210,76 @@ struct EditorUi::Impl {
         return world;
     }
 
+    // Move gizmos on the selected joint's anchors: the pivot in the node's space and, for a
+    // distance joint, its other end in the partner's space (or in the world). The matrix handed to
+    // the gizmo is the owner's with its translation at the anchor, so the anchor is edited through
+    // the owner's own rotation and scale and written back with scene.set_joint.
+    void draw_joint_anchor_gizmos(const JsonValue::Object& joint, const EditorMatrix& node_world,
+                                  const std::array<float, 16>& camera_view,
+                                  const std::array<float, 16>& projection) {
+        struct Handle {
+            const char* names[3];
+            const char* key;
+            EditorMatrix base;
+            std::array<double, 3> local;
+        };
+        std::vector<Handle> handles;
+        handles.push_back({{"anchor_x", "anchor_y", "anchor_z"}, "anchor", node_world,
+                           editor_vector(joint, "anchor", {0, 0, 0})});
+        if (string_or(joint, "type") == "distance") {
+            const auto partner = string_or(joint, "connected");
+            const auto base = partner.empty() ? editor_identity()
+                                              : editor_multiply(parent_world_of(partner), local_of(partner));
+            handles.push_back({{"connected_anchor_x", "connected_anchor_y", "connected_anchor_z"},
+                               "connected_anchor", base, editor_vector(joint, "connected_anchor", {0, 0, 0})});
+        }
+        auto* draw_list = viewport_draw_list;
+        draw_list->PushClipRect(viewport_min, viewport_max, true);
+        ImGuizmo::Enable(!navigating);
+        ImGuizmo::SetGizmoSizeClipSpace(0.1F);
+        const bool snapping = snap_enabled != ImGui::GetIO().KeyCtrl;
+        const auto step = static_cast<float>(snap_step(snap_move));
+        const std::array<float, 3> snap_values{step, step, step};
+        bool any_using = false;
+        for (std::size_t index = 0; index < handles.size(); ++index) {
+            const auto& handle = handles[index];
+            EditorMatrix matrix = handle.base;
+            const auto& l = handle.local;
+            for (std::size_t axis = 0; axis < 3; ++axis)
+                matrix[12 + axis] = handle.base[12 + axis] + handle.base[axis] * l[0] +
+                                    handle.base[4 + axis] * l[1] + handle.base[8 + axis] * l[2];
+            ImGui::PushID(gizmo_id);
+            ImGui::PushID(static_cast<int>(index) + 1);
+            const bool used = ImGuizmo::Manipulate(camera_view.data(), projection.data(), ImGuizmo::TRANSLATE,
+                                                   gizmo_mode, matrix.data(), nullptr,
+                                                   snapping ? snap_values.data() : nullptr);
+            ImGui::PopID();
+            ImGui::PopID();
+            const bool using_now = ImGuizmo::IsUsing() && (used || joint_gizmo_active == static_cast<int>(index) + 1);
+            if (using_now) any_using = true;
+            if (using_now && joint_gizmo_active != static_cast<int>(index) + 1) {
+                joint_gizmo_gesture = ++gesture_serial;
+                joint_gizmo_active = static_cast<int>(index) + 1;
+            }
+            if (!used || !using_now) continue;
+            if (const auto inverse = editor_inverse_affine(handle.base)) {
+                const auto& m = *inverse;
+                const std::array<double, 3> point{matrix[12], matrix[13], matrix[14]};
+                std::array<double, 3> moved{};
+                for (std::size_t axis = 0; axis < 3; ++axis)
+                    moved[axis] = m[axis] * point[0] + m[4 + axis] * point[1] + m[8 + axis] * point[2] + m[12 + axis];
+                mutate("scene.set_joint",
+                       entity_field(selection) +
+                           vector_fields(moved, {handle.names[0], handle.names[1], handle.names[2]}) +
+                           ",\"gesture\":" + std::to_string(joint_gizmo_gesture),
+                       "Joint anchor gizmo");
+            }
+        }
+        draw_list->PopClipRect();
+        if (!any_using) joint_gizmo_active = 0;
+        gizmo_active = any_using;
+    }
+
     void draw_gizmo() {
         const auto width = viewport_max.x - viewport_min.x;
         const auto height = viewport_max.y - viewport_min.y;
@@ -4249,6 +4322,13 @@ struct EditorUi::Impl {
         if (depth <= view.camera.near_plane * 2.0) {
             gizmo_active = false;
             return;
+        }
+        if (joint_anchor_editing) {
+            const auto* chosen = find_entity(selection);
+            if (chosen && component(*chosen, "joint") && selections.handles.size() == 1U) {
+                draw_joint_anchor_gizmos(*component(*chosen, "joint"), world, camera_view, projection);
+                return;
+            }
         }
         auto* draw_list = viewport_draw_list;
         draw_list->PushClipRect(viewport_min, viewport_max, true);
@@ -6763,15 +6843,17 @@ struct EditorUi::Impl {
         const auto set = [&](const std::string& fields, const char* label) {
             mutate("scene.set_joint", joint_request + fields, label);
         };
-        constexpr std::array<const char*, 5> type_names{"Fixed", "Point (ball and socket)", "Hinge",
-                                                        "Slider", "Distance (rope or spring)"};
-        constexpr std::array<const char*, 5> type_values{"fixed", "point", "hinge", "slider",
-                                                         "distance"};
+        constexpr std::array<const char*, 7> type_names{"Fixed", "Point (ball and socket)", "Hinge",
+                                                        "Slider", "Distance (rope or spring)",
+                                                        "Cone (swinging joint)", "Swing twist (ragdoll limb)"};
+        constexpr std::array<const char*, 7> type_values{"fixed", "point", "hinge", "slider",
+                                                         "distance", "cone", "swing_twist"};
         const auto type_text = string_or(*joint, "type", "hinge");
         std::size_t type = 2;
         for (std::size_t index = 0; index < type_values.size(); ++index)
             if (type_text == type_values[index]) type = index;
-        const bool hinge = type == 2, slider = type == 3, distance = type == 4;
+        const bool hinge = type == 2, slider = type == 3, distance = type == 4, cone = type == 5,
+                   swing_twist = type == 6;
         const bool open = inspector_begin_combo("Joint type", type_names[type]);
         note_item("joint:type");
         if (open) {
@@ -6814,12 +6896,16 @@ struct EditorUi::Impl {
             partner ? std::optional<Reference>(Reference{string_or(*partner, "name"), AssetIcon::node, node_path(connected)})
                     : std::nullopt);
 
+        inspector_checkbox("Edit anchors in viewport", &joint_anchor_editing);
+        note_item("joint:edit_anchors");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Shows move handles on the joint's anchors in the viewport instead of the node's transform gizmo.");
         auto anchor = editor_vector(*joint, "anchor", {0, 0, 0});
         if (const auto mask = drag_vector3("Anchor", anchor, 0.05F, 84.0F * ui_scale))
             set(vector_fields(anchor, {"anchor_x", "anchor_y", "anchor_z"}, mask), "Joint anchor updated");
-        if (hinge || slider) {
+        if (hinge || slider || cone || swing_twist) {
             auto axis = editor_vector(*joint, "axis", {0, 1, 0});
-            if (const auto mask = drag_vector3("Axis", axis, 0.05F, 84.0F * ui_scale);
+            if (const auto mask = drag_vector3(cone || swing_twist ? "Twist axis" : "Axis", axis, 0.05F, 84.0F * ui_scale);
                 mask && (axis[0] != 0.0 || axis[1] != 0.0 || axis[2] != 0.0))
                 set(vector_fields(axis, {"axis_x", "axis_y", "axis_z"}, mask), "Joint axis updated");
         }
@@ -6831,9 +6917,22 @@ struct EditorUi::Impl {
                                         "connected_anchor_z"}, mask),
                     "Joint anchor updated");
         }
-        if (hinge || slider || distance) {
+        if (cone || swing_twist) {
+            auto swing = number_or(*joint, "swing_limit", 45.0);
+            if (drag_scalar(swing_twist ? "Swing limit" : "Cone half angle", swing, 1.0F, "%.1f deg"))
+                set(",\"swing_limit\":" + number_text(std::clamp(swing, 0.0, 180.0)), "Joint swing updated");
+            if (swing_twist) {
+                auto plane = number_or(*joint, "swing_limit_plane", 45.0);
+                if (drag_scalar("Swing limit (plane)", plane, 1.0F, "%.1f deg"))
+                    set(",\"swing_limit_plane\":" + number_text(std::clamp(plane, 0.0, 180.0)),
+                        "Joint swing updated");
+            }
+        }
+        if (hinge || slider || distance || swing_twist) {
+            const bool angular = hinge || swing_twist;
             bool limits = boolean_or(*joint, "limits", false);
-            const char* limits_label = hinge ? "Limit angle" : slider ? "Limit travel" : "Limit length";
+            const char* limits_label = angular ? (swing_twist ? "Limit twist" : "Limit angle")
+                                     : slider ? "Limit travel" : "Limit length";
             if (inspector_checkbox(limits_label, &limits))
                 set(std::string{",\"limits\":"} + (limits ? "true" : "false"), "Joint limits updated");
             if (distance && !limits)
@@ -6842,15 +6941,15 @@ struct EditorUi::Impl {
                 // Clamped to what the joint type accepts, so a drag never produces a refusal.
                 auto minimum = number_or(*joint, "limit_min", 0.0);
                 auto maximum = number_or(*joint, "limit_max", 0.0);
-                const char* unit = hinge ? "%.1f deg" : "%.2f m";
-                if (drag_scalar("Minimum", minimum, hinge ? 1.0F : 0.05F, unit)) {
-                    minimum = hinge ? std::clamp(minimum, -180.0, 0.0)
+                const char* unit = angular ? "%.1f deg" : "%.2f m";
+                if (drag_scalar("Minimum", minimum, angular ? 1.0F : 0.05F, unit)) {
+                    minimum = angular ? std::clamp(minimum, -180.0, 0.0)
                             : slider ? std::min(minimum, 0.0)
                                      : std::clamp(minimum, 0.0, maximum);
                     set(",\"limit_min\":" + number_text(minimum), "Joint limits updated");
                 }
-                if (drag_scalar("Maximum", maximum, hinge ? 1.0F : 0.05F, unit)) {
-                    maximum = hinge ? std::clamp(maximum, 0.0, 180.0)
+                if (drag_scalar("Maximum", maximum, angular ? 1.0F : 0.05F, unit)) {
+                    maximum = angular ? std::clamp(maximum, 0.0, 180.0)
                             : slider ? std::max(maximum, 0.0)
                                      : std::max(maximum, minimum);
                     set(",\"limit_max\":" + number_text(maximum), "Joint limits updated");
@@ -6862,9 +6961,36 @@ struct EditorUi::Impl {
             if (inspector_checkbox("Motor", &motor))
                 set(std::string{",\"motor\":"} + (motor ? "true" : "false"), "Joint motor updated");
             if (motor) {
-                auto speed = number_or(*joint, "motor_speed", 90.0);
-                if (drag_scalar("Speed", speed, hinge ? 1.0F : 0.05F, hinge ? "%.1f deg/s" : "%.2f m/s"))
-                    set(",\"motor_speed\":" + number_text(speed), "Joint motor updated");
+                const bool servo = string_or(*joint, "motor_mode", "velocity") == "position";
+                const bool mode_open = inspector_begin_combo("Motor mode", servo ? "Servo (hold a target)" : "Velocity");
+                note_item("joint:motor_mode");
+                if (mode_open) {
+                    if (ImGui::Selectable("Velocity", !servo))
+                        set(",\"motor_mode\":\"velocity\"", "Joint motor updated");
+                    note_item("joint:motor_mode:velocity");
+                    if (ImGui::Selectable("Servo (hold a target)", servo))
+                        set(",\"motor_mode\":\"position\"", "Joint motor updated");
+                    note_item("joint:motor_mode:position");
+                    ImGui::EndCombo();
+                }
+                if (servo) {
+                    auto target = number_or(*joint, "motor_target", 0.0);
+                    if (drag_scalar("Target", target, hinge ? 1.0F : 0.05F, hinge ? "%.1f deg" : "%.2f m"))
+                        set(",\"motor_target\":" + number_text(hinge ? std::clamp(target, -180.0, 180.0) : target),
+                            "Joint motor updated");
+                    auto stiffness = number_or(*joint, "motor_frequency", 4.0);
+                    if (drag_scalar("Stiffness", stiffness, 0.05F, "%.2f Hz"))
+                        set(",\"motor_frequency\":" + number_text(std::clamp(stiffness, 0.0, 1000.0)),
+                            "Joint motor updated");
+                    auto servo_damping = number_or(*joint, "motor_damping", 1.0);
+                    if (drag_scalar("Servo damping", servo_damping, 0.01F))
+                        set(",\"motor_damping\":" + number_text(std::clamp(servo_damping, 0.0, 100.0)),
+                            "Joint motor updated");
+                } else {
+                    auto speed = number_or(*joint, "motor_speed", 90.0);
+                    if (drag_scalar("Speed", speed, hinge ? 1.0F : 0.05F, hinge ? "%.1f deg/s" : "%.2f m/s"))
+                        set(",\"motor_speed\":" + number_text(speed), "Joint motor updated");
+                }
                 auto force = number_or(*joint, "motor_force", 1000.0);
                 if (drag_scalar(hinge ? "Max torque" : "Max force", force, 10.0F,
                                 hinge ? "%.0f N m" : "%.0f N"))
@@ -6882,6 +7008,14 @@ struct EditorUi::Impl {
                 set(",\"spring_damping\":" + number_text(std::clamp(damping, 0.0, 100.0)),
                     "Joint spring updated");
         }
+        auto break_force = number_or(*joint, "break_force", 0.0);
+        if (drag_scalar("Break force", break_force, 10.0F, "%.0f N"))
+            set(",\"break_force\":" + number_text(std::max(break_force, 0.0)), "Joint breaking updated");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The joint breaks for the rest of the game when it carries more than this in a step. 0 never breaks.");
+        auto break_torque = number_or(*joint, "break_torque", 0.0);
+        if (drag_scalar("Break torque", break_torque, 10.0F, "%.0f N m"))
+            set(",\"break_torque\":" + number_text(std::max(break_torque, 0.0)), "Joint breaking updated");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 never breaks.");
         if (partner) {
             bool collide = boolean_or(*joint, "collide_connected", false);
             if (inspector_checkbox("Collide with connected", &collide))

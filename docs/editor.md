@@ -191,14 +191,22 @@ Add a **Joint** component (Physics category) to link a node's physics body to an
 or to a fixed point in the world when **Connected to** is **World**. **Fixed** welds the two
 together, **Point** is a ball and socket, **Hinge** turns about an axis with optional angle limits
 and a motor, **Slider** moves along an axis with optional travel limits and a motor, and
-**Distance** is a rope or, with a spring frequency, a bungee. The anchor and axis are in the
-node's own space. At least one of the two bodies must be dynamic, and the Inspector says when
+**Distance** is a rope or, with a spring frequency, a bungee. **Cone** is a ball and socket whose
+twist axis may swing no further than a half angle from where it started, and **Swing twist** adds a
+second swing angle and optional twist limits: the shoulders, hips and spines of ragdolls. A hinge or
+slider motor either spins at a **Velocity** or, as a **Servo**, holds a **Target** angle or travel
+as a spring (**Stiffness** in Hz, **Servo damping**) within the motor's maximum force. **Break
+force** and **Break torque** make any joint snap, for the rest of the game, when it carries more
+than that in a step (0 never breaks); the force it carries is shown by `physics.joint_status`.
+**Edit anchors in viewport** swaps the transform gizmo for move handles on the joint's anchors
+(and a distance joint's other end). The anchor and axis are in the node's own space. At least one of the two bodies must be dynamic, and the Inspector says when
 neither is. Joined bodies pass through each other unless **Collide with connected** is ticked.
 Removing the connected node disables the joint rather than tying it to the world. The collider
 wireframes also show joints: a cross at the anchor, the hinge or slider axis, and a line to the
 connected body. Scripts can read a joint's angle, travel or length and drive its motor. The demo
 has a joints playground behind the material row: a swinging chain, a hinged door, a motorised
-spinner and a ball on a spring.
+spinner and a ball on a spring, and a second row behind it with a servo gate sweeping between two
+angles, a ragdoll arm of two swing-twist joints, and a light crate on a rope that snaps when hit.
 
 ## Scripts
 

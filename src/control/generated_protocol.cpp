@@ -315,6 +315,10 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_physics_body_status{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 1> fields_physics_joint_status{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 1> fields_physics_contact_events{{
     {"after", ProtocolValueType::integer, false, false, true, false, 0, 0, 0U, 0U, "", ""},
 }};
@@ -360,11 +364,11 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_scripts_create{{
     {"behaviour", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 128U, "^[A-Za-z_][A-Za-z0-9_]*$", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 24> fields_scene_set_joint{{
+constexpr std::array<ProtocolFieldSpec, 32> fields_scene_set_joint{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"attached", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"enabled", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
-    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "fixed|point|hinge|slider|distance"},
+    {"type", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "fixed|point|hinge|slider|distance|cone|swing_twist"},
     {"connected", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "^(\\d+:\\d+)?$", ""},
     {"anchor_x", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
     {"anchor_y", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
@@ -383,6 +387,14 @@ constexpr std::array<ProtocolFieldSpec, 24> fields_scene_set_joint{{
     {"motor_force", ProtocolValueType::number, false, false, true, true, 0, 1000000000, 0U, 0U, "", ""},
     {"spring_frequency", ProtocolValueType::number, false, false, true, true, 0, 1000, 0U, 0U, "", ""},
     {"spring_damping", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
+    {"motor_mode", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "velocity|position"},
+    {"motor_target", ProtocolValueType::number, false, false, true, true, -1000000, 1000000, 0U, 0U, "", ""},
+    {"motor_frequency", ProtocolValueType::number, false, false, true, true, 0, 1000, 0U, 0U, "", ""},
+    {"motor_damping", ProtocolValueType::number, false, false, true, true, 0, 100, 0U, 0U, "", ""},
+    {"swing_limit", ProtocolValueType::number, false, false, true, true, 0, 180, 0U, 0U, "", ""},
+    {"swing_limit_plane", ProtocolValueType::number, false, false, true, true, 0, 180, 0U, 0U, "", ""},
+    {"break_force", ProtocolValueType::number, false, false, true, true, 0, 1000000000000, 0U, 0U, "", ""},
+    {"break_torque", ProtocolValueType::number, false, false, true, true, 0, 1000000000000, 0U, 0U, "", ""},
     {"collide_connected", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
     {"gesture", ProtocolValueType::integer, false, false, true, true, 0, 4294967295, 0U, 0U, "", ""},
 }};
@@ -845,7 +857,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_audio_set_spatialization{{
     {"mode", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "stereo|binaural"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 171> methods{{
+constexpr std::array<ProtocolMethodSpec, 172> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -922,6 +934,7 @@ constexpr std::array<ProtocolMethodSpec, 171> methods{{
     {"physics.overlaps", "physics_overlaps", "Find overlapping colliders", "List up to 128 enabled colliders of any shape overlapping an entity collider. Both colliders must pass their layer masks; reports truncation. Triangle-mesh colliders report surface contact only.", true, false, false, false, false, fields_physics_overlaps},
     {"physics.debug_boxes", "physics_debug_boxes", "Inspect collider wireframes", "Read bounded world-space collider outlines for the editor overlay, including disabled colliders.", true, false, false, true, false, no_fields},
     {"physics.body_status", "physics_body_status", "Inspect physics body", "Read the current linear and angular velocities of a dynamic body during Run Game.", true, false, false, false, false, fields_physics_body_status},
+    {"physics.joint_status", "physics_joint_status", "Inspect joint", "Read a node's joint during Run Game: whether its constraint exists or has broken, its hinge angle in degrees, slider travel in metres or distance length, and the force (N) and torque (N m) it carried over the last step, which is what break_force and break_torque are compared with.", true, false, false, false, false, fields_physics_joint_status},
     {"physics.contact_events", "physics_contact_events", "Read collision contacts", "Read bounded contact begin and end events from the current game session, using a sequence cursor. Events are cleared on Stop Game.", true, false, false, false, false, fields_physics_contact_events},
     {"physics.apply_impulse", "physics_apply_impulse", "Apply rigid body impulse", "Apply a world-space impulse to a dynamic body during Run Game. Optional world-space point produces torque and angular motion.", false, false, false, false, false, fields_physics_apply_impulse},
     {"scene.set_physics_body", "scene_set_physics_body", "Configure physics body", "Add, edit or remove an undoable static or dynamic physics body. Dynamic bodies use Jolt rigid-body collision, gravity and angular dynamics during Run Game.", false, false, false, false, false, fields_scene_set_physics_body},
@@ -933,7 +946,7 @@ constexpr std::array<ProtocolMethodSpec, 171> methods{{
     {"scripts.write", "scripts_write", "Write script source", "Create or replace a C++ source or header in the project's scripts/ folder, creating subfolders. Allowed during Run Game; build afterwards to compile it or hot reload it.", false, true, false, false, false, fields_scripts_write},
     {"scripts.create", "scripts_create", "Create behaviour script", "Create scripts/<behaviour>.cpp from a starter template defining and registering that behaviour class. Refuses to overwrite.", false, false, false, false, false, fields_scripts_create},
     {"component.types", "component_types", "List component types", "List every component a node can carry: engine components with their category and whether they can be added, removed or repeated, plus each built script behaviour with its declared properties and code defaults.", true, false, false, false, false, no_fields},
-    {"scene.set_joint", "scene_set_joint", "Configure joint", "Add, edit or remove an undoable joint linking this node's physics body to another node's body, or to the world when connected is empty, during Run Game. Types: fixed (weld), point (ball and socket), hinge (turns about axis, optional angle limits in degrees with min in [-180, 0] and max in [0, 180], optional motor), slider (moves along axis, optional travel limits in metres with min <= 0 <= max, optional motor) and distance (rope or spring between anchor and connected_anchor; limits are lengths, otherwise the starting length is kept). Anchor and axis are in this node's local space; connected_anchor is in the connected node's space, or world space for the world. At least one body must be dynamic. Joined bodies do not collide unless collide_connected is set. Changing type resets the limits to that type's defaults unless limits are given too.", false, false, false, false, false, fields_scene_set_joint},
+    {"scene.set_joint", "scene_set_joint", "Configure joint", "Add, edit or remove an undoable joint linking this node's physics body to another node's body, or to the world when connected is empty, during Run Game. Types: fixed (weld), point (ball and socket), hinge (turns about axis, optional angle limits in degrees with min in [-180, 0] and max in [0, 180], optional motor), slider (moves along axis, optional travel limits in metres with min <= 0 <= max, optional motor) distance (rope or spring between anchor and connected_anchor; limits are lengths, otherwise the starting length is kept), cone (ball and socket whose axis swings within swingLimit degrees of its start, for ragdoll shoulders and hips) and swing_twist (cone with a second angle swingLimitPlane and, with limits, twist limitMin..limitMax degrees). Hinge and slider motors are velocity motors, or servos that hold motorTarget when motorMode is position. A joint carrying more than breakForce newtons or breakTorque newton metres in a step breaks until the game stops. Anchor and axis are in this node's local space; connected_anchor is in the connected node's space, or world space for the world. At least one body must be dynamic. Joined bodies do not collide unless collide_connected is set. Changing type resets the limits to that type's defaults unless limits are given too.", false, false, false, false, false, fields_scene_set_joint},
     {"scene.set_audio_source", "scene_set_audio_source", "Configure audio source", "Add, edit or remove a node's audio source: a project sound file (.wav, .flac, .mp3 or .ogg) played through a mixer bus during Run Game. Spatial sources fade with distance from the listener (inverse, inverse square or linear rolloff between the minimum and maximum distance), pan around it and shift pitch with relative motion (doppler); flat sources play as stereo with a balance. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_audio_source},
     {"scene.set_reverb_zone", "scene_set_reverb_zone", "Configure reverb zone", "Add, edit or remove a reverb zone: a sphere or box (following the node's position, rotation and scale) where spatial sounds take on a room's reverb while the listener is inside, fading out over fade metres outside it. Choosing a preset (room, small_room, bathroom, hall, cathedral, cave, arena, forest) sets its parameters; changing a parameter makes the zone custom. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_reverb_zone},
     {"scene.set_music_player", "scene_set_music_player", "Configure music player", "Add, edit or remove a music player: a playlist of project sound files played flat on a bus during Run Game, one after another with a crossfade, optionally shuffled and looping. Long files stream. Changes asked for with audio.music wait for the player's sync point (immediate, beat, bar or track_end) counted at bpm from first_beat_seconds. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_set_music_player},

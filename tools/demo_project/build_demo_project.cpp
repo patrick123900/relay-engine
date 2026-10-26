@@ -1,7 +1,7 @@
 // Authors the dev-build demo project through the trusted control protocol, using the same requests
 // the editor and agents send. Run by tools/generate_demo_project.py from the repository root, after
 // it has written models/primitives.glb and the sounds into the project folder. The committed scripts
-// (FirstPersonController.cpp, Projectile.cpp, ImpactSound.cpp, ToneButton.cpp, MusicSwitch.cpp,
+// (FirstPersonController.cpp, Projectile.cpp, ImpactSound.cpp, ToneButton.cpp, MusicSwitch.cpp, ServoSweep.cpp,
 // GameMenu.cpp) are project source and are left as they are.
 //
 // `relay_build_demo_project --add-interface [root]` instead adds (or replaces) only the showcase's
@@ -560,6 +560,54 @@ int main(const int argument_count, char** arguments) {
     joint(bungee, "\"type\":\"distance\",\"connected_anchor_x\":7.5,\"connected_anchor_y\":5,"
                   "\"connected_anchor_z\":-9,\"limits\":true,\"limit_min\":0,\"limit_max\":1.5,"
                   "\"spring_frequency\":1.2,\"spring_damping\":0.1");
+
+    // Behind it, the newer joints: a servo gate that sweeps between two angles (scripts/ServoSweep.cpp),
+    // a ragdoll arm of two swing-twist joints that flops within its limits, and a crate on a rope
+    // that snaps when something hits it hard enough.
+    const auto servo_post = demo.mesh_entity("Servo post", joints, "Cube", "Ground", {-5, 1.2, -13}, {},
+                                             {0.2, 2.4, 0.2});
+    demo.collider(servo_post, "\"type\":\"box\"");
+    const auto servo_gate = demo.mesh_entity("Servo gate", joints, "Cube", "Mint", {-3.8, 1.2, -13}, {},
+                                             {2.4, 1.8, 0.2});
+    demo.collider(servo_gate, "\"type\":\"box\"");
+    demo.body(servo_gate, 10.0, 0.1, 0.5);
+    demo.impact(servo_gate, 0.8);
+    joint(servo_gate, "\"type\":\"hinge\",\"connected\":" + Builder::text(servo_post) +
+                          ",\"anchor_x\":-0.5,\"motor\":true,\"motor_mode\":\"position\","
+                          "\"motor_target\":0,\"motor_force\":50000,\"motor_frequency\":3,"
+                          "\"motor_damping\":1");
+    demo.script(servo_gate, "ServoSweep");
+
+    const auto arm_beam = demo.mesh_entity("Arm beam", joints, "Cube", "Ground", {1.2, 4.2, -13}, {},
+                                           {0.6, 0.4, 0.4});
+    demo.collider(arm_beam, "\"type\":\"box\"");
+    const auto upper_arm = demo.mesh_entity("Upper arm", joints, "Cube", "Copper", {2.1, 4.2, -13}, {},
+                                            {1.2, 0.3, 0.3});
+    demo.collider(upper_arm, "\"type\":\"box\"");
+    demo.body(upper_arm, 2.0, 0.1, 0.5);
+    demo.impact(upper_arm, 1.1, -6.0);
+    joint(upper_arm, "\"type\":\"swing_twist\",\"connected\":" + Builder::text(arm_beam) +
+                         ",\"anchor_x\":-0.5,\"axis_x\":1,\"axis_y\":0,\"axis_z\":0,\"swing_limit\":70,"
+                         "\"swing_limit_plane\":40,\"limits\":true,\"limit_min\":-30,\"limit_max\":30");
+    const auto lower_arm = demo.mesh_entity("Lower arm", joints, "Cube", "Copper", {3.3, 4.2, -13}, {},
+                                            {1.2, 0.25, 0.25});
+    demo.collider(lower_arm, "\"type\":\"box\"");
+    demo.body(lower_arm, 1.0, 0.1, 0.5);
+    demo.impact(lower_arm, 1.4, -6.0);
+    joint(lower_arm, "\"type\":\"swing_twist\",\"connected\":" + Builder::text(upper_arm) +
+                         ",\"anchor_x\":-0.5,\"axis_x\":1,\"axis_y\":0,\"axis_z\":0,\"swing_limit\":90,"
+                         "\"swing_limit_plane\":60,\"limits\":true,\"limit_min\":-20,\"limit_max\":20");
+
+    const auto rope_beam = demo.mesh_entity("Rope beam", joints, "Cube", "Ground", {7.5, 4.0, -13}, {},
+                                            {1.0, 0.2, 0.2});
+    demo.collider(rope_beam, "\"type\":\"box\"");
+    const auto hanging = demo.mesh_entity("Hanging crate", joints, "Cube", "Copper", {7.5, 2.8, -13}, {},
+                                          {0.8, 0.8, 0.8});
+    demo.collider(hanging, "\"type\":\"box\"");
+    demo.body(hanging, 4.0, 0.1, 0.5);
+    demo.impact(hanging, 0.7);
+    joint(hanging, "\"type\":\"point\",\"connected\":" + Builder::text(rope_beam) +
+                       ",\"anchor_y\":1.5,\"break_force\":45");
 
     // Tone button, just ahead and to the right of where the player starts: look at the cap and
     // press interact, or hit it with a ball, to play the next note (scripts/ToneButton.cpp).

@@ -1425,6 +1425,10 @@ struct ScriptSystem::Impl {
             query.push_force = settings->push_force;
             query.stick_distance = settings->stick_distance;
             query.layer_mask = settings->layer_mask;
+            query.inner_body = settings->inner_body != 0;
+            query.layer = settings->layer;
+            query.mask = settings->mask;
+            query.inner_padding = settings->inner_padding;
             auto& owner = impl.engine;
             const auto result = owner.physics().set_character(owner.scene(), unpack(entity), query);
             if (result.blocked) return -1;
@@ -1446,6 +1450,15 @@ struct ScriptSystem::Impl {
             if (!result) return 0;
             if (state) *state = raw_character(*result);
             return 1;
+        };
+        host.set_joint_target = [](void* context, RelayEntity entity, double target) {
+            auto& owner = self(context).engine;
+            return owner.physics().set_joint_target(owner.scene(), unpack(entity), target) ? 1 : 0;
+        };
+        host.joint_broken = [](void* context, RelayEntity entity) {
+            auto& owner = self(context).engine;
+            const auto state = owner.physics().joint_state(owner.scene(), unpack(entity));
+            return state && state->broken ? 1 : 0;
         };
         host.character_remove = [](void* context, RelayEntity entity) {
             return self(context).engine.physics().remove_character(unpack(entity)) ? 1 : 0;

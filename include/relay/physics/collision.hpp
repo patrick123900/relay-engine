@@ -78,7 +78,16 @@ struct CharacterSettings {
     double mass{70.0};              // Weight pressed onto bodies it stands on.
     double push_force{100.0};       // Newtons it can push dynamic bodies with.
     double stick_distance{0.5};     // How far down it follows ground it walks off; 0 turns it off.
-    std::uint32_t layer_mask{0xffffffffU};
+    std::uint32_t layer_mask{0xffffffffU}; // Colliders on these layers stop it.
+    // Inner body: a kinematic capsule that follows the character so the rest of the world can see
+    // it. The character itself only collides outward, so without this, rays, overlaps, shape
+    // casts and dynamic bodies pass through it. `layer` and `mask` work like a collider's: other
+    // colliders and queries see it on `layer`, and it interacts with colliders whose layer is in
+    // `mask` and whose mask holds `layer`.
+    bool inner_body{false};
+    std::uint32_t layer{1U};
+    std::uint32_t mask{0xffffffffU};
+    double inner_padding{0.02}; // Metres the inner capsule is inset, so it never fights the character.
 };
 
 struct CharacterState {
@@ -93,6 +102,14 @@ struct CharacterResult {
     bool ok{};
     bool blocked{}; // A taller shape did not fit; the character is unchanged.
     std::string error;
+};
+
+struct JointState {
+    bool active{};          // The constraint exists in the running world.
+    bool broken{};          // It broke under break_force or break_torque; it stays gone until the game stops.
+    std::optional<double> position; // Hinge degrees, slider metres or distance length.
+    double force{};         // Newtons the joint carried over the last step.
+    double torque{};        // Newton metres.
 };
 
 struct ContactEvent {
@@ -179,6 +196,12 @@ public:
     // Turns a hinge or slider joint's motor on or off at runtime, at `speed` degrees or metres per
     // second, up to its authored motor force. False without an active hinge or slider joint.
     [[nodiscard]] bool set_joint_motor(const Scene& scene, Entity entity, bool on, double speed);
+    // Turns a hinge or slider joint into a servo holding `target` (degrees or metres, clamped to
+    // its limits) with the authored spring and motor force. False without such a joint.
+    [[nodiscard]] bool set_joint_target(const Scene& scene, Entity entity, double target);
+    // The joint's runtime state: whether it exists, whether it broke, its angle, travel or length
+    // and the force and torque it carried over the last step. Nothing for a node without a joint.
+    [[nodiscard]] std::optional<JointState> joint_state(const Scene& scene, Entity entity);
     // Makes `entity` a kinematic character at its world position, or reconfigures it. A new height
     // or radius is tested against the world first: when a taller shape would overlap something
     // (standing up under a low ceiling) the result is `blocked` and nothing changes. Entities with

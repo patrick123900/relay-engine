@@ -1192,6 +1192,32 @@ void joints_ui() {
     check(scene.get(swing)->joint->type == relay::Joint::Type::slider &&
               scene.get(swing)->joint->limit_max == 1.0,
           "choosing a type changes the joint and its default limits");
+    const auto scroll_down = [&] {
+        if (auto* inspector = ImGui::FindWindowByName("Inspector")) {
+            ImGui::SetScrollY(inspector, inspector->ScrollMax.y);
+            frame(ui, 3);
+        }
+    };
+    click_center(ui, *ui.headless_item_rect("joint:type"));
+    frame(ui, 2);
+    click_center(ui, *ui.headless_item_rect("joint:type:swing_twist"));
+    frame(ui, 3);
+    scroll_down();
+    check(scene.get(swing)->joint->type == relay::Joint::Type::swing_twist &&
+              scene.get(swing)->joint->limit_min == -45.0 && ui.headless_item_rect("joint:edit_anchors"),
+          "the Joint section offers the ragdoll types and the viewport anchor handles");
+    (void)protocol.handle("{\"id\":1,\"method\":\"scene.set_joint\",\"entity\":\"" + swing.to_string() +
+                          "\",\"type\":\"hinge\",\"motor\":true}");
+    frame(ui, 60);
+    scroll_down();
+    check(ui.headless_item_rect("joint:motor_mode").has_value(), "the Joint section shows the motor mode");
+    click_center(ui, *ui.headless_item_rect("joint:motor_mode"));
+    frame(ui, 2);
+    check(ui.headless_item_rect("joint:motor_mode:position").has_value(), "the motor mode lists servos");
+    click_center(ui, *ui.headless_item_rect("joint:motor_mode:position"));
+    frame(ui, 3);
+    check(scene.get(swing)->joint->motor_mode == relay::Joint::MotorMode::position,
+          "the Joint section switches a motor to a servo");
     std::cout << "Headless joint Inspector tests passed\n";
 }
 

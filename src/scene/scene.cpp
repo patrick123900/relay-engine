@@ -214,6 +214,14 @@ void append_entity(JsonWriter& output, const Entity entity, const EntityRecord& 
                << ",\"motor\":" << (joint.motor ? "true" : "false")
                << ",\"motor_speed\":" << joint.motor_speed
                << ",\"motor_force\":" << joint.motor_force
+               << ",\"motor_mode\":\"" << (joint.motor_mode == Joint::MotorMode::position ? "position" : "velocity")
+               << "\",\"motor_target\":" << joint.motor_target
+               << ",\"motor_frequency\":" << joint.motor_frequency
+               << ",\"motor_damping\":" << joint.motor_damping
+               << ",\"swing_limit\":" << joint.swing_limit
+               << ",\"swing_limit_plane\":" << joint.swing_limit_plane
+               << ",\"break_force\":" << joint.break_force
+               << ",\"break_torque\":" << joint.break_torque
                << ",\"spring_frequency\":" << joint.spring_frequency
                << ",\"spring_damping\":" << joint.spring_damping
                << ",\"collide_connected\":" << (joint.collide_connected ? "true" : "false")
@@ -714,6 +722,7 @@ void set_default_joint_limits(Joint& joint) {
     case Joint::Type::hinge: joint.limit_min = -45.0; joint.limit_max = 45.0; break;
     case Joint::Type::slider: joint.limit_min = -1.0; joint.limit_max = 1.0; break;
     case Joint::Type::distance: joint.limit_min = 0.0; joint.limit_max = 2.0; break;
+    case Joint::Type::swing_twist: joint.limit_min = -45.0; joint.limit_max = 45.0; break;
     default: break;
     }
 }
@@ -725,13 +734,16 @@ std::string_view joint_type_name(const Joint::Type type) {
     case Joint::Type::hinge: return "hinge";
     case Joint::Type::slider: return "slider";
     case Joint::Type::distance: return "distance";
+    case Joint::Type::cone: return "cone";
+    case Joint::Type::swing_twist: return "swing_twist";
     }
     return "hinge";
 }
 
 std::optional<Joint::Type> joint_type_from_name(const std::string_view name) {
     for (const auto type : {Joint::Type::fixed, Joint::Type::point, Joint::Type::hinge,
-                            Joint::Type::slider, Joint::Type::distance})
+                            Joint::Type::slider, Joint::Type::distance, Joint::Type::cone,
+                            Joint::Type::swing_twist})
         if (joint_type_name(type) == name) return type;
     return std::nullopt;
 }
@@ -995,7 +1007,7 @@ bool Scene::set_joint(const Entity entity, std::optional<Joint> joint) {
             std::sqrt(j.axis.x * j.axis.x + j.axis.y * j.axis.y + j.axis.z * j.axis.z);
         bool limits_valid = std::isfinite(j.limit_min) && std::isfinite(j.limit_max) &&
                             j.limit_min <= j.limit_max;
-        if (j.type == Joint::Type::hinge)
+        if (j.type == Joint::Type::hinge || j.type == Joint::Type::swing_twist)
             limits_valid = limits_valid && j.limit_min >= -180.0 && j.limit_max <= 180.0 &&
                            j.limit_min <= 0.0 && j.limit_max >= 0.0;
         else if (j.type == Joint::Type::slider)
@@ -1003,12 +1015,15 @@ bool Scene::set_joint(const Entity entity, std::optional<Joint> joint) {
                            j.limit_min <= 0.0 && j.limit_max >= 0.0;
         else if (j.type == Joint::Type::distance)
             limits_valid = limits_valid && j.limit_min >= 0.0 && j.limit_max <= 1e6;
-        if (static_cast<unsigned>(j.type) > 4U || j.connected == entity ||
+        if (static_cast<unsigned>(j.type) > 6U || static_cast<unsigned>(j.motor_mode) > 1U || j.connected == entity ||
             (j.connected.valid() && !contains(j.connected)) || !finite(j.anchor, 1e6) ||
             !finite(j.connected_anchor, 1e6) || !finite(j.axis, 1e6) || axis_length < 1e-6 ||
             (j.limits && !limits_valid) || !within(j.motor_speed, -1e6, 1e6) ||
             !within(j.motor_force, 0.0, 1e9) || !within(j.spring_frequency, 0.0, 1000.0) ||
-            !within(j.spring_damping, 0.0, 100.0))
+            !within(j.spring_damping, 0.0, 100.0) || !within(j.motor_target, -1e6, 1e6) ||
+            !within(j.motor_frequency, 0.0, 1000.0) || !within(j.motor_damping, 0.0, 100.0) ||
+            !within(j.swing_limit, 0.0, 180.0) || !within(j.swing_limit_plane, 0.0, 180.0) ||
+            !within(j.break_force, 0.0, 1e12) || !within(j.break_torque, 0.0, 1e12))
             return false;
     }
     record->joint = std::move(joint);
@@ -1309,6 +1324,14 @@ const std::vector<ComponentDescriptor>& Scene::component_descriptors() {
           {"motor", ReflectedFieldType::boolean},
           {"motor_speed", ReflectedFieldType::number},
           {"motor_force", ReflectedFieldType::number},
+          {"motor_mode", ReflectedFieldType::string},
+          {"motor_target", ReflectedFieldType::number},
+          {"motor_frequency", ReflectedFieldType::number},
+          {"motor_damping", ReflectedFieldType::number},
+          {"swing_limit", ReflectedFieldType::number},
+          {"swing_limit_plane", ReflectedFieldType::number},
+          {"break_force", ReflectedFieldType::number},
+          {"break_torque", ReflectedFieldType::number},
           {"spring_frequency", ReflectedFieldType::number},
           {"spring_damping", ReflectedFieldType::number},
           {"collide_connected", ReflectedFieldType::boolean},

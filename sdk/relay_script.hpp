@@ -258,6 +258,9 @@ using Shader = Asset<AssetKind::shader>;
 using TextFile = Asset<AssetKind::text>;
 using AudioClip = Asset<AssetKind::audio>;
 
+struct CharacterSettings;
+struct CharacterState;
+
 class Entity {
 public:
     constexpr Entity() = default;
@@ -601,6 +604,20 @@ public:
     bool set_angular_velocity(Vec3 value) const {
         return write(api().set_angular_velocity, value);
     }
+    // Kinematic character controller: an upright capsule that collides and slides through the
+    // world, walks up steps, refuses steep slopes and sticks to ground it walks off. The node's
+    // world position is its feet and its rotation is yours to set. The node needs no collider
+    // or body (a collider on it is ignored), but cannot have a dynamic body or keyframes.
+    // `make_character` creates it or, with a new height, crouches or stands it. It returns false
+    // when the settings are refused, and when a taller shape does not fit under the ceiling;
+    // then the character is as it was. `move_character` moves it at a world-space velocity,
+    // vertical included, for dt seconds. Gravity and jumping are the script's: add them to
+    // velocity.y and zero it while `grounded`. See docs/scripting.md.
+    bool make_character(const CharacterSettings& settings) const;
+    [[nodiscard]] std::optional<CharacterState> move_character(Vec3 velocity, double dt) const;
+    [[nodiscard]] std::optional<CharacterState> character_state() const;
+    bool remove_character() const { return api().character_remove(api().context, handle_) != 0; }
+
     // World-space impulse; a world-space point off the centre of mass also adds spin.
     bool apply_impulse(Vec3 impulse) const {
         return api().apply_impulse(api().context, handle_, raw(impulse), nullptr) != 0;
@@ -663,6 +680,48 @@ struct RayHit {
     Vec3 point;
     Vec3 normal;
 };
+
+// Kinematic character settings, in metres, degrees, kilograms and newtons.
+struct CharacterSettings {
+    double radius = 0.3;
+    double height = 1.8;             // Feet to top of head, at least twice the radius.
+    double step_height = 0.4;        // The tallest step it walks up; 0 turns stepping off.
+    double max_slope_degrees = 50.0; // It cannot stand on, or walk up, steeper ground.
+    double mass = 70.0;              // The weight it presses onto bodies it stands on.
+    double push_force = 100.0;       // The most force it pushes dynamic bodies with.
+    double stick_distance = 0.5;     // How far down it follows ground it walks off; 0 turns it off.
+    std::uint32_t layer_mask = 0xffffffffu; // Colliders on these layers stop it.
+};
+
+struct CharacterState {
+    bool grounded = false;       // Standing on ground it may stand on.
+    bool on_steep_slope = false; // Touching ground steeper than max_slope_degrees.
+    Entity ground;               // What it stands on, when grounded or on a steep slope.
+    Vec3 ground_normal{0, 1, 0};
+    Vec3 velocity;               // What it actually moved at over the step, after collisions.
+};
+
+inline bool Entity::make_character(const CharacterSettings& settings) const {
+    const RelayCharacterSettings raw{settings.radius, settings.height, settings.step_height,
+                                     settings.max_slope_degrees, settings.mass, settings.push_force,
+                                     settings.stick_distance, settings.layer_mask};
+    return api().character_set(api().context, handle_, &raw) == 1;
+}
+inline std::optional<CharacterState> Entity::move_character(Vec3 velocity, double dt) const {
+    RelayCharacterState raw{};
+    if (!api().character_move(api().context, handle_, {velocity.x, velocity.y, velocity.z}, dt, &raw))
+        return std::nullopt;
+    return CharacterState{raw.grounded != 0, raw.on_steep_slope != 0, Entity{raw.ground},
+                          {raw.ground_normal.x, raw.ground_normal.y, raw.ground_normal.z},
+                          {raw.velocity.x, raw.velocity.y, raw.velocity.z}};
+}
+inline std::optional<CharacterState> Entity::character_state() const {
+    RelayCharacterState raw{};
+    if (!api().character_get(api().context, handle_, &raw)) return std::nullopt;
+    return CharacterState{raw.grounded != 0, raw.on_steep_slope != 0, Entity{raw.ground},
+                          {raw.ground_normal.x, raw.ground_normal.y, raw.ground_normal.z},
+                          {raw.velocity.x, raw.velocity.y, raw.velocity.z}};
+}
 
 // A sphere, box or capsule for shape casts and overlaps. Capsules stand along their local Y axis;
 // rotations are Euler degrees, like transforms.

@@ -415,6 +415,10 @@ bool finite(const RelayVec3 value) {
 }
 
 RelayVec3 raw(const Vec3 value) { return {value.x, value.y, value.z}; }
+RelayCharacterState raw_character(const CharacterState& state) {
+    return {state.grounded ? 1 : 0, state.on_steep_slope ? 1 : 0, state.ground.valid() ? state.ground.packed() : 0,
+            raw(state.ground_normal), raw(state.velocity)};
+}
 
 std::string_view callback_name(int callback) {
     switch (callback) {
@@ -1408,6 +1412,43 @@ struct ScriptSystem::Impl {
             if (!result.hit) return 0;
             *hit = {result.entity.packed(), result.distance, raw(result.point), raw(result.normal)};
             return 1;
+        };
+        host.character_set = [](void* context, RelayEntity entity, const RelayCharacterSettings* settings) {
+            auto& impl = self(context);
+            if (!settings) return 0;
+            CharacterSettings query;
+            query.radius = settings->radius;
+            query.height = settings->height;
+            query.step_height = settings->step_height;
+            query.max_slope_degrees = settings->max_slope_degrees;
+            query.mass = settings->mass;
+            query.push_force = settings->push_force;
+            query.stick_distance = settings->stick_distance;
+            query.layer_mask = settings->layer_mask;
+            auto& owner = impl.engine;
+            const auto result = owner.physics().set_character(owner.scene(), unpack(entity), query);
+            if (result.blocked) return -1;
+            if (!result.ok) impl.warn("character: " + result.error);
+            return result.ok ? 1 : 0;
+        };
+        host.character_move = [](void* context, RelayEntity entity, RelayVec3 velocity, double seconds,
+                                 RelayCharacterState* state) {
+            auto& owner = self(context).engine;
+            const auto result = owner.physics().move_character(owner.scene(), unpack(entity),
+                                                               {velocity.x, velocity.y, velocity.z}, seconds);
+            if (!result) return 0;
+            if (state) *state = raw_character(*result);
+            return 1;
+        };
+        host.character_get = [](void* context, RelayEntity entity, RelayCharacterState* state) {
+            auto& owner = self(context).engine;
+            const auto result = owner.physics().character_state(owner.scene(), unpack(entity));
+            if (!result) return 0;
+            if (state) *state = raw_character(*result);
+            return 1;
+        };
+        host.character_remove = [](void* context, RelayEntity entity) {
+            return self(context).engine.physics().remove_character(unpack(entity)) ? 1 : 0;
         };
         host.overlap_shape = [](void* context, const RelayShape* shape, RelayVec3 center, uint32_t layer_mask,
                                 RelayEntity ignore, RelayEntity* out, size_t capacity) -> size_t {

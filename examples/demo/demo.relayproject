@@ -17,7 +17,8 @@
         {"name": "jump", "bindings": ["key:space", "gamepad:a"]},
         {"name": "interact", "bindings": ["key:e", "gamepad:x"]},
         {"name": "fire", "bindings": ["mouse:left", "gamepad:right_trigger"]},
-        {"name": "sprint", "bindings": ["key:left_shift", "gamepad:left_stick"]}
+        {"name": "sprint", "bindings": ["key:left_shift", "gamepad:left_stick"]},
+        {"name": "crouch", "bindings": ["key:left_ctrl", "key:c", "gamepad:b"]}
       ],
       "axes": [
         {"name": "move_x", "deadzone": 0.20000000000000001, "bindings": [{"negative": "key:a", "positive": "key:d"}, {"negative": "key:left", "positive": "key:right"}, {"analog": "gamepad:leftx", "scale": 1}]},
@@ -25,6 +26,7 @@
         {"name": "look_x", "deadzone": 0.14999999999999999, "bindings": [{"analog": "gamepad:rightx", "scale": 1}]},
         {"name": "look_y", "deadzone": 0.14999999999999999, "bindings": [{"analog": "gamepad:righty", "scale": -1}]}
       ]
-    }
+    },
+    "graphics": {"global_illumination":true,"reflections":true,"frame_rate_limit":360,"vsync":false}
   }
 }

@@ -219,7 +219,7 @@ Player input goes through the project's input map. **Edit → Game Configuration
 page, where actions (buttons such as `jump`) and axes (values from -1 to 1 such as `move_x`) list
 their bindings. Click **+ Add**, **+ Keys** or **+ Stick** and press the key, mouse button or
 gamepad control to bind; keys are recorded by physical position, so WASD stays in place on other
-keyboard layouts. New projects start with move, look, jump, interact, fire and sprint. The map is
+keyboard layouts. New projects start with move, look, jump, interact, fire, sprint and crouch. The map is
 saved in the project's `.relayproject` file, under `settings`; projects that kept it in an older
 `input.relay-input.json` move it there the next time the project is saved. During Run Game, click
 the viewport to give the game keyboard and mouse input and press **Escape** to hand it back to the
@@ -310,9 +310,9 @@ to select them, drag to move them and drag their handles to resize them. Scripts
 In the development build, the editor opens the demo
 project in [`examples/demo`](../examples/demo) when started from the repository root. Its showcase
 scene has PBR materials, cascaded sun, point, and spot shadows, keyframed animation, and physics and
-joints playgrounds. **Run Game** puts you in them as a first person player: an upright capsule body,
-a camera at eye height, and the project's `scripts/FirstPersonController.cpp` for mouse, keyboard
-and gamepad look, walking, sprinting, jumping and shooting balls where you look. For sound, bodies
+joints playgrounds. **Run Game** puts you in them as a first person player: a kinematic character
+(it climbs steps and crouches under low ceilings) with a camera at eye height, and the project's `scripts/FirstPersonController.cpp` for mouse, keyboard
+and gamepad look, walking, sprinting, crouching, jumping and shooting balls where you look. For sound, bodies
 thump as they land or are hit, louder the harder the hit; the spinning torus hums, so walking
 around it pans and fades the sound; and the glowing button just ahead and to the right plays the
 next note of a scale when you look at it and press **E** (or shoot it). A campfire to the front left burns with flames, rising embers and lit smoke,

@@ -67,6 +67,34 @@ struct CollisionShape {
     Vec3 rotation_degrees{};         // Euler degrees, as transforms use.
 };
 
+// A kinematic character: an upright capsule that a script moves through the running world with
+// collide-and-slide, stair stepping, slope limits and ground sticking (Jolt's CharacterVirtual).
+// The node's world position is the character's feet.
+struct CharacterSettings {
+    double radius{0.3};
+    double height{1.8};             // Feet to top of head; at least twice the radius.
+    double step_height{0.4};        // Tallest step it walks up; 0 turns stepping off.
+    double max_slope_degrees{50.0}; // Steeper ground is not stood on.
+    double mass{70.0};              // Weight pressed onto bodies it stands on.
+    double push_force{100.0};       // Newtons it can push dynamic bodies with.
+    double stick_distance{0.5};     // How far down it follows ground it walks off; 0 turns it off.
+    std::uint32_t layer_mask{0xffffffffU};
+};
+
+struct CharacterState {
+    bool grounded{};        // Standing on ground it may stand on.
+    bool on_steep_slope{};  // Touching ground steeper than the slope limit.
+    Entity ground{};        // The collider it stands on, when grounded or on a steep slope.
+    Vec3 ground_normal{0.0, 1.0, 0.0};
+    Vec3 velocity{};        // What it actually moved at over the step, after collisions.
+};
+
+struct CharacterResult {
+    bool ok{};
+    bool blocked{}; // A taller shape did not fit; the character is unchanged.
+    std::string error;
+};
+
 struct ContactEvent {
     std::uint64_t sequence{};
     Entity first{};
@@ -151,6 +179,19 @@ public:
     // Turns a hinge or slider joint's motor on or off at runtime, at `speed` degrees or metres per
     // second, up to its authored motor force. False without an active hinge or slider joint.
     [[nodiscard]] bool set_joint_motor(const Scene& scene, Entity entity, bool on, double speed);
+    // Makes `entity` a kinematic character at its world position, or reconfigures it. A new height
+    // or radius is tested against the world first: when a taller shape would overlap something
+    // (standing up under a low ceiling) the result is `blocked` and nothing changes. Entities with
+    // dynamic bodies cannot be characters.
+    [[nodiscard]] CharacterResult set_character(const Scene& scene, Entity entity,
+                                                const CharacterSettings& settings);
+    // Moves the character at `velocity` (world space, metres per second, vertical included) for
+    // `seconds`, then writes its position to the node. While grounded it is carried by moving
+    // ground and a downward velocity is ignored. Nothing without a character.
+    [[nodiscard]] std::optional<CharacterState> move_character(Scene& scene, Entity entity,
+                                                               Vec3 velocity, double seconds);
+    [[nodiscard]] std::optional<CharacterState> character_state(const Scene& scene, Entity entity) const;
+    [[nodiscard]] bool remove_character(Entity entity);
     // Casts against the running world, without rebuilding it as collision_raycast does.
     [[nodiscard]] CollisionRaycast raycast(const Scene& scene, Vec3 origin, Vec3 direction,
                                            double maximum_distance,

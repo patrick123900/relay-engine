@@ -441,7 +441,7 @@ void demo_first_person(relay::Engine& engine, relay::ControlProtocol& protocol) 
     (void)request(protocol, "input.simulate", "\"name\":\"move_y\",\"value\":1,\"frames\":30");
     engine.step(30);
     const auto moved = engine.scene().get(scene_player)->transform.position;
-    expect(std::abs(landed.y - 0.9) < 0.05 && moved.z < landed.z - 1.5,
+    expect(std::abs(landed.y) < 0.05 && moved.z < landed.z - 1.5,
            "the showcase player stands on the ground and walks towards the playgrounds");
     expect(engine.stop_game() && engine.scene().active_camera() == scene_camera &&
                engine.scene().get(scene_player)->transform.position.z == 8.0,
@@ -543,8 +543,8 @@ void demo_first_person(relay::Engine& engine, relay::ControlProtocol& protocol) 
            "the controller looks through its own camera during the game");
     engine.step(60);
     const auto rest = engine.scene().get(player)->transform;
-    expect(std::abs(rest.position.y - 0.9) < 0.05 && rest.rotation_degrees == relay::Vec3{},
-           "the capsule lands on the ground and stays upright");
+    expect(std::abs(rest.position.y) < 0.05 && rest.rotation_degrees == relay::Vec3{},
+           "the character stands on the ground and stays upright");
     (void)request(protocol, "input.simulate", "\"name\":\"move_y\",\"value\":1,\"frames\":60");
     engine.step(60);
     auto walked = engine.scene().get(player)->transform;
@@ -569,17 +569,27 @@ void demo_first_person(relay::Engine& engine, relay::ControlProtocol& protocol) 
     expect(engine.scene().get(player)->transform.position.x - before_sprint > 3.2,
            "sprint moves faster than walking");
     engine.step(20);
+    const auto standing_eye = engine.scene().get(camera)->transform.position.y;
+    (void)request(protocol, "input.simulate", "\"name\":\"crouch\",\"frames\":30");
+    engine.step(30);
+    const auto crouched_eye = engine.scene().get(camera)->transform.position.y;
+    engine.step(30);
+    expect(standing_eye > 1.55 && crouched_eye < 1.0 &&
+               engine.scene().get(camera)->transform.position.y > 1.55,
+           "crouch lowers the eye and standing up raises it again in the open");
     const auto grounded = engine.scene().get(player)->transform.position.y;
     (void)request(protocol, "input.simulate", "\"name\":\"jump\"");
     engine.step(10);
     expect(engine.scene().get(player)->transform.position.y > grounded + 0.3,
            "jump lifts the player off the ground");
-    const auto rising = engine.physics().velocity(engine.scene(), player)->y;
     (void)request(protocol, "input.simulate", "\"name\":\"jump\"");
-    engine.step(1);
-    expect(rising > 2.0 && engine.physics().velocity(engine.scene(), player)->y < rising,
-           "jumping again in mid-air does nothing");
-    engine.step(90);
+    double apex = 0.0;
+    for (int frame = 0; frame < 40; ++frame) {
+        engine.step(1);
+        apex = std::max(apex, engine.scene().get(player)->transform.position.y - grounded);
+    }
+    expect(apex < 0.75, "jumping again in mid-air does nothing (apex " + std::to_string(apex) + ")");
+    engine.step(60);
     expect(std::abs(engine.scene().get(player)->transform.position.y - grounded) < 0.05,
            "the player lands again");
 
@@ -621,7 +631,7 @@ void demo_first_person(relay::Engine& engine, relay::ControlProtocol& protocol) 
     expect(balls().empty(), "balls remove themselves after their lifetime");
     expect(engine.stop_game() && engine.scene().get(overview)->camera->active &&
                !engine.scene().get(camera)->camera->active &&
-               engine.scene().get(player)->transform.position.y == 1.0,
+               engine.scene().get(player)->transform.position.y == 0.0,
            "Stop Game restores the scene's camera and the player's place");
 }
 
@@ -1509,6 +1519,162 @@ void references(relay::Engine& engine, relay::ControlProtocol& protocol) {
     scene.restore_state(earlier);
 }
 
+
+const char* character_source = R"(#include "relay_script.hpp"
+#include <cmath>
+
+namespace {
+std::string centi(double value) { return std::to_string(std::lround(value * 100.0)); }
+} // namespace
+
+// One walker per lane of the test course; what each does is chosen by its node's name.
+class Walker : public relay::Behaviour {
+public:
+    void on_start() override {
+        const auto name = self().name();
+        relay::CharacterSettings settings;
+        if (name == "Crouching") settings.height = 1.0;
+        if (name == "Bad") settings.height = 0.2;
+        const bool made = self().make_character(settings);
+        if (name == "Bad") relay::world::log("bad settings " + std::string(made ? "accepted" : "refused"));
+        direction = name == "Crouching" ? 0.0 : 1.0;
+        if (name == "Idle" || name == "Jumper" || name == "Bad") direction = 0.0;
+    }
+    void on_update(double dt) override {
+        ++frames;
+        const auto name = self().name();
+        if (name == "Crouching") crouching(dt);
+        if (name == "Teleporter" && frames == 30) self().set_position({20, 0, -10});
+        if (name == "Jumper" && frames == 30) vy = 5.0;
+        if (name == "Idle" && frames == 70) relay::world::log("removed " + std::string(self().remove_character() ? "yes" : "no"));
+        if (name == "Idle" && frames == 71) relay::world::log("after removal " + std::string(self().move_character({}, dt) ? "moved" : "none"));
+        vy = grounded && vy <= 0.0 ? 0.0 : vy - 9.81 * dt;
+        const auto state = self().move_character({direction * 3.0, vy, 0.0}, dt);
+        if (!state) return;
+        grounded = state->grounded;
+        steep = state->on_steep_slope;
+        if (grounded && vy < 0.0) vy = 0.0;
+        const double y = self().world_position().y;
+        apex = std::max(apex, y);
+        if (frames == 100)
+            relay::world::log(name + " end " + centi(self().world_position().x) + " " + centi(y) + " " +
+                              (grounded ? "grounded" : "airborne") + (steep ? " steep" : "") + " ground " +
+                              (state->ground ? state->ground.name() : "none") + " apex " + centi(apex));
+    }
+private:
+    // Crouch under the ceiling, try to stand there, walk out, stand.
+    void crouching(double dt) {
+        direction = frames < 70 ? 1.0 : frames >= 80 && frames < 150 ? -1.0 : 0.0;
+        if (frames == 75) {
+            relay::CharacterSettings tall;
+            relay::world::log("stand under ceiling " + std::string(self().make_character(tall) ? "allowed" : "refused"));
+            relay::world::log("still crouched at " + centi(self().world_position().x));
+        }
+        if (frames == 160) {
+            relay::CharacterSettings tall;
+            relay::world::log("stand in the open " + std::string(self().make_character(tall) ? "allowed" : "refused"));
+        }
+        (void)dt;
+    }
+    int frames = 0;
+    double direction = 0.0;
+    double vy = 0.0;
+    double apex = 0.0;
+    bool grounded = false;
+    bool steep = false;
+};
+RELAY_BEHAVIOUR(Walker)
+)";
+
+// Scripts drive kinematic characters through steps, walls, slopes, ceilings and crates.
+void character_scripts(relay::Engine& engine, relay::ControlProtocol& protocol) {
+    expect(ok(write_script(protocol, "walker.cpp", character_source)) && ok(request(protocol, "scripts.build")),
+           "the character script is written");
+    const auto status = wait_for_build(engine, protocol);
+    expect(status.find("\"state\":\"ready\"") != std::string::npos,
+           "the character script compiles: " + status.substr(0, 800));
+    auto& scene = engine.scene();
+    const auto earlier = scene.capture_state();
+    expect(ok(request(protocol, "scene.clear")), "start the character course empty");
+    const auto slab = [&](const char* name, relay::Vec3 centre, relay::Vec3 half, double roll = 0.0) {
+        const auto entity = scene.create(name);
+        (void)scene.set_transform(entity, {centre, {0, 0, roll}, {1, 1, 1}});
+        relay::BoxCollider box;
+        box.half_extents = half;
+        (void)scene.set_collider(entity, box);
+        return entity;
+    };
+    slab("Floor", {0, -0.5, 0}, {80, 0.5, 80});
+    slab("Step", {5.5, 0.15, 0}, {3, 0.15, 2});
+    slab("Wall", {3, 0.75, 10}, {0.5, 0.75, 2});
+    slab("SteepRamp", {2.51, 0.5, 20}, {3, 0.25, 2}, 65.0);
+    slab("ShallowRamp", {2.85, 0.2, 30}, {3, 0.25, 2}, 30.0);
+    slab("Ceiling", {3, 1.65, 40}, {1.5, 0.25, 2});
+    const auto crate = slab("Crate", {2, 0.5, 50}, {0.25, 0.5, 1.5});
+    relay::PhysicsBody body;
+    body.mass = 2.0;
+    (void)scene.set_physics_body(crate, body);
+    const auto walker = [&](const char* name, relay::Vec3 at) {
+        const auto entity = scene.create(name);
+        (void)scene.set_transform(entity, {at, {}, {1, 1, 1}});
+        expect(ok(add_script(protocol, entity, "Walker")), std::string("attach the walker to ") + name);
+        return entity;
+    };
+    walker("Stepper", {0, 0.5, 0});
+    walker("Walled", {0, 0.5, 10});
+    walker("Steep", {0, 0.5, 20});
+    walker("Shallow", {0, 0.5, 30});
+    walker("Crouching", {0, 0, 40});
+    const auto pusher = walker("Pusher", {0, 0.5, 50});
+    walker("Teleporter", {0, 0, -10});
+    walker("Jumper", {0, 0.5, -20});
+    walker("Idle", {0, 0, -30});
+    walker("Bad", {0, 0, -40});
+    expect(engine.run_game(), "the character course runs");
+    engine.step(200);
+    const auto centi_log = [&](const std::string& name, std::string& rest) {
+        rest.clear();
+        for (const auto& entry : engine.logs().read_after(0))
+            if (const auto at = entry.message.find(name + " end "); at != std::string::npos)
+                rest = entry.message.substr(at + name.size() + 5U);
+        return !rest.empty();
+    };
+    const auto number = [](const std::string& text, int index) {
+        std::size_t at = 0;
+        for (int skipped = 0; skipped < index; ++skipped) at = text.find(' ', at) + 1U;
+        return std::atol(text.c_str() + at);
+    };
+    std::string text;
+    expect(centi_log("Stepper", text) && number(text, 0) > 450 && number(text, 1) >= 28 && number(text, 1) <= 33 &&
+               text.find("grounded ground Step") != std::string::npos,
+           "a character falls to the floor and walks up a step: " + text);
+    expect(centi_log("Walled", text) && number(text, 0) <= 222 && number(text, 0) > 150 && number(text, 1) <= 3,
+           "a wall taller than the step height stops it: " + text);
+    expect(centi_log("Steep", text) && number(text, 1) <= 12 && number(text, 0) < 260,
+           "ground steeper than the slope limit is not climbed: " + text);
+    expect(centi_log("Shallow", text) && number(text, 1) > 100 && text.find("grounded") != std::string::npos &&
+               text.find("steep") == std::string::npos,
+           "a gentler slope is climbed: " + text);
+    expect(logged(engine, "stand under ceiling refused") && logged(engine, "stand in the open allowed"),
+           "standing up under a low ceiling is refused until there is room");
+    long apex = -1;
+    const bool jumped = centi_log("Jumper", text);
+    if (jumped) apex = std::atol(text.c_str() + text.find(" apex ") + 6U);
+    expect(jumped && number(text, 1) <= 3 && text.find("grounded") != std::string::npos,
+           "a jumper lands again: " + text);
+    expect(apex >= 110 && apex <= 135, "a jump of 5 m/s rises about 1.27 m: " + std::to_string(apex));
+    expect(centi_log("Teleporter", text) && number(text, 0) > 2300,
+           "a script moving the node teleports the character: " + text);
+    expect(scene.get(pusher)->transform.position.x > 0.5, "the pusher walks");
+    expect(scene.get(crate)->transform.position.x > 2.4, "a character pushes a light dynamic body");
+    expect(logged(engine, "removed yes") && logged(engine, "after removal none"),
+           "removing a character stops it moving");
+    expect(logged(engine, "bad settings refused") && logged(engine, "character: height must be at least twice the radius"),
+           "bad character settings are refused with a reason");
+    expect(engine.stop_game(), "the character course stops");
+    scene.restore_state(earlier);
+}
+
 } // namespace
 
 int main() {
@@ -1538,6 +1704,7 @@ int main() {
         game_interface(engine, protocol);
         particle_scripts(engine, protocol);
         component_scripts(engine, protocol);
+        character_scripts(engine, protocol);
         references(engine, protocol);
         compile_errors(engine, protocol);
         demo_first_person(engine, protocol);

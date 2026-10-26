@@ -72,6 +72,7 @@ InputMap default_input_map() {
         {"interact", {"key:e", "gamepad:x"}},
         {"fire", {"mouse:left", "gamepad:right_trigger"}},
         {"sprint", {"key:left_shift", "gamepad:left_stick"}},
+        {"crouch", {"key:left_ctrl", "key:c", "gamepad:b"}},
     };
     map.axes = {
         {"move_x", 0.2, {{"key:a", "key:d", "", 1.0}, {"key:left", "key:right", "", 1.0},

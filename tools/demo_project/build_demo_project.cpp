@@ -603,25 +603,18 @@ int main(const int argument_count, char** arguments) {
     input.lock_mouse = true;
     demo.call("input.set_map", "\"map\":" + Builder::text(relay::input_map_json(input)));
 
-    // First Person Controller: an upright capsule body with a camera at eye height, moved by the
-    // project's FirstPersonController script. It is saved as a template at the origin (its camera
-    // inactive, so placing it never steals another scene's view), then placed in the showcase in
-    // front of the playgrounds, looking down -Z, as the scene's only and active camera.
+    // First Person Controller: a plain node standing on the floor with a camera at eye height. Its
+    // FirstPersonController script makes it a kinematic character (the node's position is its
+    // feet). It is saved as a template at the origin (its camera inactive, so placing it never
+    // steals another scene's view), then placed in the showcase in front of the playgrounds,
+    // looking down -Z, as the scene's only and active camera.
     const auto player = demo.create("First Person Controller");
     const auto player_field = "\"entity\":" + Builder::text(player);
-    demo.transform(player, {0, 1, 0});
-    // Its mask leaves out layer 2, the Ball template's, so the player's own shots pass through it.
-    demo.collider(player, "\"type\":\"capsule\",\"radius\":0.35,\"half_height\":0.55,"
-                          "\"mask\":4294967293");
-    // Walking sets velocity, so friction and damping would only catch on walls.
-    demo.call("scene.set_physics_body", player_field +
-                                            ",\"type\":\"dynamic\",\"mass\":70,\"friction\":0,"
-                                            "\"linear_damping\":0,\"angular_damping\":0,"
-                                            "\"lock_rotation\":true");
+    demo.transform(player, {0, 0, 0});
     demo.call("component.add", player_field + ",\"component\":\"script\","
                                               "\"behaviour\":\"FirstPersonController\"");
     const auto player_camera = demo.create("Camera", player);
-    demo.transform(player_camera, {0, 0.7, 0});
+    demo.transform(player_camera, {0, 1.6, 0});
     // The game hears from the player's eyes.
     demo.call("component.add", "\"entity\":" + Builder::text(player_camera) +
                                    ",\"component\":\"audio_listener\"");
@@ -632,7 +625,7 @@ int main(const int argument_count, char** arguments) {
     // template's own Camera.
     demo.reference(player, 0, "camera", player_camera);
     demo.call("templates.save", player_field + ",\"name\":\"First Person Controller\",\"replace\":true");
-    demo.transform(player, {0, 1, 8});
+    demo.transform(player, {0, 0, 8});
     demo.call("scene.set_camera", "\"entity\":" + Builder::text(player_camera) + ",\"active\":true");
     // The sound tests find the player, the way MusicSwitch also finds its soundtrack, by reference.
     demo.reference(button, 0, "player", player);

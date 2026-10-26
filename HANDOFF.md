@@ -405,10 +405,10 @@ without blocking simultaneous human editing.
   into a `FirstPersonController` script component with the same settings as property overrides
   (`camera` becomes `camera_name`). The demo project provides that behaviour in
   `examples/demo/scripts/FirstPersonController.cpp` and a "First Person Controller" template: a
-  0.35 m radius capsule (70 kg, no friction or damping, rotation locked) 1 m up, with a child
-  "Camera" 0.7 m above it (75 degree field of view, inactive until the script's `on_start`
-  activates it). The script turns the camera for look and sets the body's horizontal velocity,
-  jumping only when a raycast that ignores the body finds ground. On `fire` it instantiates the
+  plain node (the character's feet; the script adds the capsule) with a child
+  "Camera" 1.6 m above it (75 degree field of view, inactive until the script's `on_start`
+  activates it). The script turns the camera for look and moves the character with its own
+  gravity, jumping when grounded or within the coyote time. On `fire` it instantiates the
   "Ball" template 0.5 m along the view from the camera with velocity `ball_speed` (20 m/s) along
   the view plus the body's velocity. Ball is a 0.3-scale gold sphere, a dynamic 0.5 kg body on
   collider layer 2 with `scripts/Projectile.cpp` (destroys it after `lifetime`, 6 s); the
@@ -812,7 +812,15 @@ Phase 3:
   "<component>.<field>" names for camera, mesh renderer, light, collider, physics body, joint,
   audio source and keyframes, set through the scene's validating setters; renderer and collider
   meshes and materials are checked against the asset registry as the protocol does),
-  `joint_connect`, `shape_cast` and `overlap_shape` (`RelayShape`: sphere, box or capsule).
+  `joint_connect`, `shape_cast` and `overlap_shape` (`RelayShape`: sphere, box or capsule), and
+  the kinematic character (`character_set/move/get/remove`, `Entity::make_character` and
+  `move_character`). `JoltState::characters_` holds a `JPH::CharacterVirtual` per entity, with the
+  capsule's origin at the feet (the node's world position), created lazily by
+  `PhysicsWorld::set_character` and moved by `move_character` through `ExtendedUpdate` (stairs,
+  stick to floor, ground velocity added while supported). Crouching is `set_character` with a new
+  height, which `SetShape`-tests for room and reports `blocked`. A script that writes the node's
+  position is noticed by comparing it with `CharacterEntry::written`. Characters die with the
+  Jolt state and with their entity (`remove_missing_bodies`); there is no inner body.
   Collider, physics body, joint and keyframe presence changes, a renderer change under a collider,
   scale writes and reparenting call `PhysicsWorld::rebuild_bodies`, which recreates the bodies from
   the scene, keeps dynamic velocities, recreates joints on or to them from the current poses, and
@@ -1327,14 +1335,14 @@ Phase 3:
    Add Component window, script property editors and template dialog are covered headlessly or by
    protocol tests, not by a desktop review. The Add Node window's template tree and palette icon
    have been seen on a Linux desktop.
-8. The demo's first person controller is a dynamic rigid body driven by velocity from a script,
-   not a kinematic character controller: it does not step up stairs, has no slope limit, crouch
-   or coyote time, and pushes other dynamic bodies with its full 70 kg. Jolt's CharacterVirtual
-   would handle those if exposed to scripts. It reads move_x, move_y, look_x, look_y, jump and
-   sprint, and shoots on fire. It has simulated-input coverage through the compiled script
-   (landing upright, walking, mouse turn, sprint, grounded-only jump, shooting, camera switch and
-   restore) and has been play-tested with mouse and keyboard on a Linux desktop, including
-   shooting balls. The first viewport click, which gives the game input, also counts as fire.
+8. The demo's first person controller is a kinematic character (`make_character`/`move_character`):
+   it steps up stairs, refuses steep slopes, crouches under ceilings (`crouch` action, default
+   Left Ctrl / C / gamepad B), and has gravity, coyote time and a jump buffer in the script. It has
+   no collider or inner body, so thrown bodies and raycasts pass through it. It reads move_x,
+   move_y, look_x, look_y, jump, sprint and crouch, and shoots on fire. It has simulated-input
+   coverage through the compiled script (standing, walking, mouse turn, sprint, crouch, jump,
+   shooting, camera switch and restore). The earlier rigid-body version was play-tested on a Linux
+   desktop; the character version has not been.
 9. Input has headless, protocol and compiled-script coverage, and viewport focus and mouse lock
    with real mouse and keyboard events were exercised by the desktop play-test of the demo
    controller. Gamepad input has not been tried with hardware, and press-to-bind capture from
@@ -1441,10 +1449,9 @@ Phase 3:
 
 ## Next priorities
 
-1. Give scripts a kinematic character controller (Jolt's CharacterVirtual: stepping up stairs,
-   slope limits, crouching) and add more example controllers (third-person, orbit) beside the
-   demo's scripted first person one. Scripts can now add, remove and configure components,
-   reparent nodes and shape cast.
+1. Add more example controllers (third-person, orbit) beside it. The character has no inner body, so thrown
+   dynamic bodies and raycasts pass through it; add one (`mInnerBodyShape`) if games need to
+   shoot or be hit by physics objects.
 2. Grow joints where games need them: breakable joints, cone/swing-twist limits for ragdolls,
    hinge target angles (servo motors), and editing joint anchors with a viewport gizmo.
 

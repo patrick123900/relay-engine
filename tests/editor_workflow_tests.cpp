@@ -1137,13 +1137,12 @@ void demo_first_person_template() {
     for (const auto& value : *relay::field(*listed.object(), "templates")->array())
         if (*relay::field(*value.object(), "name")->string() == "First Person Controller")
             controller = value.object();
-    check(controller && *relay::field(*controller, "type")->string() == "RigidBody",
-          "the demo lists its First Person Controller template under Rigid Body");
+    check(controller && *relay::field(*controller, "type")->string() == "Node",
+          "the demo lists its First Person Controller template under Node");
     const auto& behaviours = *relay::field(*controller, "behaviours")->array();
     const auto& components = *relay::field(*controller, "components")->array();
     check(behaviours.size() == 1U && *behaviours.front().string() == "FirstPersonController" &&
-              components.size() == 3U && *components[0].string() == "transform" &&
-              *components[1].string() == "collider" && *components[2].string() == "physics_body",
+              components.size() == 1U && *components[0].string() == "transform",
           "templates.list reports the template root's components and script");
     check(std::filesystem::is_regular_file("examples/demo/scripts/FirstPersonController.cpp"),
           "the controller script is editable project source");
@@ -1151,12 +1150,10 @@ void demo_first_person_template() {
     const auto player = created_entity(request(
         protocol, "templates.instantiate", "\"template\":\"project:First Person Controller\""));
     const auto* record = engine.scene().get(player);
-    check(record->collider->type == relay::BoxCollider::Type::capsule &&
-              record->physics_body->type == relay::PhysicsBody::Type::dynamic &&
-              record->physics_body->lock_rotation && record->scripts.size() == 1U &&
+    check(!record->collider && !record->physics_body && record->scripts.size() == 1U &&
               record->scripts.front().behaviour == "FirstPersonController" &&
-              record->transform.position.y == 1.0 && record->name == "First Person Controller",
-          "the template is an upright capsule body running the controller script");
+              record->transform.position.y == 0.0 && record->name == "First Person Controller",
+          "the template is a plain node running the controller script");
     relay::Entity camera{};
     for (const auto entity : engine.scene().entities())
         if (engine.scene().get(entity)->parent == player) camera = entity;

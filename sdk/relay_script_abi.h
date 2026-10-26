@@ -112,6 +112,26 @@ typedef struct RelayPropertyInfo {
     size_t filter_length;
 } RelayPropertyInfo;
 
+/* A kinematic character: an upright capsule whose feet are at the node's world position. */
+typedef struct RelayCharacterSettings {
+    double radius;
+    double height;
+    double step_height;
+    double max_slope_degrees;
+    double mass;
+    double push_force;
+    double stick_distance;
+    uint32_t layer_mask;
+} RelayCharacterSettings;
+
+typedef struct RelayCharacterState {
+    int grounded;
+    int on_steep_slope;
+    RelayEntity ground;
+    RelayVec3 ground_normal;
+    RelayVec3 velocity;
+} RelayCharacterState;
+
 /* Functions returning int report 1 on success and 0 when the entity is gone or lacks the needed
  * component. Every call runs on the engine thread during a script callback. */
 typedef struct RelayHostApi {
@@ -312,6 +332,14 @@ typedef struct RelayHostApi {
     /* Entities with a running script component of that behaviour, sorted; returns the total. */
     size_t (*script_entities)(void* context, const char* behaviour, size_t length, RelayEntity* out,
                               size_t capacity);
+    /* Makes the entity a character, or reconfigures it. Returns 1 on success, 0 when the settings
+     * are refused (logging why) and -1 when a taller shape does not fit, leaving it unchanged. */
+    int (*character_set)(void* context, RelayEntity entity, const RelayCharacterSettings* settings);
+    /* Moves the character at `velocity` for `delta_seconds` and writes its position to the node. */
+    int (*character_move)(void* context, RelayEntity entity, RelayVec3 velocity, double delta_seconds,
+                          RelayCharacterState* state);
+    int (*character_get)(void* context, RelayEntity entity, RelayCharacterState* state);
+    int (*character_remove)(void* context, RelayEntity entity);
 } RelayHostApi;
 
 /* Returned by the module entry point. `error` receives a NUL-terminated message when a call

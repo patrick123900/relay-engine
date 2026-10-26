@@ -150,18 +150,21 @@ void on_update(double dt) override {
 The demo project in [`examples/demo`](../examples/demo) starts with a player in its showcase scene:
 press **Run Game** (and trust the project the first time) to walk around. The player is also a
 **First Person Controller** template for other scenes; find it in the Add Node window under
-**Physics Body › Rigid Body**, marked with a palette icon like every custom template. It is an
-upright capsule with a dynamic, rotation-locked physics body, a child **Camera** at eye height, and
-a `FirstPersonController` script component from
+**Node**, marked with a palette icon like every custom template. It is a plain node whose position
+is the player's feet, a child **Camera** at eye height, and a `FirstPersonController` script
+component from
 [`scripts/FirstPersonController.cpp`](../examples/demo/scripts/FirstPersonController.cpp). The
-script looks around with the mouse and `look_x`/`look_y`, walks with `move_x`/`move_y` relative to
-the view, sprints, and jumps only when a raycast finds ground. `fire` (left mouse button or right
-trigger) shoots: it instantiates the demo's **Ball** template just in front of the camera and sets
-its velocity along the view, plus the player's own motion. Balls sit on collider layer 2, which the
-player's collider mask leaves out, so they never knock into the shooter, and their
+script makes the node a [kinematic character](#character-controller), so the player walks up steps,
+cannot climb steep slopes and is not shoved by bodies. It looks around with the mouse and
+`look_x`/`look_y`, walks with `move_x`/`move_y` relative to the view, sprints, crouches with
+`crouch` (standing back up waits for headroom), and jumps with gravity of its own, with coyote time
+and a short jump buffer. `fire` (left mouse button or right trigger) shoots: it instantiates the
+demo's **Ball** template just in front of the camera and sets its velocity along the view, plus the
+player's own motion. The character has no collider, so balls pass through the shooter, and their
 [`Projectile`](../examples/demo/scripts/Projectile.cpp) script destroys them after six seconds. Its
-speeds, mouse sensitivity, camera node, ball template and ball speed are Inspector properties. Edit
-the script to change how the player moves, or copy the file and the template into another project.
+speeds, size, step and slope limits, crouch, mouse sensitivity, camera node, ball template and ball
+speed are Inspector properties. Edit the script to change how the player moves, or copy the file
+and the template into another project.
 The demo's input map locks the mouse while the game has input.
 
 ## Callbacks
@@ -280,6 +283,73 @@ void on_contact_begin(relay::Entity other) override {
   [Properties](#properties)). `entity.children()` lists direct children.
 
 All queries use the running physics world, including spawned bodies and excluding destroyed ones.
+
+## Character controller
+
+A **kinematic character** is an upright capsule that a script moves through the physics world with
+collide-and-slide movement (Jolt's `CharacterVirtual`). Unlike a dynamic rigid body it walks up
+steps, refuses slopes that are too steep, follows the ground down small drops, can crouch, rides
+moving platforms and pushes light dynamic bodies, and nothing else shoves it around.
+
+```cpp
+class Walker : public relay::Behaviour {
+public:
+    void on_start() override {
+        relay::CharacterSettings settings;  // 0.3 m radius, 1.8 m tall, 0.4 m steps, 50 degree slopes
+        settings.step_height = 0.35;
+        self().make_character(settings);
+    }
+    void on_update(double dt) override {
+        const auto move = relay::input::vector("move_x", "move_y");
+        if (grounded) vertical = relay::input::pressed("jump") ? 5.0 : 0.0;
+        else vertical -= 9.81 * dt;
+        if (const auto state = self().move_character({move.x * 4.0, vertical, -move.y * 4.0}, dt))
+            grounded = state->grounded;
+    }
+private:
+    double vertical = 0.0;
+    bool grounded = false;
+};
+RELAY_BEHAVIOUR(Walker)
+```
+
+- `entity.make_character(settings)` turns the node into a character, or reconfigures it. The
+  node's **world position is the character's feet**; put the camera or model on a child raised by
+  the eye or body height. The capsule always stands upright, and the node's rotation is yours to
+  set (turn it to face the way you walk). The node needs no collider or body of its own; one it
+  has is ignored by its own character. A node with a dynamic body or keyframes cannot be a
+  character, and settings that do not make sense (a height under twice the radius) are refused
+  with a log message.
+- `entity.move_character(velocity, dt)` moves the character at a world-space velocity, vertical
+  included, and writes the new position to the node. Call it once per `on_update`; there is no
+  gravity unless you add it. It returns a `relay::CharacterState`, or nothing when the node has no
+  character: `grounded`, `on_steep_slope`, the `ground` entity and its `ground_normal`, and the
+  `velocity` it actually moved at after collisions (zero into a wall).
+- While `grounded`, a downward velocity is ignored and the character is carried along by the
+  ground it stands on, so a script zeroes its vertical speed when grounded, sets it positive to
+  jump, and otherwise accumulates gravity. A positive vertical speed lifts it off the ground.
+- `entity.character_state()` reads the last state without moving, and `entity.remove_character()`
+  turns the node back into an ordinary one.
+- A script that moves the node itself with `set_position` teleports the character there.
+
+Settings (metres, degrees, kilograms, newtons): `radius`, `height` (feet to head), `step_height`
+(about the tallest step it walks up; a rounded body may climb a little higher), `max_slope_degrees`,
+`mass` (the weight it presses onto what it stands on), `push_force` (how hard it shoves dynamic
+bodies; a 100 N character moves a few kilograms but not a stack of crates), `stick_distance` (how
+far down it follows ground it walks off, so it hugs ramps and stairs instead of hopping) and
+`layer_mask` (colliders on those layers stop it).
+
+**Crouching** is `make_character` again with a smaller `height`; the feet stay put. Standing back up
+returns `false` when something is in the way, and the character stays crouched, so a script keeps
+trying (for example every frame the crouch key is up):
+
+```cpp
+settings.height = crouch_held ? 1.0 : 1.8;
+if (!self().make_character(settings)) { /* no room to stand yet */ }
+```
+
+Characters collide with enabled colliders on their `layer_mask`, but they have no collider of their
+own: raycasts, overlaps and dynamic bodies pass through them.
 
 ## Joints
 

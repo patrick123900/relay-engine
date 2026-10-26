@@ -24,6 +24,7 @@
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/ShapeCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Character/CharacterVirtual.h>
 #include <Jolt/Physics/Constraints/DistanceConstraint.h>
 #include <Jolt/Physics/Constraints/FixedConstraint.h>
 #include <Jolt/Physics/Constraints/HingeConstraint.h>
@@ -368,6 +369,41 @@ bool triangle_mesh(const JPH::Body& body) {
 
 Vec3 add_vectors(const Vec3 a, const Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
 
+// A world position as a local position under the entity's parent, or nothing for a degenerate
+// parent.
+std::optional<Vec3> local_position_in_parent(const Scene& scene, const EntityRecord& record,
+                                             const Vec3 world) {
+    if (!record.parent.valid()) return world;
+    const auto parent = world_transform(scene, record.parent);
+    if (!parent) return std::nullopt;
+    const Vec3 relative{world.x - parent->position.x, world.y - parent->position.y,
+                        world.z - parent->position.z};
+    const auto& axes = parent->axes;
+    const double determinant = dot(axes[0], cross(axes[1], axes[2]));
+    if (std::abs(determinant) < 1e-30) return std::nullopt;
+    return Vec3{dot(relative, cross(axes[1], axes[2])) / determinant,
+                dot(relative, cross(axes[2], axes[0])) / determinant,
+                dot(relative, cross(axes[0], axes[1])) / determinant};
+}
+
+// What a character collides with: enabled colliders on its layers, other than its own node and the
+// nodes it is attached to or carries.
+class CharacterBodyFilter final : public JPH::BodyFilter {
+public:
+    CharacterBodyFilter(const Scene& scene, const std::uint32_t mask, const Entity self)
+        : scene_(scene), mask_(mask), self_(self) {}
+    bool ShouldCollideLocked(const JPH::Body& body) const override {
+        const auto entity = from_user_data(body.GetUserData());
+        const auto* record = scene_.get(entity);
+        return record && record->collider && record->collider->enabled &&
+               (record->collider->layer & mask_) && !related(scene_, entity, self_);
+    }
+private:
+    const Scene& scene_;
+    std::uint32_t mask_;
+    Entity self_;
+};
+
 struct JointEntry {
     Entity owner;     // The node carrying the Joint component.
     Entity connected; // Invalid for the world.
@@ -430,6 +466,7 @@ public:
             remove_constraint(joint);
             return true;
         });
+        std::erase_if(characters_, [&](const auto& entry) { return !scene.contains(entry.first); });
         for (auto it = bodies_.begin(); it != bodies_.end();) {
             if (scene.contains(it->first)) {
                 ++it;
@@ -767,16 +804,9 @@ public:
             JPH::Quat local_rotation = world_rotation;
             if (record->parent.valid()) {
                 const auto parent = world_transform(scene, record->parent);
-                if (!parent) continue;
-                const Vec3 relative{local_position.x - parent->position.x,
-                                    local_position.y - parent->position.y,
-                                    local_position.z - parent->position.z};
-                const auto& axes = parent->axes;
-                const double determinant = dot(axes[0], cross(axes[1], axes[2]));
-                if (std::abs(determinant) < 1e-30) continue;
-                local_position = {dot(relative, cross(axes[1], axes[2])) / determinant,
-                                  dot(relative, cross(axes[2], axes[0])) / determinant,
-                                  dot(relative, cross(axes[0], axes[1])) / determinant};
+                const auto local = local_position_in_parent(scene, *record, local_position);
+                if (!parent || !local) continue;
+                local_position = *local;
                 local_rotation = parent->rotation.Conjugated() * world_rotation;
             }
             auto authored = record->transform;
@@ -804,6 +834,145 @@ public:
         }
     }
 
+    static std::string character_problem(const CharacterSettings& s) {
+        const auto finite = [](const double value) { return std::isfinite(value); };
+        if (!finite(s.radius) || s.radius <= 0.0 || s.radius > 100.0) return "radius must be in (0, 100] metres";
+        if (!finite(s.height) || s.height < s.radius * 2.0 || s.height > 100.0)
+            return "height must be at least twice the radius and at most 100 metres";
+        if (!finite(s.step_height) || s.step_height < 0.0 || s.step_height > s.height)
+            return "step height must be between 0 and the height";
+        if (!finite(s.max_slope_degrees) || s.max_slope_degrees < 0.0 || s.max_slope_degrees > 89.0)
+            return "max slope must be between 0 and 89 degrees";
+        if (!finite(s.mass) || s.mass <= 0.0 || s.mass > 1e6) return "mass must be positive";
+        if (!finite(s.push_force) || s.push_force < 0.0 || s.push_force > 1e9) return "push force must not be negative";
+        if (!finite(s.stick_distance) || s.stick_distance < 0.0 || s.stick_distance > 10.0)
+            return "stick distance must be between 0 and 10 metres";
+        return {};
+    }
+
+    // Upright capsule with its origin at the feet.
+    static JPH::ShapeRefC character_shape(const CharacterSettings& s) {
+        const double cylinder = s.height * 0.5 - s.radius;
+        JPH::ShapeRefC inner;
+        if (cylinder > 1e-4) inner = JPH::CapsuleShapeSettings(static_cast<float>(cylinder),
+                                                               static_cast<float>(s.radius)).Create().Get();
+        else inner = JPH::SphereShapeSettings(static_cast<float>(s.radius)).Create().Get();
+        return JPH::RotatedTranslatedShapeSettings(JPH::Vec3(0, static_cast<float>(s.height * 0.5), 0),
+                                                   JPH::Quat::sIdentity(), inner.GetPtr()).Create().Get();
+    }
+
+    CharacterResult set_character(const Scene& scene, const Entity entity, const CharacterSettings& s) {
+        CharacterResult result;
+        const auto* record = scene.get(entity);
+        const auto pose = world_transform(scene, entity);
+        if (!record || !pose) {
+            result.error = "the entity is gone or has a degenerate transform";
+            return result;
+        }
+        result.error = character_problem(s);
+        if (!result.error.empty()) return result;
+        if (dynamic_body(*record) || keyframes_play(*record)) {
+            result.error = "a node with a dynamic body or keyframes cannot be a character";
+            return result;
+        }
+        const auto shape = character_shape(s);
+        const auto radians = static_cast<float>(s.max_slope_degrees * 3.14159265358979323846 / 180.0);
+        auto found = characters_.find(entity);
+        if (found == characters_.end()) {
+            JPH::CharacterVirtualSettings settings;
+            settings.mShape = shape;
+            settings.mUp = JPH::Vec3::sAxisY();
+            settings.mMaxSlopeAngle = radians;
+            settings.mSupportingVolume = JPH::Plane(JPH::Vec3::sAxisY(), -static_cast<float>(s.radius));
+            settings.mMass = static_cast<float>(s.mass);
+            settings.mMaxStrength = static_cast<float>(s.push_force);
+            settings.mEnhancedInternalEdgeRemoval = true;
+            CharacterEntry entry;
+            entry.character = new JPH::CharacterVirtual(&settings, to_jolt_position(pose->position),
+                                                        JPH::Quat::sIdentity(), entity.packed(), &system_);
+            entry.written = pose->position;
+            entry.settings = s;
+            characters_.emplace(entity, std::move(entry));
+            result.ok = true;
+            return result;
+        }
+        auto& entry = found->second;
+        auto& character = *entry.character;
+        const bool reshaped = s.height != entry.settings.height || s.radius != entry.settings.radius;
+        if (reshaped) {
+            // Only the shape's volume can collide with something, so it is tested in place, with the
+            // node's own position as the character's if a script moved it.
+            adopt_teleport(entry, pose->position);
+            const CharacterBodyFilter filter(scene, s.layer_mask, entity);
+            if (!character.SetShape(shape.GetPtr(), 1.5f * system_.GetPhysicsSettings().mPenetrationSlop,
+                                    system_.GetDefaultBroadPhaseLayerFilter(Layers::moving),
+                                    system_.GetDefaultLayerFilter(Layers::moving), filter, {}, allocator_)) {
+                result.blocked = true;
+                return result;
+            }
+            character.SetSupportingVolume(JPH::Plane(JPH::Vec3::sAxisY(), -static_cast<float>(s.radius)));
+        }
+        character.SetMaxSlopeAngle(radians);
+        character.SetMass(static_cast<float>(s.mass));
+        character.SetMaxStrength(static_cast<float>(s.push_force));
+        entry.settings = s;
+        result.ok = true;
+        return result;
+    }
+
+    std::optional<CharacterState> move_character(Scene& scene, const Entity entity, const Vec3 velocity,
+                                                 const double seconds) {
+        const auto found = characters_.find(entity);
+        const auto pose = world_transform(scene, entity);
+        if (found == characters_.end() || !pose) return std::nullopt;
+        auto& entry = found->second;
+        auto& character = *entry.character;
+        adopt_teleport(entry, pose->position);
+        const CharacterBodyFilter filter(scene, entry.settings.layer_mask, entity);
+        const auto before = character.GetPosition();
+        const auto& settings = entry.settings;
+
+        auto desired = to_jolt(velocity);
+        const bool supported = character.GetGroundState() == JPH::CharacterBase::EGroundState::OnGround;
+        const auto ground_velocity = character.GetGroundVelocity();
+        if (supported && desired.GetY() - ground_velocity.GetY() < 0.1f) {
+            // Walking on the ground: ride it, and let the sticking pull the feet down rather than
+            // pressing into it.
+            desired = JPH::Vec3(desired.GetX() + ground_velocity.GetX(), ground_velocity.GetY(),
+                                desired.GetZ() + ground_velocity.GetZ());
+        }
+        character.SetLinearVelocity(character.CancelVelocityTowardsSteepSlopes(desired));
+
+        JPH::CharacterVirtual::ExtendedUpdateSettings update;
+        update.mStickToFloorStepDown = JPH::Vec3(0, -static_cast<float>(settings.stick_distance), 0);
+        update.mWalkStairsStepUp = JPH::Vec3(0, static_cast<float>(settings.step_height), 0);
+        character.ExtendedUpdate(static_cast<float>(seconds), system_.GetGravity(), update,
+                                 system_.GetDefaultBroadPhaseLayerFilter(Layers::moving),
+                                 system_.GetDefaultLayerFilter(Layers::moving), filter, {}, allocator_);
+
+        const auto after = from_jolt(character.GetPosition());
+        entry.written = after;
+        if (auto* record = scene.get(entity)) {
+            if (const auto local = local_position_in_parent(scene, *record, after)) {
+                auto transform = record->transform;
+                transform.position = *local;
+                (void)scene.set_transform(entity, transform);
+                sync_transforms(scene, entity);
+            }
+        }
+        auto state = describe(entity, entry);
+        state.velocity = from_jolt((character.GetPosition() - before) / static_cast<float>(seconds));
+        return state;
+    }
+
+    [[nodiscard]] std::optional<CharacterState> character_state(const Entity entity) const {
+        const auto found = characters_.find(entity);
+        if (found == characters_.end()) return std::nullopt;
+        return describe(entity, found->second);
+    }
+
+    bool remove_character(const Entity entity) { return characters_.erase(entity) != 0U; }
+
     [[nodiscard]] std::optional<JPH::BodyID> body(Entity entity) const {
         const auto found = bodies_.find(entity);
         return found == bodies_.end() ? std::nullopt : std::optional{found->second};
@@ -821,6 +990,35 @@ public:
         return result;
     }
 private:
+    struct CharacterEntry {
+        JPH::Ref<JPH::CharacterVirtual> character;
+        CharacterSettings settings;
+        Vec3 written; // The world position last given to the node, to notice scripts moving it.
+    };
+
+    // A script that set the node's position since the last move has teleported the character.
+    static void adopt_teleport(CharacterEntry& entry, const Vec3 node_position) {
+        const auto moved = [](const double a, const double b) { return std::abs(a - b) > 1e-5; };
+        if (!moved(node_position.x, entry.written.x) && !moved(node_position.y, entry.written.y) &&
+            !moved(node_position.z, entry.written.z)) return;
+        entry.character->SetPosition(to_jolt_position(node_position));
+        entry.character->SetLinearVelocity(JPH::Vec3::sZero());
+        entry.written = node_position;
+    }
+
+    static CharacterState describe(const Entity, const CharacterEntry& entry) {
+        const auto& character = *entry.character;
+        CharacterState state;
+        const auto ground = character.GetGroundState();
+        state.grounded = ground == JPH::CharacterBase::EGroundState::OnGround;
+        state.on_steep_slope = ground == JPH::CharacterBase::EGroundState::OnSteepGround;
+        if (state.grounded || state.on_steep_slope) {
+            state.ground = from_user_data(character.GetGroundUserData());
+            state.ground_normal = from_jolt(character.GetGroundNormal());
+        }
+        return state;
+    }
+
     BroadLayerInterface broad_layers_;
     BroadFilter broad_filter_;
     PairFilter pair_filter_;
@@ -831,6 +1029,7 @@ private:
     std::map<Entity, JPH::BodyID> bodies_;
     std::map<Entity, std::size_t> mesh_triangles_; // Budget taken by each triangle-mesh body.
     std::vector<JointEntry> joints_;
+    std::map<Entity, CharacterEntry> characters_;
     std::deque<ContactEvent> events_;
     std::uint64_t latest_sequence_{};
     const AssetRegistry* assets_{};
@@ -1247,6 +1446,23 @@ CollisionRaycast PhysicsWorld::shape_cast(const Scene& scene, const CollisionSha
     result.point = {origin.x + contact.x, origin.y + contact.y, origin.z + contact.z};
     result.normal = from_jolt(-hit.mHit.mPenetrationAxis.NormalizedOr(-to_jolt(unit)));
     return result;
+}
+CharacterResult PhysicsWorld::set_character(const Scene& scene, const Entity entity,
+                                            const CharacterSettings& settings) {
+    ensure_built(scene);
+    return impl_->state->set_character(scene, entity, settings);
+}
+std::optional<CharacterState> PhysicsWorld::move_character(Scene& scene, const Entity entity,
+                                                           const Vec3 velocity, const double seconds) {
+    if (!impl_->state || !finite_vector(velocity) || !std::isfinite(seconds) || seconds <= 0.0 ||
+        seconds > 1.0) return std::nullopt;
+    return impl_->state->move_character(scene, entity, velocity, seconds);
+}
+std::optional<CharacterState> PhysicsWorld::character_state(const Scene&, const Entity entity) const {
+    return impl_->state ? impl_->state->character_state(entity) : std::nullopt;
+}
+bool PhysicsWorld::remove_character(const Entity entity) {
+    return impl_->state && impl_->state->remove_character(entity);
 }
 bool PhysicsWorld::apply_impulse(const Scene& scene, Entity entity, Vec3 impulse,
                                  std::optional<Vec3> world_point) {

@@ -409,6 +409,9 @@ struct EntityRecord {
     UiComponents ui{};
     // Bits of `ComponentFlag` for components that are present but switched off.
     std::uint32_t disabled_components{};
+    // Position among its siblings, the hierarchy's order: ascending, ties in creation order. Interface
+    // controls sort by their control's order instead (Scene::move keeps the two equal).
+    double order{};
 };
 
 [[nodiscard]] constexpr bool component_disabled(const EntityRecord& record,
@@ -460,6 +463,9 @@ public:
     [[nodiscard]] bool set_name(Entity entity, std::string name);
     [[nodiscard]] bool set_transform(Entity entity, const Transform& transform);
     [[nodiscard]] bool set_parent(Entity entity, Entity parent);
+    // Reparents an entity and places it among its new siblings: in front of `before`, one of them, or
+    // last when `before` is invalid. Renumbers the siblings' order (and their controls').
+    [[nodiscard]] bool move(Entity entity, Entity parent, Entity before);
     [[nodiscard]] bool set_camera(Entity entity, std::optional<Camera> camera);
     [[nodiscard]] bool set_mesh_renderer(Entity entity, std::optional<MeshRenderer> renderer);
     [[nodiscard]] bool set_animator(Entity entity, std::optional<Animator> animator);

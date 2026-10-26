@@ -1043,6 +1043,8 @@ SceneFileLoadResult load_scene_file(const std::filesystem::path& path) {
                 slot.record.disabled_components |= static_cast<std::uint32_t>(*flag);
             }
         }
+        if (const auto* order = field(*entity_object, "order"); order && order->number() && std::isfinite(*order->number()))
+            slot.record.order = *order->number();
         ++result.entity_count;
     }
 

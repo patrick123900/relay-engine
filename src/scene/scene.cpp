@@ -298,7 +298,9 @@ void append_entity(JsonWriter& output, const Entity entity, const EntityRecord& 
         output << (first_disabled ? "" : ",") << '"' << kind.id << '"';
         first_disabled = false;
     }
-    output << "]}";
+    output << ']';
+    if (record.order != 0.0) output << ",\"order\":" << record.order;
+    output << '}';
 }
 
 std::string_view field_type_name(const ReflectedFieldType type) {
@@ -440,6 +442,34 @@ bool Scene::set_parent(const Entity entity, const Entity parent) {
         return false;
     }
     record->parent = parent;
+    return true;
+}
+
+bool Scene::move(const Entity entity, const Entity parent, const Entity before) {
+    auto* record = get(entity);
+    if (record == nullptr || (parent.valid() && !contains(parent)) || would_create_cycle(entity, parent)) return false;
+    if (before.valid()) {
+        const auto* sibling = get(before);
+        if (sibling == nullptr || before == entity || sibling->parent != parent) return false;
+    }
+    const auto key = [](const EntityRecord& item) {
+        return item.ui.control ? static_cast<double>(item.ui.control->order) : item.order;
+    };
+    std::vector<std::uint32_t> siblings;
+    for (std::uint32_t index = 0; index < slots_.size(); ++index)
+        if (slots_[index].alive && slots_[index].record.parent == parent && index != entity.index) siblings.push_back(index);
+    std::stable_sort(siblings.begin(), siblings.end(), [&](const std::uint32_t a, const std::uint32_t b) {
+        return key(slots_[a].record) < key(slots_[b].record);
+    });
+    auto place = siblings.end();
+    if (before.valid()) place = std::find(siblings.begin(), siblings.end(), before.index);
+    siblings.insert(place, entity.index);
+    record->parent = parent;
+    for (std::size_t position = 0; position < siblings.size(); ++position) {
+        auto& item = slots_[siblings[position]].record;
+        item.order = static_cast<double>(position);
+        if (item.ui.control) item.ui.control->order = static_cast<std::int32_t>(position);
+    }
     return true;
 }
 

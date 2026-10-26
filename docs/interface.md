@@ -69,7 +69,7 @@ common resolutions, portrait, or a custom size. Check an interface at several si
 on it.
 
 - Click a control to select it, and drag it to move it. The handles on the selected control resize
-  it; **Ctrl** snaps to 8 units. The arrow keys nudge the selection by 1, or 8 with **Shift**. Each
+  it; **Ctrl** flips grid snapping (see below). The arrow keys nudge the selection by 1, or 8 with **Shift**. Each
   drag is one undo step.
 - Green markers show where the selected control is anchored, and a circle its pivot.
 - The mouse wheel zooms about the pointer, the middle button pans, and **Fit** frames the screen.
@@ -77,6 +77,13 @@ on it.
 - Controls placed by a container cannot be dragged; change the container, or the child's minimum
   size and expand settings, instead.
 - During Run Game it shows the game's interface as it is, and does not edit it.
+
+## Editing in the viewport
+
+Switch the viewport to the **Scene camera** (the camera button in its toolbar, or the View menu) and
+the interface draws over the scene, laid out for the viewport's own size as the game would be. It
+selects, moves, resizes and nudges controls exactly as the Interface editor does. It does not
+show on the editor camera, where clicks and gizmos belong to the 3D scene, nor during Run Game.
 
 Hidden controls (**Visible** off, such as a menu a script opens) do not draw; turn them on while you
 work on them.
@@ -180,8 +187,8 @@ Agents build interfaces with the same operations: `scene.create` with an interfa
 `scene.set_ui` to add, change or remove a component (for example
 `{"entity": "4:1", "component": "ui_label", "values": {"text": "Score: 0", "size": 32}}`, or
 `"anchor_preset": "top_right"` for a control), and `component.types`, which lists every interface
-field with its type, range, choices and default. Since the interface does not show in the editor's
-view, `ui.render` draws it alone into a PNG at any screen size, while editing or during the game,
+field with its type, range, choices and default. Since the interface only shows in the editor's
+scene camera view, `ui.render` draws it alone into a PNG at any screen size, while editing or during the game,
 and `ui.layout` reports each control's rectangle in pixels, whether it shows, and the latest game
 step's events. During Run Game, `ui.click` clicks a button, check box or slider as a player would.
 
@@ -197,3 +204,11 @@ complex scripts such as Arabic or Devanagari are not shaped.
 
 World-space interfaces (a screen in the 3D world), keyboard and gamepad focus navigation, text
 input fields, scroll containers, rich text, and interface animation beyond what scripts do.
+
+## Grid snapping
+
+The viewport toolbar has a grid button, after a divider, that turns grid snapping on or off. The arrow
+beside it opens the grid sizes: move (world units), rotate (degrees), scale, and interface units.
+Snapping applies to the 3D gizmo and to dragging or resizing interface controls, in the viewport
+and the Interface editor. Holding **Ctrl** while dragging flips it for that drag. The settings are
+kept with the editor layout. Arrow-key nudges ignore the grid.

@@ -111,6 +111,7 @@ add_custom_target(relay_protocol_codegen_check ALL
 set(RELAY_EMBEDDED_SHADER_INPUTS
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bindings.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/surface_lighting.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/reflection_trace_common.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/effects/Bloom.relay-shader"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/effects/ColorGrading.relay-shader"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/effects/Vignette.relay-shader")
@@ -440,6 +441,7 @@ if(RELAY_ENABLE_SDL)
                             -o "${RELAY_${shader}_SHADER}"
                     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.comp"
                             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/surface_lighting.glsl"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/reflection_trace_common.glsl"
                         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bindings.glsl"
                     VERBATIM
                 )

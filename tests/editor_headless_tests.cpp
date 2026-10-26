@@ -2892,9 +2892,106 @@ void interface_ui() {
     // A label in a container is placed by it, so the Interface editor leaves it where it is.
     if (const char* directory = std::getenv("RELAY_UI_SNAPSHOT_DIR"))
         (void)relay_test::write_ui_snapshot(std::filesystem::path(directory) / "interface-editor-dragged.png");
+
+    // The viewport shows the interface only on the scene camera, and edits it in place.
+    ui.set_panel_visible("Interface", false);
+    frame(ui, 5);
+    const auto viewport = rect("viewport");
+    // Where the button sits in the viewport: the game lays the interface out for the viewport's size.
+    const auto button_centre = [&] {
+        const auto width = static_cast<std::uint32_t>(viewport[2] - viewport[0]);
+        const auto height = static_cast<std::uint32_t>(viewport[3] - viewport[1]);
+        const auto layout = engine.ui().layout(scene, width, height);
+        const auto* node = layout.find(button);
+        check(node != nullptr, "the button is laid out for the viewport");
+        const auto corners = layout.corners(*node);
+        return std::array<float, 2>{viewport[0] + static_cast<float>((corners[0].x + corners[2].x) / 2.0),
+                                    viewport[1] + static_cast<float>((corners[0].y + corners[2].y) / 2.0)};
+    };
+    const auto drag_in_viewport = [&] {
+        const auto start = button_centre();
+        io.AddMousePosEvent(start[0], start[1]);
+        frame(ui);
+        io.AddMouseButtonEvent(0, true);
+        frame(ui);
+        io.AddMousePosEvent(start[0] + 30.0F, start[1] + 20.0F);
+        frame(ui, 2);
+        io.AddMouseButtonEvent(0, false);
+        frame(ui, 3);
+    };
+    const auto editor_before = scene.get(button)->ui.control->offset_min;
+    drag_in_viewport();
+    check(scene.get(button)->ui.control->offset_min == editor_before,
+          "the viewport leaves the interface alone on the editor camera");
+    click_center(ui, rect("toolbar:camera"));
+    frame(ui, 3);
+    const auto scene_before = scene.get(button)->ui.control->offset_min;
+    const auto scene_undo = engine.scene_history().undo_depth();
+    drag_in_viewport();
+    const auto scene_after = scene.get(button)->ui.control->offset_min;
+    check(scene_after.x > scene_before.x + 10.0 && scene_after.y > scene_before.y + 5.0,
+          "dragging a control in the viewport on the scene camera moves it");
+    check(engine.scene_history().undo_depth() == scene_undo + 1U, "one viewport drag is one undo step");
+    // Grid snapping (default 8 interface units) applies to the viewport drag too.
+    click_center(ui, rect("toolbar:snap"));
+    frame(ui, 2);
+    drag_in_viewport();
+    const auto snapped = scene.get(button)->ui.control->offset_min;
+    check(std::fmod(snapped.x, 8.0) == 0.0 && std::fmod(snapped.y, 8.0) == 0.0 && snapped != scene_after,
+          "grid snapping rounds a viewport drag to the grid size");
+    click_center(ui, rect("toolbar:camera"));
+    frame(ui, 3);
     std::cout << "Headless interface editor tests passed\n";
 }
 
+
+// Dragging a Hierarchy row onto the top or bottom of another places it between rows, ordering the
+// siblings and moving it out of its parent; the middle of a row still reparents.
+void hierarchy_order_ui() {
+    relay::EngineConfig config;
+    config.editor_mode = true;
+    relay::Engine engine(config);
+    relay::ControlProtocol protocol(engine);
+    check(protocol.handle(R"({"id":1,"method":"project.create","filename":"projects/ordering/project.relayproject","name":"Ordering"})")
+              .find("\"ok\":true") != std::string::npos, "create ordering project");
+    auto& scene = engine.scene();
+    const auto first = scene.create("First");
+    const auto second = scene.create("Second");
+    const auto third = scene.create("Third");
+    const auto inner = scene.create("Inner", first);
+    relay::EditorUi ui([&](std::string_view request) { return protocol.handle(request); });
+    std::string error;
+    check(ui.initialize_headless(error), "initialize ordering editor without windows");
+    frame(ui, 5);
+    const auto row = [&](relay::Entity entity) {
+        const auto found = ui.headless_item_rect("entity:" + entity.to_string());
+        check(found.has_value(), "the node has a Hierarchy row");
+        return *found;
+    };
+    // Drags a row's centre to `fraction` of the way down another row.
+    const auto drag_to = [&](relay::Entity from, relay::Entity to, float fraction) {
+        auto target = row(to);
+        const float y = target[1] + (target[3] - target[1]) * fraction;
+        target = {target[0], y, target[2], y};
+        drag_onto(ui, row(from), target);
+        frame(ui, 3);
+    };
+    drag_to(inner, second, 0.1F);
+    check(!scene.get(inner)->parent.valid(), "dropping on the top of a row moves a child out of its parent");
+    check(scene.get(first)->order < scene.get(inner)->order && scene.get(inner)->order < scene.get(second)->order &&
+              scene.get(second)->order < scene.get(third)->order,
+          "the node lands between the rows it was dropped between");
+    drag_to(first, third, 0.9F);
+    check(scene.get(first)->order > scene.get(third)->order && scene.get(first)->order > scene.get(second)->order,
+          "dropping on the bottom of the last row places the node after it");
+    drag_to(third, second, 0.5F);
+    check(scene.get(third)->parent == second, "dropping on the middle of a row still reparents");
+    const auto undo_before = engine.scene_history().undo_depth();
+    check(protocol.handle("{\"id\":2,\"method\":\"scene.undo\"}").find("\"ok\":true") != std::string::npos &&
+              !scene.get(third)->parent.valid() && engine.scene_history().undo_depth() + 1U == undo_before,
+          "a move is one undo step");
+    std::cout << "Headless hierarchy order tests passed\n";
+}
 
 // Opt-in cost report (RELAY_EDITOR_BENCH=1): builds the editor UI over the demo project at a
 // simulated 250 FPS, in Editor mode and while the game runs, and prints frame-time statistics, the
@@ -3063,6 +3160,7 @@ int main() {
         fresh(shader_ui);
         fresh(asset_browser_ui);
         fresh(interface_ui);
+        fresh(hierarchy_order_ui);
         fresh(hierarchy_search_ui);
         fresh(profiler_ui);
         fresh(game_configuration_ui);

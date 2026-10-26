@@ -515,6 +515,117 @@ layout(location = 5) out vec4 output_diffuse_light;
     return text;
 }
 
+// The compute kernel that shades ray traced reflection hits on a custom surface (see
+// reflection_trace_common.glsl): the hit is rebuilt from the trace's record, the user's fragment()
+// runs on it, and the result is lit like any reflected surface. Compute has no screen derivatives,
+// so texture() reads an explicit level of detail, and vertex() does not move reflected surfaces.
+std::string surface_hit(const ParsedShader& shader) {
+    std::string text = "#version 450\n#extension GL_EXT_nonuniform_qualifier : require\n#line 200000\n";
+    text += "layout(local_size_x = 32) in;\n";
+    text += "float surface_lod = 0.0;\n";
+    text += "#define SURFACE_TEXTURE(index, uv) textureLod(textures[nonuniformEXT(index)], uv, surface_lod)\n";
+    text += embedded("surface_lighting.glsl");
+    text += "#define RELAY_TRACE_SET 2\n";
+    text += embedded("reflection_trace_common.glsl");
+    text += parameter_declarations(shader);
+    text += surface_builtins;
+    text += "#define texture(sampler, coordinates) textureLod(sampler, coordinates, surface_lod)\n";
+    text += "#line 1\n" + stage_code(shader, "vertex") + '\n';
+    text += "#line " + std::to_string(generated_line) + "\nvoid main() {\n";
+    text += R"(    uint ray_index = gl_GlobalInvocationID.x;
+    if (ray_index >= counter[5]) return;
+    uint instance_index = hit_records[ray_index * 4u];
+    if (instance_index == no_hit) return;
+    InstanceData instance = instances[instance_index];
+    if (instance.extra.x != trace.hit.x + 1u) return;
+    uint primitive = hit_records[ray_index * 4u + 1u];
+    uint fractions = hit_records[ray_index * 4u + 2u];
+    vec2 barycentrics = vec2(float(fractions & 0xFFFFu), float(fractions >> 16u)) / 65535.0;
+    float hit_distance = uintBitsToFloat(hit_records[ray_index * 4u + 3u]);
+    uint packed = rays[ray_index];
+    ivec2 pixel = ivec2(packed & 32767u, (packed >> 15u) & 16383u);
+    bool copy_horizontal = ((packed >> 29u) & 1u) != 0u;
+    bool copy_vertical = ((packed >> 30u) & 1u) != 0u;
+    bool copy_diagonal = ((packed >> 31u) & 1u) != 0u;
+    vec3 origin, direction;
+    reflection_ray(pixel, origin, direction);
+
+    vec3 weights = vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
+    uint first = instance.first_index + primitive * 3u;
+    uvec3 corners = uvec3(uint(int(indices[first]) + instance.vertex_offset),
+                          uint(int(indices[first + 1u]) + instance.vertex_offset),
+                          uint(int(indices[first + 2u]) + instance.vertex_offset));
+    vec2 hit_uv = vertex_uv(instance, corners.x) * weights.x + vertex_uv(instance, corners.y) * weights.y +
+                  vertex_uv(instance, corners.z) * weights.z;
+    vec3 object_normal = vertex_vector(instance, corners.x, 5u) * weights.x +
+                         vertex_vector(instance, corners.y, 5u) * weights.y +
+                         vertex_vector(instance, corners.z, 5u) * weights.z;
+    vec4 object_tangent = vertex_vector4(instance, corners.x, 8u) * weights.x +
+                          vertex_vector4(instance, corners.y, 8u) * weights.y +
+                          vertex_vector4(instance, corners.z, 8u) * weights.z;
+    mat3 model = mat3(instance.model);
+    vec3 world_normal = normalize(transpose(inverse(model)) * object_normal);
+    vec3 hit_position = origin + direction * hit_distance;
+    surface_lod = clamp(log2(1.0 + hit_distance), 0.0, 6.0);
+    UV = hit_uv;
+    // Custom surfaces face the viewer on both sides; here the viewer is the ray's origin.
+    NORMAL = dot(world_normal, direction) > 0.0 ? -world_normal : world_normal;
+    TANGENT = vec4(normalize(model * object_tangent.xyz), object_tangent.w);
+    WORLD_POSITION = hit_position;
+    CAMERA_POSITION = lighting.camera_count.xyz;
+    VIEW = -direction;
+    TIME = lighting.frame_time.x;
+    FRAGCOORD = vec4(vec2(pixel) + 0.5, 0.0, 1.0);
+    FRONT_FACING = dot(world_normal, direction) < 0.0;
+    MODEL_MATRIX = instance.model;
+    ALBEDO = vec3(1.0);
+    ALPHA = 1.0;
+    METALLIC = 0.0;
+    ROUGHNESS = 0.5;
+    EMISSION = vec3(0.0);
+    AO = 1.0;
+    NORMAL_MAP = vec3(0.5, 0.5, 1.0);
+    NORMAL_MAP_DEPTH = 1.0;
+    ALPHA_SCISSOR_THRESHOLD = 0.0;
+)";
+    if (shader.has_fragment) text += "    fragment();\n";
+    text += R"(    Surface surface;
+    surface.base_color = vec4(max(ALBEDO, vec3(0.0)), 1.0);
+    surface.metallic = clamp(METALLIC, 0.0, 1.0);
+    surface.roughness = clamp(ROUGHNESS, 0.045, 1.0);
+    vec3 normal = normalize(NORMAL);
+    if (NORMAL_MAP != vec3(0.5, 0.5, 1.0)) {
+        vec3 tangent = normalize(TANGENT.xyz - normal * dot(normal, TANGENT.xyz));
+        vec3 bitangent = normalize(cross(normal, tangent)) * (TANGENT.w < 0.0 ? -1.0 : 1.0);
+        vec3 mapped = NORMAL_MAP * 2.0 - 1.0;
+        mapped.xy *= NORMAL_MAP_DEPTH;
+        normal = normalize(mat3(tangent, bitangent, normal) * mapped);
+    }
+    surface.normal = normal;
+    surface.occlusion = clamp(AO, 0.0, 1.0);
+    surface.emissive = max(EMISSION, vec3(0.0));
+)";
+    if (shader.unshaded) {
+        text += "    vec3 radiance = surface.base_color.rgb + surface.emissive;\n";
+    } else {
+        text += R"(    vec3 direct_total;
+    vec3 direct_diffuse;
+    direct_lighting(surface, hit_position, -direction, direct_total, direct_diffuse);
+    vec3 radiance = direct_total + ambient_lighting(surface, -direction) + surface.emissive;
+)";
+    }
+    text += R"(    vec4 result = vec4(radiance, hit_distance);
+    if (any(isnan(result))) return;
+    result.rgb = min(result.rgb, vec3(64.0));
+    store(pixel, result);
+    if (copy_horizontal) store(pixel ^ ivec2(1, 0), result);
+    if (copy_vertical) store(pixel ^ ivec2(0, 1), result);
+    if (copy_diagonal) store(pixel ^ ivec2(1, 1), result);
+}
+)";
+    return text;
+}
+
 std::string post_fragment(const ParsedShader& shader) {
     std::string text = "#version 450\n#line 200000\n";
     text += R"(layout(location = 0) out vec4 output_color;
@@ -889,6 +1000,7 @@ GeneratedShader generate_shader_glsl(const ParsedShader& shader) {
     result.vertex = surface_vertex(shader);
     result.fragment = surface_fragment(shader, false);
     result.shadow_fragment = surface_fragment(shader, true);
+    result.hit = surface_hit(shader);
     return result;
 }
 
@@ -917,6 +1029,11 @@ std::shared_ptr<const CompiledShader> compile_relay_shader(const std::string_vie
                compile_stage(EShLangFragment, generated.fragment, compiled->fragment, messages)) {
         compile_stage(EShLangFragment, generated.shadow_fragment, compiled->shadow_fragment, messages);
     }
+    if (messages.empty() && compiled->parsed.type != ShaderType::post_process) {
+        // Not reported: a shader the kernel cannot express still draws, and shows grey in reflections.
+        std::vector<ShaderMessage> ignored;
+        if (!compile_stage(EShLangCompute, generated.hit, compiled->hit, ignored)) compiled->hit.clear();
+    }
     std::sort(messages.begin(), messages.end());
     messages.erase(std::unique(messages.begin(), messages.end()), messages.end());
     compiled->errors = std::move(messages);
@@ -924,6 +1041,7 @@ std::shared_ptr<const CompiledShader> compile_relay_shader(const std::string_vie
         compiled->vertex.clear();
         compiled->fragment.clear();
         compiled->shadow_fragment.clear();
+        compiled->hit.clear();
     }
 #else
     compiled->errors.push_back({0U, "this build of Relay cannot compile shaders (glslang was not found)"});

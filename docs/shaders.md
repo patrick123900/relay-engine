@@ -263,7 +263,11 @@ not parse is edited as text until they do. Comments inside a converted stage are
 
 ## Limits
 
-- Ray traced reflections show custom surfaces in plain grey; their shaders only run on screen.
+- Ray traced reflections run a custom surface's `fragment()` on what they hit, with `vertex()` left out
+  (reflected surfaces do not wave or swell), no screen derivatives (`texture()` reads a level of
+  detail chosen by distance) and `FRAGCOORD` set to the reflecting pixel. A shader that cannot be
+  built that way, or a scene with more than 24 materials in use at once, shows grey there. Transparent
+  custom surfaces are not in reflections.
 - Per-object values cover numbers, vectors, colors and booleans, not images; the material preview
   shows the material's own values.
 - Effects run one after another over the whole image; there is no per-camera stack beyond the

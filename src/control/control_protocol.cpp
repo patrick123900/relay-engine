@@ -2955,6 +2955,22 @@ std::string ControlProtocol::handle(const std::string_view request) {
         return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
                ",\"history\":" + history_json(engine_.scene_history()) + "}}";
     }
+    if (method == "scene.move_node") {
+        const auto entity = entity_field(request, "entity");
+        const auto parent = entity_field(request, "parent");
+        const auto before = entity_field(request, "before");
+        if (!entity.has_value() || !entity->valid() || !parent.has_value() || !before.has_value()) {
+            return error_response(id, "invalid entity, parent or before handle");
+        }
+        if (!engine_.scene_history().execute("Move " + entity->to_string(), [&](Scene& scene) {
+                return scene.move(*entity, *parent, *before);
+            })) {
+            return error_response(id, "moving failed; check handles, that before is a child of parent, and hierarchy cycles");
+        }
+        engine_.logs().write(LogLevel::info, "Moved entity " + entity->to_string());
+        return response_prefix(id) + "{\"entity\":" + engine_.scene().entity_json(*entity) +
+               ",\"history\":" + history_json(engine_.scene_history()) + "}}";
+    }
     if (method == "scene.undo") {
         if (!engine_.scene_history().undo()) return error_response(id, "nothing to undo");
         engine_.logs().write(LogLevel::info, "Undid scene transaction");

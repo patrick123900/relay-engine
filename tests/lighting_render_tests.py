@@ -8,9 +8,11 @@ renders the scene, and that each effect changes the image where it should. A cop
 with a Sky node then checks the gradient sky, fog and a sky material's panorama, and another the
 custom surface shaders and post processing. The demo's motion blur must blur a camera that
 turns between frames and leave a still one sharp. Finally particles in front of the camera must
-glow additively, cover alpha-blended and rise as the capture steps.
+glow additively, cover alpha-blended and rise as the capture steps, and a particle out of view
+must show in a glossy sphere's reflection, as must a custom shader's surface.
 """
 
+import copy
 import json
 import os
 import pathlib
@@ -416,6 +418,134 @@ def particle_checks(binary: str, folder: pathlib.Path) -> list:
     return failures
 
 
+def particle_reflection_checks(binary: str, folder: pathlib.Path) -> list:
+    """A big red additive particle behind the camera is out of view, so it can only show in the
+    demo's glossy spheres through ray traced reflections: red must appear in the image with
+    reflections on, and nowhere with them off."""
+    project = folder / "particle-reflection-demo"
+    shutil.copytree(ROOT / "examples" / "demo", project, ignore=shutil.ignore_patterns(".relay-cache"))
+    hide_interface(project)
+    path = project / "scenes" / "showcase.relay.json"
+    document = json.loads(path.read_text())
+    entities = document["scene"]["entities"]
+    for entity in entities:
+        entity["particle_emitter"] = None
+        if entity.get("post_process") is not None:
+            entity["post_process"] = None
+    camera = next(entity for entity in entities if entity.get("camera") and entity["camera"]["active"])
+    generations = document["scene"]["allocator"]["slot_generations"]
+
+    emitter = {"rate": 0, "bursts": [{"time": 0, "count": 1}], "shape": "point", "speed": 0, "lifetime": 100,
+               "soft_distance": 0, "size": 1.5, "color": [1, 0.1, 0.05, 1], "blend": "additive", "emission": 8,
+               "builtin_texture": "square"}
+    glow = {key: ([] if key == "disabled_components" else None) for key in entities[0]}
+    glow.update(entity=f"{len(generations)}:1", name="Glow", scripts=[], parent=camera["entity"],
+                transform={"position": {"x": 0, "y": 0, "z": 2.5}, "rotation_degrees": {"x": 0, "y": 0, "z": 0},
+                           "scale": {"x": 1, "y": 1, "z": 1}})
+    generations.append(1)
+    entities.append(glow)
+    document["version"] = max(document["version"], 26)
+    images = {}
+    for name, lit, reflections in (("plain-on", False, True), ("glow-on", True, True), ("glow-off", True, False),
+                                   ("plain-off", False, False)):
+        glow["particle_emitter"] = emitter if lit else None
+        path.write_text(json.dumps(document))
+        result, status = render(binary, folder / f"{name}.png", True, reflections, folder,
+                                "particle-reflection-demo/demo.relayproject")
+        if result.returncode != 0 or status is None:
+            return [f"particle reflection render ({name}) failed: {result.stderr.strip()[-400:]}"]
+        images[name] = read_png(folder / f"{name}.png")
+
+    def redder(with_glow, without):
+        width, channels = with_glow[0], with_glow[2]
+        count = 0
+        for y in range(with_glow[1]):
+            for x in range(width):
+                if with_glow[3][y][x * channels] - without[3][y][x * channels] > 40:
+                    count += 1
+        return count
+
+    reflected, unreflected = redder(images["glow-on"], images["plain-on"]), redder(images["glow-off"], images["plain-off"])
+    print(f"pixels the unseen glow reddens: {reflected} with reflections, {unreflected} without")
+    failures = []
+    if reflected < 50:
+        failures.append(f"the particle should show in ray traced reflections ({reflected} pixels)")
+    if unreflected > 10:
+        failures.append(f"the particle behind the camera should not show without reflections ({unreflected} pixels)")
+    return failures
+
+
+def shader_reflection_checks(binary: str, folder: pathlib.Path) -> list:
+    """A custom surface shader's own result shows in ray traced reflections, not the grey stand-in:
+    a cyan unshaded ball behind the camera is out of view, so only the chrome sphere in front of
+    the camera can show it. Cyan must appear with reflections on, and nowhere with them off."""
+    project = folder / "shader-reflection-demo"
+    shutil.copytree(ROOT / "examples" / "demo", project, ignore=shutil.ignore_patterns(".relay-cache"))
+    hide_interface(project)
+    (project / "Cyan.relay-shader").write_text(
+        "shader_type surface;\nrender_mode unshaded;\n"
+        "uniform vec3 paint : source_color = vec3(0.0, 1.0, 1.0);\n"
+        "void fragment() { ALBEDO = paint * (0.75 + 0.25 * sin(UV.x * 20.0)); }\n")
+    (project / "Cyan.relay-material").write_text(json.dumps(
+        {"format": "relay.material", "version": 1, "type": "surface", "shader": "Cyan.relay-shader",
+         "parameters": {}}))
+    path = project / "scenes" / "showcase.relay.json"
+    document = json.loads(path.read_text())
+    entities = document["scene"]["entities"]
+    for entity in entities:
+        entity["particle_emitter"] = None
+        if entity.get("post_process") is not None:
+            entity["post_process"] = None
+    camera = next(entity for entity in entities if entity.get("camera") and entity["camera"]["active"])
+    generations = document["scene"]["allocator"]["slot_generations"]
+    ball = copy.deepcopy(next(entity for entity in entities if entity["name"] == "Plasma orb"))
+    ball.update(entity=f"{len(generations)}:1", name="Cyan ball", parent=camera["entity"],
+                transform={"position": {"x": 0, "y": 0.5, "z": 4.0}, "rotation_degrees": {"x": 0, "y": 0, "z": 0},
+                           "scale": {"x": 3, "y": 3, "z": 3}})
+    ball["mesh_renderer"]["material"] = "Cyan.relay-material"
+    ball["mesh_renderer"]["parameters"] = {}
+    generations.append(1)
+    entities.append(ball)
+    # A big chrome sphere in front of the camera to mirror what is behind it.
+    mirror = copy.deepcopy(next(entity for entity in entities if entity["name"] == "Chrome sphere"))
+    mirror.update(entity=f"{len(generations)}:1", name="Mirror", parent=camera["entity"],
+                  transform={"position": {"x": 0, "y": -0.2, "z": -3.0}, "rotation_degrees": {"x": 0, "y": 0, "z": 0},
+                             "scale": {"x": 2, "y": 2, "z": 2}})
+    generations.append(1)
+    entities.append(mirror)
+    document["version"] = max(document["version"], 26)
+    images = {}
+    for name, shown, reflections in (("plain-on", False, True), ("cyan-on", True, True), ("cyan-off", True, False),
+                                     ("plain-off", False, False)):
+        ball["transform"]["scale"] = {"x": 3, "y": 3, "z": 3} if shown else {"x": 0.0001, "y": 0.0001, "z": 0.0001}
+        path.write_text(json.dumps(document))
+        result, status = render(binary, folder / f"shader-{name}.png", True, reflections, folder,
+                                "shader-reflection-demo/demo.relayproject")
+        if result.returncode != 0 or status is None:
+            return [f"shader reflection render ({name}) failed: {result.stderr.strip()[-400:]}"]
+        images[name] = read_png(folder / f"shader-{name}.png")
+
+    def cyan_pixels(image):
+        width, channels = image[0], image[2]
+        count = 0
+        for y in range(image[1]):
+            for x in range(width):
+                r, g, b = (image[3][y][x * channels + c] for c in range(3))
+                if g - r > 70 and b - r > 70:
+                    count += 1
+        return count
+
+    reflected = cyan_pixels(images["cyan-on"]) - cyan_pixels(images["plain-on"])
+    unreflected = cyan_pixels(images["cyan-off"]) - cyan_pixels(images["plain-off"])
+    print(f"cyan pixels the unseen ball adds: {reflected} with reflections, {unreflected} without")
+    failures = []
+    if reflected < 300:
+        failures.append(f"the custom shader's cyan should show in ray traced reflections ({reflected} pixels)")
+    if unreflected > 5:
+        failures.append(f"the ball behind the camera should not show without reflections ({unreflected} pixels)")
+    return failures
+
+
 def main() -> int:
     binary = sys.argv[1]
     with tempfile.TemporaryDirectory(prefix="relay-lighting-") as directory:
@@ -463,6 +593,10 @@ def main() -> int:
             failures += motion_blur_checks(binary, folder)
         if not failures:
             failures += particle_checks(binary, folder)
+        if not failures:
+            failures += particle_reflection_checks(binary, folder)
+        if not failures:
+            failures += shader_reflection_checks(binary, folder)
         for failure in failures:
             print("FAIL:", failure)
         if failures:

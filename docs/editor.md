@@ -64,7 +64,11 @@ Script properties show as in the main Inspector once the project's scripts are b
 The **Hierarchy** lists the scene's nodes. Right-click empty space to create a node, or a row to
 add a child, duplicate, move, rename, save as a template, or destroy it. Rename in place with
 **F2**, **Rename** in the context menu, or a second, slower click on the selected row; **Enter** or
-clicking away commits and **Escape** cancels. Drag rows onto each other to reparent them.
+clicking away commits and **Escape** cancels. Drag a row onto the middle of another to make it a
+child. Drop it on the top or bottom quarter of a row to place it between rows instead, as that row's
+sibling (a line shows where; under an open row the bottom edge means its first child), which also
+moves a child out of its parent. Dropping in the empty space below the rows moves it to the end of
+the top level. The order is saved with the scene.
 Type in the search box at the top (**Ctrl+F** while the panel is focused) to find nodes by name,
 and use the funnel button to show only certain node types; a category such as Light includes its
 directional, point and spot lights. Results list each match with its parents; double-click one or

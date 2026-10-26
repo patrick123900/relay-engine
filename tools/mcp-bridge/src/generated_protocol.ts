@@ -1148,6 +1148,25 @@ export function registerGeneratedTools(
   );
 
   server.registerTool(
+    "scene_move_node",
+    {
+      title: "Move node among siblings",
+      description: "Reparent an entity and place it among its new siblings, as the Hierarchy's drag and drop does: in front of the sibling `before`, or last when before is null. before must be a child of parent (or a root node when parent is null). The siblings are renumbered so the order is saved with the scene (interface controls also get their control order). One undoable transaction.",
+      inputSchema: z.object({
+        "entity": z.string().regex(new RegExp("^\\d+:\\d+$")),
+        "parent": z.string().regex(new RegExp("^\\d+:\\d+$")).nullable(),
+        "before": z.string().regex(new RegExp("^\\d+:\\d+$")).nullable()
+      }),
+      annotations: {readOnlyHint:false,destructiveHint:false,openWorldHint:false},
+    },
+    async (input) => {
+        const override = overrides["scene_move_node"];
+        if (override) return override(input as JsonObject);
+        return invoke("scene.move_node", {"entity": input["entity"], "parent": input["parent"], "before": input["before"]});
+      },
+  );
+
+  server.registerTool(
     "scene_undo",
     {
       title: "Undo scene change",

@@ -388,18 +388,55 @@ struct VulkanWindow::Impl {
     std::array<VkBuffer, frames_in_flight> trace_instance_buffers{};
     std::array<VkDeviceMemory, frames_in_flight> trace_instance_memories{};
     std::array<VkDeviceSize, frames_in_flight> trace_instance_capacities{};
+    // Particles in reflections: each frame's sprites become two-triangle quads in an acceleration
+    // structure (built on the CPU with the same orientation as particle.vert), and the trace shader
+    // shades their hits from the sprite, batch and orientation buffers and a small texture array.
+    static constexpr std::uint32_t particle_trace_textures = 16U;
+    static constexpr std::size_t particle_trace_limit = 32768U;
+    struct GpuParticleBatch {
+        std::uint32_t first{}, count{}, slot{}, mode{}; // mode: blend | lit << 4 | flipbook blend << 5.
+        std::array<float, 4> local_x{}; // w: flipbook columns.
+        std::array<float, 4> local_y{}; // w: flipbook rows.
+        std::array<float, 4> padding{};
+    };
+    static_assert(sizeof(GpuParticleBatch) == 64U);
+    std::array<VkBuffer, frames_in_flight> particle_trace_vertex_buffers{}, particle_trace_index_buffers{},
+        particle_trace_frame_buffers{}, particle_trace_batch_buffers{};
+    std::array<VkDeviceMemory, frames_in_flight> particle_trace_vertex_memories{}, particle_trace_index_memories{},
+        particle_trace_frame_memories{}, particle_trace_batch_memories{};
+    std::array<VkDeviceSize, frames_in_flight> particle_trace_vertex_capacities{}, particle_trace_index_capacities{},
+        particle_trace_frame_capacities{}, particle_trace_batch_capacities{};
+    std::array<VkImageView, particle_trace_textures> particle_trace_views{};
+    std::uint32_t particle_trace_batch_count{};
     struct TraceConstants {
         std::array<float, 16> inverse_view_projection{};
         std::array<float, 4> camera_position{};
         std::array<std::uint32_t, 4> extent{};
+        std::array<std::uint32_t, 4> hit{}; // x: the custom shader slot a hit kernel shades.
     };
-    static_assert(sizeof(TraceConstants) == 96U);
+    static_assert(sizeof(TraceConstants) == 112U);
     struct GpuTraceInstance {
         std::uint32_t material{};
         std::uint32_t first_index{};
         std::int32_t vertex_offset{};
         std::uint32_t deformed{};
+        std::array<std::uint32_t, 4> extra{}; // x: 1 + the custom shader slot, or 0.
+        std::array<float, 16> model{};
     };
+    static_assert(sizeof(GpuTraceInstance) == 96U);
+    // Custom surface shaders in reflections: each material in use gets a slot, shaded by its
+    // shader's compute kernel from the hit records the trace writes (one 16-byte record per ray).
+    static constexpr std::size_t hit_slot_limit = 24U;
+    struct HitSlot {
+        VkPipeline pipeline{};
+        VkDescriptorSet set{};
+        std::uint32_t offset{};
+    };
+    std::vector<HitSlot> hit_slots;
+    VkPipelineLayout hit_pipeline_layout{};
+    std::array<VkBuffer, frames_in_flight> hit_record_buffers{};
+    std::array<VkDeviceMemory, frames_in_flight> hit_record_memories{};
+    std::array<VkDeviceSize, frames_in_flight> hit_record_capacities{};
     VkDescriptorSetLayout composite_layout{};
     VkDescriptorPool composite_pool{};
     std::array<VkDescriptorSet, frames_in_flight> composite_sets{};
@@ -430,6 +467,8 @@ struct VulkanWindow::Impl {
     // They use the swapchain's render passes, so they are rebuilt with it.
     struct CustomShader {
         VkPipeline surface{}, shadow{}, post{};
+        VkPipeline hit{}; // The reflection hit kernel, made on first use.
+        bool hit_tried{};
         bool used{};
     };
     std::unordered_map<std::uint64_t, CustomShader> custom_shaders;
@@ -2079,7 +2118,9 @@ struct VulkanWindow::Impl {
             bindings[binding].descriptorType = binding == 0U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
                                                               : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             bindings[binding].descriptorCount = 1U;
-            bindings[binding].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+            // Reflection hit kernels read materials too.
+            bindings[binding].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                           VK_SHADER_STAGE_COMPUTE_BIT;
         }
         {
             VkPhysicalDeviceProperties properties{};
@@ -2309,7 +2350,7 @@ void fragment() {
 
     void destroy_custom_pipelines() {
         for (auto& [revision, shader] : custom_shaders)
-            for (const auto pipeline_handle : {shader.surface, shader.shadow, shader.post})
+            for (const auto pipeline_handle : {shader.surface, shader.shadow, shader.post, shader.hit})
                 vkDestroyPipeline(device, pipeline_handle, nullptr);
         custom_shaders.clear();
     }
@@ -5617,6 +5658,14 @@ void fragment() {
             vkDestroyPipeline(device, *pipeline_handle, nullptr), *pipeline_handle = VK_NULL_HANDLE;
         for (auto* layout : {&trace_pipeline_layout, &arguments_pipeline_layout})
             vkDestroyPipelineLayout(device, *layout, nullptr), *layout = VK_NULL_HANDLE;
+        for (auto& [revision, shader] : custom_shaders) {
+            vkDestroyPipeline(device, shader.hit, nullptr);
+            shader.hit = VK_NULL_HANDLE;
+            shader.hit_tried = false;
+        }
+        vkDestroyPipelineLayout(device, hit_pipeline_layout, nullptr);
+        hit_pipeline_layout = VK_NULL_HANDLE;
+        hit_slots.clear();
         vkDestroyDescriptorPool(device, trace_pool, nullptr);
         trace_pool = VK_NULL_HANDLE;
         for (auto* layout : {&trace_layout, &arguments_layout})
@@ -5627,6 +5676,22 @@ void fragment() {
             trace_instance_buffers[frame] = VK_NULL_HANDLE;
             trace_instance_memories[frame] = VK_NULL_HANDLE;
             trace_instance_capacities[frame] = 0U;
+            const auto release = [&](VkBuffer& buffer, VkDeviceMemory& memory, VkDeviceSize& capacity) {
+                vkDestroyBuffer(device, buffer, nullptr);
+                vkFreeMemory(device, memory, nullptr);
+                buffer = VK_NULL_HANDLE;
+                memory = VK_NULL_HANDLE;
+                capacity = 0U;
+            };
+            release(hit_record_buffers[frame], hit_record_memories[frame], hit_record_capacities[frame]);
+            release(particle_trace_vertex_buffers[frame], particle_trace_vertex_memories[frame],
+                    particle_trace_vertex_capacities[frame]);
+            release(particle_trace_index_buffers[frame], particle_trace_index_memories[frame],
+                    particle_trace_index_capacities[frame]);
+            release(particle_trace_frame_buffers[frame], particle_trace_frame_memories[frame],
+                    particle_trace_frame_capacities[frame]);
+            release(particle_trace_batch_buffers[frame], particle_trace_batch_memories[frame],
+                    particle_trace_batch_capacities[frame]);
         }
     }
 
@@ -5669,6 +5734,8 @@ void fragment() {
             entry.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
             return entry;
         };
+        auto image_array_binding = binding(15U, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        image_array_binding.descriptorCount = particle_trace_textures;
         const std::array trace_bindings{
             binding(0U, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR),
             binding(1U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER), binding(2U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
@@ -5677,7 +5744,10 @@ void fragment() {
             binding(6U, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
             binding(7U, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
             binding(8U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER), binding(9U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
-            binding(10U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER), binding(11U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+            binding(10U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER), binding(11U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+            binding(12U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER), binding(13U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+            binding(14U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER), image_array_binding,
+            binding(16U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
         const std::array arguments_bindings{binding(0U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
                                             binding(1U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
         VkDescriptorSetLayoutCreateInfo layout_info{};
@@ -5691,9 +5761,9 @@ void fragment() {
             result = vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &arguments_layout);
         const std::array pool_sizes{
             VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, frames_in_flight},
-            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8U * frames_in_flight},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12U * frames_in_flight},
             VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2U * frames_in_flight},
-            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3U * frames_in_flight}};
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (3U + particle_trace_textures) * frames_in_flight}};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = 2U * frames_in_flight;
@@ -5794,13 +5864,268 @@ void fragment() {
                              &barrier, 0U, nullptr, 0U, nullptr);
     }
 
+    // The reflection hit kernel of a custom surface shader, made on first use; null when it did not
+    // compile or the device cannot make it.
+    VkPipeline hit_pipeline(const CompiledShader& shader) {
+        const auto found = custom_shaders.find(shader.revision);
+        if (found == custom_shaders.end() || shader.hit.empty()) return VK_NULL_HANDLE;
+        auto& entry = found->second;
+        if (entry.hit_tried) return entry.hit;
+        entry.hit_tried = true;
+        if (hit_pipeline_layout == VK_NULL_HANDLE) {
+            if (material_layout == VK_NULL_HANDLE || trace_layout == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+            const std::array sets{texture_layout, material_layout, trace_layout};
+            VkPushConstantRange push{};
+            push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            push.size = sizeof(TraceConstants);
+            VkPipelineLayoutCreateInfo layout_info{};
+            layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            layout_info.setLayoutCount = static_cast<std::uint32_t>(sets.size());
+            layout_info.pSetLayouts = sets.data();
+            layout_info.pushConstantRangeCount = 1U;
+            layout_info.pPushConstantRanges = &push;
+            if (vkCreatePipelineLayout(device, &layout_info, nullptr, &hit_pipeline_layout) != VK_SUCCESS) {
+                hit_pipeline_layout = VK_NULL_HANDLE;
+                return VK_NULL_HANDLE;
+            }
+        }
+        VkShaderModuleCreateInfo module_info{};
+        module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        module_info.codeSize = shader.hit.size() * sizeof(std::uint32_t);
+        module_info.pCode = shader.hit.data();
+        VkShaderModule module{};
+        if (vkCreateShaderModule(device, &module_info, nullptr, &module) != VK_SUCCESS) return VK_NULL_HANDLE;
+        VkComputePipelineCreateInfo pipeline_info{};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = module;
+        pipeline_info.stage.pName = "main";
+        pipeline_info.layout = hit_pipeline_layout;
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1U, &pipeline_info, nullptr, &entry.hit) != VK_SUCCESS)
+            entry.hit = VK_NULL_HANDLE;
+        vkDestroyShaderModule(device, module, nullptr);
+        return entry.hit;
+    }
+
+    // The hit slot that shades a custom-shader instance in reflections (1 + its index), or 0 for
+    // instances an ordinary material shades. Slots are per material set and parameter block.
+    std::uint32_t hit_slot_for(const RenderInstance& draw_instance, const std::size_t index) {
+        if (!shader_resources_ready || !valid_material_path(draw_instance.material)) return 0U;
+        const auto& material = draw_instance.shader_material;
+        if (!material || !material->drawable() || !material->shader) return 0U;
+        const auto set = custom_materials.find(material->path);
+        if (set == custom_materials.end() || set->second.key != custom_material_key(*material) ||
+            index >= instance_parameter_offsets.size())
+            return 0U;
+        const VkDescriptorSet descriptor = set->second.sets[current_frame];
+        const auto offset = instance_parameter_offsets[index];
+        for (std::size_t slot = 0; slot < hit_slots.size(); ++slot)
+            if (hit_slots[slot].set == descriptor && hit_slots[slot].offset == offset)
+                return static_cast<std::uint32_t>(slot + 1U);
+        if (hit_slots.size() >= hit_slot_limit) return 0U;
+        const auto pipeline_handle = hit_pipeline(*material->shader);
+        if (pipeline_handle == VK_NULL_HANDLE) return 0U;
+        hit_slots.push_back({pipeline_handle, descriptor, offset});
+        return static_cast<std::uint32_t>(hit_slots.size());
+    }
+
+    // Camera-facing (or aligned) sprite axes, as particle.vert computes them.
+    struct SpriteAxes {
+        std::array<float, 3> right{}, up{};
+    };
+    static SpriteAxes particle_sprite_axes(const ParticleSprite& sprite, const ParticleBatch& batch,
+                                           const std::array<float, 16>& view,
+                                           const std::array<float, 3>& camera) {
+        using Vector = std::array<float, 3>;
+        const auto dot = [](const Vector& a, const Vector& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+        const auto cross = [](const Vector& a, const Vector& b) {
+            return Vector{a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+        };
+        const auto normalized = [&](const Vector& a) {
+            const float length = std::sqrt(dot(a, a));
+            return length > 0.0F ? Vector{a[0] / length, a[1] / length, a[2] / length} : a;
+        };
+        // The view matrix's rows are the camera's axes in world space.
+        const Vector camera_right{view[0], view[4], view[8]}, camera_up{view[1], view[5], view[9]};
+        const Vector camera_forward{-view[2], -view[6], -view[10]};
+        Vector to_camera{camera[0] - sprite.position[0], camera[1] - sprite.position[1],
+                         camera[2] - sprite.position[2]};
+        to_camera = normalized(to_camera);
+        if (std::isnan(to_camera[0]) || std::isnan(to_camera[1]) || std::isnan(to_camera[2]) ||
+            dot(to_camera, to_camera) < 0.5F)
+            to_camera = {-camera_forward[0], -camera_forward[1], -camera_forward[2]};
+        Vector right = camera_right, up = camera_up;
+        bool turns = true;
+        switch (batch.alignment) {
+        case ParticleEmitter::Alignment::stretched: {
+            const float along_amount = dot(sprite.axis, to_camera);
+            const Vector along{sprite.axis[0] - to_camera[0] * along_amount, sprite.axis[1] - to_camera[1] * along_amount,
+                               sprite.axis[2] - to_camera[2] * along_amount};
+            up = dot(along, along) > 1e-8F ? normalized(along) : camera_up;
+            right = normalized(cross(up, to_camera));
+            turns = false;
+            break;
+        }
+        case ParticleEmitter::Alignment::horizontal:
+            right = {1.0F, 0.0F, 0.0F};
+            up = {0.0F, 0.0F, -1.0F};
+            break;
+        case ParticleEmitter::Alignment::vertical: {
+            up = {0.0F, 1.0F, 0.0F};
+            const auto side = cross(up, to_camera);
+            right = dot(side, side) > 1e-8F ? normalized(side) : camera_right;
+            break;
+        }
+        case ParticleEmitter::Alignment::local:
+            right = batch.local_x;
+            up = batch.local_y;
+            break;
+        case ParticleEmitter::Alignment::billboard: break;
+        }
+        if (turns) {
+            const float c = std::cos(sprite.rotation), s = std::sin(sprite.rotation);
+            const Vector turned{c * right[0] + s * up[0], c * right[1] + s * up[1], c * right[2] + s * up[2]};
+            up = {-s * right[0] + c * up[0], -s * right[1] + c * up[1], -s * right[2] + c * up[2]};
+            right = turned;
+        }
+        return {right, up};
+    }
+
+    // Builds this frame's particle quads for the acceleration structure, with the buffers the trace
+    // shader shades them from. Returns false (and adds nothing) when there are no particles.
+    bool prepare_particle_trace(const RenderScene& render_scene, std::vector<RayTracingInstance>& ray_instances,
+                                std::vector<GpuTraceInstance>& table) {
+        particle_trace_batch_count = 0U;
+        particle_trace_views.fill(VK_NULL_HANDLE);
+        if (!particle_list || particle_list->empty() || particle_sprite_buffers[current_frame] == VK_NULL_HANDLE)
+            return false;
+        const auto& list = *particle_list;
+        const std::size_t sprites = std::min(list.sprites.size(), particle_trace_limit);
+        // Textures take slots in the order batches use them; further textures are left out.
+        std::vector<std::uint64_t> slot_ids;
+        std::vector<std::pair<GpuParticleBatch, const ParticleBatch*>> entries;
+        for (const auto& batch : list.batches) {
+            if (!batch.texture || batch.count == 0U || batch.first >= sprites) continue;
+            const auto found = particle_textures.find(batch.texture->id);
+            if (found == particle_textures.end() || found->second.view == VK_NULL_HANDLE) continue;
+            auto slot = static_cast<std::uint32_t>(
+                std::find(slot_ids.begin(), slot_ids.end(), batch.texture->id) - slot_ids.begin());
+            if (slot == slot_ids.size()) {
+                if (slot_ids.size() >= particle_trace_textures) continue;
+                slot_ids.push_back(batch.texture->id);
+                particle_trace_views[slot] = found->second.view;
+            }
+            GpuParticleBatch entry;
+            entry.first = batch.first;
+            entry.count = static_cast<std::uint32_t>(std::min<std::size_t>(batch.count, sprites - batch.first));
+            entry.slot = slot;
+            entry.mode = static_cast<std::uint32_t>(batch.blend) | (batch.lit ? 16U : 0U) | (batch.sheet_blend ? 32U : 0U);
+            entry.local_x = {batch.local_x[0], batch.local_x[1], batch.local_x[2], static_cast<float>(batch.sheet_columns)};
+            entry.local_y = {batch.local_y[0], batch.local_y[1], batch.local_y[2], static_cast<float>(batch.sheet_rows)};
+            entries.emplace_back(entry, &batch);
+        }
+        if (entries.empty()) return false;
+        // Sorted by first sprite, so the shader finds a sprite's batch by binary search.
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& a, const auto& b) { return a.first.first < b.first.first; });
+        std::vector<GpuParticleBatch> batches;
+        batches.reserve(entries.size());
+        for (const auto& entry : entries) batches.push_back(entry.first);
+
+        struct Vertex {
+            float x, y, z, w;
+        };
+        std::vector<Vertex> vertices(sprites * 4U);
+        std::vector<float> frames(sprites * 8U);
+        std::vector<std::uint32_t> indices(sprites * 6U);
+        const std::array<float, 3> camera{static_cast<float>(render_scene.camera_position.x),
+                                          static_cast<float>(render_scene.camera_position.y),
+                                          static_cast<float>(render_scene.camera_position.z)};
+        std::size_t entry_index = 0U;
+        for (std::size_t sprite_index = 0; sprite_index < sprites; ++sprite_index) {
+            while (entry_index < batches.size() &&
+                   sprite_index >= static_cast<std::size_t>(batches[entry_index].first) + batches[entry_index].count)
+                ++entry_index;
+            const auto& sprite = list.sprites[sprite_index];
+            const bool covered = entry_index < batches.size() && sprite_index >= batches[entry_index].first;
+            std::array<float, 3> right{}, up{};
+            if (covered) {
+                const auto axes = particle_sprite_axes(sprite, *entries[entry_index].second, render_scene.camera.view.values, camera);
+                right = axes.right;
+                up = axes.up;
+            }
+            const float half_width = covered ? sprite.width * 0.5F : 0.0F;
+            const float half_height = covered ? sprite.height * 0.5F : 0.0F;
+            // Corners as particle.vert orders them: (-1,-1), (1,-1), (1,1), (-1,1).
+            constexpr std::array<std::array<float, 2>, 4> corners{{{-1.0F, -1.0F}, {1.0F, -1.0F}, {1.0F, 1.0F}, {-1.0F, 1.0F}}};
+            for (std::size_t corner = 0; corner < 4U; ++corner)
+                vertices[sprite_index * 4U + corner] = {
+                    sprite.position[0] + right[0] * corners[corner][0] * half_width + up[0] * corners[corner][1] * half_height,
+                    sprite.position[1] + right[1] * corners[corner][0] * half_width + up[1] * corners[corner][1] * half_height,
+                    sprite.position[2] + right[2] * corners[corner][0] * half_width + up[2] * corners[corner][1] * half_height,
+                    0.0F};
+            for (std::size_t axis = 0; axis < 3U; ++axis) {
+                frames[sprite_index * 8U + axis] = right[axis];
+                frames[sprite_index * 8U + 4U + axis] = up[axis];
+            }
+            const auto base = static_cast<std::uint32_t>(sprite_index * 4U);
+            const std::array<std::uint32_t, 6> quad{0U, 1U, 2U, 0U, 2U, 3U};
+            for (std::size_t corner = 0; corner < 6U; ++corner) indices[sprite_index * 6U + corner] = base + quad[corner];
+        }
+
+        const auto upload = [&](VkBuffer& buffer, VkDeviceMemory& memory, VkDeviceSize& capacity, const void* data,
+                                const VkDeviceSize bytes, const VkBufferUsageFlags usage) {
+            if (!ensure_ui_buffer(buffer, memory, capacity, bytes, usage)) return false;
+            void* mapped = nullptr;
+            if (vkMapMemory(device, memory, 0U, bytes, 0U, &mapped) != VK_SUCCESS) return false;
+            std::memcpy(mapped, data, static_cast<std::size_t>(bytes));
+            vkUnmapMemory(device, memory);
+            return true;
+        };
+        const VkBufferUsageFlags geometry = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | geometry_buffer_usage();
+        if (!upload(particle_trace_vertex_buffers[current_frame], particle_trace_vertex_memories[current_frame],
+                    particle_trace_vertex_capacities[current_frame], vertices.data(),
+                    vertices.size() * sizeof(Vertex), geometry) ||
+            !upload(particle_trace_index_buffers[current_frame], particle_trace_index_memories[current_frame],
+                    particle_trace_index_capacities[current_frame], indices.data(),
+                    indices.size() * sizeof(std::uint32_t), geometry) ||
+            !upload(particle_trace_frame_buffers[current_frame], particle_trace_frame_memories[current_frame],
+                    particle_trace_frame_capacities[current_frame], frames.data(), frames.size() * sizeof(float),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+            !upload(particle_trace_batch_buffers[current_frame], particle_trace_batch_memories[current_frame],
+                    particle_trace_batch_capacities[current_frame], batches.data(),
+                    batches.size() * sizeof(GpuParticleBatch), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+            reflections_error = "could not upload the particle reflection geometry";
+            return false;
+        }
+        particle_trace_batch_count = static_cast<std::uint32_t>(batches.size());
+
+        RayTracingInstance quads;
+        quads.deformed = true;
+        quads.geometry.vertex_buffer = particle_trace_vertex_buffers[current_frame];
+        quads.geometry.vertex_stride = sizeof(Vertex);
+        quads.geometry.vertex_count = static_cast<std::uint32_t>(vertices.size());
+        quads.geometry.index_buffer = particle_trace_index_buffers[current_frame];
+        quads.geometry.index_count = static_cast<std::uint32_t>(indices.size());
+        quads.geometry.opaque = false;
+        quads.model = {1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F};
+        quads.custom_index = static_cast<std::uint32_t>(table.size());
+        ray_instances.push_back(std::move(quads));
+        // deformed = 2 marks the particle geometry for the trace shader.
+        table.push_back({0U, 0U, 0, 2U});
+        return true;
+    }
+
     // Builds the acceleration structures, classifies, traces and denoises this frame's
     // reflections between the geometry and forward passes.
     bool record_reflections(const VkCommandBuffer commands, const RenderScene& render_scene) {
 #ifdef RELAY_HAS_FIDELITYFX
         std::vector<RayTracingInstance> ray_instances;
         std::vector<GpuTraceInstance> table;
-        for (const auto& draw_instance : render_scene.instances) {
+        hit_slots.clear();
+        for (std::size_t draw_index = 0; draw_index < render_scene.instances.size(); ++draw_index) {
+            const auto& draw_instance = render_scene.instances[draw_index];
             if (draw_instance.alpha_blended) continue;
             const auto* mesh = assets->find_mesh(draw_instance.mesh);
             if (mesh == nullptr || mesh->index_count < 3U) continue;
@@ -5819,10 +6144,13 @@ void fragment() {
             ray_instance.model = draw_instance.model.values;
             ray_instance.custom_index = static_cast<std::uint32_t>(table.size());
             ray_instances.push_back(std::move(ray_instance));
-            table.push_back({draw_instance.material_index, mesh->first_index,
-                             deformed ? draw_instance.deformed_vertex_offset : mesh->vertex_offset,
-                             deformed ? 1U : 0U});
+            GpuTraceInstance entry{draw_instance.material_index, mesh->first_index,
+                                   deformed ? draw_instance.deformed_vertex_offset : mesh->vertex_offset,
+                                   deformed ? 1U : 0U, {}, draw_instance.model.values};
+            entry.extra[0] = hit_slot_for(draw_instance, draw_index);
+            table.push_back(entry);
         }
+        (void)prepare_particle_trace(render_scene, ray_instances, table);
         if (table.empty()) table.emplace_back();
         std::string error;
         if (!acceleration_structures->record(commands, static_cast<std::uint32_t>(current_frame),
@@ -5909,8 +6237,44 @@ void fragment() {
             entry.descriptorType = type;
             return entry;
         };
+        // Particles: the sprites, their batches and orientations, and the textures they use; without
+        // particles, any valid buffer and image stand in and the shader reads none of them.
+        const bool particles_traced = particle_trace_batch_count > 0U;
+        const VkBuffer spare = mesh_vertex_buffer;
+        const VkDescriptorBufferInfo sprites_info{particles_traced ? particle_sprite_buffers[current_frame] : spare, 0U,
+                                                  VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo batches_info{particles_traced ? particle_trace_batch_buffers[current_frame] : spare,
+                                                  0U, VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo axes_info{particles_traced ? particle_trace_frame_buffers[current_frame] : spare,
+                                               0U, VK_WHOLE_SIZE};
+        std::array<VkDescriptorImageInfo, particle_trace_textures> particle_images{};
+        for (std::uint32_t slot = 0; slot < particle_trace_textures; ++slot)
+            particle_images[slot] = particle_trace_views[slot] != VK_NULL_HANDLE
+                                        ? VkDescriptorImageInfo{particle_sampler, particle_trace_views[slot],
+                                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}
+                                        : noise_info;
+        // Hit records, for the custom shaders' kernels: one 16-byte record per pixel at most.
+        const bool shaded_hits = !hit_slots.empty();
+        if (shaded_hits) {
+            const auto bytes = static_cast<VkDeviceSize>(scene_extent.width) * scene_extent.height * 16U;
+            if (bytes > hit_record_capacities[current_frame]) {
+                vkDestroyBuffer(device, hit_record_buffers[current_frame], nullptr);
+                vkFreeMemory(device, hit_record_memories[current_frame], nullptr);
+                hit_record_buffers[current_frame] = VK_NULL_HANDLE;
+                hit_record_memories[current_frame] = VK_NULL_HANDLE;
+                hit_record_capacities[current_frame] = 0U;
+                if (!create_buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                   hit_record_buffers[current_frame], hit_record_memories[current_frame])) {
+                    reflections_error = last_error;
+                    return false;
+                }
+                hit_record_capacities[current_frame] = bytes;
+            }
+        }
+        const VkDescriptorBufferInfo hits_info{shaded_hits ? hit_record_buffers[current_frame] : spare, 0U,
+                                               VK_WHOLE_SIZE};
         const auto trace_set = trace_sets[current_frame];
-        std::array<VkWriteDescriptorSet, 14> writes{
+        std::array<VkWriteDescriptorSet, 19> writes{
             write(trace_set, 0U, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR),
             write(trace_set, 1U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
             write(trace_set, 2U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
@@ -5923,6 +6287,11 @@ void fragment() {
             write(trace_set, 9U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
             write(trace_set, 10U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
             write(trace_set, 11U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+            write(trace_set, 12U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+            write(trace_set, 13U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+            write(trace_set, 14U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+            write(trace_set, 15U, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            write(trace_set, 16U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
             write(arguments_sets[current_frame], 0U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
             write(arguments_sets[current_frame], 1U, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
         writes[0].pNext = &structure_info;
@@ -5937,8 +6306,14 @@ void fragment() {
         writes[9].pBufferInfo = &deformed_info;
         writes[10].pBufferInfo = &index_info;
         writes[11].pBufferInfo = &table_info;
-        writes[12].pBufferInfo = &counter_info;
-        writes[13].pBufferInfo = &arguments_info;
+        writes[12].pBufferInfo = &sprites_info;
+        writes[13].pBufferInfo = &batches_info;
+        writes[14].pBufferInfo = &axes_info;
+        writes[15].descriptorCount = particle_trace_textures;
+        writes[15].pImageInfo = particle_images.data();
+        writes[16].pBufferInfo = &hits_info;
+        writes[17].pBufferInfo = &counter_info;
+        writes[18].pBufferInfo = &arguments_info;
         vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0U,
                                nullptr);
 
@@ -5960,12 +6335,30 @@ void fragment() {
                                      static_cast<float>(render_scene.camera_position.y),
                                      static_cast<float>(render_scene.camera_position.z), 1.0F};
         constants.extent = {scene_extent.width, scene_extent.height,
-                            static_cast<std::uint32_t>(frame.frame_index), 0U};
+                            static_cast<std::uint32_t>(frame.frame_index),
+                            particle_trace_batch_count | (shaded_hits ? 0x80000000U : 0U)};
         vkCmdPushConstants(commands, trace_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0U,
                            sizeof(constants), &constants);
         vkCmdDispatchIndirect(commands, targets.indirect_arguments, reflection_arguments_hardware);
         compute_barrier(commands, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        // Custom surface shaders shade their own hits, over the stand-in the trace wrote.
+        for (std::size_t slot = 0; slot < hit_slots.size(); ++slot) {
+            const auto& hit_slot = hit_slots[slot];
+            vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, hit_slot.pipeline);
+            const std::array hit_bind{texture_sets[current_frame], hit_slot.set, trace_set};
+            vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, hit_pipeline_layout, 0U,
+                                    static_cast<std::uint32_t>(hit_bind.size()), hit_bind.data(), 1U,
+                                    &hit_slot.offset);
+            auto slot_constants = constants;
+            slot_constants.hit[0] = static_cast<std::uint32_t>(slot);
+            vkCmdPushConstants(commands, hit_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0U,
+                               sizeof(slot_constants), &slot_constants);
+            vkCmdDispatchIndirect(commands, targets.indirect_arguments, reflection_arguments_hardware);
+        }
+        if (!hit_slots.empty())
+            compute_barrier(commands, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         return reflections->record_denoising(frame, reflections_error);
 #else
         (void)commands;
@@ -6968,6 +7361,12 @@ void fragment() {
             }
             mark_gpu_pass(commands, global_illumination_pass);
         }
+        {
+            RELAY_PROFILE_SCOPE("Particles");
+            // The engine's particles belong to the main scene.
+            if (off) particle_list = nullptr;
+            else prepare_particles(commands, render_scene, scene);
+        }
         if (reflections_active) {
             RELAY_PROFILE_SCOPE("Record reflections");
             if (!record_reflections(commands, render_scene)) {
@@ -6977,12 +7376,6 @@ void fragment() {
             mark_gpu_pass(commands, reflections_pass);
         }
 
-        {
-            RELAY_PROFILE_SCOPE("Particles");
-            // The engine's particles belong to the main scene.
-            if (off) particle_list = nullptr;
-            else prepare_particles(commands, render_scene, scene);
-        }
         // Forward pass: transparent geometry, then editor-only overlays.
         scene_pass_info.renderPass = scene_render_pass;
         scene_pass_info.framebuffer = targets.forward_framebuffer;

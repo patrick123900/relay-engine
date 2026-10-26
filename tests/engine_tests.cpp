@@ -250,6 +250,34 @@ void test_game_interface() {
         expect(same && loaded.source_version == scene_file_version, "scene files round-trip UI components: " + loaded.error);
         std::filesystem::remove(path);
     }
+    // Moving a node among its siblings numbers them, rejects strangers and cycles, and is saved.
+    {
+        Scene scene;
+        std::string error;
+        const auto one = scene.create("One");
+        const auto two = scene.create("Two");
+        const auto three = scene.create("Three");
+        const auto leaf = scene.create("Leaf", one);
+        expect(scene.move(three, {}, one), "a root node moves in front of another");
+        expect(scene.get(three)->order < scene.get(one)->order && scene.get(one)->order < scene.get(two)->order,
+               "the siblings are numbered in their new order");
+        expect(scene.move(leaf, {}, two) && !scene.get(leaf)->parent.valid() &&
+                   scene.get(one)->order < scene.get(leaf)->order && scene.get(leaf)->order < scene.get(two)->order,
+               "moving a child out of its parent puts it between the roots");
+        expect(!scene.move(two, one, three), "a node cannot go in front of one that is not its new sibling");
+        expect(!scene.move(one, leaf, {}) || scene.get(one)->parent == leaf, "a valid reparent still moves");
+        expect(!scene.move(leaf, one, {}) , "moving a node under its own descendant is refused");
+        expect(scene.move(two, {}, {}) && scene.get(two)->order > scene.get(leaf)->order, "no `before` puts it last");
+        const auto path = std::filesystem::temp_directory_path() / "relay-order-scene-test.relay.json";
+        expect(save_scene_file_atomic(scene, path, error), "save a scene with ordered nodes");
+        const auto loaded = load_scene_file(path);
+        bool same = loaded.state.has_value();
+        if (loaded.state)
+            for (const auto entity : scene.entities())
+                same = same && loaded.state->slots[entity.index].record.order == scene.get(entity)->order;
+        expect(same, "sibling order round-trips through scene files: " + loaded.error);
+        std::filesystem::remove(path);
+    }
     // Layout: canvases scale to the view, anchors and offsets place controls, containers stack.
     {
         Scene scene;
@@ -3131,7 +3159,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 54U && relay::protocol_methods().size() == 170U,
+    expect(relay::protocol_schema_version == 55U && relay::protocol_methods().size() == 171U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");

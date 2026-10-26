@@ -106,7 +106,10 @@ without blocking simultaneous human editing.
   mesh or material (several open the browser inside the model); fields that would take the drag
   are outlined, and refusals replace the drag tooltip with what the field takes (`AssetPick::what`
   or one derived from kinds). Hierarchy rows now select on an undragged release
-  (`hierarchy_pressed`), so dragging a node leaves the Inspector on the current one. Fields, the Music player's **+ Add track...** and Post Process
+  (`hierarchy_pressed`), so dragging a node leaves the Inspector on the current one. Dropping a row on the top or bottom quarter of
+  another row places it between rows (`scene.move_node`, `Scene::move`): siblings carry an `order` (saved
+  as an optional entity field; interface controls keep their control order equal to it), the middle of a row
+  still reparents, and the space below the rows moves to the end of the roots. Covered headlessly only. Fields, the Music player's **+ Add track...** and Post Process
   **+ Add effect...** buttons open the browser with an `AssetPick`: accepted kinds, an extra file test, `AssetChoice`s for non-file items
   (group `""` = footer button such as None or Gradient; `@builtin`, `@ready`, `@scene`, or the source
   model's path for imported meshes and materials, which makes that model a folder-like tile),
@@ -1038,7 +1041,12 @@ Phase 3:
   `surface_lighting.glsl` (misses see the sky at 1/pi); the FidelityFX reflection denoiser
   filters the result, reading R32F depth as mip 0 of its depth hierarchy. The composite blends
   from the rough specular (GI or the analytic sky) to traced reflections over the last fifth
-  of the threshold. Materials are treated as opaque by rays.
+  of the threshold. Materials are treated as opaque by rays. Particle sprites join the
+  acceleration structure each frame as non-opaque quads the CPU orients as `particle.vert` does;
+  the trace keeps the nearest four a ray passes and blends them over what it ends on. Custom
+  surface shaders shade their own hits: the trace records each hit on a custom material (16 bytes
+  per ray) and a compute kernel per material (`surface_hit` in `shader_language.cpp`, sharing
+  `shaders/reflection_trace_common.glsl`) reruns the shader's `fragment()` over the ray list.
 - `relay_demo --vulkan-scene-capture <project> <png> [frames]` opens a project and captures it;
   with `SDL_VIDEODRIVER=offscreen` (Mesa's `VK_EXT_headless_surface`) the real renderer runs
   without a window, which is how the lighting was verified and how
@@ -1391,7 +1399,9 @@ Phase 3:
 16. Custom shaders have headless, protocol and offscreen-render coverage (a custom surface, the
    error surface, shadows and a post effect, under the validation layer with synchronization
    checks), not a desktop review of the Shader Editor, the material fields or live preview on a
-   real display. Ray traced reflections draw shader-material surfaces with `builtin.grey`; motion
+   real display. Ray traced reflections run a custom shader's `fragment()` but not its `vertex()`,
+   cover at most 24 materials in use at once (more show `builtin.grey`) and leave out transparent
+   custom surfaces; motion
    vectors ignore vertex movement since the last frame; selection outlines ignore vertex movement;
    shadows of transparent shaders are not cast. Compiling and swapping pipelines run on the engine
    thread and wait for the device (preview keystrokes after a pause, so at most a few per second).
@@ -1422,7 +1432,9 @@ Phase 3:
    Vulkan checks on RADV; the Inspector section and live editor preview have not been used on a
    desktop. Particles simulate on the CPU; they are drawn after all transparent meshes (no
    interleaving), cast no shadows, write no motion vectors (motion blur smears them with what is
-   behind), and are not in GI or ray traced reflections. Editor previews do not collide with the
+   behind), and are not in GI. In ray traced reflections they are camera-facing quads without soft
+   fading (32768 sprites, 16 textures at most), and are dropped in front of a custom-shader surface.
+   Editor previews do not collide with the
    world. There are no ribbons or trails, mesh particles, GPU simulation, attractors, per-burst
    colors or particle lights, and emitter transforms are not interpolated between steps for
    local-space particles. The demo effects were tuned from offscreen captures only.

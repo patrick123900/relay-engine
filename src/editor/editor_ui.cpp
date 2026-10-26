@@ -140,7 +140,7 @@ struct EditorUi::Impl {
         return open;
     }
 
-    enum class ToolIcon { previous, restart, loop, snap, play, stop, pause, step, undo, redo, camera, focus, move, rotate, scale, local, world };
+    enum class ToolIcon { previous, restart, loop, snap, grid, play, stop, pause, step, undo, redo, camera, focus, move, rotate, scale, local, world };
     bool toolbar_button(const char* id, ToolIcon icon, bool active, const char* tooltip) {
         const auto& palette = editor_palette();
         if (active) {
@@ -180,6 +180,19 @@ struct EditorUi::Impl {
             draw->PathStroke(color, 0, 1.6F * ui_scale);
             line(8, 20, 12, 16);
             line(8, 20, 12, 24);
+        } else if (icon == ToolIcon::grid) {
+            // Three cells by three, bounded by four bars, on whole pixels so every bar is crisp and the
+            // square sits in the exact middle of the button, whatever the interface scale.
+            const float bar = std::max(1.0F, std::round(1.6F * ui_scale)), cell = std::max(2.0F, std::round(4.0F * ui_scale));
+            const float side = 3.0F * cell + 4.0F * bar;
+            const auto bottom = ImGui::GetItemRectMax();
+            const float left = std::floor(top.x + (bottom.x - top.x - side) * 0.5F);
+            const float above = std::floor(top.y + (bottom.y - top.y - side) * 0.5F);
+            for (int index = 0; index < 4; ++index) {
+                const float offset = static_cast<float>(index) * (cell + bar);
+                draw->AddRectFilled({left + offset, above}, {left + offset + bar, above + side}, color);
+                draw->AddRectFilled({left, above + offset}, {left + side, above + offset + bar}, color);
+            }
         } else if (icon == ToolIcon::snap) {
             draw->AddRect(point(9, 6), point(23, 22), color, 2 * ui_scale, 0, 1.6F * ui_scale);
             line(13, 6, 13, 11); line(19, 17, 23, 17); line(13, 6, 13, 22);
@@ -251,6 +264,35 @@ struct EditorUi::Impl {
             ImGui::SetTooltip("%s", tooltip);
         ImGui::SameLine();
         return pressed;
+    }
+
+    // The snap toggle and its grid-size popup, after a divider. `id` keeps embedded editors apart.
+    void draw_snap_controls(const char* id) {
+        toolbar_divider();
+        const std::string button = std::string("##snap") + id, popup = std::string("##snap_settings") + id;
+        if (toolbar_button(button.c_str(), ToolIcon::grid, snap_enabled,
+                           snap_enabled ? "Grid snapping on (hold Ctrl to flip)" : "Grid snapping off (hold Ctrl to flip)"))
+            snap_enabled = !snap_enabled;
+        note_item(std::string("toolbar:snap") + id);
+        if (ImGui::ArrowButton((std::string("##snap_arrow") + id).c_str(), ImGuiDir_Down)) ImGui::OpenPopup(popup.c_str());
+        note_item(std::string("toolbar:snap_settings") + id);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Grid size");
+        ImGui::SameLine();
+        if (ImGui::BeginPopup(popup.c_str())) {
+            editor_checkbox("Snap to grid", &snap_enabled);
+            ImGui::TextColored(editor_color(editor_palette().text_dim), "Grid size");
+            static constexpr std::array<const char*, 4> labels{"Move (units)", "Rotate (degrees)", "Scale", "Interface (units)"};
+            for (std::size_t index = 0; index < snap_steps.size(); ++index) {
+                ImGui::SetNextItemWidth(90.0F * ui_scale);
+                std::array<char, 24> text{};
+                std::snprintf(text.data(), text.size(), "%s", snap_steps[index].c_str());
+                const std::string label = std::string(labels[index]) + "##step" + std::to_string(index);
+                if (ImGui::InputText(label.c_str(), text.data(), text.size(), ImGuiInputTextFlags_CharsDecimal))
+                    snap_steps[index] = text.data();
+                note_item("snap:step" + std::to_string(index) + id);
+            }
+            ImGui::EndPopup();
+        }
     }
 
     void toolbar_divider() {
@@ -474,7 +516,7 @@ struct EditorUi::Impl {
     } last_preview;
     AssetThumbnails thumbnails;
     // The Interface editor: the scene's game interface, parsed from scene.list, drawn at a chosen
-    // screen size. The 3D viewport never shows it.
+    // screen size. The viewport shows it too, but only on the scene camera.
     std::vector<UiComponents> interface_components; // By index into `entities`.
     std::vector<UiSourceNode> interface_sources;
     UiPainter interface_painter;
@@ -494,6 +536,7 @@ struct EditorUi::Impl {
         float scale{1.0F};  // Panel pixels per view pixel.
         std::uint64_t gesture{};
         bool moved{};
+        std::string pick; // What a click without a drag selects, on release.
     };
     std::optional<InterfaceDrag> interface_drag;
     std::uint64_t interface_gesture{};
@@ -641,6 +684,18 @@ struct EditorUi::Impl {
     JsonValue timeline_metadata;
     ImGuizmo::OPERATION gizmo_operation{ImGuizmo::TRANSLATE};
     ImGuizmo::MODE gizmo_mode{ImGuizmo::LOCAL};
+    // Grid snapping for the gizmo (3D nodes) and for dragging interface controls (2D nodes). Holding
+    // Ctrl flips it while dragging. The steps are text so they persist with the other preferences.
+    enum SnapStep { snap_move, snap_rotate, snap_scale, snap_interface };
+    bool snap_enabled{};
+    std::array<std::string, 4> snap_steps{"1", "15", "0.1", "8"};
+    static constexpr std::array<double, 4> snap_defaults{1.0, 15.0, 0.1, 8.0};
+    [[nodiscard]] double snap_step(const SnapStep step) const {
+        char* end = nullptr;
+        const auto& text = snap_steps[static_cast<std::size_t>(step)];
+        const double value = std::strtod(text.c_str(), &end);
+        return end != text.c_str() && std::isfinite(value) && value > 0.0 ? value : snap_defaults[static_cast<std::size_t>(step)];
+    }
     // Screen-space bounds of the area left clear for the scene, in the window's pixel coordinates.
     ImVec2 viewport_min{}, viewport_max{};
 
@@ -3152,7 +3207,8 @@ struct EditorUi::Impl {
         const auto control_order = [&](std::size_t index) {
             const auto* ui = ui_object(*entities[index]);
             const auto* control = ui ? field(*ui, "control") : nullptr;
-            return control && control->object() ? number_or(*control->object(), "order", 0.0) : 0.0;
+            return control && control->object() ? number_or(*control->object(), "order", 0.0)
+                                                : number_or(*entities[index], "order", 0.0);
         };
         const auto by_order = [&](std::vector<std::size_t>& members) {
             std::stable_sort(members.begin(), members.end(),
@@ -4200,8 +4256,14 @@ struct EditorUi::Impl {
         ImGuizmo::SetGizmoSizeClipSpace(0.12F);
         // Each viewport's gizmo keeps its own drag state.
         ImGui::PushID(gizmo_id);
+        const bool snapping = snap_enabled != ImGui::GetIO().KeyCtrl;
+        const auto step = static_cast<float>(snap_step(gizmo_operation == ImGuizmo::ROTATE  ? snap_rotate
+                                                       : gizmo_operation == ImGuizmo::SCALE ? snap_scale
+                                                                                            : snap_move));
+        const std::array<float, 3> snap_values{step, step, step};
         const bool used = ImGuizmo::Manipulate(camera_view.data(), projection.data(),
-                                               gizmo_operation, gizmo_mode, world.data());
+                                               gizmo_operation, gizmo_mode, world.data(), nullptr,
+                                               snapping ? snap_values.data() : nullptr);
         ImGui::PopID();
         draw_list->PopClipRect();
         const bool using_gizmo = ImGuizmo::IsUsing();
@@ -4245,6 +4307,9 @@ struct EditorUi::Impl {
         for (std::size_t index = 0; index < panel_names.size(); ++index)
             layout.bind(std::string("panel.") + panel_names[index], &panel_open[index]);
         layout.bind("view.ground_grid", &grid_enabled);
+        layout.bind("view.snap", &snap_enabled);
+        for (std::size_t index = 0; index < snap_steps.size(); ++index)
+            layout.bind_text("view.snap_step" + std::to_string(index), &snap_steps[index]);
         layout.bind("view.collider_wireframes", &collider_wireframes_enabled);
         layout.bind("view.node_icons", &node_icons_enabled);
         layout.bind("view.camera_wireframes", &camera_wireframes_enabled);
@@ -4579,20 +4644,66 @@ struct EditorUi::Impl {
             }
         }
 
-        // Dragging one row onto another reparents it. The drop target rejects its own subtree
-        // implicitly: scene.set_parent refuses cycles, and the failure surfaces as a status
+        // Dragging one row onto another reparents it; onto the top or bottom quarter of a row it
+        // goes between rows instead, as a sibling there (or the first child of an open row), with a
+        // line showing where. scene.move_node refuses cycles, and the failure surfaces as a status
         // message. Dropping a model file imports it as a child.
         if (!editing && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
             ImGui::SetDragDropPayload("relay.entity", handle.c_str(), handle.size() + 1U);
-            ImGui::Text("Reparent %s", name.c_str());
+            ImGui::Text("Move %s", name.c_str());
             ImGui::EndDragDropSource();
         }
         if (ImGui::BeginDragDropTarget()) {
-            if (const auto* payload = ImGui::AcceptDragDropPayload("relay.entity")) {
+            const float fraction = (ImGui::GetIO().MousePos.y - row_min.y) / std::max(row_max.y - row_min.y, 1.0F);
+            enum class Zone { before, onto, after };
+            const auto zone = fraction < 0.25F ? Zone::before : fraction > 0.75F ? Zone::after : Zone::onto;
+            ImGuiDragDropFlags accept = ImGuiDragDropFlags_AcceptBeforeDelivery;
+            if (zone != Zone::onto) accept |= ImGuiDragDropFlags_AcceptNoDrawDefaultRect;
+            if (const auto* payload = ImGui::AcceptDragDropPayload("relay.entity", accept)) {
                 const std::string dragged(static_cast<const char*>(payload->Data));
                 if (dragged != handle) {
-                    mutate("scene.set_parent",
-                           entity_field(dragged) + ",\"parent\":\"" + handle + '"', "Reparented");
+                    // Where it would land: under `target`, in front of `ahead` (empty for last).
+                    std::string target = handle, ahead;
+                    if (zone != Zone::onto) {
+                        const auto parent = string_or(*entity, "parent");
+                        const auto& siblings = parent.empty() ? roots : children[parent];
+                        const auto next_after = [&](const std::string& item) {
+                            bool seen = false;
+                            for (const auto sibling : siblings) {
+                                const auto candidate = string_or(*entities[sibling], "entity");
+                                if (seen && candidate != dragged) return candidate;
+                                seen = seen || candidate == item;
+                            }
+                            return std::string{};
+                        };
+                        if (zone == Zone::before) {
+                            target = parent;
+                            ahead = handle;
+                        } else if (has_children && open) {
+                            // Under an open row, "after" is its first child.
+                            for (const auto child : found->second)
+                                if (string_or(*entities[child], "entity") != dragged) {
+                                    ahead = string_or(*entities[child], "entity");
+                                    break;
+                                }
+                        } else {
+                            target = parent;
+                            ahead = next_after(handle);
+                        }
+                        const float y = zone == Zone::before ? row_min.y : row_max.y;
+                        ImGui::GetWindowDrawList()->AddLine(ImVec2(row_min.x, y), ImVec2(row_max.x, y),
+                                                            ImGui::GetColorU32(editor_color(editor_palette().accent)),
+                                                            2.0F * ui_scale);
+                    }
+                    if (payload->IsDelivery()) {
+                        const auto handle_or_null = [](const std::string& value) {
+                            return value.empty() ? std::string("null") : '"' + value + '"';
+                        };
+                        mutate("scene.move_node",
+                               entity_field(dragged) + ",\"parent\":" + handle_or_null(target) +
+                                   ",\"before\":" + handle_or_null(ahead),
+                               zone == Zone::onto ? "Reparented" : "Moved");
+                    }
                 }
             }
             if (const auto model = accept_model_drop()) import_model(*model, "scene", handle);
@@ -4918,8 +5029,7 @@ struct EditorUi::Impl {
             if (ImGui::BeginDragDropTarget()) {
                 if (const auto* payload = ImGui::AcceptDragDropPayload("relay.entity")) {
                     const std::string dragged(static_cast<const char*>(payload->Data));
-                    mutate("scene.set_parent", entity_field(dragged) + ",\"parent\":null",
-                           "Reparented");
+                    mutate("scene.move_node", entity_field(dragged) + ",\"parent\":null,\"before\":null", "Moved");
                 }
                 if (const auto model = accept_model_drop()) import_model(*model);
                 if (const auto dropped = accept_template_drop()) instantiate_template(*dropped);
@@ -7857,8 +7967,7 @@ struct EditorUi::Impl {
         const auto& palette = editor_palette();
         const auto& io = ImGui::GetIO();
         const bool game = runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game";
-        interface_preview.begin_frame(headless);
-        if (!assets_root.empty()) interface_painter.set_root(assets_root);
+        begin_interface_frame();
 
         // Toolbar: the screen size to lay out for, zoom and outlines.
         ImGui::SetNextItemWidth(210.0F * ui_scale);
@@ -7897,7 +8006,7 @@ struct EditorUi::Impl {
         ImGui::SameLine();
         ImGui::TextColored(editor_color(palette.text_faint),
                            game ? "Running: the game's interface, as it is now"
-                                : "Drag controls to move them, their handles to resize. Ctrl snaps to 8.");
+                                : "Drag controls to move them, their handles to resize. Ctrl flips grid snapping.");
 
         const auto low = ImGui::GetCursorScreenPos();
         const auto area = ImGui::GetContentRegionAvail();
@@ -7947,15 +8056,61 @@ struct EditorUi::Impl {
                                              std::min(origin.y + static_cast<float>(row + 1) * cell, to.y)},
                                             IM_COL32(64, 64, 68, 255));
         }
+        draw_interface_surface(draw, origin, scale, low, high, view_width, view_height, hovered, game, true);
+        draw->PopClipRect();
+    }
+
+    // Once per ImGui frame, whichever of the Interface editor and the viewport draws first.
+    void begin_interface_frame() {
+        const int frame = ImGui::GetFrameCount();
+        if (interface_frame == frame) return;
+        interface_frame = frame;
+        interface_preview.begin_frame(headless);
+        if (!assets_root.empty()) interface_painter.set_root(assets_root);
+    }
+    int interface_frame{-1};
+
+    // The interface in the viewport. The scene camera view shows the game as it will look, so the
+    // interface is laid out for the viewport's own size, as the game lays it out, and edited in place.
+    void draw_viewport_interface() {
+        if (camera_enabled || !viewport_visible || !viewport_draw_list) return;
+        if (runtime_status.object() && string_or(*runtime_status.object(), "mode") == "game") return;
+        const float width = viewport_max.x - viewport_min.x, height = viewport_max.y - viewport_min.y;
+        if (width < 32.0F || height < 32.0F) return;
+        begin_interface_frame();
+        const auto [view_width, view_height] = interface_game_view;
+        const float scale = width / static_cast<float>(view_width);
+        const bool hovered = viewport_hovered && pointer_in_viewport();
+        viewport_draw_list->PushClipRect(viewport_min, viewport_max, true);
+        draw_interface_surface(viewport_draw_list, viewport_min, scale, viewport_min, viewport_max, view_width,
+                               view_height, hovered || interface_drag.has_value(), false, false);
+        viewport_draw_list->PopClipRect();
+    }
+
+    // Draws the interface laid out for a `view_width` x `view_height` screen with its top-left corner at
+    // `origin` and `scale` panel pixels per screen pixel, then its outlines, handles and editing. The
+    // caller clips to [low, high]. `panel` is the Interface editor, which also frames the screen.
+    void draw_interface_surface(ImDrawList* draw, const ImVec2 origin, const float scale, const ImVec2 low,
+                                const ImVec2 high, const int view_width, const int view_height, const bool hovered,
+                                const bool game, const bool panel) {
+        const auto& palette = editor_palette();
+        const auto& io = ImGui::GetIO();
         const auto laid_out = interface_painter.layout(interface_sources, static_cast<std::uint32_t>(view_width),
                                                      static_cast<std::uint32_t>(view_height));
         const auto list = interface_painter.draw(laid_out);
         interface_preview.draw(draw, list, origin, scale, low, high);
-        draw->AddRect(origin, corner, ImGui::GetColorU32(editor_color(palette.border)), 0.0F, 0, 1.0F);
-        if (laid_out.nodes.empty()) {
-            const char* hint = "No interface yet. Add a Canvas, then Labels, Buttons and other controls under it.";
-            const auto size = ImGui::CalcTextSize(hint);
-            draw->AddText({centre.x - size.x * 0.5F, centre.y - size.y * 0.5F}, ImGui::GetColorU32(editor_color(palette.text_dim)), hint);
+        if (panel) {
+            draw->AddRect(origin, {origin.x + static_cast<float>(view_width) * scale, origin.y + static_cast<float>(view_height) * scale},
+                          ImGui::GetColorU32(editor_color(palette.border)), 0.0F, 0, 1.0F);
+            if (laid_out.nodes.empty()) {
+                const char* hint = "No interface yet. Add a Canvas, then Labels, Buttons and other controls under it.";
+                const auto size = ImGui::CalcTextSize(hint);
+                const ImVec2 centre{(low.x + high.x) * 0.5F, (low.y + high.y) * 0.5F};
+                draw->AddText({centre.x - size.x * 0.5F, centre.y - size.y * 0.5F}, ImGui::GetColorU32(editor_color(palette.text_dim)), hint);
+            }
+        } else if (!laid_out.nodes.empty()) {
+            const char* hint = "Scene camera: drag interface controls to move them, their handles to resize. Ctrl flips grid snapping.";
+            draw->AddText({low.x + 10.0F * ui_scale, low.y + 10.0F * ui_scale}, ImGui::GetColorU32(editor_color(palette.text_dim)), hint);
         }
 
         const auto faded = [](ImU32 color, float alpha) {
@@ -8042,35 +8197,41 @@ struct EditorUi::Impl {
         // Editing: select with a click, move by dragging, resize by the handles. The game's own
         // interface is only watched while it runs.
         if (!game) {
-            const auto begin_drag = [&](const UiLayoutNode& node, int handle) {
+            const auto begin_drag = [&](const UiLayoutNode& node, int handle, std::string pick) {
                 const auto inverse = node.parent_transform.inverse();
-                if (!inverse || contained(node)) return;
                 InterfaceDrag drag;
                 drag.entity = node.entity.to_string();
+                drag.pick = std::move(pick);
                 drag.handle = handle;
                 drag.start = io.MousePos;
                 drag.offset_min = node.ui->control->offset_min;
                 drag.offset_max = node.ui->control->offset_max;
-                drag.to_parent = *inverse;
+                if (inverse && !contained(node)) drag.to_parent = *inverse;
+                else drag.entity.clear(); // Not movable: a click still selects.
                 drag.scale = scale;
                 drag.gesture = ++gesture_serial;
                 interface_drag = drag;
             };
+            // Selecting waits for the release, so a selected panel can be dragged from where its
+            // children are; a drag of something else selects it as it starts.
             if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 if (chosen && handle_under >= 0) {
-                    begin_drag(*chosen, handle_under);
+                    begin_drag(*chosen, handle_under, {});
+                } else if (chosen && laid_out.contains(*chosen, pointer)) {
+                    begin_drag(*chosen, -1, under ? under->entity.to_string() : std::string{});
                 } else if (under) {
-                    if (under->entity.to_string() != selection) select(under->entity.to_string());
-                    begin_drag(*under, -1);
+                    begin_drag(*under, -1, under->entity.to_string());
                 }
             }
-            if (interface_drag && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            if (interface_drag && ImGui::IsMouseDown(ImGuiMouseButton_Left) && !interface_drag->entity.empty()) {
                 auto& drag = *interface_drag;
                 const double dx = (io.MousePos.x - drag.start.x) / drag.scale, dy = (io.MousePos.y - drag.start.y) / drag.scale;
                 // View pixels to the parent's units (its scale and rotation, without translation).
                 const Vec2 delta{drag.to_parent.a * dx + drag.to_parent.c * dy, drag.to_parent.b * dx + drag.to_parent.d * dy};
                 auto low_offset = drag.offset_min, high_offset = drag.offset_max;
-                const auto snap = [&](double value) { return io.KeyCtrl ? std::round(value / 8.0) * 8.0 : std::round(value); };
+                const bool snapping = snap_enabled != io.KeyCtrl;
+                const double grid = snap_step(snap_interface);
+                const auto snap = [&](double value) { return snapping ? std::round(value / grid) * grid : std::round(value); };
                 const int handle = drag.handle;
                 if (handle < 0) {
                     low_offset = {snap(low_offset.x + delta.x), snap(low_offset.y + delta.y)};
@@ -8089,6 +8250,7 @@ struct EditorUi::Impl {
                 const auto now_max = control && control->object() ? editor_vector2(*control->object(), "offset_max") : Vec2{};
                 if (now_min != low_offset || now_max != high_offset) {
                     drag.moved = true;
+                    if (drag.entity != selection) select(drag.entity);
                     pending_gesture = drag.gesture;
                     mutate("scene.set_ui",
                            entity_field(drag.entity) + ",\"component\":\"ui_control\",\"values\":{\"offset_min\":[" +
@@ -8097,7 +8259,11 @@ struct EditorUi::Impl {
                            handle < 0 ? "Control moved" : "Control resized");
                 }
             }
-            if (interface_drag && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) interface_drag.reset();
+            if (interface_drag && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                if (!interface_drag->moved && !interface_drag->pick.empty() && interface_drag->pick != selection)
+                    select(interface_drag->pick);
+                interface_drag.reset();
+            }
             // Arrow keys nudge the selected control by a unit, or eight with Shift.
             if (chosen && !contained(*chosen) && ImGui::IsWindowFocused() && !io.WantTextInput) {
                 const double step = io.KeyShift ? 8.0 : 1.0;
@@ -8117,7 +8283,6 @@ struct EditorUi::Impl {
                 }
             }
         }
-        draw->PopClipRect();
     }
 
     static Vec2 editor_vector2(const JsonValue::Object& object, const std::string_view name) {
@@ -10300,6 +10465,7 @@ struct EditorUi::Impl {
         if (toolbar_button("##camera", ToolIcon::camera, camera_enabled,
                            "Toggle editor view / scene camera"))
             camera_enabled = !camera_enabled;
+        note_item("toolbar:camera");
         ImGui::BeginDisabled(!camera_enabled);
         if (toolbar_button("##frame", ToolIcon::focus, false, "Frame selection (F)"))
             focus_selection();
@@ -10319,6 +10485,7 @@ struct EditorUi::Impl {
                                                          : "World axes: switch to local"))
             gizmo_mode = gizmo_mode == ImGuizmo::LOCAL ? ImGuizmo::WORLD : ImGuizmo::LOCAL;
         ImGui::EndDisabled();
+        draw_snap_controls("");
 
         const float left_end = ImGui::GetCursorScreenPos().x;
         const float button_width = 32.0F * ui_scale;
@@ -10466,6 +10633,8 @@ struct EditorUi::Impl {
         child->fonts = fonts;
         child->ui_scale = ui_scale;
         child->grid_enabled = grid_enabled;
+        child->snap_enabled = snap_enabled;
+        child->snap_steps = snap_steps;
         child->collider_wireframes_enabled = collider_wireframes_enabled;
         child->node_icons_enabled = node_icons_enabled;
         child->camera_wireframes_enabled = camera_wireframes_enabled;
@@ -10732,6 +10901,8 @@ struct EditorUi::Impl {
             if (ui.toolbar_button("##tpl_orientation", ui.gizmo_mode == ImGuizmo::LOCAL ? ToolIcon::local : ToolIcon::world, false,
                                   ui.gizmo_mode == ImGuizmo::LOCAL ? "Local axes: switch to world" : "World axes: switch to local"))
                 ui.gizmo_mode = ui.gizmo_mode == ImGuizmo::LOCAL ? ImGuizmo::WORLD : ImGuizmo::LOCAL;
+            ImGui::SameLine();
+            ui.draw_snap_controls("_tpl");
             ImGui::NewLine();
 
             // Hierarchy | viewport | inspector, with draggable dividers.
@@ -14232,6 +14403,10 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
             RELAY_PROFILE_SCOPE("Viewport: node icons");
             impl_->draw_scene_nodes();
         }
+        {
+            RELAY_PROFILE_SCOPE("Viewport: interface");
+            impl_->draw_viewport_interface();
+        }
         impl_->draw_game_input_hint();
         {
             RELAY_PROFILE_SCOPE("Viewport: gizmo");
@@ -14307,7 +14482,8 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
         if (panel("Interface", 12)) impl_->draw_interface_editor();
         ImGui::End();
     } else {
-        impl_->interface_drag.reset();
+        // The viewport's scene camera view edits the interface too, so a drag there carries on.
+        if (impl_->camera_enabled) impl_->interface_drag.reset();
     }
     if (impl_->panel_open[10]) {
         // Like the profiler, the mixer joins Diagnostics the first time it opens.

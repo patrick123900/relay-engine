@@ -116,7 +116,9 @@ capture shows them.
   particles each is tested every few steps along the path it took since, so fast particles can
   slip through thin colliders. Editor previews collide with planes only.
 - Particles are drawn after transparent surfaces, sorted within each emitter and emitters sorted
-  by distance; they do not interleave with transparent meshes, cast shadows, write motion vectors,
-  appear in ray traced reflections or take part in global illumination.
+  by distance; they do not interleave with transparent meshes, cast shadows, write motion vectors
+  or take part in global illumination. Ray traced reflections show them as camera-facing quads (the
+  alignment the main view uses), up to 32768 sprites and 16 textures, without soft-particle fading,
+  and a particle in front of a custom-shader surface is left out of that surface's reflection.
 - There are no trails or ribbons, mesh particles, GPU simulation, attractors or per-particle
   lights yet.

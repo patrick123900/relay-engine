@@ -110,6 +110,8 @@ struct GeneratedShader {
     std::string vertex;
     std::string fragment;
     std::string shadow_fragment;
+    // A compute kernel shading ray traced reflection hits on surface shaders' surfaces.
+    std::string hit;
 };
 [[nodiscard]] GeneratedShader generate_shader_glsl(const ParsedShader& shader);
 
@@ -117,6 +119,9 @@ struct CompiledShader {
     std::string path;
     ParsedShader parsed;
     std::vector<std::uint32_t> vertex, fragment, shadow_fragment;
+    // A compute kernel that shades ray traced reflection hits on this surface shader's surfaces; empty
+    // for post shaders and when it does not compile, which leaves reflections of the surface grey.
+    std::vector<std::uint32_t> hit;
     // Parse and compile errors, sorted by line and without duplicates.
     std::vector<ShaderMessage> errors;
     // Distinct for every compile, so renderers know when to rebuild pipelines.

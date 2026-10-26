@@ -169,7 +169,7 @@ struct SceneAccelerationStructures::Impl {
         VkAccelerationStructureGeometryKHR description{};
         description.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
         description.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-        description.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        description.flags = geometry.opaque ? static_cast<VkGeometryFlagsKHR>(VK_GEOMETRY_OPAQUE_BIT_KHR) : 0U;
         auto& data = description.geometry.triangles;
         data.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
         data.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;

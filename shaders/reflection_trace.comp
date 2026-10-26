@@ -15,53 +15,32 @@ float surface_lod = 0.0;
 #include "surface_lighting.glsl"
 
 layout(set = 1, binding = 0) uniform accelerationStructureEXT scene;
-layout(std430, set = 1, binding = 1) readonly buffer RayList { uint rays[]; };
-layout(std430, set = 1, binding = 2) readonly buffer RayCounter { uint counter[]; };
-layout(set = 1, binding = 3, rgba16f) uniform writeonly image2D radiance_output;
-layout(set = 1, binding = 4, r16f) uniform writeonly image2D variance_output;
-layout(set = 1, binding = 5) uniform sampler2D depth_texture;
-layout(set = 1, binding = 6) uniform sampler2D normal_roughness_texture;
-layout(set = 1, binding = 7) uniform sampler2D blue_noise;
-layout(std430, set = 1, binding = 8) readonly buffer StaticVertices { float static_vertices[]; };
-layout(std430, set = 1, binding = 9) readonly buffer DeformedVertices { float deformed_vertices[]; };
-layout(std430, set = 1, binding = 10) readonly buffer Indices { uint indices[]; };
-struct InstanceData {
-    uint material;
-    uint first_index;
-    int vertex_offset;
-    uint deformed;
+#include "reflection_trace_common.glsl"
+
+// Particle sprites, as particle.vert reads them, with each sprite's right and up axes (the CPU
+// orients the quads the acceleration structure holds), the batches that say how to draw them
+// (sorted by first sprite) and the batches' textures.
+struct SpriteData {
+    vec4 position_width;
+    vec4 axis_height;
+    vec4 color;
+    vec4 rotation_frame_age;
 };
-layout(std430, set = 1, binding = 11) readonly buffer Instances { InstanceData instances[]; };
+layout(std430, set = 1, binding = 12) readonly buffer Sprites { SpriteData sprites[]; };
+struct BatchData {
+    // first sprite, sprite count, texture slot, mode: blend | lit << 4 | flipbook blend << 5.
+    uvec4 range;
+    vec4 local_x; // w: flipbook columns
+    vec4 local_y; // w: flipbook rows
+    vec4 padding;
+};
+layout(std430, set = 1, binding = 13) readonly buffer Batches { BatchData batches[]; };
+layout(std430, set = 1, binding = 14) readonly buffer SpriteAxes { vec4 sprite_axes[]; };
+layout(set = 1, binding = 15) uniform sampler2D particle_images[16];
 
-layout(push_constant) uniform TraceData {
-    mat4 inverse_view_projection;
-    vec4 camera_position;
-    // x, y: target size; z: frame index.
-    uvec4 extent;
-} trace;
-
-const uint floats_per_vertex = 12u;
 const float max_distance = 1000.0;
 // Hit distance reported for rays that leave the scene, as in AMD's sample.
 const float sky_distance = 100.0;
-
-// Samples a visible GGX microfacet normal (Heitz 2018, "Sampling the GGX Distribution of Visible
-// Normals"). `view` is in the tangent frame with z along the surface normal.
-vec3 sample_visible_normal(vec3 view, float alpha, vec2 u) {
-    vec3 stretched = normalize(vec3(alpha * view.x, alpha * view.y, view.z));
-    float length_squared = dot(stretched.xy, stretched.xy);
-    vec3 t1 = length_squared > 0.0 ? vec3(-stretched.y, stretched.x, 0.0) * inversesqrt(length_squared)
-                                   : vec3(1.0, 0.0, 0.0);
-    vec3 t2 = cross(stretched, t1);
-    float r = sqrt(u.x);
-    float phi = 2.0 * pi * u.y;
-    float p1 = r * cos(phi);
-    float p2 = r * sin(phi);
-    float s = 0.5 * (1.0 + stretched.z);
-    p2 = (1.0 - s) * sqrt(1.0 - p1 * p1) + s * p2;
-    vec3 normal = p1 * t1 + p2 * t2 + sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * stretched;
-    return normalize(vec3(alpha * normal.x, alpha * normal.y, max(0.0, normal.z)));
-}
 
 vec3 environment(vec3 direction) {
     // The sky as global illumination sees it: the ambient scale divided by pi, which with a sky
@@ -69,31 +48,72 @@ vec3 environment(vec3 direction) {
     return sky_environment(direction) / pi;
 }
 
-vec3 vertex_vector(InstanceData instance, uint vertex, uint offset) {
-    uint base = vertex * floats_per_vertex + offset;
-    return instance.deformed != 0u
-               ? vec3(deformed_vertices[base], deformed_vertices[base + 1u], deformed_vertices[base + 2u])
-               : vec3(static_vertices[base], static_vertices[base + 1u], static_vertices[base + 2u]);
-}
+// Particle sprites are non-opaque quads the ray query reports as candidates. Each one found is
+// shaded as particle.frag does (without the soft-particle fade, which needs the screen's depth) and
+// kept, nearest four, to be blended over whatever the ray ends on.
+const int max_layers = 4;
 
-vec4 vertex_vector4(InstanceData instance, uint vertex, uint offset) {
-    uint base = vertex * floats_per_vertex + offset;
-    return instance.deformed != 0u
-               ? vec4(deformed_vertices[base], deformed_vertices[base + 1u],
-                      deformed_vertices[base + 2u], deformed_vertices[base + 3u])
-               : vec4(static_vertices[base], static_vertices[base + 1u], static_vertices[base + 2u],
-                      static_vertices[base + 3u]);
-}
-
-vec2 vertex_uv(InstanceData instance, uint vertex) {
-    uint base = vertex * floats_per_vertex + 3u;
-    return instance.deformed != 0u ? vec2(deformed_vertices[base], deformed_vertices[base + 1u])
-                                   : vec2(static_vertices[base], static_vertices[base + 1u]);
-}
-
-void store(ivec2 pixel, vec4 value) {
-    imageStore(radiance_output, pixel, value);
-    imageStore(variance_output, pixel, vec4(value.w));
+// Premultiplied color and coverage: alpha sprites cover, additive ones (coverage 0) add light.
+vec4 particle_layer(uint sprite_index, uint triangle, vec2 barycentrics, vec3 hit_position, vec3 direction,
+                    float distance) {
+    uint low = 0u;
+    uint high = trace.extent.w & 0x7FFFFFFFu;
+    while (high - low > 1u) {
+        uint middle = (low + high) / 2u;
+        if (batches[middle].range.x <= sprite_index) low = middle;
+        else high = middle;
+    }
+    BatchData batch = batches[low];
+    if (sprite_index < batch.range.x || sprite_index >= batch.range.x + batch.range.y) return vec4(0.0);
+    SpriteData sprite = sprites[sprite_index];
+    vec3 weights = vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
+    // The quad's corners are (-1,-1), (1,-1), (1,1), (-1,1); the triangles (0,1,2) and (0,2,3).
+    vec2 corner = triangle == 0u
+        ? weights.x * vec2(-1.0, -1.0) + weights.y * vec2(1.0, -1.0) + weights.z * vec2(1.0, 1.0)
+        : weights.x * vec2(-1.0, -1.0) + weights.y * vec2(1.0, 1.0) + weights.z * vec2(-1.0, 1.0);
+    vec2 uv = vec2(corner.x * 0.5 + 0.5, 0.5 - corner.y * 0.5);
+    float columns = batch.local_x.w;
+    float rows = batch.local_y.w;
+    float frames = columns * rows;
+    float current = floor(sprite.rotation_frame_age.y);
+    vec2 cell = vec2(mod(current, columns), floor(current / columns));
+    vec2 frame_uv = (cell + uv) / vec2(columns, rows);
+    float lod = clamp(log2(1.0 + distance), 0.0, 4.0);
+    uint slot = batch.range.z;
+    vec4 texel = textureLod(particle_images[nonuniformEXT(slot)], frame_uv, lod);
+    if ((batch.range.w & 32u) != 0u) {
+        float next = mod(current + 1.0, frames);
+        vec2 next_cell = vec2(mod(next, columns), floor(next / columns));
+        texel = mix(texel, textureLod(particle_images[nonuniformEXT(slot)], (next_cell + uv) / vec2(columns, rows), lod),
+                    fract(sprite.rotation_frame_age.y));
+    }
+    uint blend = batch.range.w & 15u;
+    vec3 color = sprite.color.rgb * texel.rgb;
+    float alpha = sprite.color.a * texel.a;
+    if (alpha <= 0.002 && blend != 2u) return vec4(0.0);
+    if ((batch.range.w & 16u) != 0u) {
+        vec3 right = sprite_axes[sprite_index * 2u].xyz;
+        vec3 up = sprite_axes[sprite_index * 2u + 1u].xyz;
+        vec3 facing = normalize(cross(right, up));
+        vec3 view_direction = -direction;
+        if (dot(facing, view_direction) < 0.0) facing = -facing;
+        float edge = clamp(dot(corner, corner), 0.0, 1.0);
+        Surface surface;
+        surface.base_color = vec4(blend == 2u ? color / max(alpha, 0.001) : color, 1.0);
+        surface.metallic = 0.0;
+        surface.roughness = 1.0;
+        surface.normal = normalize(right * corner.x + up * corner.y + facing * sqrt(1.0 - edge));
+        surface.occlusion = 1.0;
+        surface.emissive = vec3(0.0);
+        vec3 total, diffuse;
+        direct_lighting(surface, hit_position, view_direction, total, diffuse);
+        vec3 lit = total + ambient_diffuse(surface);
+        color = blend == 2u ? lit * alpha : lit;
+    }
+    float fog = fog_amount(length(hit_position - trace.camera_position.xyz));
+    if (blend == 1u) return vec4(color * alpha * (1.0 - fog), 0.0);
+    if (blend == 2u) return vec4(mix(color, fog_color(fog) * alpha, fog), alpha);
+    return vec4(mix(color, fog_color(fog), fog) * alpha, alpha);
 }
 
 void main() {
@@ -105,44 +125,59 @@ void main() {
     bool copy_vertical = ((packed >> 30u) & 1u) != 0u;
     bool copy_diagonal = ((packed >> 31u) & 1u) != 0u;
 
-    float depth = texelFetch(depth_texture, pixel, 0).r;
-    vec4 normal_roughness = texelFetch(normal_roughness_texture, pixel, 0);
-    vec2 uv = (vec2(pixel) + 0.5) / vec2(trace.extent.xy);
-    vec4 world = trace.inverse_view_projection * vec4(uv * 2.0 - 1.0, depth, 1.0);
-    vec3 position = world.xyz / world.w;
-    vec3 normal = normalize(normal_roughness.xyz);
-    vec3 view_direction = normalize(trace.camera_position.xyz - position);
-    float alpha = normal_roughness.w * normal_roughness.w;
-
-    // Reflect about a GGX microfacet normal drawn with this frame's blue noise.
-    vec3 helper = abs(normal.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 tangent = normalize(cross(helper, normal));
-    vec3 bitangent = cross(normal, tangent);
-    vec3 local_view = vec3(dot(view_direction, tangent), dot(view_direction, bitangent),
-                           dot(view_direction, normal));
-    // Blue noise, shifted by the R2 sequence every frame so temporal accumulation keeps seeing
-    // new directions rather than cycling through a few patterns.
-    vec2 noise = fract(texelFetch(blue_noise, pixel & 127, 0).rg +
-                       float(trace.extent.z & 0xFFFFu) * vec2(0.7548776662, 0.5698402910));
-    vec3 local_half = sample_visible_normal(local_view, max(alpha, 1e-4), noise);
-    vec3 half_vector = normalize(tangent * local_half.x + bitangent * local_half.y + normal * local_half.z);
-    vec3 direction = reflect(-view_direction, half_vector);
-    if (dot(direction, normal) <= 0.0) direction = reflect(-view_direction, normal);
-
-    // Push the origin off the surface in proportion to its distance from the camera.
-    float camera_distance = length(trace.camera_position.xyz - position);
-    vec3 origin = position + normal * max(0.002, camera_distance * 0.0015);
+    vec3 origin, direction;
+    reflection_ray(pixel, origin, direction);
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 0xFFu, origin, 0.0, direction,
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsNoneEXT, 0xFFu, origin, 0.0, direction,
                           max_distance);
+    float layer_distance[max_layers];
+    vec4 layer_color[max_layers];
+    int layers = 0;
     while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+        InstanceData candidate = instances[rayQueryGetIntersectionInstanceCustomIndexEXT(query, false)];
+        if (candidate.deformed != 2u) {
+            rayQueryConfirmIntersectionEXT(query);
+            continue;
+        }
+        float candidate_distance = rayQueryGetIntersectionTEXT(query, false);
+        uint candidate_primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, false));
+        vec4 layer = particle_layer(candidate_primitive >> 1u, candidate_primitive & 1u,
+                                    rayQueryGetIntersectionBarycentricsEXT(query, false),
+                                    origin + direction * candidate_distance, direction, candidate_distance);
+        if (layer == vec4(0.0)) continue;
+        // Keep the nearest few, nearest first.
+        int place = layers < max_layers ? layers : max_layers - 1;
+        if (layers == max_layers && candidate_distance >= layer_distance[max_layers - 1]) continue;
+        while (place > 0 && layer_distance[place - 1] > candidate_distance) {
+            layer_distance[place] = layer_distance[place - 1];
+            layer_color[place] = layer_color[place - 1];
+            --place;
+        }
+        layer_distance[place] = candidate_distance;
+        layer_color[place] = layer;
+        layers = min(layers + 1, max_layers);
     }
+    float opaque_distance = max_distance;
     vec4 result;
+    bool keep_hits = (trace.extent.w & 0x80000000u) != 0u;
+    if (keep_hits) hit_records[ray_index * 4u] = no_hit;
     if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
         float distance = rayQueryGetIntersectionTEXT(query, true);
-        InstanceData instance = instances[rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)];
+        opaque_distance = distance;
+        uint instance_index = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true));
+        InstanceData instance = instances[instance_index];
         uint primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
         vec2 barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, true);
+        // A custom shader's surface is shaded again by that shader's hit kernel; what follows, with
+        // the instance's stand-in material, is what shows where there is none.
+        if (keep_hits && instance.extra.x != 0u) {
+            uvec2 fractions = uvec2(clamp(barycentrics, vec2(0.0), vec2(1.0)) * 65535.0 + 0.5);
+            hit_records[ray_index * 4u] = instance_index;
+            hit_records[ray_index * 4u + 1u] = primitive;
+            hit_records[ray_index * 4u + 2u] = fractions.x | (fractions.y << 16u);
+            hit_records[ray_index * 4u + 3u] = floatBitsToUint(distance);
+        }
         vec3 weights = vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
         uint first = instance.first_index + primitive * 3u;
         uvec3 corners = uvec3(uint(int(indices[first]) + instance.vertex_offset),
@@ -176,6 +211,10 @@ void main() {
     } else {
         result = vec4(environment(direction), sky_distance);
     }
+    // Particles in front of what the ray ended on, farthest first.
+    for (int layer = layers - 1; layer >= 0; --layer)
+        if (layer_distance[layer] < opaque_distance)
+            result.rgb = layer_color[layer].rgb + result.rgb * (1.0 - layer_color[layer].a);
     // A single NaN would spread through the denoiser's history, so such a ray is dropped.
     if (any(isnan(result))) return;
     result.rgb = min(result.rgb, vec3(64.0));

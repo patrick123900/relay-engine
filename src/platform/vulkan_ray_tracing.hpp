@@ -22,6 +22,9 @@ struct RayTracingGeometry {
     VkBuffer index_buffer{};
     std::uint32_t first_index{};
     std::uint32_t index_count{};
+    // Opaque triangles are confirmed by ray queries on their own; others (particle sprites) are
+    // reported to the shader as candidates to blend or skip.
+    bool opaque{true};
 };
 
 struct RayTracingInstance {

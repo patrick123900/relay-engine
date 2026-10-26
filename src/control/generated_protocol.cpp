@@ -253,6 +253,12 @@ constexpr std::array<ProtocolFieldSpec, 2> fields_scene_set_parent{{
     {"parent", ProtocolValueType::string, true, true, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
 }};
 
+constexpr std::array<ProtocolFieldSpec, 3> fields_scene_move_node{{
+    {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"parent", ProtocolValueType::string, true, true, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+    {"before", ProtocolValueType::string, true, true, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
+}};
+
 constexpr std::array<ProtocolFieldSpec, 7> fields_scene_set_animation{{
     {"entity", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "^\\d+:\\d+$", ""},
     {"clip", ProtocolValueType::integer, false, false, true, true, 0, 255, 0U, 0U, "", ""},
@@ -839,7 +845,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_audio_set_spatialization{{
     {"mode", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "stereo|binaural"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 170> methods{{
+constexpr std::array<ProtocolMethodSpec, 171> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -906,6 +912,7 @@ constexpr std::array<ProtocolMethodSpec, 170> methods{{
     {"scene.set_renderer", "scene_set_renderer", "Configure entity renderer", "Attach a registered built-in or imported mesh and a material to an entity, or remove its renderer component. The material is a registered material name or a project surface material (.relay-material) drawn by its shader. Per-object parameter values (scene.set_renderer_parameter) stay while the material is unchanged.", false, false, false, false, false, fields_scene_set_renderer},
     {"scene.set_renderer_parameter", "scene_set_renderer_parameter", "Set per-object material parameter", "Give one object its own value for a parameter of its shader material, without changing the material file or other objects that use it: value is 1 to 4 numbers matching the uniform (float, int, bool as 0 or 1, vec2, vec3 or vec4; colors are linear). Images cannot be overridden. clear returns the object to the material's value. Undoable; scripts change the same values during the game with entity.set_material_parameter.", false, false, false, false, false, fields_scene_set_renderer_parameter},
     {"scene.set_parent", "scene_set_parent", "Set entity parent", "Reparent an entity safely; use null to move it to the scene root.", false, false, false, false, false, fields_scene_set_parent},
+    {"scene.move_node", "scene_move_node", "Move node among siblings", "Reparent an entity and place it among its new siblings, as the Hierarchy's drag and drop does: in front of the sibling `before`, or last when before is null. before must be a child of parent (or a root node when parent is null). The siblings are renumbered so the order is saved with the scene (interface controls also get their control order). One undoable transaction.", false, false, false, false, false, fields_scene_move_node},
     {"scene.undo", "scene_undo", "Undo scene change", "Undo the most recent scene transaction and restore exact entity generations.", false, false, false, false, false, no_fields},
     {"scene.redo", "scene_redo", "Redo scene change", "Reapply the most recently undone scene transaction.", false, false, false, false, false, no_fields},
     {"scene.set_animation", "scene_set_animation", "Control imported animation", "Configure clip, playback, looping, speed and seek time on an imported model root.", false, false, false, false, false, fields_scene_set_animation},

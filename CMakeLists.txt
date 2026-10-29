@@ -133,6 +133,7 @@ set(RELAY_ENGINE_IMPORTER_SOURCES src/render/model_import.cpp src/render/shader_
 add_library(relay_engine_common OBJECT
     src/audio/audio_clip.cpp
     src/audio/audio_effects.cpp
+    src/audio/flac_encoder.cpp
     src/audio/audio_mixer.cpp
     src/audio/audio_settings.cpp
     src/audio/audio_system.cpp
@@ -146,6 +147,7 @@ add_library(relay_engine_common OBJECT
     src/core/input.cpp
     src/core/log.cpp
     src/core/pak.cpp
+    src/core/elf_requirements.cpp
     src/core/process.cpp
     src/physics/collision.cpp
     src/physics/jolt_world.cpp
@@ -157,6 +159,7 @@ add_library(relay_engine_common OBJECT
     src/render/software_renderer.cpp
     src/render/asset_manifest.cpp
     src/render/cooked_assets.cpp
+    src/render/texture_compression.cpp
     src/render/asset_thumbnail.cpp
     src/render/scene_preview.cpp
     src/control/template_session.cpp
@@ -183,6 +186,7 @@ add_library(relay_engine_common OBJECT
     src/scene/asset_references.cpp
     src/scene/project_package.cpp
     src/scene/project_build.cpp
+    src/scene/build_runner.cpp
     src/scene/project_files.cpp
     src/scene/scene_edit.cpp
     src/scene/scene_history.cpp
@@ -208,7 +212,8 @@ foreach(_target IN LISTS RELAY_ENGINE_TARGETS)
     target_compile_definitions(${_target} PRIVATE
         RELAY_SCRIPT_DEFAULT_COMPILER="${CMAKE_CXX_COMPILER}"
         RELAY_SCRIPT_DEFAULT_SDK_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sdk"
-        RELAY_PLAYER_DEFAULT_PATH="${CMAKE_CURRENT_BINARY_DIR}/relay_player")
+        RELAY_PLAYER_DEFAULT_PATH="${CMAKE_CURRENT_BINARY_DIR}/relay_player"
+        RELAY_PLAYERS_DEFAULT_DIR="${CMAKE_CURRENT_BINARY_DIR}/players")
     add_dependencies(${_target} relay_protocol_codegen_check)
     target_compile_features(${_target} PUBLIC cxx_std_20)
     target_include_directories(${_target}
@@ -309,6 +314,10 @@ if(WIN32)
         target_link_libraries(${_target} PRIVATE ws2_32 psapi)
     endforeach()
 endif()
+
+# Reads the glibc and libstdc++ versions a Linux program asks for; see tools/elf_requirements.cpp.
+add_executable(relay_elf_requirements tools/elf_requirements.cpp)
+target_link_libraries(relay_elf_requirements PRIVATE Relay::EngineRuntime)
 
 add_executable(relay_demo apps/relay_demo/main.cpp)
 target_compile_definitions(relay_demo PRIVATE RELAY_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -716,7 +725,9 @@ if(RELAY_BUILD_TESTS)
         target_link_libraries(relay_game_build_tests PRIVATE Relay::Engine)
         add_dependencies(relay_game_build_tests relay_player)
         target_compile_definitions(relay_game_build_tests PRIVATE
-            RELAY_DEMO_DIRECTORY="${CMAKE_CURRENT_SOURCE_DIR}/examples/demo")
+            RELAY_DEMO_DIRECTORY="${CMAKE_CURRENT_SOURCE_DIR}/examples/demo"
+            RELAY_FIXTURE_MODELS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/models"
+            RELAY_PLAYER_BINARY_PATH="${CMAKE_CURRENT_BINARY_DIR}/relay_player")
         relay_enable_warnings(relay_game_build_tests)
         add_test(NAME relay_game_build_tests COMMAND relay_game_build_tests)
         set_tests_properties(relay_game_build_tests PROPERTIES TIMEOUT 900)

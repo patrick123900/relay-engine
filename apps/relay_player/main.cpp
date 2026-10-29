@@ -261,6 +261,7 @@ int main(int argc, char** argv) {
         // frames reach the display, so a slow game can be told from a slow setting.
         if (frames == 30U && (debug || frame_limit != 0U))
             std::cerr << "Renderer: " << window.lighting_status_json() << '\n'
+                      << "Uploads: " << window.upload_status_json() << '\n'
                       << "Project graphics: vsync " << (engine.graphics_settings().vsync ? "on" : "off")
                       << ", frame rate limit " << engine.graphics_settings().frame_rate_limit << '\n';
         if (frame_limit != 0U && frames >= frame_limit) break;

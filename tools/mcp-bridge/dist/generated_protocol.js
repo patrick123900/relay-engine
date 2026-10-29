@@ -1948,21 +1948,25 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "name": z.string().min(1).max(32).describe("Profile to change; it is created when it does not exist"),
             "new_name": z.string().min(1).max(32).optional().describe("Rename the profile"),
             "copy_from": z.string().max(32).optional().describe("When creating the profile, start from this existing profile"),
-            "target_platform": z.enum(["linux"]).optional().describe("Platform to build for"),
-            "architecture": z.enum(["x86_64"]).optional().describe("CPU architecture to build for"),
+            "target_platform": z.enum(["linux", "windows", "macos"]).optional().describe("Platform to build for"),
+            "architecture": z.enum(["x86_64", "aarch64"]).optional().describe("CPU architecture to build for"),
             "configuration": z.enum(["release", "debug"]).optional().describe("Build configuration; each has its own folder below the build folder"),
             "output_directory": z.string().max(512).optional().describe("Folder that holds the release and debug folders: relative to the project, or absolute (default builds)"),
             "window_mode": z.enum(["windowed", "borderless", "fullscreen"]).optional().describe("How the game's window first opens"),
             "window_width": z.number().int().min(320).max(16384).optional().describe("Window width in pixels when windowed"),
             "window_height": z.number().int().min(320).max(16384).optional().describe("Window height in pixels when windowed"),
-            "include_unused_assets": z.boolean().optional().describe("Ship every file in the project instead of only the files the game refers to; for games whose code loads files by names it builds up")
+            "include_unused_assets": z.boolean().optional().describe("Ship every file in the project instead of only the files the game refers to; for games whose code loads files by names it builds up"),
+            "always_include": z.array(z.string()).max(64).optional().describe("Project files and folders that always ship, whatever the scan of what the game refers to finds, with everything they refer to; replaces the list"),
+            "compress_textures": z.boolean().optional().describe("Cook the imported models' textures into GPU-compressed BC1/BC3 with mip chains (default true)"),
+            "compress_audio": z.boolean().optional().describe("Cook uncompressed wav sounds into lossless FLAC (default true)"),
+            "minimum_glibc": z.string().max(8).optional().describe("Linux: the oldest glibc the game must run on, such as 2.31; a build whose program or libraries need a newer one fails and says which. Empty does not check")
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
         const override = overrides["project_set_build_profile"];
         if (override)
             return override(input);
-        return invoke("project.set_build_profile", { "name": input["name"], "new_name": input["new_name"], "copy_from": input["copy_from"], "target_platform": input["target_platform"], "architecture": input["architecture"], "configuration": input["configuration"], "output_directory": input["output_directory"], "window_mode": input["window_mode"], "window_width": input["window_width"], "window_height": input["window_height"], "include_unused_assets": input["include_unused_assets"] });
+        return invoke("project.set_build_profile", { "name": input["name"], "new_name": input["new_name"], "copy_from": input["copy_from"], "target_platform": input["target_platform"], "architecture": input["architecture"], "configuration": input["configuration"], "output_directory": input["output_directory"], "window_mode": input["window_mode"], "window_width": input["window_width"], "window_height": input["window_height"], "include_unused_assets": input["include_unused_assets"], "always_include": input["always_include"], "compress_textures": input["compress_textures"], "compress_audio": input["compress_audio"], "minimum_glibc": input["minimum_glibc"] });
     });
     server.registerTool("project_remove_build_profile", {
         title: "Remove a build profile",
@@ -1979,7 +1983,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("project_build", {
         title: "Build project",
-        description: "Build the game for a build profile into <build folder>/<configuration>/ (the release and debug folders are both created), replacing the previous build of that configuration. The result runs on its own: the game's program (named for the game, from relay_player), game.pak (every file the game refers to in one archive, with its models and project shaders already imported and compiled; unreferenced files are left out unless the profile ships every file), scripts/ (the behaviours compiled for the configuration; the project's scripts must be trusted), shaders/, lib/ (libraries the program needs; the model importer and shader compiler are not among them), build.json and icon.png. Linux x86_64 only. Compiling scripts can take a while, and the call returns when the build is done. Save scene changes first.",
+        description: "Build the game for a build profile into <build folder>/<configuration>/ (the release and debug folders are both created), replacing the previous build of that configuration. The result runs on its own: the game's program (named for the game, from relay_player), game.pak (every file the game refers to in one archive, with its models and project shaders already imported and compiled; unreferenced files are left out unless the profile ships every file), scripts/ (the behaviours compiled for the configuration; the project's scripts must be trusted), shaders/, lib/ (libraries the program needs; the model importer and shader compiler are not among them), build.json and icon.png. Linux x86_64 only. The call waits until the build is done (compiling scripts can take a while); an editor uses project.build_start and project.build_status instead, to keep drawing. Save scene changes first.",
         inputSchema: z.object({
             "profile": z.string().max(32).optional().describe("Profile to build; default is the active profile")
         }),
@@ -1989,6 +1993,54 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override(input);
         return invoke("project.build", { "profile": input["profile"] });
+    });
+    server.registerTool("project_build_start", {
+        title: "Start a build",
+        description: "Start building the game for a build profile on a background thread and return at once. Poll project.build_status for the stage, how far along it is and the result; project.build_cancel stops it, leaving the earlier build as it was. One build at a time. Save scene changes first.",
+        inputSchema: z.object({
+            "profile": z.string().max(32).optional().describe("Profile to build; default is the active profile")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["project_build_start"];
+        if (override)
+            return override(input);
+        return invoke("project.build_start", { "profile": input["profile"] });
+    });
+    server.registerTool("project_build_preview", {
+        title: "Preview what a build packs",
+        description: "Without building, list the project files a build of a profile would leave out because nothing the game uses refers to them (the first 500, sorted), how many files it would pack, and anything the scan was unsure of, such as a script string that reads like a path but matches no file. Use the profile's always_include or include_unused_assets to keep files that are listed.",
+        inputSchema: z.object({
+            "profile": z.string().max(32).optional().describe("Profile to build; default is the active profile")
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["project_build_preview"];
+        if (override)
+            return override(input);
+        return invoke("project.build_preview", { "profile": input["profile"] });
+    });
+    server.registerTool("project_build_status", {
+        title: "Read the build's progress",
+        description: "The state of the latest build (idle, running, succeeded, failed or cancelled), the stage it is on, how far through the whole build it is (0 to 1), seconds elapsed, the error if it failed, and, once it succeeded, the build's folder, file count and whether it has a program.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["project_build_status"];
+        if (override)
+            return override({});
+        return invoke("project.build_status", {});
+    });
+    server.registerTool("project_build_cancel", {
+        title: "Cancel the build",
+        description: "Ask the running build to stop. It stops at its next check, removes what it was writing and leaves the earlier build of that configuration as it was. Harmless when no build is running.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["project_build_cancel"];
+        if (override)
+            return override({});
+        return invoke("project.build_cancel", {});
     });
     server.registerTool("scene_keyframe_set", {
         title: "Set transform keyframe",

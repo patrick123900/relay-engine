@@ -46,11 +46,15 @@ UploadEstimate estimate_asset_upload(const AssetRegistry& assets,
     const auto textures = assets.textures();
     for (std::size_t index = std::min(first_texture, textures.size()); index < textures.size(); ++index) {
         const auto& texture = textures[index];
-        const auto bytes = texture_mip_bytes(texture.width, texture.height);
+        // Cooked textures are counted as the blocks they upload; a device that cannot sample them
+        // decompresses on the CPU, which this does not count.
+        const auto bytes = texture.compressed ? static_cast<std::uint64_t>(texture.compressed->data.size())
+                                              : texture_mip_bytes(texture.width, texture.height);
         result.largest_texture_bytes = std::max(result.largest_texture_bytes, bytes);
         result.overflow |= !add(result.device_bytes, bytes);
         result.overflow |= !add(result.staging_bytes,
-                                static_cast<std::uint64_t>(texture.rgba.size()));
+                                texture.compressed ? static_cast<std::uint64_t>(texture.compressed->data.size())
+                                                   : static_cast<std::uint64_t>(texture.rgba.size()));
         ++result.new_textures;
     }
     return result;

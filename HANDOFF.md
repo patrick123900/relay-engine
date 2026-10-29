@@ -1588,41 +1588,50 @@ Phase 3:
 
 ## Next priorities
 
-1. Finish game builds (Run > Build project; see "Game builds" above for what exists). In rough order of value:
-   - **Asynchronous build with progress and cancel.** `project.build` runs on the protocol thread, so the
-     editor freezes while scripts compile (the first build of a script-heavy project takes a while). Run it
-     on a worker (script compile already has `run_build`), report stages (collecting, cooking models, cooking
-     shaders, compiling scripts, writing the archive) through a status call the Build window polls, and let
-     the person cancel. Keep the staging-folder swap so a cancelled build leaves the old one intact.
-   - **Look at it on a desktop.** The player and the Build, Export and file-dialog windows were only run
-     headlessly or offscreen: check a real window (title, icon, windowed/borderless/fullscreen, pointer
-     lock, resize), the system file dialogs through a real portal, and Wayland as well as X11. Fullscreen
-     and exclusive modes are untested.
-   - **Texture and audio cooking.** Project images and audio are packed as authored and embedded model
-     textures are raw RGBA. Add an encoder (stb_dxt is public domain) and GPU-compressed formats with mip
-     chains, which needs renderer support for compressed uploads; optionally deflate the archive's text
-     entries and re-encode audio. Models could also be cooked further (quantized vertices, meshlets).
-   - **A list of what was left out.** Pruning is generous for scripts but still a guess: show the dropped
-     files in the Build window, let a profile keep named folders (`always_include`) and warn when a script
-     builds a path whose prefix matches nothing.
-   - **A separate debug player.** Debug and release differ only in the scripts' flags and the player's log;
-     a debug player with assertions and symbols (and a stripped release player: the dev tree's is 100 MB)
-     would make the configurations mean something.
-   - **Run the built game from the editor** (a Run button in the Build window, as a host action like
-     Open in file browser), a build log with the script compiler's diagnostics in the window, and a
-     `.desktop` file or launcher script.
-   - **Portability.** The result needs a glibc at least as new as the machine that built it (libstdc++ is
-     bundled, glibc is not); consider building releases in an older container, and check the bundle list
-     (`system_library`) on other distributions. Other targets: Windows and macOS players, `.dll` and
-     `.dylib` scripts (the deferred item below), Arm Linux (the build refuses non-x86_64 hosts).
-   - **Recent projects and remembered folders** for the system dialogs (last Open/New/Export/Build
-     locations), now that projects can live anywhere.
-2. Keep the character controller project agnostic: every behaviour a game might need (inner body,
+**Top priority (set 2026-10-29): done, with what remains.** The four items about game builds were
+implemented; "Game builds" above is the reference. What is left of each:
+
+1. **Asynchronous build** (done). `BuildRunner` (`Engine::builds()`) runs `build_project` on a worker with
+   `BuildControl` progress and cancel; `project.build_start/status/cancel` drive it and the Build window
+   polls (progress bar, Cancel). `project.build` remains as the blocking call. A cancelled build leaves
+   the old one in place. Not done: the script compiler's diagnostics are not shown in the window.
+2. **Left-out files** (done). `project.build_preview` and the window list the dropped files; a profile has
+   `always_include` (files and folders kept with what they refer to); scripts naming paths that match
+   nothing produce warnings. The scan is still a guess.
+3. **Texture and audio cooking** (done in part). Profile flags `compress_textures` (BC1/BC3 with CPU mip
+   chains for project images and embedded model textures, cooked-model format v2, uploaded compressed
+   with a CPU decompress fallback) and `compress_audio` (WAV to FLAC, own encoder, verified bit exact).
+   Not done: normal maps stay raw, BC5/BC7 and other formats, project audio other than WAV, archive
+   deflate, quantized model vertices.
+4. **Portability** (done in part). The glibc/libstdc++ floor is measured (`relay_elf_requirements`,
+   `build.json` requirements) and a profile's `minimum_glibc` enforces it; see `docs/portable-builds.md`.
+   Targets: linux/windows/macos and x86_64/aarch64 can be chosen, and a build uses a player installed in
+   `players/<platform>-<arch>/`. Not done: no player for anything but Linux x86_64 is produced, scripts
+   cannot be built for foreign targets, a container recipe for an old-glibc player is untested (no Docker
+   here), and the editor UI does not yet warn under Target when a player is missing.
+
+Also open for game builds, after those:
+- **Look at it on a desktop.** The player and the Build, Export and file-dialog windows were only run
+  headlessly or offscreen: check a real window (title, icon, windowed/borderless/fullscreen, pointer
+  lock, resize), the system file dialogs through a real portal, and Wayland as well as X11. Fullscreen
+  and exclusive modes are untested.
+- **A separate debug player.** Debug and release differ only in the scripts' flags and the player's log;
+  a debug player with assertions and symbols (and a stripped release player: the dev tree's is 100 MB)
+  would make the configurations mean something.
+- **Run the built game from the editor** (a Run button in the Build window, as a host action like
+  Open in file browser), a build log with the script compiler's diagnostics in the window, and a
+  `.desktop` file or launcher script.
+- **Recent projects and remembered folders** for the system dialogs (last Open/New/Export/Build
+  locations), now that projects can live anywhere.
+
+Other:
+
+1. Keep the character controller project agnostic: every behaviour a game might need (inner body,
    layers, shape, step and slope limits) is a `CharacterSettings` field, and example controllers
    are secondary. Candidates: other shapes than the upright capsule, a settable up direction,
    moving the inner body by the character's own velocity for better pushes, and a Jolt inner
    body that is a real `CharacterVirtual` inner body for character-versus-character pushing.
-3. Grow joints where games need them: swing-twist motors (drive a ragdoll to a pose), a `joint_broken`
+2. Grow joints where games need them: swing-twist motors (drive a ragdoll to a pose), a `joint_broken`
    event or callback instead of polling, an axis gizmo and cone drawing in the viewport, and
    re-attaching a broken joint from a script.
 

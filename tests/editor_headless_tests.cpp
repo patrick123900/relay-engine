@@ -1498,6 +1498,17 @@ void profiler_ui() {
     std::cout << "Headless profiler tests passed\n";
 }
 
+// Frames until the Build window's progress bar is gone: the build runs on its own thread and the
+// window polls it.
+void wait_for_build(relay::EditorUi& ui) {
+    frame(ui, 2);
+    for (int i = 0; i < 1500 && ui.headless_item_rect("build:progress"); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        frame(ui);
+    }
+    frame(ui, 2);
+}
+
 std::optional<std::array<float, 4>> need_item(relay::EditorUi& ui, const std::string& key) {
     auto rect = ui.headless_item_rect(key);
     if (!rect) throw std::runtime_error("missing editor item: " + key);
@@ -1568,8 +1579,32 @@ void export_and_build_ui() {
               ui.headless_item_rect("build:window_mode") && ui.headless_item_rect("build:window_width") &&
               ui.headless_item_rect("build:window_height"),
           "Build project shows the profile list and the profile's fields");
-    click_center(ui, *need_item(ui, "build:build"));
+    // What the build leaves out can be looked at, and a file kept from there.
+    click_center(ui, *need_item(ui, "build:preview:refresh"));
+    frame(ui, 4);
+    click_center(ui, *need_item(ui, "build:preview:keep:art/note.txt"));
+    frame(ui, 4);
+    check(engine.build_settings().active().always_include == std::vector<std::string>{"art/note.txt"},
+          "Keep adds a left-out file to the profile's always-included files");
+    {
+        const auto preview = protocol.handle(R"({"id":88,"method":"project.build_preview"})");
+        check(preview.find("\"left_out\":[\"art/note.txt") == std::string::npos && preview.find("\"packed\":1") != std::string::npos,
+              "and it is no longer left out");
+    }
+    // The list sits below the fold once files are left out; scroll the profile pane to it.
+    ImGui::GetIO().AddMousePosEvent(900.0F, 500.0F);
+    frame(ui);
+    ImGui::GetIO().AddMouseWheelEvent(0.0F, -20.0F);
     frame(ui, 3);
+    click_center(ui, *need_item(ui, "build:always:remove:art/note.txt"));
+    frame(ui, 3);
+    ImGui::GetIO().AddMousePosEvent(900.0F, 500.0F);
+    frame(ui);
+    ImGui::GetIO().AddMouseWheelEvent(0.0F, 20.0F);
+    frame(ui, 3);
+    check(engine.build_settings().active().always_include.empty(), "Remove takes it off the list again");
+    click_center(ui, *need_item(ui, "build:build"));
+    wait_for_build(ui);
     check(std::filesystem::is_regular_file("projects/shipping/builds/release/build.json"),
           "Build stages the release folder");
     check(std::filesystem::is_directory("projects/shipping/builds/debug"),
@@ -1588,6 +1623,16 @@ void export_and_build_ui() {
     check(engine.build_settings().active().configuration == "debug" &&
               engine.build_settings().find_profile("Linux")->configuration == "release",
           "a profile's configuration changes without touching the others");
+    click_center(ui, *need_item(ui, "build:compress_textures"));
+    click_center(ui, *need_item(ui, "build:compress_audio"));
+    frame(ui, 3);
+    check(!engine.build_settings().active().compress_textures && !engine.build_settings().active().compress_audio,
+          "the compression checkboxes save in the profile");
+    click_center(ui, *need_item(ui, "build:compress_textures"));
+    click_center(ui, *need_item(ui, "build:compress_audio"));
+    frame(ui, 3);
+    check(engine.build_settings().active().compress_textures && engine.build_settings().active().compress_audio,
+          "and switch back on");
     click_center(ui, *need_item(ui, "build:include_unused"));
     frame(ui, 3);
     check(engine.build_settings().active().include_unused_assets, "Include unused files saves in the profile");
@@ -1612,7 +1657,7 @@ void export_and_build_ui() {
     check(engine.build_settings().active().output_directory == "handover",
           "a build folder chosen inside the project is saved relative to it");
     click_center(ui, *need_item(ui, "build:build"));
-    frame(ui, 3);
+    wait_for_build(ui);
     check(std::filesystem::is_regular_file("projects/shipping/handover/debug/build.json"),
           "the copy builds into its own folder and configuration");
     click_center(ui, *need_item(ui, "build:profile:Linux"));

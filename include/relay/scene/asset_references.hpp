@@ -20,12 +20,16 @@ struct AssetReferences {
     // Kept only because a model's import reads them (its textures and buffers). A build that ships
     // the model already imported leaves them out, unless something else refers to them too.
     std::set<std::string> import_only;
+    // Things worth a person's look: a string in a script that reads like a project path but matches
+    // no file, so the game may be building a name the scan cannot follow.
+    std::vector<std::string> warnings;
 };
 
 // `files` is what collect_project_files listed (generated entries have an empty source).
 [[nodiscard]] bool find_referenced_assets(const Project& project,
                                           const std::vector<ProjectFile>& files,
                                           const std::string& project_metadata,
+                                          const std::vector<std::string>& always_include,
                                           AssetReferences& references, std::string& error);
 
 } // namespace relay

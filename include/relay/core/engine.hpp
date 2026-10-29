@@ -17,6 +17,7 @@
 #include "relay/render/sky.hpp"
 #include "relay/scene/scene.hpp"
 #include "relay/scene/scene_edit.hpp"
+#include "relay/scene/build_runner.hpp"
 #include "relay/scene/project.hpp"
 #include "relay/scene/scene_history.hpp"
 #include "relay/script/script_system.hpp"
@@ -112,6 +113,8 @@ public:
     [[nodiscard]] AssetRegistry& assets();
     [[nodiscard]] const AssetRegistry& assets() const;
     [[nodiscard]] ScriptSystem& scripts() { return scripts_; }
+    // Builds games from the open project on a worker thread.
+    [[nodiscard]] BuildRunner& builds() { return builds_; }
     [[nodiscard]] AudioSystem& audio();
     // The game interface: layout, pointer interaction and events during Run Game, and the draw
     // list hosts draw over the game's view.
@@ -217,6 +220,7 @@ private:
     std::optional<std::filesystem::path> audio_root_;
     // Declared last: script callbacks reach every other member, so it is destroyed first.
     ScriptSystem scripts_{*this};
+    BuildRunner builds_;
 };
 
 } // namespace relay

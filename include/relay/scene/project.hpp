@@ -5,7 +5,9 @@
 #include "relay/core/input.hpp"
 #include "relay/render/graphics_settings.hpp"
 
+#include <atomic>
 #include <filesystem>
+#include <functional>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -86,6 +88,15 @@ inline constexpr std::uint64_t maximum_package_bytes = 2ULL * 1024ULL * 1024ULL 
     return package_project(project, filename, {}, error, bytes);
 }
 
+// How a build reports on itself and how it is told to stop. Both may be used from another thread.
+struct BuildControl {
+    // The stage now running ("Compiling scripts"), how far through the whole build it is (0 to 1),
+    // and what it is on. Called from the thread that builds, and from script compiler threads.
+    std::function<void(std::string_view stage, double fraction, std::string_view detail)> progress;
+    const std::atomic<bool>* cancel{};
+    [[nodiscard]] bool cancelled() const { return cancel != nullptr && cancel->load(); }
+};
+
 // What Run > Build Project produced.
 struct BuildReport {
     std::filesystem::path directory; // <output>/<configuration>
@@ -94,7 +105,36 @@ struct BuildReport {
     // The game's program inside `directory`.
     bool executable{};
     std::filesystem::path executable_path;
+    // The build stopped because it was told to, not because something failed.
+    bool cancelled{};
+    // Project files the game does not refer to and so does not ship (the first few hundred, sorted),
+    // how many there were, and anything the scan was unsure of.
+    std::vector<std::string> left_out;
+    std::size_t left_out_count{};
+    std::vector<std::string> warnings;
+    // The newest glibc, libstdc++ and C++ ABI the program and its libraries ask of the system, and
+    // the file that asks the most of glibc. Empty for targets that are not Linux.
+    std::string glibc, glibc_from, libstdcxx, cxxabi;
 };
+
+// The targets a build can be made for, and whether this Relay has a player for each: its own
+// platform's, or one installed in the players folder (see project_build.cpp).
+struct BuildTarget {
+    std::string platform;
+    std::string architecture;
+    bool available{};
+    bool native{}; // This machine's own platform and CPU.
+};
+[[nodiscard]] std::vector<BuildTarget> available_build_targets();
+
+// What a build of `profile` would pack and leave out, without building.
+struct BuildPreview {
+    std::size_t packed{};
+    std::vector<std::string> left_out; // Sorted.
+    std::vector<std::string> warnings;
+};
+[[nodiscard]] bool preview_build(const Project& project, const BuildSettings& settings,
+                                 const BuildProfile& profile, BuildPreview& preview, std::string& error);
 // Builds the game for `profile` (one of `settings.profiles`) into <output folder>/<configuration>/
 // (both configuration folders are created; the folder is project-relative or absolute). The
 // result runs on its own: the game's program named for the game, data/ (the project, without
@@ -102,6 +142,7 @@ struct BuildReport {
 // libraries the program needs that a system may lack), build.json and icon.png. A previous build
 // of the same configuration is replaced. Needs the player program (relay_player) from this Relay.
 [[nodiscard]] bool build_project(const Project& project, const BuildSettings& settings,
-                                 const BuildProfile& profile, std::string& error, BuildReport& report);
+                                 const BuildProfile& profile, std::string& error, BuildReport& report,
+                                 BuildControl* control = nullptr);
 
 } // namespace relay

@@ -242,6 +242,8 @@ struct BuildRequest {
     std::string fingerprint;
     // Compiler flags; empty means the editor's (compile_flags).
     std::string flags;
+    // Called, from any worker thread, with how many sources are done of how many.
+    std::function<void(std::uint32_t done, std::uint32_t total)> progress;
 };
 
 struct BuildResult {
@@ -336,10 +338,14 @@ BuildResult run_build(const BuildRequest& request, const std::atomic<bool>& canc
     std::atomic<std::size_t> next{0};
     std::atomic<bool> failed{false};
     std::atomic<std::uint32_t> compiled{0};
+    std::atomic<std::uint32_t> finished{0};
     const auto worker = [&] {
         for (auto index = next++; index < units.size(); index = next++) {
             const auto& unit = units[index];
-            if (unit.cached) continue;
+            if (unit.cached) {
+                if (request.progress) request.progress(++finished, static_cast<std::uint32_t>(units.size()));
+                continue;
+            }
             if (cancel || failed) return;
             const auto temporary = unit.object.string() + ".tmp";
             std::vector<std::string> arguments{request.compiler};
@@ -367,6 +373,7 @@ BuildResult run_build(const BuildRequest& request, const std::atomic<bool>& canc
             }
             fs::rename(temporary, unit.object, ignored);
             ++compiled;
+            if (request.progress) request.progress(++finished, static_cast<std::uint32_t>(units.size()));
         }
     };
     const auto parallel = std::clamp<unsigned>(std::thread::hardware_concurrency(), 1U, 8U);
@@ -2211,7 +2218,14 @@ bool ScriptSystem::set_trusted(const bool trusted, std::string& error) {
     return true;
 }
 
-ScriptExport compile_scripts_for_export(const std::filesystem::path& project_root, const bool debug) {
+bool project_has_script_sources(const std::filesystem::path& project_root) {
+    const auto scan = scan_sources(project_root);
+    return std::any_of(scan.files.begin(), scan.files.end(), [](const SourceFile& file) { return !file.header; });
+}
+
+ScriptExport compile_scripts_for_export(const std::filesystem::path& project_root, const bool debug,
+                                        const std::atomic<bool>* cancel,
+                                        std::function<void(std::uint32_t, std::uint32_t)> progress) {
     ScriptExport exported;
     auto scan = scan_sources(project_root);
     if (!scan.error.empty()) {
@@ -2239,8 +2253,10 @@ ScriptExport compile_scripts_for_export(const std::filesystem::path& project_roo
                             "-fdiagnostics-color=never -Wall -Wextra"
                           : "-std=c++20 -O2 -DNDEBUG -fPIC -fvisibility=hidden -fvisibility-inlines-hidden "
                             "-fdiagnostics-color=never -Wall -Wextra";
+    request.progress = std::move(progress);
     const std::atomic<bool> never{false};
-    auto result = run_build(request, never);
+    auto result = run_build(request, cancel ? *cancel : never);
+    exported.cancelled = result.cancelled;
     exported.succeeded = result.succeeded;
     exported.library = result.library;
     exported.error = result.error;

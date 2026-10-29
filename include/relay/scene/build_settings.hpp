@@ -31,6 +31,18 @@ struct BuildProfile {
     // A build ships only the files the game refers to (see asset_references.hpp). Turn this on to
     // ship every file in the project, for a game that loads files by names its code builds up.
     bool include_unused_assets{false};
+    // Cook the models' textures into BC1/BC3 blocks with mip chains (a fourth to an eighth of the
+    // memory, nothing to generate at start), and wav sounds into lossless FLAC. Both are off for
+    // a build that should keep its files exactly as authored.
+    bool compress_textures{true};
+    bool compress_audio{true};
+    // Linux: the oldest glibc the game must run on ("2.31"), or empty to not check. A build whose
+    // program or libraries ask for more fails, naming the file, so a game is not shipped that only
+    // starts on the machine that built it.
+    std::string minimum_glibc;
+    // Project files and folders (project-relative, with forward slashes) that always ship, whatever
+    // the scan finds, and whatever they refer to ships with them.
+    std::vector<std::string> always_include;
 
     friend bool operator==(const BuildProfile&, const BuildProfile&) = default;
 };
@@ -65,6 +77,7 @@ inline constexpr std::size_t maximum_game_version_length = 32;
 inline constexpr std::size_t maximum_profile_name_length = 32;
 inline constexpr std::size_t maximum_build_profiles = 16;
 inline constexpr std::size_t maximum_output_directory_length = 512;
+inline constexpr std::size_t maximum_always_include = 64;
 inline constexpr std::uint32_t minimum_window_size = 320;
 inline constexpr std::uint32_t maximum_window_size = 16384;
 

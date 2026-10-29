@@ -666,18 +666,22 @@ constexpr std::array<ProtocolFieldSpec, 7> fields_project_set_build_settings{{
     {"active_profile", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 32U, "", ""},
 }};
 
-constexpr std::array<ProtocolFieldSpec, 11> fields_project_set_build_profile{{
+constexpr std::array<ProtocolFieldSpec, 15> fields_project_set_build_profile{{
     {"name", ProtocolValueType::string, true, false, false, false, 0, 0, 1U, 32U, "", ""},
     {"new_name", ProtocolValueType::string, false, false, false, false, 0, 0, 1U, 32U, "", ""},
     {"copy_from", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 32U, "", ""},
-    {"target_platform", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "linux"},
-    {"architecture", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "x86_64"},
+    {"target_platform", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "linux|windows|macos"},
+    {"architecture", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "x86_64|aarch64"},
     {"configuration", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "release|debug"},
     {"output_directory", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 512U, "", ""},
     {"window_mode", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 0U, "", "windowed|borderless|fullscreen"},
     {"window_width", ProtocolValueType::integer, false, false, true, true, 320, 16384, 0U, 0U, "", ""},
     {"window_height", ProtocolValueType::integer, false, false, true, true, 320, 16384, 0U, 0U, "", ""},
     {"include_unused_assets", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"always_include", ProtocolValueType::string_array, false, false, false, false, 0, 0, 0U, 64U, "", ""},
+    {"compress_textures", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"compress_audio", ProtocolValueType::boolean, false, false, false, false, 0, 0, 0U, 0U, "", ""},
+    {"minimum_glibc", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 8U, "", ""},
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_project_remove_build_profile{{
@@ -685,6 +689,14 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_project_remove_build_profile{{
 }};
 
 constexpr std::array<ProtocolFieldSpec, 1> fields_project_build{{
+    {"profile", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 32U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_project_build_start{{
+    {"profile", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 32U, "", ""},
+}};
+
+constexpr std::array<ProtocolFieldSpec, 1> fields_project_build_preview{{
     {"profile", ProtocolValueType::string, false, false, false, false, 0, 0, 0U, 32U, "", ""},
 }};
 
@@ -890,7 +902,7 @@ constexpr std::array<ProtocolFieldSpec, 1> fields_audio_set_spatialization{{
     {"mode", ProtocolValueType::string, true, false, false, false, 0, 0, 0U, 0U, "", "stereo|binaural"},
 }};
 
-constexpr std::array<ProtocolMethodSpec, 177> methods{{
+constexpr std::array<ProtocolMethodSpec, 181> methods{{
     {"runtime.status", "runtime_status", "Inspect Relay runtime", "Read the current editor or game mode, pause, frame, simulation time and resolution state.", true, false, false, false, false, no_fields},
     {"runtime.play", "runtime_play", "Run game", "Start a temporary game session from the authored scene. Stop restores the authored scene and discards runtime changes.", false, false, false, false, false, no_fields},
     {"runtime.stop", "runtime_stop", "Stop game", "Stop the current game session and restore the authored scene without changing undo history.", false, false, false, false, false, no_fields},
@@ -1030,7 +1042,11 @@ constexpr std::array<ProtocolMethodSpec, 177> methods{{
     {"project.set_build_settings", "project_set_build_settings", "Change game build settings", "Change the game's identity shared by every build profile, or choose the active profile, and save it in the project file. Omitted settings keep their current values; an empty string clears a text setting.", false, false, false, false, false, fields_project_set_build_settings},
     {"project.set_build_profile", "project_set_build_profile", "Change a build profile", "Create or change a build profile, the settings for building the game for one target, and save it in the project file. A profile that does not exist is created from the defaults or from copy_from. Omitted settings keep their current values.", false, false, false, false, false, fields_project_set_build_profile},
     {"project.remove_build_profile", "project_remove_build_profile", "Remove a build profile", "Delete a build profile from the project's settings. The last profile cannot be removed; builds already written are kept.", false, false, false, false, false, fields_project_remove_build_profile},
-    {"project.build", "project_build", "Build project", "Build the game for a build profile into <build folder>/<configuration>/ (the release and debug folders are both created), replacing the previous build of that configuration. The result runs on its own: the game's program (named for the game, from relay_player), game.pak (every file the game refers to in one archive, with its models and project shaders already imported and compiled; unreferenced files are left out unless the profile ships every file), scripts/ (the behaviours compiled for the configuration; the project's scripts must be trusted), shaders/, lib/ (libraries the program needs; the model importer and shader compiler are not among them), build.json and icon.png. Linux x86_64 only. Compiling scripts can take a while, and the call returns when the build is done. Save scene changes first.", false, false, false, false, false, fields_project_build},
+    {"project.build", "project_build", "Build project", "Build the game for a build profile into <build folder>/<configuration>/ (the release and debug folders are both created), replacing the previous build of that configuration. The result runs on its own: the game's program (named for the game, from relay_player), game.pak (every file the game refers to in one archive, with its models and project shaders already imported and compiled; unreferenced files are left out unless the profile ships every file), scripts/ (the behaviours compiled for the configuration; the project's scripts must be trusted), shaders/, lib/ (libraries the program needs; the model importer and shader compiler are not among them), build.json and icon.png. Linux x86_64 only. The call waits until the build is done (compiling scripts can take a while); an editor uses project.build_start and project.build_status instead, to keep drawing. Save scene changes first.", false, false, false, false, false, fields_project_build},
+    {"project.build_start", "project_build_start", "Start a build", "Start building the game for a build profile on a background thread and return at once. Poll project.build_status for the stage, how far along it is and the result; project.build_cancel stops it, leaving the earlier build as it was. One build at a time. Save scene changes first.", false, false, false, false, false, fields_project_build_start},
+    {"project.build_preview", "project_build_preview", "Preview what a build packs", "Without building, list the project files a build of a profile would leave out because nothing the game uses refers to them (the first 500, sorted), how many files it would pack, and anything the scan was unsure of, such as a script string that reads like a path but matches no file. Use the profile's always_include or include_unused_assets to keep files that are listed.", true, false, false, false, false, fields_project_build_preview},
+    {"project.build_status", "project_build_status", "Read the build's progress", "The state of the latest build (idle, running, succeeded, failed or cancelled), the stage it is on, how far through the whole build it is (0 to 1), seconds elapsed, the error if it failed, and, once it succeeded, the build's folder, file count and whether it has a program.", true, false, false, false, false, no_fields},
+    {"project.build_cancel", "project_build_cancel", "Cancel the build", "Ask the running build to stop. It stops at its next check, removes what it was writing and leaves the earlier build of that configuration as it was. Harmless when no build is running.", true, false, false, false, false, no_fields},
     {"scene.keyframe.set", "scene_keyframe_set", "Set transform keyframe", "Add or update a scene-owned transform keyframe at an exact time. Unspecified transform fields use the current entity transform or existing key. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_keyframe_set},
     {"scene.keyframe.delete", "scene_keyframe_delete", "Delete transform keyframe", "Remove one scene-owned transform keyframe at an exact time as an undoable edit.", false, false, false, false, false, fields_scene_keyframe_delete},
     {"scene.keyframes.playback", "scene_keyframes_playback", "Control transform keyframes", "Set playback, loop, speed, duration or current time for scene-owned transform keys. Undoable and saved with the scene.", false, false, false, false, false, fields_scene_keyframes_playback},

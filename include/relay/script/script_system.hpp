@@ -2,7 +2,9 @@
 
 #include "relay/scene/scene.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -110,6 +112,7 @@ inline constexpr std::size_t maximum_script_source_bytes = 256U * 1024U;
 // What compile_scripts_for_export produced. `library` is empty when the project has no scripts.
 struct ScriptExport {
     bool succeeded{};
+    bool cancelled{};
     std::filesystem::path library;
     std::uint32_t sources{};
     std::string error;
@@ -119,7 +122,13 @@ struct ScriptExport {
 // Compiles the project's scripts into one library for shipping, and waits for it. `debug` keeps
 // symbols and skips optimization; otherwise they are optimized. The library is kept in the
 // project's .relay-cache. The caller decides whether the project may build native code.
-[[nodiscard]] ScriptExport compile_scripts_for_export(const std::filesystem::path& project_root, bool debug);
+// `cancel`, when set, stops the build between files; `progress` hears how many are done of how
+// many (from any thread).
+[[nodiscard]] ScriptExport compile_scripts_for_export(
+    const std::filesystem::path& project_root, bool debug, const std::atomic<bool>* cancel = nullptr,
+    std::function<void(std::uint32_t done, std::uint32_t total)> progress = {});
+// Whether the project has any script source to compile.
+[[nodiscard]] bool project_has_script_sources(const std::filesystem::path& project_root);
 
 // Compiles project scripts into a native library in the background, loads it, and drives
 // behaviour instances through Run Game. Everything except the compiler runs on the engine thread.

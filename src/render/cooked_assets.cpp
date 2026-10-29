@@ -13,7 +13,7 @@ namespace {
 
 constexpr char models_magic[4] = {'R', 'L', 'Y', 'M'};
 constexpr char shader_magic[4] = {'R', 'L', 'Y', 'S'};
-constexpr std::uint32_t cooked_version = 1;
+constexpr std::uint32_t cooked_version = 2;
 
 class Writer {
 public:
@@ -39,6 +39,7 @@ class Reader {
 public:
     explicit Reader(const std::span<const std::uint8_t> bytes) : at_(bytes.data()), end_(bytes.data() + bytes.size()) {}
     [[nodiscard]] bool ok() const { return ok_; }
+    void fail() { ok_ = false; }
     void raw(void* data, const std::size_t size) {
         if (!ok_ || static_cast<std::size_t>(end_ - at_) < size) { ok_ = false; std::memset(data, 0, size); return; }
         std::memcpy(data, at_, size);
@@ -164,6 +165,12 @@ void write_texture(Writer& w, const TextureAsset& t) {
     w.text(t.name);
     w.value(t.width); w.value(t.height);
     w.array(t.rgba);
+    // Compressed textures (cooked version 2): the codec, then where each mip level starts, then the blocks.
+    w.value<std::uint8_t>(t.compressed ? static_cast<std::uint8_t>(t.compressed->codec) : 0U);
+    if (t.compressed) {
+        w.array(t.compressed->level_offsets);
+        w.array(t.compressed->data);
+    }
     for (const auto v : {static_cast<std::uint8_t>(t.color_space), static_cast<std::uint8_t>(t.mag_filter),
                          static_cast<std::uint8_t>(t.min_filter), static_cast<std::uint8_t>(t.mip_filter),
                          static_cast<std::uint8_t>(t.wrap_u), static_cast<std::uint8_t>(t.wrap_v)})
@@ -175,6 +182,28 @@ TextureAsset read_texture(Reader& r) {
     t.name = r.text();
     t.width = r.value<std::uint32_t>(); t.height = r.value<std::uint32_t>();
     t.rgba = r.array<std::uint8_t>();
+    if (const auto codec = r.value<std::uint8_t>(); codec == 1U || codec == 3U) {
+        auto compressed = std::make_shared<CompressedTexture>();
+        compressed->codec = static_cast<TextureCodec>(codec);
+        compressed->width = t.width;
+        compressed->height = t.height;
+        compressed->level_offsets = r.array<std::uint32_t>();
+        compressed->data = r.array<std::uint8_t>();
+        // The level table must describe the blocks, or an upload would read past them.
+        bool consistent = compressed->level_offsets.size() >= 2U &&
+                          compressed->level_offsets.size() - 1U <= 16U &&
+                          compressed->level_offsets.back() == compressed->data.size();
+        for (std::uint32_t level = 0; consistent && level + 1U < compressed->level_offsets.size(); ++level)
+            consistent = compressed->level_offsets[level + 1U] - compressed->level_offsets[level] ==
+                         compressed_level_bytes(compressed->codec, std::max(t.width >> level, 1U), std::max(t.height >> level, 1U));
+        if (!consistent || !r.ok()) {
+            r.fail();
+        } else {
+            t.compressed = std::move(compressed);
+        }
+    } else if (codec != 0U) {
+        r.fail();
+    }
     const auto small = [&](const std::uint8_t limit) { return std::min<std::uint8_t>(r.value<std::uint8_t>(), limit); };
     t.color_space = static_cast<TextureColorSpace>(small(1));
     t.mag_filter = static_cast<TextureFilter>(small(1));
@@ -359,8 +388,35 @@ void apply_cooked_models(const CookedModels& cooked, AssetRegistry& registry) {
     }
 }
 
+void compress_batch_textures(ImportBatch& batch, CookStats* stats) {
+    std::set<std::string> normal_maps;
+    for (const auto& material : batch.materials)
+        if (!material.normal_texture.empty()) normal_maps.insert(material.normal_texture);
+    for (auto& texture : batch.textures) {
+        if (stats) ++stats->textures;
+        const auto raw_bytes = static_cast<std::uint64_t>(texture.rgba.size());
+        if (stats) stats->texture_bytes_before += raw_bytes;
+        if (texture.compressed || texture.rgba.empty() || normal_maps.contains(texture.name) ||
+            texture.width < 8U || texture.height < 8U ||
+            texture.rgba.size() != static_cast<std::size_t>(texture.width) * texture.height * 4U) {
+            if (stats) stats->texture_bytes_after += raw_bytes;
+            continue;
+        }
+        auto compressed = std::make_shared<CompressedTexture>(compress_texture(
+            texture.rgba, texture.width, texture.height, texture.color_space == TextureColorSpace::srgb,
+            choose_texture_codec(texture.rgba)));
+        if (stats) {
+            ++stats->textures_compressed;
+            stats->texture_bytes_after += compressed->data.size();
+        }
+        texture.compressed = std::move(compressed);
+        texture.rgba.clear();
+        texture.rgba.shrink_to_fit();
+    }
+}
+
 bool cook_models(const std::filesystem::path& root, const std::set<std::string>& sources, std::string& bytes,
-                 std::string& error) {
+                 std::string& error, const bool compress_textures, CookStats* stats) {
     AssetRegistry registry;
     CookedModels cooked;
     AssetRecorder recorder;
@@ -374,6 +430,9 @@ bool cook_models(const std::filesystem::path& root, const std::set<std::string>&
         return false;
     }
     cooked.models = static_cast<std::uint32_t>(report.restored);
+    if (compress_textures)
+        for (auto& step : cooked.steps)
+            if (step.batch) compress_batch_textures(*step.batch, stats);
     bytes = serialize_cooked_models(cooked);
     error.clear();
     return true;

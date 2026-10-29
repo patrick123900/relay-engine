@@ -65,7 +65,8 @@ std::string stem_of(const std::string& name) {
 } // namespace
 
 bool find_referenced_assets(const Project& project, const std::vector<ProjectFile>& files,
-                            const std::string& project_metadata, AssetReferences& references,
+                            const std::string& project_metadata,
+                            const std::vector<std::string>& always_include, AssetReferences& references,
                             std::string& error) {
     references = {};
     std::map<std::string, const ProjectFile*> candidates;
@@ -113,27 +114,49 @@ bool find_referenced_assets(const Project& project, const std::vector<ProjectFil
             candidate.resize(cut);
         }
     };
+    // The folders at the top of the project, to tell a script's path from any other text with a slash.
+    std::set<std::string> top_folders;
+    for (const auto& [name, file] : candidates) {
+        (void)file;
+        const auto slash = name.find('/');
+        if (slash != std::string::npos) top_folders.insert(name.substr(0, slash));
+    }
+    std::set<std::string> warned;
     // A string from a script: strict matches plus whatever the code could be building.
     const auto generous = [&](const std::string& token) {
         strict(token);
         if (token.size() < 3U) return;
         const bool path = token.find('/') != std::string::npos;
+        bool matched = candidates.contains(token);
         for (const auto& [name, file] : candidates) {
             (void)file;
             if (path) {
-                if (name.rfind(token, 0) == 0) keep(name);
-                if (name.size() > token.size() && name.ends_with(token) && name[name.size() - token.size() - 1U] == '/')
+                if (name.rfind(token, 0) == 0) { keep(name); matched = true; }
+                if (name.size() > token.size() && name.ends_with(token) && name[name.size() - token.size() - 1U] == '/') {
                     keep(name);
+                    matched = true;
+                }
             } else {
                 const auto file_name = filename_of(name);
-                if (file_name == token || (token.size() >= 4U && file_name.rfind(token, 0) == 0)) keep(name);
-                if (stem_of(name) == token) keep(name);
+                if (file_name == token || (token.size() >= 4U && file_name.rfind(token, 0) == 0)) { keep(name); matched = true; }
+                if (stem_of(name) == token) { keep(name); matched = true; }
             }
         }
+        // "sounds/boom_" in a script, with a sounds folder but nothing starting that way, is probably a typo
+        // or a path made up in code that the scan cannot follow.
+        if (path && !matched && token.find(' ') == std::string::npos && token.size() >= 4U &&
+            top_folders.contains(token.substr(0, token.find('/'))) && warned.insert(token).second)
+            references.warnings.push_back("a script mentions \"" + token + "\", which matches no file in the project");
     };
 
     for (const auto& token : quoted_strings(project_metadata)) strict(token);
     for (const auto& scene : project.scenes) keep("scenes/" + scene);
+    // Files and folders the profile always keeps, with everything they refer to.
+    for (const auto& wanted : always_include)
+        for (const auto& [name, file] : candidates) {
+            (void)file;
+            if (name == wanted || name.rfind(wanted + "/", 0) == 0) keep(name);
+        }
 
     // Scripts are not shipped as sources, so they are read from the project.
     std::error_code ec;

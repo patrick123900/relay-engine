@@ -1,5 +1,8 @@
 #include "relay/scene/project.hpp"
 
+#include "relay/audio/audio_clip.hpp"
+#include "relay/audio/flac_encoder.hpp"
+#include "relay/core/elf_requirements.hpp"
 #include "relay/core/pak.hpp"
 #include "relay/core/process.hpp"
 #include "relay/render/cooked_assets.hpp"
@@ -18,11 +21,23 @@
 #ifndef RELAY_PLAYER_DEFAULT_PATH
 #define RELAY_PLAYER_DEFAULT_PATH ""
 #endif
+#ifndef RELAY_PLAYERS_DEFAULT_DIR
+#define RELAY_PLAYERS_DEFAULT_DIR ""
+#endif
 
 namespace relay {
 namespace {
 
 constexpr std::string_view game_archive_name = "game.pak";
+constexpr std::size_t maximum_reported_left_out = 500;
+
+// What a game is made of before anything is cooked or copied.
+struct BuildPlan {
+    std::vector<ProjectFile> files;
+    std::string metadata;
+    std::set<std::string> kept, import_only;
+    std::vector<std::string> left_out, warnings;
+};
 
 bool copy_regular_file(const std::filesystem::path& from, const std::filesystem::path& to) {
     std::error_code ec;
@@ -36,6 +51,78 @@ bool write_text_file(const std::filesystem::path& path, const std::string& text)
     stream << text;
     stream.flush();
     return static_cast<bool>(stream);
+}
+
+bool has_wav_extension(const std::string& name) {
+    if (name.size() < 4U) return false;
+    std::string tail = name.substr(name.size() - 4U);
+    std::transform(tail.begin(), tail.end(), tail.begin(), [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return tail == ".wav";
+}
+
+// A WAV file as lossless FLAC, kept only when it is smaller and decodes to exactly the same
+// samples. The game reads it under the same name: the audio decoders go by what is inside.
+std::optional<std::string> cook_wav(const std::filesystem::path& source) {
+    std::ifstream stream(source, std::ios::binary);
+    const std::vector<std::uint8_t> wav{std::istreambuf_iterator<char>(stream), {}};
+    std::string error;
+    auto flac = encode_wav_as_flac(wav, error);
+    if (!flac || flac->size() + flac->size() / 20U >= wav.size()) return std::nullopt;
+    std::string decode_error;
+    const auto before = decode_audio(wav, decode_error);
+    const std::vector<std::uint8_t> packed(flac->begin(), flac->end());
+    const auto after = decode_audio(packed, decode_error);
+    if (!before || !after || before->samples != after->samples || before->sample_rate != after->sample_rate ||
+        before->channels != after->channels)
+        return std::nullopt;
+    return flac;
+}
+
+const char* host_platform() {
+#if defined(_WIN32)
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#else
+    return "linux";
+#endif
+}
+
+const char* host_architecture() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "aarch64";
+#else
+    return "x86_64";
+#endif
+}
+
+// The program of a game and the files that go beside it: the shaders it loads and the libraries it
+// needs. `files` maps a path inside the game's folder to the file to copy there.
+struct PlayerKit {
+    std::filesystem::path program;
+    std::string program_extension; // ".exe" for Windows.
+    std::vector<std::pair<std::string, std::filesystem::path>> files;
+};
+
+// Players for other targets than the machine's own are built elsewhere (a Windows player needs
+// Windows' toolchain) and installed in a folder per target below `players/` beside Relay:
+// players/windows-x86_64/relay_player.exe with its shaders/ and the libraries it needs.
+std::filesystem::path players_directory() {
+    if (const char* chosen = std::getenv("RELAY_PLAYERS_DIR"); chosen && *chosen) return chosen;
+    std::error_code ec;
+#ifndef _WIN32
+    const auto self = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec && std::filesystem::is_directory(self.parent_path() / "players", ec)) return self.parent_path() / "players";
+#endif
+    return RELAY_PLAYERS_DEFAULT_DIR;
+}
+
+std::string player_target_name(const BuildProfile& profile) { return profile.target_platform + "-" + profile.architecture; }
+
+bool player_installed(const BuildProfile& profile) {
+    std::error_code ec;
+    const auto folder = players_directory() / player_target_name(profile);
+    return std::filesystem::is_regular_file(folder / "relay_player", ec) || std::filesystem::is_regular_file(folder / "relay_player.exe", ec);
 }
 
 // The program a built game runs: RELAY_PLAYER_BINARY, else relay_player beside the running
@@ -95,6 +182,69 @@ bool program_libraries(const std::filesystem::path& program,
     return true;
 }
 
+// Finds the player for the profile's target and the files it needs. This machine's own target uses
+// the relay_player it was built with; any other (and any target on a machine that is not Linux) uses
+// an installed player folder, whose files are copied as they are.
+bool find_player_kit(const BuildProfile& profile, PlayerKit& kit, std::string& error) {
+    std::error_code ec;
+    const bool own = profile.target_platform == host_platform() && profile.architecture == host_architecture();
+    if (own && profile.target_platform == "linux") {
+        const auto player = find_player_binary();
+        if (player.empty() || !std::filesystem::is_regular_file(player, ec)) {
+            error = "the game player was not found" + (player.empty() ? std::string{} : " at " + player.generic_string()) +
+                    "; build the relay_player target or set RELAY_PLAYER_BINARY";
+            return false;
+        }
+        kit.program = player;
+        const auto shader_source = player.parent_path() / "shaders";
+        std::size_t shaders = 0;
+        for (std::filesystem::directory_iterator it(shader_source, ec), end; !ec && it != end; it.increment(ec))
+            if (it->is_regular_file() && it->path().extension() == ".spv") {
+                kit.files.emplace_back("shaders/" + it->path().filename().string(), it->path());
+                ++shaders;
+            }
+        if (shaders == 0U) {
+            error = "the player's compiled shaders were not found in " + shader_source.generic_string();
+            return false;
+        }
+        std::vector<std::pair<std::string, std::filesystem::path>> libraries;
+        if (!program_libraries(player, libraries, error)) return false;
+        for (const auto& [soname, path] : libraries) {
+            std::error_code resolve;
+            kit.files.emplace_back("lib/" + soname, std::filesystem::canonical(path, resolve));
+        }
+        return true;
+    }
+    const auto folder = players_directory() / player_target_name(profile);
+    for (const char* name : {"relay_player", "relay_player.exe"})
+        if (std::filesystem::is_regular_file(folder / name, ec)) {
+            kit.program = folder / name;
+            kit.program_extension = std::string{name} == "relay_player.exe" ? ".exe" : "";
+        }
+    if (kit.program.empty()) {
+        error = "there is no " + std::string{profile.target_platform} + " " + profile.architecture + " player installed. " +
+                "Players for other targets are built on their own platform and installed in " +
+                (folder).generic_string() + " (with relay_player, its shaders/ folder and the libraries it needs); set RELAY_PLAYERS_DIR to use another folder";
+        return false;
+    }
+    std::size_t shaders = 0;
+    for (std::filesystem::recursive_directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec) || it->path() == kit.program) continue;
+        const auto relative = it->path().lexically_relative(folder).generic_string();
+        if (kit.files.size() >= 4096U) {
+            error = "the player folder " + folder.generic_string() + " holds too many files";
+            return false;
+        }
+        if (relative.rfind("shaders/", 0) == 0 && it->path().extension() == ".spv") ++shaders;
+        kit.files.emplace_back(relative, it->path());
+    }
+    if (shaders == 0U) {
+        error = "the " + player_target_name(profile) + " player has no compiled shaders in " + (folder / "shaders").generic_string();
+        return false;
+    }
+    return true;
+}
+
 // No component of `path` below `root` may be a link, so a build never writes outside the project.
 bool free_of_links(const std::filesystem::path& root, const std::filesystem::path& relative) {
     std::error_code ec;
@@ -109,9 +259,80 @@ bool free_of_links(const std::filesystem::path& root, const std::filesystem::pat
 
 } // namespace
 
+static bool plan_game_files(const Project& project, const BuildSettings& settings, const BuildProfile& profile,
+                     BuildPlan& plan, std::string& error) {
+    plan = {};
+    const auto root = project.root();
+    // The build folder is output, so neither it nor the default builds folder belongs in the game.
+    // The game ships its scripts compiled, so their sources stay behind.
+    std::vector<std::string> excluded{"builds", std::string{script_source_directory}};
+    for (const auto& other : settings.profiles)
+        if (const auto inside = output_inside_project(root, other); !inside.empty())
+            excluded.push_back(inside);
+    if (!collect_project_files(project, excluded, plan.files, plan.metadata, error)) return false;
+    // Only what the game refers to ships, unless the profile says everything should.
+    if (!profile.include_unused_assets) {
+        AssetReferences references;
+        if (!find_referenced_assets(project, plan.files, plan.metadata, profile.always_include, references, error)) return false;
+        plan.kept = std::move(references.kept);
+        plan.import_only = std::move(references.import_only);
+        plan.warnings = std::move(references.warnings);
+        plan.left_out = std::move(references.dropped);
+        std::sort(plan.left_out.begin(), plan.left_out.end());
+    } else {
+        for (const auto& file : plan.files)
+            if (!file.source.empty()) plan.kept.insert(file.name);
+    }
+    return true;
+}
+
+std::vector<BuildTarget> available_build_targets() {
+    std::vector<BuildTarget> targets;
+    for (const auto platform : build_platforms())
+        for (const auto architecture : build_architectures()) {
+            BuildProfile profile;
+            profile.target_platform = std::string{platform};
+            profile.architecture = std::string{architecture};
+            BuildTarget target{std::string{platform}, std::string{architecture}, false,
+                               platform == host_platform() && architecture == host_architecture()};
+            if (target.native && platform == "linux") {
+                std::error_code ec;
+                const auto player = find_player_binary();
+                target.available = !player.empty() && std::filesystem::is_regular_file(player, ec);
+            } else {
+                target.available = player_installed(profile);
+            }
+            targets.push_back(std::move(target));
+        }
+    return targets;
+}
+
+bool preview_build(const Project& project, const BuildSettings& settings, const BuildProfile& profile,
+                   BuildPreview& preview, std::string& error) {
+    preview = {};
+    if (!validate_build_settings(settings, error) || !validate_build_profile(profile, error)) return false;
+    BuildPlan plan;
+    if (!plan_game_files(project, settings, profile, plan, error)) return false;
+    preview.packed = plan.kept.size();
+    preview.left_out = std::move(plan.left_out);
+    preview.warnings = std::move(plan.warnings);
+    return true;
+}
+
 bool build_project(const Project& project, const BuildSettings& settings, const BuildProfile& profile,
-                   std::string& error, BuildReport& report) {
+                   std::string& error, BuildReport& report, BuildControl* control) {
     report = {};
+    const auto step = [&](const std::string_view stage, const double fraction, const std::string_view detail = {}) {
+        if (control && control->progress) control->progress(stage, fraction, detail);
+    };
+    // True (with the report and error set) when the build was told to stop.
+    const auto stopped = [&] {
+        if (!control || !control->cancelled()) return false;
+        report.cancelled = true;
+        error = "the build was cancelled";
+        return true;
+    };
+    step("Checking the project", 0.0);
     if (!validate_build_settings(settings, error) || !validate_build_profile(profile, error)) return false;
     const auto root = project.root();
     std::error_code ec;
@@ -132,61 +353,37 @@ bool build_project(const Project& project, const BuildSettings& settings, const 
         }
     }
 
-    // The game's program, from this installation of Relay.
-    if (profile.target_platform != "linux") {
-        error = "only Linux games can be built for now";
+    // The game's program, from this installation of Relay (or its players folder, for other targets).
+    PlayerKit kit;
+    if (!find_player_kit(profile, kit, error)) return false;
+    const bool native_target = profile.target_platform == host_platform() && profile.architecture == host_architecture();
+    if (!native_target && project_has_script_sources(root)) {
+        error = "this project has scripts, which are native code built with this machine's compiler, so a " +
+                player_target_name(profile) + " game cannot be built here yet; build it on that platform";
         return false;
     }
-#if !defined(__x86_64__)
-    error = "this Relay produces players for its own CPU, which is not x86_64";
-    return false;
-#endif
-    const auto player = find_player_binary();
-    if (player.empty() || !std::filesystem::is_regular_file(player, ec)) {
-        error = "the game player was not found" + (player.empty() ? std::string{} : " at " + player.generic_string()) +
-                "; build the relay_player target or set RELAY_PLAYER_BINARY";
+    if (project_has_script_sources(root) && !project_scripts_trusted(root)) {
+        error = "this project's scripts have not been trusted to build native code; trust the project in the editor first";
         return false;
     }
-    const auto shader_source = player.parent_path() / "shaders";
-    std::vector<std::filesystem::path> shader_files;
-    for (std::filesystem::directory_iterator it(shader_source, ec), end; !ec && it != end; it.increment(ec))
-        if (it->is_regular_file() && it->path().extension() == ".spv") shader_files.push_back(it->path());
-    if (shader_files.empty()) {
-        error = "the player's compiled shaders were not found in " + shader_source.generic_string();
-        return false;
-    }
-    std::vector<std::pair<std::string, std::filesystem::path>> libraries;
-    if (!program_libraries(player, libraries, error)) return false;
+    if (stopped()) return false;
 
-    std::vector<ProjectFile> files;
-    std::string metadata;
-    // The build folder is output, so neither it nor the default builds folder belongs in the game.
-    // The game ships its scripts compiled, so their sources stay behind.
-    std::vector<std::string> excluded{"builds", std::string{script_source_directory}};
-    for (const auto& other : settings.profiles)
-        if (const auto inside = output_inside_project(root, other); !inside.empty())
-            excluded.push_back(inside);
-    if (!collect_project_files(project, excluded, files, metadata, error)) return false;
-
-    // Only what the game refers to ships, unless the profile says everything should.
-    std::set<std::string> kept;
-    std::set<std::string> import_only;
-    std::size_t dropped = 0;
-    if (!profile.include_unused_assets) {
-        AssetReferences references;
-        if (!find_referenced_assets(project, files, metadata, references, error)) return false;
-        dropped = references.dropped.size();
-        kept = std::move(references.kept);
-        import_only = std::move(references.import_only);
-    } else {
-        for (const auto& file : files)
-            if (!file.source.empty()) kept.insert(file.name);
-    }
+    step("Collecting files", 0.03);
+    BuildPlan plan;
+    if (!plan_game_files(project, settings, profile, plan, error)) return false;
+    auto& files = plan.files;
+    auto& metadata = plan.metadata;
+    auto& kept = plan.kept;
+    auto& import_only = plan.import_only;
+    const std::size_t dropped = plan.left_out.size();
+    step("Finding what the game uses", 0.07, std::to_string(files.size()) + " files");
+    if (stopped()) return false;
 
     // Models and shaders ship cooked: imported and compiled now, so the game neither carries the
     // importer and the shader compiler nor spends its start-up running them.
     std::vector<PakInput> inputs;
     std::set<std::string> cooked_sources;
+    CookStats cook_stats;
     std::uint32_t cooked_models = 0;
     std::uint32_t cooked_shaders = 0;
     {
@@ -196,8 +393,10 @@ bool build_project(const Project& project, const BuildSettings& settings, const 
         for (const auto& entry : imports.entries())
             if (kept.contains(entry.source)) models.insert(entry.source);
         if (!models.empty()) {
+            step("Cooking models", 0.12, std::to_string(models.size()) + (models.size() == 1U ? " model" : " models"));
             std::string bytes;
-            if (!cook_models(root, models, bytes, error)) {
+            if (!cook_models(root, models, bytes, error, profile.compress_textures, &cook_stats)) {
+                if (stopped()) return false;
                 error = "cannot cook the models: " + error;
                 return false;
             }
@@ -205,8 +404,16 @@ bool build_project(const Project& project, const BuildSettings& settings, const 
             cooked_models = static_cast<std::uint32_t>(models.size());
             cooked_sources.insert(models.begin(), models.end());
         }
+        if (stopped()) return false;
+        std::size_t shaders_done = 0;
+        std::size_t shaders_total = 0;
+        for (const auto& name : kept)
+            if (name.ends_with(".relay-shader")) ++shaders_total;
         for (const auto& name : kept)
             if (name.ends_with(".relay-shader")) {
+                if (stopped()) return false;
+                step("Compiling shaders", 0.25 + 0.10 * static_cast<double>(shaders_done) / static_cast<double>(std::max<std::size_t>(shaders_total, 1U)), name);
+                ++shaders_done;
                 std::string bytes;
                 if (!cook_shader(root, name, bytes, error)) {
                     error = "cannot compile the shader " + error;
@@ -217,15 +424,29 @@ bool build_project(const Project& project, const BuildSettings& settings, const 
                 cooked_sources.insert(name);
             }
     }
+    std::uint32_t sounds_compressed = 0;
+    std::uint64_t sound_bytes_before = 0, sound_bytes_after = 0;
     for (const auto& file : files) {
         if (file.source.empty()) {
             inputs.push_back({file.name, {}, file.text});
         } else if (file.name != ".relay-imports.json" && kept.contains(file.name) &&
                    !cooked_sources.contains(file.name) && !import_only.contains(file.name)) {
+            if (stopped()) return false;
+            if (profile.compress_audio && has_wav_extension(file.name)) {
+                step("Compressing sounds", 0.30, file.name);
+                if (auto flac = cook_wav(file.source)) {
+                    ++sounds_compressed;
+                    sound_bytes_before += file.size;
+                    sound_bytes_after += flac->size();
+                    inputs.push_back({file.name, {}, std::move(*flac)});
+                    continue;
+                }
+            }
             inputs.push_back({file.name, file.source, {}});
         }
     }
 
+    if (stopped()) return false;
     const auto output_root = build_output_root(root, profile);
     if (std::filesystem::is_symlink(output_root, ec)) {
         error = "the build folder is a symlink";
@@ -260,10 +481,12 @@ bool build_project(const Project& project, const BuildSettings& settings, const 
         std::error_code cleanup;
         std::filesystem::remove_all(stage, cleanup);
         error = std::move(message);
+        if (control && control->cancelled()) report.cancelled = true;
         return false;
     };
     std::filesystem::create_directories(stage, ec);
     if (ec) return fail("cannot create the build folder");
+    step("Writing the game's files", 0.36, std::to_string(inputs.size()) + " files");
     std::string pak_error;
     if (!write_pak(stage / game_archive_name, inputs, pak_error)) return fail("cannot write the game archive: " + pak_error);
     std::uint64_t bytes = 0;
@@ -276,8 +499,16 @@ bool build_project(const Project& project, const BuildSettings& settings, const 
 
     // The scripts, compiled for this build's configuration.
     std::string scripts_entry = "null";
+    if (stopped()) return fail("the build was cancelled");
     {
-        const auto scripts = compile_scripts_for_export(root, profile.configuration == "debug");
+        step("Compiling scripts", 0.42);
+        const auto scripts = compile_scripts_for_export(
+            root, profile.configuration == "debug", control ? control->cancel : nullptr,
+            [&](const std::uint32_t done, const std::uint32_t total) {
+                step("Compiling scripts", 0.42 + 0.43 * static_cast<double>(done) / static_cast<double>(std::max<std::uint32_t>(total, 1U)),
+                     std::to_string(done) + " of " + std::to_string(total) + " files");
+            });
+        if (scripts.cancelled) return fail("the build was cancelled");
         if (!scripts.succeeded) {
             std::string message = "the scripts did not compile: " + scripts.error;
             for (const auto& diagnostic : scripts.diagnostics)
@@ -297,21 +528,56 @@ bool build_project(const Project& project, const BuildSettings& settings, const 
     }
 
     // The player, renamed for the game, with the shaders and libraries it loads from beside itself.
+    step("Copying the player and its libraries", 0.88);
     const auto name = effective_game_name(settings, project.name);
     const auto stem = game_file_stem(name);
-    if (!copy_regular_file(player, stage / stem)) return fail("cannot copy the game player");
-    std::filesystem::permissions(stage / stem,
+    const auto program_name = stem + kit.program_extension;
+    if (!copy_regular_file(kit.program, stage / program_name)) return fail("cannot copy the game player");
+    std::filesystem::permissions(stage / program_name,
                                  std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec |
                                      std::filesystem::perms::others_exec,
                                  std::filesystem::perm_options::add, ec);
-    for (const auto& shader : shader_files)
-        if (!copy_regular_file(shader, stage / "shaders" / shader.filename())) return fail("cannot copy a shader");
-    for (const auto& [soname, path] : libraries) {
-        std::error_code resolve;
-        const auto real = std::filesystem::canonical(path, resolve);
-        if (resolve || !copy_regular_file(real, stage / "lib" / soname)) return fail("cannot copy the library " + soname);
+    for (const auto& [destination, source] : kit.files) {
+        if (stopped()) return fail("the build was cancelled");
+        if (!copy_regular_file(source, stage / destination)) return fail("cannot copy " + destination);
     }
 
+    // What the finished game asks of the system it runs on.
+    {
+        ElfRequirements newest;
+        std::string from;
+        const auto consider = [&](const std::filesystem::path& file) {
+            ElfRequirements found;
+            std::string read_error;
+            if (!read_elf_requirements(file, found, read_error)) return;
+            if (!found.glibc.empty() && compare_dotted_versions(found.glibc, newest.glibc) > 0) from = file.filename().string();
+            merge_requirements(newest, found);
+        };
+        consider(stage / program_name);
+        for (const auto& [destination, source] : kit.files)
+            if (destination.rfind("lib/", 0) == 0) consider(stage / destination);
+        if (scripts_entry != "null") consider(stage / "scripts" / "relay-scripts.so");
+        report.glibc = newest.glibc;
+        report.glibc_from = from;
+        report.libstdcxx = newest.libstdcxx;
+        report.cxxabi = newest.cxxabi;
+        if (!profile.minimum_glibc.empty() && compare_dotted_versions(newest.glibc, profile.minimum_glibc) > 0)
+            return fail("the game needs glibc " + newest.glibc + " (" + from + "), newer than the minimum " +
+                        profile.minimum_glibc + " this profile asks for. Build Relay in an environment with an older glibc "
+                        "(see docs/portable-builds.md), or lower the minimum.");
+    }
+    std::string left_out_json = "[";
+    for (std::size_t i = 0; i < plan.left_out.size() && i < maximum_reported_left_out; ++i)
+        left_out_json += (i ? "," : "") + std::string{"\""} + json_escape(plan.left_out[i]) + '"';
+    left_out_json += ']';
+    std::string warnings_json = "[";
+    for (std::size_t i = 0; i < plan.warnings.size(); ++i)
+        warnings_json += (i ? "," : "") + std::string{"\""} + json_escape(plan.warnings[i]) + '"';
+    warnings_json += ']';
+    report.left_out_count = plan.left_out.size();
+    report.left_out.assign(plan.left_out.begin(),
+                           plan.left_out.begin() + static_cast<std::ptrdiff_t>(std::min(plan.left_out.size(), maximum_reported_left_out)));
+    report.warnings = plan.warnings;
     const std::string manifest =
         "{\n  \"format\": \"relay.build\",\n  \"version\": 1,\n  \"game\": {\"name\": \"" +
         json_escape(name) + "\", \"file_name\": \"" + json_escape(game_file_stem(name)) +
@@ -328,13 +594,25 @@ bool build_project(const Project& project, const BuildSettings& settings, const 
         json_escape(profile.configuration) + "\"},\n  \"content\": {\"archive\": \"" +
         std::string{game_archive_name} + "\", \"root\": \"data\", "
         "\"project\": \"project.relayproject\", \"unused_files_left_out\": " + std::to_string(dropped) +
+        ", \"left_out\": " + left_out_json + ", \"warnings\": " + warnings_json +
+        ", \"requirements\": {\"glibc\": \"" + json_escape(report.glibc) + "\", \"glibc_from\": \"" +
+        json_escape(report.glibc_from) + "\", \"libstdcxx\": \"" + json_escape(report.libstdcxx) +
+        "\", \"cxxabi\": \"" + json_escape(report.cxxabi) + "\"}" +
         ", \"cooked_models\": " + std::to_string(cooked_models) +
+        ", \"textures_compressed\": " + std::to_string(cook_stats.textures_compressed) +
+        ", \"texture_bytes_before\": " + std::to_string(cook_stats.texture_bytes_before) +
+        ", \"texture_bytes_after\": " + std::to_string(cook_stats.texture_bytes_after) +
+        ", \"sounds_compressed\": " + std::to_string(sounds_compressed) +
+        ", \"sound_bytes_before\": " + std::to_string(sound_bytes_before) +
+        ", \"sound_bytes_after\": " + std::to_string(sound_bytes_after) +
         ", \"cooked_shaders\": " + std::to_string(cooked_shaders) +
         ", \"startup_scene\": \"" +
         json_escape(project.startup_scene) + "\", \"files\": " + std::to_string(inputs.size()) +
         ", \"bytes\": " + std::to_string(bytes) + "},\n  \"scripts\": " + scripts_entry +
-        ",\n  \"executable\": \"" + json_escape(stem) + "\"\n}\n";
+        ",\n  \"executable\": \"" + json_escape(program_name) + "\"\n}\n";
     if (!write_text_file(stage / "build.json", manifest)) return fail("cannot write build.json");
+    if (stopped()) return fail("the build was cancelled");
+    step("Finishing", 0.97);
 
     std::filesystem::remove_all(target, ec);
     if (ec) return fail("cannot replace the previous build");
@@ -344,7 +622,7 @@ bool build_project(const Project& project, const BuildSettings& settings, const 
     report.files = files.size();
     report.bytes = bytes;
     report.executable = true;
-    report.executable_path = target / stem;
+    report.executable_path = target / program_name;
     error.clear();
     return true;
 }

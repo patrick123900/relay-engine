@@ -504,7 +504,8 @@ std::string imported_content_hash(const aiScene& scene,
 
 bool decode_texture_reference(const aiScene& scene, SandboxedIOSystem& sandbox,
                               const aiString& reference, const TextureColorSpace color_space,
-                              TextureAsset& output, std::string& error) {
+                              TextureAsset& output, std::string& error,
+                              const std::filesystem::path& model_directory = {}) {
     const auto* embedded = scene.GetEmbeddedTexture(reference.C_Str());
     if (embedded != nullptr) {
         if (embedded->mHeight != 0U) {
@@ -530,8 +531,12 @@ bool decode_texture_reference(const aiScene& scene, SandboxedIOSystem& sandbox,
             if (!decode_image_rgba(bytes, embedded->achFormatHint, output, error)) return false;
         }
     } else {
+        // An image named by a model is named relative to the model's own folder; a path from the
+        // project's root is accepted too.
         std::vector<std::uint8_t> bytes;
-        if (!sandbox.read_bytes(reference.C_Str(), bytes)) {
+        const bool beside = !model_directory.empty() && !std::filesystem::path{reference.C_Str()}.is_absolute() &&
+                            sandbox.read_bytes((model_directory / reference.C_Str()).generic_string().c_str(), bytes);
+        if (!beside && !sandbox.read_bytes(reference.C_Str(), bytes)) {
             error = sandbox.rejection();
             return false;
         }
@@ -1337,7 +1342,7 @@ ModelImportResult import_model_asset(const std::filesystem::path& assets_root,
                                  ? TextureFilter::nearest : TextureFilter::linear;
         std::string decode_error;
         if (!decode_texture_reference(*imported, *sandbox, reference, color_space, texture,
-                                      decode_error)) {
+                                      decode_error, import_path.parent_path())) {
             result.warnings.push_back(std::string{semantic} + " texture '" + reference.C_Str() +
                                       "' was not decoded: " + decode_error);
             return;

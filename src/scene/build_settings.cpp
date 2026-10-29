@@ -114,12 +114,12 @@ const std::vector<std::string_view>& build_window_modes() {
 }
 
 const std::vector<std::string_view>& build_platforms() {
-    static const std::vector<std::string_view> values{"linux"};
+    static const std::vector<std::string_view> values{"linux", "windows", "macos"};
     return values;
 }
 
 const std::vector<std::string_view>& build_architectures() {
-    static const std::vector<std::string_view> values{"x86_64"};
+    static const std::vector<std::string_view> values{"x86_64", "aarch64"};
     return values;
 }
 
@@ -149,6 +149,34 @@ bool validate_build_profile(const BuildProfile& profile, std::string& error) {
     if (!safe_relative_path(profile.output_directory) && !plain_absolute_path(profile.output_directory)) {
         error = "the build folder must be a plain folder inside the project or an absolute path";
         return false;
+    }
+    if (!profile.minimum_glibc.empty()) {
+        const auto dot = profile.minimum_glibc.find('.');
+        const bool shaped = dot != std::string::npos && dot > 0U && dot + 1U < profile.minimum_glibc.size() &&
+                            profile.minimum_glibc.size() <= 8U &&
+                            std::all_of(profile.minimum_glibc.begin(), profile.minimum_glibc.end(),
+                                        [](const char c) { return (c >= '0' && c <= '9') || c == '.'; }) &&
+                            profile.minimum_glibc.find('.', dot + 1U) == std::string::npos;
+        if (!shaped) {
+            error = "the minimum glibc must look like 2.31, or be empty";
+            return false;
+        }
+    }
+    if (profile.always_include.size() > maximum_always_include) {
+        error = "a profile can always include at most " + std::to_string(maximum_always_include) + " files or folders";
+        return false;
+    }
+    for (std::size_t i = 0; i < profile.always_include.size(); ++i) {
+        const auto& entry = profile.always_include[i];
+        if (!safe_relative_path(entry)) {
+            error = "always_include entries must be plain project-relative files or folders: " + entry;
+            return false;
+        }
+        for (std::size_t j = 0; j < i; ++j)
+            if (profile.always_include[j] == entry) {
+                error = "always_include lists " + entry + " twice";
+                return false;
+            }
     }
     if (!listed(build_window_modes(), profile.window_mode)) {
         error = "the window mode must be windowed, borderless or fullscreen";
@@ -221,6 +249,12 @@ bool validate_build_settings(const BuildSettings& settings, std::string& error) 
 }
 
 std::string build_profile_json(const BuildProfile& profile) {
+    std::string always = "[";
+    for (const auto& entry : profile.always_include) {
+        if (always.size() > 1) always += ',';
+        always += '"' + json_escape(entry) + '"';
+    }
+    always += ']';
     return "{\"name\":\"" + json_escape(profile.name) + "\",\"target_platform\":\"" +
            json_escape(profile.target_platform) + "\",\"architecture\":\"" +
            json_escape(profile.architecture) + "\",\"configuration\":\"" +
@@ -229,7 +263,10 @@ std::string build_profile_json(const BuildProfile& profile) {
            json_escape(profile.window_mode) + "\",\"window_width\":" +
            std::to_string(profile.window_width) + ",\"window_height\":" +
            std::to_string(profile.window_height) + ",\"include_unused_assets\":" +
-           (profile.include_unused_assets ? "true" : "false") + '}';
+           (profile.include_unused_assets ? "true" : "false") + ",\"compress_textures\":" +
+           (profile.compress_textures ? "true" : "false") + ",\"compress_audio\":" +
+           (profile.compress_audio ? "true" : "false") + ",\"minimum_glibc\":\"" +
+           json_escape(profile.minimum_glibc) + "\",\"always_include\":" + always + '}';
 }
 
 std::string build_settings_json(const BuildSettings& settings) {
@@ -262,12 +299,29 @@ std::optional<BuildProfile> parse_build_profile(const JsonValue::Object& object,
                 static_cast<std::uint32_t>(*number);
             continue;
         }
-        if (name == "include_unused_assets") {
-            if (entry.boolean() == nullptr) {
-                error = "build profile setting include_unused_assets must be true or false";
+        if (name == "always_include") {
+            const auto* list = entry.array();
+            if (list == nullptr) {
+                error = "build profile setting always_include must be a list of project paths";
                 return std::nullopt;
             }
-            profile.include_unused_assets = *entry.boolean();
+            profile.always_include.clear();
+            for (const auto& item : *list) {
+                if (item.string() == nullptr) {
+                    error = "build profile setting always_include must be a list of project paths";
+                    return std::nullopt;
+                }
+                profile.always_include.push_back(*item.string());
+            }
+            continue;
+        }
+        if (name == "include_unused_assets" || name == "compress_textures" || name == "compress_audio") {
+            if (entry.boolean() == nullptr) {
+                error = "build profile setting " + name + " must be true or false";
+                return std::nullopt;
+            }
+            (name == "include_unused_assets" ? profile.include_unused_assets
+             : name == "compress_textures" ? profile.compress_textures : profile.compress_audio) = *entry.boolean();
             continue;
         }
         std::string* target = name == "name"               ? &profile.name
@@ -276,6 +330,7 @@ std::optional<BuildProfile> parse_build_profile(const JsonValue::Object& object,
                               : name == "configuration"    ? &profile.configuration
                               : name == "output_directory" ? &profile.output_directory
                               : name == "window_mode"      ? &profile.window_mode
+                              : name == "minimum_glibc"    ? &profile.minimum_glibc
                                                            : nullptr;
         if (target == nullptr) {
             error = "unknown build profile setting " + name;

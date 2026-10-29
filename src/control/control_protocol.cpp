@@ -394,6 +394,35 @@ std::string shader_material_json(const std::string& path, const ResolvedShaderMa
     return json + "]}";
 }
 
+std::string string_list_json(const std::vector<std::string>& values) {
+    std::string text = "[";
+    for (const auto& value : values) {
+        if (text.size() > 1) text += ',';
+        text += '"' + escape_json(value) + '"';
+    }
+    return text + ']';
+}
+
+std::string build_status_json(const BuildStatus& status) {
+    std::string text = "{\"state\":\"" + std::string{build_state_name(status.state)} + "\",\"serial\":" +
+                       std::to_string(status.serial) + ",\"profile\":\"" + escape_json(status.profile) +
+                       "\",\"stage\":\"" + escape_json(status.stage) + "\",\"detail\":\"" +
+                       escape_json(status.detail) + "\",\"fraction\":" + std::to_string(status.fraction) +
+                       ",\"seconds\":" + std::to_string(status.seconds) + ",\"error\":\"" +
+                       escape_json(status.error) + "\"";
+    if (status.state == BuildStatus::State::succeeded)
+        text += ",\"directory\":\"" + escape_json(status.report.directory.generic_string()) +
+                "\",\"profile_built\":\"" + escape_json(status.profile) + "\",\"files\":" +
+                std::to_string(status.report.files) + ",\"bytes\":" + std::to_string(status.report.bytes) +
+                ",\"executable\":" + (status.report.executable ? "true" : "false") +
+                ",\"left_out_count\":" + std::to_string(status.report.left_out_count) +
+                ",\"left_out\":" + string_list_json(status.report.left_out) +
+                ",\"warnings\":" + string_list_json(status.report.warnings) +
+                ",\"glibc\":\"" + escape_json(status.report.glibc) + "\",\"glibc_from\":\"" +
+                escape_json(status.report.glibc_from) + "\",\"libstdcxx\":\"" + escape_json(status.report.libstdcxx) + '"';
+    return text + '}';
+}
+
 } // namespace
 
 ControlProtocol::ControlProtocol(Engine& engine, CaptureHandler capture_handler,
@@ -1760,12 +1789,20 @@ std::string ControlProtocol::handle(const std::string_view request) {
                       escape_json(directory.generic_string()) + "\",\"built\":" +
                       (built ? "true" : "false") + '}';
         }
+        std::string targets = "[";
+        for (const auto& target : available_build_targets()) {
+            if (targets.size() > 1) targets += ',';
+            targets += "{\"platform\":\"" + target.platform + "\",\"architecture\":\"" + target.architecture +
+                       "\",\"available\":" + (target.available ? "true" : "false") + ",\"native\":" +
+                       (target.native ? "true" : "false") + '}';
+        }
+        targets += ']';
         return response_prefix(id) + "{\"settings\":" + build_settings_json(settings) +
                ",\"saved\":" + (project && project->build ? "true" : "false") +
                ",\"defaults\":" + build_settings_json(BuildSettings{}) +
                ",\"game_name\":\"" +
                escape_json(effective_game_name(settings, project ? project->name : std::string{})) +
-               "\",\"platforms\":" + list(build_platforms()) +
+               "\",\"targets\":" + targets + ",\"platforms\":" + list(build_platforms()) +
                ",\"architectures\":" + list(build_architectures()) +
                ",\"configurations\":" + list(build_configurations()) +
                ",\"window_modes\":" + list(build_window_modes()) +
@@ -1813,12 +1850,21 @@ std::string ControlProtocol::handle(const std::string_view request) {
         assign("configuration", profile->configuration);
         assign("output_directory", profile->output_directory);
         assign("window_mode", profile->window_mode);
+        assign("minimum_glibc", profile->minimum_glibc);
         profile->window_width = static_cast<std::uint32_t>(
             unsigned_field(request, "window_width", profile->window_width));
         profile->window_height = static_cast<std::uint32_t>(
             unsigned_field(request, "window_height", profile->window_height));
         profile->include_unused_assets =
             boolean_field(request, "include_unused_assets", profile->include_unused_assets);
+        profile->compress_textures = boolean_field(request, "compress_textures", profile->compress_textures);
+        profile->compress_audio = boolean_field(request, "compress_audio", profile->compress_audio);
+        if (const auto parsed = JsonParser{request}.parse(); parsed && parsed->object())
+            if (const auto* list = field(*parsed->object(), "always_include"); list && list->array()) {
+                profile->always_include.clear();
+                for (const auto& item : *list->array())
+                    if (item.string()) profile->always_include.push_back(*item.string());
+            }
         if (was_active) settings.active_profile = profile->name;
         const auto shown = *profile;
         std::string error;
@@ -1841,23 +1887,44 @@ std::string ControlProtocol::handle(const std::string_view request) {
         engine_.logs().write(LogLevel::info, "Build profile " + name + " removed");
         return response_prefix(id) + "{\"settings\":" + build_settings_json(settings) + "}}";
     }
-    if (method == "project.build") {
+    if (method == "project.build" || method == "project.build_start") {
         if (!engine_.project()) return error_response(id, "no project is open");
         const auto settings = engine_.build_settings();
         const auto requested = optional_string_field(request, "profile");
         const auto* profile = requested ? settings.find_profile(*requested) : &settings.active();
         if (profile == nullptr) return error_response(id, "there is no build profile named " + *requested);
         std::string error;
-        BuildReport report;
-        if (!build_project(*engine_.project(), settings, *profile, error, report))
-            return error_response(id, error);
-        engine_.logs().write(LogLevel::info, "Built " + report.directory.generic_string());
-        return response_prefix(id) + "{\"profile\":\"" + escape_json(profile->name) + "\",\"directory\":\"" +
-               escape_json(report.directory.generic_string()) +
-               "\",\"configuration\":\"" + escape_json(profile->configuration) +
-               "\",\"files\":" + std::to_string(report.files) +
-               ",\"bytes\":" + std::to_string(report.bytes) +
-               ",\"executable\":" + (report.executable ? "true" : "false") + "}}";
+        if (!engine_.builds().start(*engine_.project(), settings, *profile, error)) return error_response(id, error);
+        if (method == "project.build_start") return response_prefix(id) + build_status_json(engine_.builds().status()) + "}";
+        // project.build waits for the build, so agents and scripts get its result in one call.
+        engine_.builds().wait();
+        const auto status = engine_.builds().status();
+        if (status.state != BuildStatus::State::succeeded) return error_response(id, status.error);
+        engine_.logs().write(LogLevel::info, "Built " + status.report.directory.generic_string());
+        return response_prefix(id) + build_status_json(status) + "}";
+    }
+    if (method == "project.build_preview") {
+        if (!engine_.project()) return error_response(id, "no project is open");
+        const auto settings = engine_.build_settings();
+        const auto requested = optional_string_field(request, "profile");
+        const auto* profile = requested ? settings.find_profile(*requested) : &settings.active();
+        if (profile == nullptr) return error_response(id, "there is no build profile named " + *requested);
+        std::string error;
+        BuildPreview preview;
+        if (!preview_build(*engine_.project(), settings, *profile, preview, error)) return error_response(id, error);
+        const auto shown = std::min<std::size_t>(preview.left_out.size(), 500U);
+        const std::vector<std::string> names(preview.left_out.begin(), preview.left_out.begin() + static_cast<std::ptrdiff_t>(shown));
+        return response_prefix(id) + "{\"profile\":\"" + escape_json(profile->name) + "\",\"everything\":" +
+               (profile->include_unused_assets ? "true" : "false") + ",\"packed\":" + std::to_string(preview.packed) +
+               ",\"left_out_count\":" + std::to_string(preview.left_out.size()) + ",\"left_out\":" +
+               string_list_json(names) + ",\"warnings\":" + string_list_json(preview.warnings) +
+               ",\"always_include\":" + string_list_json(profile->always_include) + "}}";
+    }
+    if (method == "project.build_status") return response_prefix(id) + build_status_json(engine_.builds().status()) + "}";
+    if (method == "project.build_cancel") {
+        const bool running = engine_.builds().running();
+        engine_.builds().cancel();
+        return response_prefix(id) + "{\"cancelling\":" + (running ? "true" : "false") + "}}";
     }
     if (method == "project.close") {
         engine_.project().reset();

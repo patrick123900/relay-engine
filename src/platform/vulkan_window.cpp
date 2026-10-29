@@ -218,6 +218,10 @@ struct VulkanWindow::Impl {
         std::uint32_t mip_levels{};
     };
     std::vector<GpuTexture> textures;
+    // The device can sample BC1 and BC3 images (the feature was enabled), so cooked textures upload as they are.
+    bool bc_textures_supported{};
+    // How many cooked textures went to the GPU as blocks, and how many had to be decompressed first.
+    std::uint32_t compressed_texture_uploads{}, decompressed_texture_uploads{};
     VkDescriptorSetLayout texture_layout{};
     VkDescriptorPool texture_pool{};
     std::array<VkDescriptorSet, frames_in_flight> texture_sets{};
@@ -1063,6 +1067,9 @@ struct VulkanWindow::Impl {
         VkPhysicalDeviceFeatures2 enabled_features{};
         enabled_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         enabled_features.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+        // Cooked games ship BC1 and BC3 textures; any device that has them has this feature.
+        enabled_features.features.textureCompressionBC = supported_features.textureCompressionBC;
+        bc_textures_supported = supported_features.textureCompressionBC == VK_TRUE;
         VkPhysicalDeviceVulkan11Features enabled11{};
         enabled11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
         VkPhysicalDeviceVulkan12Features enabled12{};
@@ -1647,21 +1654,50 @@ struct VulkanWindow::Impl {
         return true;
     }
 
+    // The Vulkan format of a cooked texture, when this device can sample it.
+    [[nodiscard]] std::optional<VkFormat> compressed_texture_format(const TextureAsset& asset) const {
+        if (!asset.compressed || !bc_textures_supported) return std::nullopt;
+        const bool srgb = asset.color_space == TextureColorSpace::srgb;
+        const auto format = asset.compressed->codec == TextureCodec::bc1
+                                ? (srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK)
+                                : (srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK);
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(physical_device, format, &properties);
+        constexpr VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                                VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        if ((properties.optimalTilingFeatures & needed) != needed) return std::nullopt;
+        return format;
+    }
+
     bool create_texture_image(const TextureAsset& asset, GpuTexture& texture) {
-        texture.mip_levels = static_cast<std::uint32_t>(
-                                 std::floor(std::log2(static_cast<double>(
-                                     std::max(asset.width, asset.height))))) + 1U;
+        // A device that cannot sample the cooked blocks gets the pixels, made on the CPU.
+        if (asset.compressed && !compressed_texture_format(asset)) {
+            ++decompressed_texture_uploads;
+            TextureAsset plain = asset;
+            plain.rgba = decompress_texture_level(*asset.compressed, 0);
+            plain.compressed.reset();
+            return create_texture_image(plain, texture);
+        }
+        const auto packed_format = compressed_texture_format(asset);
+        const bool packed = packed_format.has_value();
+        if (packed) ++compressed_texture_uploads;
+        texture.mip_levels = packed ? asset.compressed->levels()
+                                    : static_cast<std::uint32_t>(
+                                          std::floor(std::log2(static_cast<double>(
+                                              std::max(asset.width, asset.height))))) + 1U;
         VkImageCreateInfo image_info{};
         image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         image_info.imageType = VK_IMAGE_TYPE_2D;
-        const auto image_format = asset.color_space == TextureColorSpace::srgb
+        const auto image_format = packed ? *packed_format
+                                  : asset.color_space == TextureColorSpace::srgb
                                       ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
         VkFormatProperties format_properties{};
         vkGetPhysicalDeviceFormatProperties(physical_device, image_format, &format_properties);
         constexpr VkFormatFeatureFlags required_format_features =
             VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
             VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-        if ((format_properties.optimalTilingFeatures & required_format_features) !=
+        if (!packed && (format_properties.optimalTilingFeatures & required_format_features) !=
             required_format_features) {
             last_error = "RGBA8 texture format does not support linear blit mip generation";
             return false;
@@ -1708,7 +1744,7 @@ struct VulkanWindow::Impl {
 
         VkBuffer staging{};
         VkDeviceMemory staging_memory{};
-        const auto byte_count = static_cast<VkDeviceSize>(asset.rgba.size());
+        const auto byte_count = static_cast<VkDeviceSize>(packed ? asset.compressed->data.size() : asset.rgba.size());
         if (!may_stage(byte_count)) return false;
         if (!create_buffer(byte_count, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -1716,7 +1752,8 @@ struct VulkanWindow::Impl {
         void* mapped = nullptr;
         result = vkMapMemory(device, staging_memory, 0U, byte_count, 0U, &mapped);
         if (result == VK_SUCCESS) {
-            std::memcpy(mapped, asset.rgba.data(), asset.rgba.size());
+            if (packed) std::memcpy(mapped, asset.compressed->data.data(), asset.compressed->data.size());
+            else std::memcpy(mapped, asset.rgba.data(), asset.rgba.size());
             vkUnmapMemory(device, staging_memory);
         }
         if (result == VK_SUCCESS && upload_commands == VK_NULL_HANDLE)
@@ -1737,6 +1774,38 @@ struct VulkanWindow::Impl {
             vkCmdPipelineBarrier(upload_commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr,
                                  1U, &initial);
+            if (packed) {
+                // Cooked: every mip level is in the buffer already, so copy them all and hand the image over.
+                std::vector<VkBufferImageCopy> regions;
+                for (std::uint32_t level = 0; level < texture.mip_levels; ++level) {
+                    VkBufferImageCopy region{};
+                    region.bufferOffset = asset.compressed->level_offsets[level];
+                    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    region.imageSubresource.mipLevel = level;
+                    region.imageSubresource.layerCount = 1U;
+                    region.imageExtent = {std::max(asset.width >> level, 1U), std::max(asset.height >> level, 1U), 1U};
+                    regions.push_back(region);
+                }
+                vkCmdCopyBufferToImage(upload_commands, staging, texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       static_cast<std::uint32_t>(regions.size()), regions.data());
+                VkImageMemoryBarrier ready{};
+                ready.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                ready.dstAccessMask = transfer_family == graphics_family
+                                          ? static_cast<VkAccessFlags>(VK_ACCESS_SHADER_READ_BIT) : 0U;
+                ready.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                ready.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                ready.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                ready.image = texture.image;
+                ready.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                ready.subresourceRange.levelCount = texture.mip_levels;
+                ready.subresourceRange.layerCount = 1U;
+                vkCmdPipelineBarrier(upload_commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     transfer_family == graphics_family ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                                                        : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                     0U, 0U, nullptr, 0U, nullptr, 1U, &ready);
+            } else {
             VkBufferImageCopy copy{};
             copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             copy.imageSubresource.layerCount = 1U;
@@ -1810,6 +1879,7 @@ struct VulkanWindow::Impl {
                                      : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                  0U, 0U, nullptr, 0U,
                                  nullptr, 1U, &last);
+            }
         }
         if (result == VK_SUCCESS) {
             upload_staging_buffers.push_back(staging);
@@ -8247,6 +8317,8 @@ std::string VulkanWindow::upload_status_json() const {
            ",\"pending\":" +
            (impl_->upload_fence != VK_NULL_HANDLE || impl_->upload_wait_pending
                 ? "true" : "false") +
+           ",\"compressed_textures\":" + std::to_string(impl_->compressed_texture_uploads) +
+           ",\"decompressed_textures\":" + std::to_string(impl_->decompressed_texture_uploads) +
            ",\"dedicated_transfer_queue\":" +
            (impl_->transfer_family != impl_->graphics_family ? "true" : "false") +
            '}';

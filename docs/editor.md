@@ -148,7 +148,8 @@ refuses to overwrite an existing file. Exporting is not building: it saves the p
 **Run → Build project...** opens the Build Project window, a free-floating window. Its left column
 lists the project's *build profiles*, one per target (a Linux release profile, a debug profile, and
 so on); **New** adds one, **Copy** duplicates the selected one and **Delete** removes it. The right
-column edits the selected profile: its name, platform, architecture (Linux and x86_64 for now),
+column edits the selected profile: its name, platform, architecture (a target other than the editor's needs an installed player; see
+[portable builds](portable-builds.md)),
 configuration (release or debug), build folder (type a path or **Browse...**; inside the project it
 is saved relative to it, `builds` by default) and the window mode (windowed, borderless or
 fullscreen) with its size when windowed. Below those are the game's own details, shared by every
@@ -185,10 +186,17 @@ profile to pack every file in the project.
 The game plays the project the way **Run → Run Game** does, without the editor, and applies the
 project's graphics, input and audio settings. The debug configuration prints the game's log to the
 terminal. Building compiles the scripts, so the project's scripts must be trusted first (as for Run
-Game), and the editor waits while it runs. Building again replaces the previous build of that
-configuration, and Relay refuses to clear a folder that is not one of its builds. Only Linux x86_64
-games can be built so far, and they need a machine with a Vulkan GPU driver and a C library at least as
-new as this one's.
+Game). The build runs in the background: the window shows its progress and a **Cancel** button, and the
+editor stays usable. Building again replaces the previous build of that
+configuration, and Relay refuses to clear a folder that is not one of its builds. A cancelled or failed
+build leaves the previous one alone.
+
+**What was left out.** **Preview** lists the files a build would leave out and warns about script paths
+that match nothing. **Always include** names files or folders (with what they refer to) that the profile
+keeps whatever the scan finds. **Compress textures** stores images as BC1/BC3 with mip chains, and
+**Compress audio** stores WAV sounds as lossless FLAC. **Minimum glibc** fails a build whose player
+needs a newer C library. Linux x86_64 builds need a Vulkan GPU driver and a C library at least as new as
+the build machine's; [portable builds](portable-builds.md) covers older systems and other targets.
 
 ## Graphics settings
 

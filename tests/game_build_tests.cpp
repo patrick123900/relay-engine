@@ -3,9 +3,12 @@
 // offscreen (SDL_VIDEODRIVER=offscreen), so no window reaches the desktop.
 
 #include "relay/control/control_protocol.hpp"
+#include "relay/core/elf_requirements.hpp"
 #include "relay/core/engine.hpp"
+#include "relay/audio/audio_clip.hpp"
 #include "relay/core/pak.hpp"
 #include "relay/core/process.hpp"
+#include "relay/observe/capture.hpp"
 #include "relay/render/image_decode.hpp"
 #include "relay/script/script_system.hpp"
 
@@ -13,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -157,6 +161,24 @@ int main() {
                    "sources that shipped cooked are not shipped");
             expect(std::none_of(names.begin(), names.end(), [](const std::string& name) { return name.starts_with("scripts/") || name.starts_with("builds/"); }),
                    "script sources and earlier builds are not shipped");
+            // Sounds ship as lossless FLAC under their own names, and decode to the very same samples.
+            for (const char* sound : {"sounds/hum.wav", "sounds/shot.wav", "music/daylight.wav"}) {
+                const auto packed_bytes = archive->find(sound);
+                expect(packed_bytes && packed_bytes->size() > 4U && std::memcmp(packed_bytes->data(), "fLaC", 4) == 0 &&
+                           packed_bytes->size() < fs::file_size(demo / sound),
+                       std::string{"a wav sound ships as smaller FLAC: "} + sound);
+                if (!packed_bytes) continue;
+                std::ifstream original(demo / sound, std::ios::binary);
+                const std::vector<std::uint8_t> wav{std::istreambuf_iterator<char>(original), {}};
+                std::string decode_error;
+                const auto before = relay::decode_audio(wav, decode_error);
+                const auto after = relay::decode_audio(std::vector<std::uint8_t>(packed_bytes->begin(), packed_bytes->end()), decode_error);
+                expect(before && after && before->samples == after->samples && before->sample_rate == after->sample_rate &&
+                           before->channels == after->channels,
+                       std::string{"and decodes to the same samples: "} + sound);
+            }
+            expect(read_text(game / "build.json").find("\"sounds_compressed\": 6") != std::string::npos,
+                   "build.json counts the compressed sounds");
         }
     }
     if (fs::is_directory(game / "shaders") && fs::is_directory(game / "lib")) {
@@ -197,6 +219,133 @@ int main() {
         const auto second = run_game(moved / "Showcase_Game", temporary / "second.png");
         expect(second.exit_code == 0, "the game runs after its folder moves: " + second.output);
         expect(picture_has_content(temporary / "second.png"), "the moved game draws its scene");
+    }
+
+    // A textured model, built once with compressed textures and once without: the GPU shows the same
+    // picture, and the compressed game's archive is smaller.
+    {
+        fs::current_path(temporary / "work");
+        fs::create_directories("textured/models");
+        std::string error;
+        relay::OwnedFrame texture;
+        texture.width = texture.height = 128;
+        texture.rgba.resize(128U * 128U * 4U);
+        for (std::uint32_t y = 0; y < 128U; ++y)
+            for (std::uint32_t x = 0; x < 128U; ++x) {
+                auto* p = &texture.rgba[(static_cast<std::size_t>(y) * 128U + x) * 4U];
+                const bool tile = ((x / 16U) + (y / 16U)) % 2U == 0U;
+                p[0] = static_cast<std::uint8_t>(tile ? 230U : 40U + x);
+                p[1] = static_cast<std::uint8_t>(60U + y);
+                p[2] = static_cast<std::uint8_t>(tile ? 40U : 200U);
+                p[3] = 255U;
+            }
+        expect(relay::write_frame_image(texture.view(), "textured/models/tex.png", error), "the test texture is written: " + error);
+        {
+            auto gltf = read_text(fs::path{RELAY_FIXTURE_MODELS} / "relay-test-triangle.gltf");
+            const auto swap = [&](const std::string& from, const std::string& to) {
+                const auto at = gltf.find(from);
+                if (at != std::string::npos) gltf.replace(at, from.size(), to);
+            };
+            swap("\"materials\"", "\"images\":[{\"uri\":\"tex.png\"}],\"textures\":[{\"source\":0}],\"materials\"");
+            swap("\"baseColorFactor\"", "\"baseColorTexture\":{\"index\":0},\"baseColorFactor\"");
+            std::ofstream("textured/models/quad.gltf") << gltf;
+        }
+        relay::EngineConfig config;
+        config.editor_mode = true;
+        relay::Engine engine(config);
+        relay::ControlProtocol protocol(engine);
+        const auto ok = [](const std::string& response) { return response.find("\"ok\":true") != std::string::npos; };
+        expect(ok(protocol.handle(R"({"id":1,"method":"project.create","filename":"textured/project.relayproject","name":"Textured"})")),
+               "the textured project is created");
+        const auto imported = protocol.handle(R"({"id":2,"method":"assets.import_model","filename":"models/quad.gltf","instantiate":true})");
+        expect(ok(imported), "the textured model is imported");
+        const auto camera = protocol.handle(R"({"id":3,"method":"scene.create","name":"View","type":"Camera"})");
+        const auto at = camera.find("\"entity\":\"");
+        expect(at != std::string::npos, "a camera is added");
+        if (at != std::string::npos) {
+            const auto handle = camera.substr(at + 10U, camera.find('"', at + 10U) - at - 10U);
+            expect(ok(protocol.handle(R"({"id":4,"method":"scene.set_transform","entity":")" + handle + R"(","pz":1.4})")), "the camera is moved back");
+        }
+        expect(ok(protocol.handle(R"({"id":5,"method":"scene.save","filename":"main.relay.json"})")) &&
+                   ok(protocol.handle(R"({"id":6,"method":"project.add_scene","scene_file":"main.relay.json"})")) &&
+                   ok(protocol.handle(R"({"id":7,"method":"project.set_startup","scene_file":"main.relay.json"})")) &&
+                   ok(protocol.handle(R"({"id":8,"method":"project.set_build_profile","name":"Linux","configuration":"release","output_directory":"builds","window_width":640,"window_height":360})")),
+               "the scene is saved and made the startup scene");
+
+        const auto build = [&](const bool compressed, const fs::path& capture) {
+            struct Result { bool built{}; std::uint64_t archive{}; GameRun run; std::string manifest; };
+            Result result;
+            const auto response = protocol.handle(std::string{R"({"id":9,"method":"project.set_build_profile","name":"Linux","compress_textures":)"} +
+                                                  (compressed ? "true" : "false") + "}");
+            result.built = ok(response) && ok(protocol.handle(R"({"id":10,"method":"project.build"})"));
+            const auto folder = fs::path{"textured/builds/release"};
+            std::error_code ec;
+            result.archive = fs::file_size(folder / "game.pak", ec);
+            result.manifest = read_text(folder / "build.json");
+            result.run = run_game(folder / "Textured", fs::absolute(capture));
+            return result;
+        };
+        setenv("RELAY_GLOBAL_ILLUMINATION", "0", 1);
+        setenv("RELAY_REFLECTIONS", "0", 1);
+        const auto packed = build(true, temporary / "textured-bc.png");
+        const auto plain = build(false, temporary / "textured-raw.png");
+        unsetenv("RELAY_GLOBAL_ILLUMINATION");
+        unsetenv("RELAY_REFLECTIONS");
+        expect(packed.built && plain.built, "the textured game builds both ways");
+        // The glibc the game needs is measured from its files, and a profile can set a floor under it.
+        {
+            relay::ElfRequirements player_needs;
+            std::string elf_error;
+            const auto player = fs::path{RELAY_PLAYER_BINARY_PATH};
+            expect(relay::read_elf_requirements(player, player_needs, elf_error), "the player's requirements are readable: " + elf_error);
+            const std::string key = "\"glibc\": \"";
+            const auto marker = packed.manifest.find(key);
+            const auto recorded = marker == std::string::npos ? std::string{}
+                                  : packed.manifest.substr(marker + key.size(), packed.manifest.find('"', marker + key.size()) - marker - key.size());
+            expect(!recorded.empty() && relay::compare_dotted_versions(recorded, player_needs.glibc) >= 0,
+                   "build.json records at least the glibc the player itself needs: " + recorded + " against " + player_needs.glibc);
+            expect(ok(protocol.handle(R"({"id":12,"method":"project.set_build_profile","name":"Linux","minimum_glibc":"2.17"})")), "a minimum glibc is set");
+            const auto refused = protocol.handle(R"({"id":13,"method":"project.build"})");
+            expect(refused.find("\"ok\":false") != std::string::npos && refused.find("needs glibc") != std::string::npos,
+                   "a build that needs newer glibc than the profile's minimum fails: " + refused);
+            expect(ok(protocol.handle(R"({"id":14,"method":"project.set_build_profile","name":"Linux","minimum_glibc":""})")), "and the minimum is cleared");
+        }
+        expect(packed.manifest.find("\"textures_compressed\": 1") != std::string::npos &&
+                   plain.manifest.find("\"textures_compressed\": 0") != std::string::npos,
+               "build.json says whether the textures were compressed");
+        expect(packed.archive + 40U * 1024U < plain.archive, "the compressed archive is smaller: " + std::to_string(packed.archive) + " against " + std::to_string(plain.archive));
+        if (packed.run.no_gpu) {
+            std::cout << "SKIP: no Vulkan device for the textured game\n";
+        } else {
+            expect(packed.run.exit_code == 0 && plain.run.exit_code == 0, "both textured games run: " + packed.run.output + plain.run.output);
+            expect(packed.run.output.find("\"compressed_textures\":1") != std::string::npos &&
+                       plain.run.output.find("\"compressed_textures\":0") != std::string::npos,
+                   "the GPU took the compressed texture as blocks: " + packed.run.output);
+            const auto pixels = [&](const fs::path& path) {
+                std::ifstream stream(path, std::ios::binary);
+                const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream), {}};
+                relay::TextureAsset picture;
+                std::string decode_error;
+                (void)relay::decode_image_rgba(bytes, "png", picture, decode_error);
+                return picture;
+            };
+            const auto a = pixels(temporary / "textured-bc.png"), b = pixels(temporary / "textured-raw.png");
+            double difference = 0.0;
+            std::size_t lit = 0;
+            for (std::size_t i = 0; i + 3U < a.rgba.size() && a.rgba.size() == b.rgba.size(); i += 4U) {
+                difference += std::abs(static_cast<int>(a.rgba[i]) - b.rgba[i]) + std::abs(static_cast<int>(a.rgba[i + 1U]) - b.rgba[i + 1U]) +
+                              std::abs(static_cast<int>(a.rgba[i + 2U]) - b.rgba[i + 2U]);
+                lit += (a.rgba[i] > 90U || a.rgba[i + 1U] > 90U) ? 1U : 0U;
+            }
+            const auto count = std::max<std::size_t>(a.rgba.size() / 4U, 1U);
+            expect(a.rgba.size() == b.rgba.size() && !a.rgba.empty() && lit > count / 40U,
+                   "the textured model is on screen");
+            std::cout << "textured game: archive " << packed.archive << " bytes compressed, " << plain.archive
+                      << " plain; mean picture difference " << difference / static_cast<double>(count * 3U) << " of 255\n";
+            expect(difference / static_cast<double>(count * 3U) < 3.0,
+                   "compressed and plain textures draw the same picture: mean difference " +
+                       std::to_string(difference / static_cast<double>(count * 3U)));
+        }
     }
 
     fs::current_path(original);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "relay/render/blender_adapter.hpp"
+#include "relay/render/texture_compression.hpp"
 #include "relay/scene/scene.hpp"
 
 #include <array>
@@ -142,6 +143,9 @@ struct TextureAsset {
     std::uint32_t width{};
     std::uint32_t height{};
     std::vector<std::uint8_t> rgba;
+    // A cooked game's textures arrive already compressed, with their mip chain, and `rgba` is
+    // empty. The renderer uploads the blocks as they are, or decompresses them when the GPU cannot.
+    std::shared_ptr<const CompressedTexture> compressed;
     TextureColorSpace color_space{TextureColorSpace::srgb};
     TextureFilter mag_filter{TextureFilter::linear};
     TextureFilter min_filter{TextureFilter::linear};

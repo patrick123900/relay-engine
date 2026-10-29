@@ -40,8 +40,21 @@ void apply_cooked_models(const CookedModels& cooked, AssetRegistry& registry);
 // Imports the models of the project at `root` that `sources` names (project-relative model files)
 // with the importer, and writes down what it registers. Fails when a model no longer matches its
 // import record, since a game cannot rebind scenes the way the editor does.
+// What cooking the textures did.
+struct CookStats {
+    std::uint32_t textures{};
+    std::uint32_t textures_compressed{};
+    std::uint64_t texture_bytes_before{};
+    std::uint64_t texture_bytes_after{};
+};
+// With `compress_textures`, colour and data textures of the models become BC1 or BC3 with mip
+// chains (see texture_compression.hpp). Normal maps stay as they are: the shaders read all three
+// channels, which these formats keep too coarsely, and tiny textures are not worth the trouble.
 [[nodiscard]] bool cook_models(const std::filesystem::path& root, const std::set<std::string>& sources,
-                               std::string& bytes, std::string& error);
+                               std::string& bytes, std::string& error, bool compress_textures = false,
+                               CookStats* stats = nullptr);
+// Compresses the textures of one imported batch in place (what cook_models does for each).
+void compress_batch_textures(ImportBatch& batch, CookStats* stats = nullptr);
 
 // A compiled project shader, without the source text and editing data.
 [[nodiscard]] std::string serialize_cooked_shader(const CompiledShader& shader);

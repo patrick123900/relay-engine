@@ -1,3 +1,4 @@
+#include "relay/render/texture_compression.hpp"
 #include "relay/core/pak.hpp"
 #include "relay/control/control_protocol.hpp"
 #include "relay/control/template_session.hpp"
@@ -36,6 +37,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -3150,6 +3152,84 @@ int main() {
                "parented dynamic body moves downward in world space");
     }
 
+    {
+        // GPU texture compression: BC1 and BC3 blocks with a full mip chain, checked by decoding them.
+        const auto make = [](const std::uint32_t width, const std::uint32_t height, const auto& pixel) {
+            std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4U);
+            for (std::uint32_t y = 0; y < height; ++y)
+                for (std::uint32_t x = 0; x < width; ++x) {
+                    const auto value = pixel(x, y);
+                    for (int c = 0; c < 4; ++c) rgba[(static_cast<std::size_t>(y) * width + x) * 4U + static_cast<std::size_t>(c)] = value[static_cast<std::size_t>(c)];
+                }
+            return rgba;
+        };
+        const auto psnr = [](const std::vector<std::uint8_t>& a, const std::vector<std::uint8_t>& b, const int channels) {
+            double error = 0.0;
+            std::size_t count = 0;
+            for (std::size_t i = 0; i < a.size(); i += 4U)
+                for (int c = 0; c < channels; ++c) {
+                    const double d = static_cast<double>(a[i + static_cast<std::size_t>(c)]) - b[i + static_cast<std::size_t>(c)];
+                    error += d * d;
+                    ++count;
+                }
+            return error == 0.0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / (error / static_cast<double>(count)));
+        };
+        const auto gradient = make(64, 32, [](std::uint32_t x, std::uint32_t y) {
+            return std::array<std::uint8_t, 4>{static_cast<std::uint8_t>(x * 4U), static_cast<std::uint8_t>(y * 8U),
+                                               static_cast<std::uint8_t>(128U + x), 255};
+        });
+        const auto bc1 = relay::compress_texture(gradient, 64, 32, true, relay::TextureCodec::bc1);
+        expect(bc1.levels() == 7U && bc1.levels() == relay::full_mip_levels(64, 32) && bc1.data.size() == bc1.level_offsets.back(),
+               "a 64x32 texture has seven mip levels");
+        std::uint64_t expected_bytes = 0;
+        for (std::uint32_t level = 0; level < bc1.levels(); ++level)
+            expected_bytes += relay::compressed_level_bytes(relay::TextureCodec::bc1, std::max(64U >> level, 1U), std::max(32U >> level, 1U));
+        expect(expected_bytes == bc1.data.size() && bc1.level_offsets[1] == 64U * 32U / 2U,
+               "BC1 takes half a byte a pixel, mip levels laid end to end");
+        expect(psnr(gradient, relay::decompress_texture_level(bc1, 0), 3) > 35.0, "a smooth gradient compresses to BC1 with little error");
+
+        const auto rings = make(48, 48, [](std::uint32_t x, std::uint32_t y) {
+            const double d = std::hypot(static_cast<double>(x) - 24.0, static_cast<double>(y) - 24.0);
+            const bool on = static_cast<int>(d / 4.0) % 2 == 0;
+            return std::array<std::uint8_t, 4>{static_cast<std::uint8_t>(on ? 230 : 40), static_cast<std::uint8_t>(on ? 80 : 160),
+                                               static_cast<std::uint8_t>(on ? 60 : 220), 255};
+        });
+        expect(psnr(rings, relay::decompress_texture_level(relay::compress_texture(rings, 48, 48, true, relay::TextureCodec::bc1), 0), 3) > 28.0,
+               "hard coloured edges stay recognisable in BC1");
+        const auto flat = make(8, 8, [](std::uint32_t, std::uint32_t) { return std::array<std::uint8_t, 4>{200, 120, 40, 255}; });
+        const auto flat_back = relay::decompress_texture_level(relay::compress_texture(flat, 8, 8, true, relay::TextureCodec::bc1), 0);
+        expect(std::abs(static_cast<int>(flat_back[0]) - 200) <= 4 && std::abs(static_cast<int>(flat_back[1]) - 120) <= 3 &&
+                   std::abs(static_cast<int>(flat_back[2]) - 40) <= 5,
+               "a flat colour comes back within the 565 rounding");
+
+        const auto fade = make(40, 20, [](std::uint32_t x, std::uint32_t y) {
+            return std::array<std::uint8_t, 4>{static_cast<std::uint8_t>(255U - x * 4U), 90, static_cast<std::uint8_t>(y * 10U),
+                                               static_cast<std::uint8_t>(x * 6U + 10U)};
+        });
+        expect(relay::choose_texture_codec(fade) == relay::TextureCodec::bc3 && relay::choose_texture_codec(gradient) == relay::TextureCodec::bc1,
+               "pixels with alpha get BC3 and opaque ones BC1");
+        const auto bc3 = relay::compress_texture(fade, 40, 20, true, relay::TextureCodec::bc3);
+        const auto fade_back = relay::decompress_texture_level(bc3, 0);
+        int worst_alpha = 0;
+        for (std::size_t i = 3; i < fade.size(); i += 4U) worst_alpha = std::max(worst_alpha, std::abs(static_cast<int>(fade[i]) - fade_back[i]));
+        expect(worst_alpha <= 20 && bc3.level_offsets[1] == 40U / 4U * 20U / 4U * 16U && fade_back.size() == fade.size(),
+               "BC3 keeps alpha, sixteen bytes a block, sizes that are not multiples of four included");
+
+        // Mip levels average in linear light for colour: a black and white checker is mid grey.
+        const auto checker = make(8, 8, [](std::uint32_t x, std::uint32_t y) {
+            const std::uint8_t v = (x + y) % 2U == 0U ? 0 : 255;
+            return std::array<std::uint8_t, 4>{v, v, v, 255};
+        });
+        const auto checker_mips = relay::compress_texture(checker, 8, 8, true, relay::TextureCodec::bc1);
+        const auto grey = relay::decompress_texture_level(checker_mips, 1);
+        expect(grey.size() == 4U * 4U * 4U && std::abs(static_cast<int>(grey[0]) - 188) <= 8,
+               "an sRGB checker halves to the grey of equal light");
+        const auto single = relay::compress_texture(make(1, 1, [](std::uint32_t, std::uint32_t) { return std::array<std::uint8_t, 4>{10, 200, 90, 255}; }),
+                                                    1, 1, false, relay::TextureCodec::bc1);
+        expect(single.levels() == 1U && single.data.size() == 8U && relay::decompress_texture_level(single, 1).empty(),
+               "a one pixel texture is one block");
+    }
+
     relay::Engine engine({64, 48, 1.0 / 60.0});
     expect(engine.status().frame_index == 0, "engine starts at frame zero");
     engine.tick();
@@ -3161,7 +3241,7 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 58U && relay::protocol_methods().size() == 177U,
+    expect(relay::protocol_schema_version == 60U && relay::protocol_methods().size() == 181U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");
@@ -3338,7 +3418,7 @@ int main() {
                  R"({"id":120191,"method":"project.set_build_settings","active_profile":"Nowhere"})",
                  R"({"id":120192,"method":"project.set_build_profile","name":"Linux","output_directory":"a/../../b"})",
                  R"({"id":120193,"method":"project.set_build_profile","name":"Linux","output_directory":"relative/../x"})",
-                 R"({"id":120194,"method":"project.set_build_profile","name":"Linux","target_platform":"windows"})",
+                 R"({"id":120194,"method":"project.set_build_profile","name":"Linux","target_platform":"freebsd"})",
                  R"({"id":120195,"method":"project.set_build_profile","name":"Linux","configuration":"profile"})",
                  R"({"id":120196,"method":"project.set_build_profile","name":"Linux","window_mode":"maximized"})",
                  R"({"id":120197,"method":"project.set_build_profile","name":"Linux","window_width":100})",
@@ -3412,6 +3492,67 @@ int main() {
                "a profile can ship every file");
         expect(protocol.handle(R"({"id":120253,"method":"project.set_build_profile","name":"Linux","include_unused_assets":false})")
                        .find(R"("ok":true)") != std::string::npos, "unused files are left out again");
+        // What a build would leave out can be seen first, and a profile can keep folders whatever the scan finds.
+        {
+            const auto read_build_json = [&] {
+                std::ifstream stream(package_root / "builds/release/build.json");
+                return std::string{std::istreambuf_iterator<char>(stream), {}};
+            };
+            const auto preview = protocol.handle(R"({"id":120254,"method":"project.build_preview"})");
+            expect(preview.find(R"("ok":true)") != std::string::npos && preview.find("textures/pixel.png") != std::string::npos &&
+                       preview.find("textures/used.png\"") == std::string::npos && preview.find("\"left_out_count\":") != std::string::npos &&
+                       preview.find("\"everything\":false") != std::string::npos,
+                   "the preview lists the files a build leaves out: " + preview);
+            write_file(package_root / "scripts_probe.txt", "x");
+            std::filesystem::create_directories(package_root / "scripts");
+            write_file(package_root / "scripts/Probe.cpp", "const char* a = \"textures/zzz_\"; const char* b = \"textures/used.png\"; const char* c = \"not a path\";");
+            const auto warned = protocol.handle(R"({"id":120255,"method":"project.build_preview"})");
+            expect(warned.find("textures/zzz_") != std::string::npos && warned.find("not a path") == std::string::npos,
+                   "a script string that reads like a project path but matches nothing is flagged: " + warned);
+            std::filesystem::remove_all(package_root / "scripts");
+            std::filesystem::remove(package_root / "scripts_probe.txt");
+            expect(protocol.handle(R"({"id":120256,"method":"project.set_build_profile","name":"Linux","always_include":["textures"]})")
+                           .find(R"("ok":true)") != std::string::npos &&
+                       protocol.handle(R"({"id":120257,"method":"project.build_preview"})").find("textures/pixel.png") == std::string::npos &&
+                       protocol.handle(R"({"id":120258,"method":"project.build"})").find(R"("ok":true)") != std::string::npos &&
+                       pak_names(package_root / "builds/release/game.pak").contains("textures/pixel.png"),
+                   "a folder the profile always includes ships, used or not");
+            for (const char* bad : {R"({"id":120259,"method":"project.set_build_profile","name":"Linux","always_include":["../outside"]})",
+                                    R"({"id":120260,"method":"project.set_build_profile","name":"Linux","always_include":["/etc"]})",
+                                    R"({"id":120261,"method":"project.set_build_profile","name":"Linux","always_include":["a","a"]})",
+                                    R"({"id":120262,"method":"project.set_build_profile","name":"Linux","always_include":[".hidden"]})"})
+                expect(protocol.handle(bad).find(R"("ok":false)") != std::string::npos,
+                       std::string("an unsafe always_include is refused: ") + bad);
+            const auto before_floor = read_build_json();
+            const auto status = protocol.handle(R"({"id":120263,"method":"project.build_status"})");
+            expect(status.find("\"left_out\":[") != std::string::npos && status.find("\"left_out_count\":") != std::string::npos,
+                   "a finished build reports what it left out");
+            std::ifstream manifest_stream(package_root / "builds/release/build.json");
+            const std::string manifest{std::istreambuf_iterator<char>(manifest_stream), {}};
+            expect(manifest.find("\"left_out\": [") != std::string::npos && manifest.find("\"warnings\": [") != std::string::npos,
+                   "build.json lists what was left out");
+            expect(protocol.handle(R"({"id":120264,"method":"project.set_build_profile","name":"Linux","always_include":[]})")
+                       .find(R"("ok":true)") != std::string::npos, "the list is cleared again");
+            // The game's glibc requirement is measured, and a profile can set a floor it must stay under.
+            expect(manifest.find("\"requirements\": {\"glibc\": \"") != std::string::npos, "build.json records what the game asks of glibc");
+            for (const char* bad : {"2", "2.31.1", "abc", "2.", ".5"})
+                expect(protocol.handle(std::string{R"({"id":120265,"method":"project.set_build_profile","name":"Linux","minimum_glibc":")"} + bad + R"("})")
+                           .find(R"("ok":false)") != std::string::npos,
+                       std::string{"a malformed minimum glibc is refused: "} + bad);
+            expect(protocol.handle(R"({"id":120266,"method":"project.set_build_profile","name":"Linux","minimum_glibc":"1.1"})")
+                       .find(R"("ok":true)") != std::string::npos, "a minimum glibc is set");
+            const auto too_old = protocol.handle(R"({"id":120267,"method":"project.build"})");
+            expect(too_old.find(R"("ok":false)") != std::string::npos && too_old.find("needs glibc") != std::string::npos &&
+                       too_old.find("minimum 1.1") != std::string::npos,
+                   "a build needing newer glibc than the profile allows fails and says so: " + too_old);
+            expect(read_build_json() == before_floor, "and leaves the earlier build alone");
+            expect(protocol.handle(R"({"id":120268,"method":"project.set_build_profile","name":"Linux","minimum_glibc":"99.0"})")
+                           .find(R"("ok":true)") != std::string::npos &&
+                       protocol.handle(R"({"id":120269,"method":"project.build"})").find(R"("ok":true)") != std::string::npos,
+                   "a build under the floor passes");
+            expect(protocol.handle(R"({"id":120270,"method":"project.set_build_profile","name":"Linux","minimum_glibc":""})")
+                       .find(R"("ok":true)") != std::string::npos, "the floor is cleared");
+        }
         {
             std::ifstream manifest_stream(package_root / "builds/release/build.json");
             const std::string manifest{std::istreambuf_iterator<char>(manifest_stream), {}};
@@ -3464,6 +3605,133 @@ int main() {
         expect(protocol.handle(R"({"id":12034,"method":"project.remove_build_profile","name":"Elsewhere"})").find(R"("ok":true)") != std::string::npos &&
                    engine.build_settings().find_profile("Elsewhere") == nullptr,
                "a profile is removed");
+        // The build runs on its own thread: it reports its stages, can be told to stop, and a stopped
+        // build leaves the earlier one alone.
+        {
+            const auto read_build_json = [&] {
+                std::ifstream stream(package_root / "builds/release/build.json");
+                return std::string{std::istreambuf_iterator<char>(stream), {}};
+            };
+            const auto wait_for_state = [&](const char* wanted) {
+                std::string status;
+                for (int i = 0; i < 2000; ++i) {
+                    status = protocol.handle(R"({"id":12040,"method":"project.build_status"})");
+                    if (status.find(std::string{"\"state\":\""} + wanted + "\"") != std::string::npos) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return status;
+            };
+            expect(protocol.handle(R"({"id":12041,"method":"project.build_status"})").find("\"state\":") != std::string::npos,
+                   "the build status can always be read");
+            const auto before = read_build_json();
+            std::vector<double> fractions;
+            std::vector<std::string> stages;
+            engine.builds().set_observer([&](const relay::BuildStatus& status) {
+                fractions.push_back(status.fraction);
+                if (stages.empty() || stages.back() != status.stage) stages.push_back(status.stage);
+            });
+            expect(protocol.handle(R"({"id":12042,"method":"project.build_start","profile":"Linux"})").find(R"("ok":true)") != std::string::npos,
+                   "a build starts without waiting");
+            const auto finished = wait_for_state("succeeded");
+            expect(finished.find("\"state\":\"succeeded\"") != std::string::npos && finished.find("\"fraction\":1.0") != std::string::npos &&
+                       finished.find("\"directory\":") != std::string::npos,
+                   "polling sees it finish: " + finished);
+            expect(std::is_sorted(fractions.begin(), fractions.end()) && stages.size() >= 4U &&
+                       stages.front() == "Checking the project" && std::find(stages.begin(), stages.end(), "Writing the game's files") != stages.end(),
+                   "progress only moves forward through the stages");
+            engine.builds().set_observer({});
+
+            // Hold a build at its first report: only one build runs at a time, and it can be cancelled.
+            std::promise<void> reached, release;
+            auto released = release.get_future();
+            bool first = true;
+            engine.builds().set_observer([&](const relay::BuildStatus&) {
+                if (!std::exchange(first, false)) return;
+                reached.set_value();
+                released.wait();
+            });
+            expect(protocol.handle(R"({"id":12043,"method":"project.build_start"})").find(R"("ok":true)") != std::string::npos,
+                   "another build starts");
+            reached.get_future().wait();
+            expect(protocol.handle(R"({"id":12044,"method":"project.build_start"})").find("already running") != std::string::npos &&
+                       protocol.handle(R"({"id":12045,"method":"project.build"})").find("already running") != std::string::npos,
+                   "a second build is refused while one runs");
+            expect(protocol.handle(R"({"id":12046,"method":"project.build_cancel"})").find("\"cancelling\":true") != std::string::npos,
+                   "cancel is accepted");
+            release.set_value();
+            const auto cancelled = wait_for_state("cancelled");
+            expect(cancelled.find("\"state\":\"cancelled\"") != std::string::npos && read_build_json() == before,
+                   "a cancelled build leaves the earlier one as it was: " + cancelled);
+            engine.builds().set_observer({});
+
+            // Cancelling late, while the archive is written, removes what was half made.
+            engine.builds().set_observer([&](const relay::BuildStatus& status) {
+                if (status.stage == "Writing the game's files") engine.builds().cancel();
+            });
+            expect(protocol.handle(R"({"id":12047,"method":"project.build_start"})").find(R"("ok":true)") != std::string::npos, "build again");
+            expect(wait_for_state("cancelled").find("\"state\":\"cancelled\"") != std::string::npos, "cancelled mid-build");
+            engine.builds().set_observer({});
+            bool leftovers = false;
+            for (const auto& entry : std::filesystem::directory_iterator(package_root / "builds"))
+                leftovers = leftovers || entry.path().filename().string().starts_with(".staging");
+            expect(!leftovers && read_build_json() == before, "no half-made folder is left and the earlier build is intact");
+            expect(protocol.handle(R"({"id":12048,"method":"project.build_cancel"})").find("\"cancelling\":false") != std::string::npos,
+                   "cancelling with no build running is harmless");
+
+            // A failure is reported, not thrown away.
+            setenv("RELAY_PLAYER_BINARY", (fake_player / "missing").c_str(), 1);
+            expect(protocol.handle(R"({"id":12049,"method":"project.build_start"})").find(R"("ok":true)") != std::string::npos, "a doomed build starts");
+            const auto failed = wait_for_state("failed");
+            expect(failed.find("\"state\":\"failed\"") != std::string::npos && failed.find("player was not found") != std::string::npos,
+                   "a failed build says why: " + failed);
+            setenv("RELAY_PLAYER_BINARY", (fake_player / "relay_player").c_str(), 1);
+        }
+        // Other targets: a player built elsewhere and installed in a folder per target.
+        {
+            const auto targets = protocol.handle(R"({"id":120380,"method":"project.build_settings"})");
+            expect(targets.find("\"targets\":[") != std::string::npos &&
+                       targets.find("{\"platform\":\"linux\",\"architecture\":\"x86_64\",\"available\":true,\"native\":true}") != std::string::npos &&
+                       targets.find("{\"platform\":\"windows\",\"architecture\":\"x86_64\",\"available\":false,\"native\":false}") != std::string::npos,
+                   "the settings list which targets have a player: " + targets);
+            const auto players = std::filesystem::temp_directory_path() /
+                ("relay-players-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            setenv("RELAY_PLAYERS_DIR", players.c_str(), 1);
+            expect(protocol.handle(R"({"id":120381,"method":"project.set_build_profile","name":"Windows","copy_from":"Linux","target_platform":"windows","configuration":"release"})")
+                       .find(R"("ok":true)") != std::string::npos, "a Windows profile is added");
+            const auto missing = protocol.handle(R"({"id":120382,"method":"project.build","profile":"Windows"})");
+            expect(missing.find(R"("ok":false)") != std::string::npos && missing.find("no windows x86_64 player installed") != std::string::npos &&
+                       missing.find("players") != std::string::npos,
+                   "a target without an installed player says what to install: " + missing);
+            std::filesystem::create_directories(players / "windows-x86_64" / "shaders");
+            std::filesystem::copy_file("/bin/true", players / "windows-x86_64" / "relay_player.exe");
+            write_file(players / "windows-x86_64" / "shaders" / "scene.spv", "spirv");
+            write_file(players / "windows-x86_64" / "SDL3.dll", "dll-bytes");
+            const auto windows_built = protocol.handle(R"({"id":120383,"method":"project.build","profile":"Windows"})");
+            expect(windows_built.find(R"("ok":true)") != std::string::npos &&
+                       std::filesystem::is_regular_file(package_root / "builds/release/Portable_Game.exe") &&
+                       std::filesystem::is_regular_file(package_root / "builds/release/SDL3.dll") &&
+                       std::filesystem::is_regular_file(package_root / "builds/release/shaders/scene.spv") &&
+                       !std::filesystem::exists(package_root / "builds/release/lib"),
+                   "an installed player is copied with its files, named for the game with its extension: " + windows_built);
+            std::ifstream windows_manifest(package_root / "builds/release/build.json");
+            const std::string windows_json{std::istreambuf_iterator<char>(windows_manifest), {}};
+            expect(windows_json.find("\"platform\": \"windows\"") != std::string::npos &&
+                       windows_json.find("\"executable\": \"Portable_Game.exe\"") != std::string::npos,
+                   "build.json names the target and the program");
+            std::filesystem::create_directories(package_root / "scripts");
+            write_file(package_root / "scripts/Probe.cpp", "int main() { return 0; }");
+            const auto with_scripts = protocol.handle(R"({"id":120384,"method":"project.build","profile":"Windows"})");
+            expect(with_scripts.find(R"("ok":false)") != std::string::npos && with_scripts.find("scripts") != std::string::npos,
+                   "scripts block a build for another platform, which cannot compile them: " + with_scripts);
+            std::filesystem::remove_all(package_root / "scripts");
+            expect(protocol.handle(R"({"id":120385,"method":"project.remove_build_profile","name":"Windows"})").find(R"("ok":true)") != std::string::npos,
+                   "the Windows profile is removed");
+            unsetenv("RELAY_PLAYERS_DIR");
+            std::filesystem::remove_all(players);
+            // The Linux build in the same folder was replaced by the Windows one; make it again.
+            expect(protocol.handle(R"({"id":120386,"method":"project.build","profile":"Linux"})").find(R"("ok":true)") != std::string::npos,
+                   "the native build still works");
+        }
         setenv("RELAY_PLAYER_BINARY", (fake_player / "missing").c_str(), 1);
         expect(protocol.handle(R"({"id":12036,"method":"project.build","profile":"Linux"})").find("player was not found") != std::string::npos,
                "a build without the player program says so");

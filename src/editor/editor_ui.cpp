@@ -793,6 +793,15 @@ struct EditorUi::Impl {
     int build_width{1280}, build_height{720};
     std::string build_result;
     bool build_failed{};
+    // What the profile would leave out, from project.build_preview; refreshed on request.
+    JsonValue build_preview;
+    std::string build_preview_profile;
+    std::array<char, 129> build_always_text{};
+    std::array<char, 9> build_minimum_glibc{};
+    // The build in progress, from project.build_status, polled every frame the window is drawn.
+    bool build_running{};
+    std::string build_stage, build_detail, build_error;
+    double build_fraction{}, build_seconds{};
     // Saving reloads build_status, which the window is reading through pointers while it draws, so
     // edits wait here until the frame's widgets are done.
     std::vector<std::function<void()>> build_deferred;
@@ -10843,6 +10852,7 @@ struct EditorUi::Impl {
         if (const auto* profile = build_profile_object(active)) {
             fill_buffer(build_profile_name, active);
             fill_buffer(build_output, string_or(*profile, "output_directory", "builds"));
+            fill_buffer(build_minimum_glibc, string_or(*profile, "minimum_glibc"));
             build_width = static_cast<int>(number_or(*profile, "window_width", 1280.0));
             build_height = static_cast<int>(number_or(*profile, "window_height", 720.0));
         }
@@ -10853,8 +10863,10 @@ struct EditorUi::Impl {
     void open_build_window() {
         build_open = true;
         build_result.clear();
+        build_error.clear();
         build_deferred.clear();
         load_build_edit();
+        poll_build();
         ImGui::SetWindowFocus("Build Project");
     }
 
@@ -11050,6 +11062,124 @@ struct EditorUi::Impl {
                            "A build ships only the files the game refers to. Turn this on if its code loads "
                            "files by names it builds up.");
 
+        if (string_or(*profile, "target_platform") == "linux") {
+            text_row("Minimum glibc", build_minimum_glibc.data(), build_minimum_glibc.size(), "not checked", "build:minimum_glibc",
+                     [&] { save_build_profile_text("minimum_glibc", build_minimum_glibc.data()); });
+            ImGui::TextColored(editor_color(palette.text_faint), "%s",
+                               "Fail the build if the game needs a newer glibc than this (such as 2.31), so it is not "
+                               "shipped to machines that cannot start it.");
+        }
+        bool compress_textures = boolean_or(*profile, "compress_textures", true);
+        if (inspector_checkbox("Compress textures", &compress_textures))
+            save_build_profile("compress_textures", compress_textures ? "true" : "false");
+        note_item("build:compress_textures");
+        ImGui::TextColored(editor_color(palette.text_faint), "%s",
+                           "Models' textures ship as GPU-compressed BC1/BC3 with mip levels: a fourth to an eighth of "
+                           "the memory. Normal maps keep full quality.");
+        bool compress_audio = boolean_or(*profile, "compress_audio", true);
+        if (inspector_checkbox("Compress sounds", &compress_audio))
+            save_build_profile("compress_audio", compress_audio ? "true" : "false");
+        note_item("build:compress_audio");
+        ImGui::TextColored(editor_color(palette.text_faint), "%s",
+                           "wav sounds ship as lossless FLAC, about half the size and exactly the same samples.");
+
+        // What the build would leave out, and folders that always go in.
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Files in the build");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Check what is left out")) {
+            defer_build([this, active] {
+                if (auto preview = call("project.build_preview", "\"profile\":\"" + json_escape(active) + "\""))
+                    build_preview = std::move(*preview);
+                build_preview_profile = active;
+            });
+        }
+        note_item("build:preview:refresh");
+        if (const auto* preview = build_preview_profile == active ? build_preview.object() : nullptr) {
+            const auto left = static_cast<std::size_t>(number_or(*preview, "left_out_count", 0.0));
+            ImGui::TextColored(editor_color(palette.text_dim), "%d files are packed; %d are left out because nothing the game uses refers to them.",
+                               static_cast<int>(number_or(*preview, "packed", 0.0)), static_cast<int>(left));
+            if (const auto* warnings_value = field(*preview, "warnings"); warnings_value && warnings_value->array())
+                for (const auto& warning : *warnings_value->array())
+                    if (const auto* text = warning.string())
+                        ImGui::TextColored(editor_color(palette.warning), "%s", text->c_str());
+            if (left != 0U && ImGui::TreeNodeEx("Left out", ImGuiTreeNodeFlags_DefaultOpen, "Left out (%d)", static_cast<int>(left))) {
+                if (const auto* names_value = field(*preview, "left_out"); names_value && names_value->array()) {
+                    ImGui::BeginChild("##left_out", ImVec2(0.0F, std::min(180.0F * ui_scale, ImGui::GetTextLineHeightWithSpacing() * 8.0F)),
+                                      ImGuiChildFlags_Borders);
+                    for (const auto& entry : *names_value->array())
+                        if (const auto* name = entry.string()) {
+                            ImGui::PushID(name->c_str());
+                            ImGui::TextUnformatted(name->c_str());
+                            ImGui::SameLine();
+                            if (ImGui::SmallButton("Keep")) {
+                                std::vector<std::string> kept_names;
+                                if (const auto* always = field(*profile, "always_include"); always && always->array())
+                                    for (const auto& item : *always->array())
+                                        if (item.string()) kept_names.push_back(*item.string());
+                                kept_names.push_back(*name);
+                                std::string array = "[";
+                                for (const auto& kept_name : kept_names) array += (array.size() > 1 ? "," : "") + std::string{"\""} + json_escape(kept_name) + '"';
+                                save_build_profile("always_include", array + "]");
+                                defer_build([this, active] {
+                                    if (auto refreshed = call("project.build_preview", "\"profile\":\"" + json_escape(active) + "\""))
+                                        build_preview = std::move(*refreshed);
+                                });
+                            }
+                            note_item("build:preview:keep:" + *name);
+                            ImGui::PopID();
+                        }
+                    ImGui::EndChild();
+                    if (left > 500U) ImGui::TextColored(editor_color(palette.text_faint), "Showing the first 500.");
+                }
+                ImGui::TreePop();
+            }
+        }
+        {
+            ImGui::TextUnformatted("Always include");
+            const auto* always_value = field(*profile, "always_include");
+            const auto* always = always_value ? always_value->array() : nullptr;
+            const auto save_always = [this](std::vector<std::string> names) {
+                std::string array = "[";
+                for (const auto& name : names) array += (array.size() > 1 ? "," : "") + std::string{"\""} + json_escape(name) + '"';
+                save_build_profile("always_include", array + "]");
+            };
+            if (always)
+                for (const auto& entry : *always)
+                    if (const auto* name = entry.string()) {
+                        ImGui::PushID(name->c_str());
+                        ImGui::BulletText("%s", name->c_str());
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Remove")) {
+                            std::vector<std::string> remaining;
+                            for (const auto& other : *always)
+                                if (other.string() && *other.string() != *name) remaining.push_back(*other.string());
+                            save_always(std::move(remaining));
+                        }
+                        note_item("build:always:remove:" + *name);
+                        ImGui::PopID();
+                    }
+            ImGui::SetNextItemWidth(-90.0F * ui_scale);
+            ImGui::InputTextWithHint("##build_always", "A file or folder in the project, such as sounds/voices", build_always_text.data(),
+                                     build_always_text.size());
+            note_item("build:always:text");
+            ImGui::SameLine();
+            if (ImGui::Button("Add", ImVec2(-FLT_MIN, 0.0F)) && build_always_text[0] != '\0') {
+                std::vector<std::string> names;
+                if (always)
+                    for (const auto& item : *always)
+                        if (item.string()) names.push_back(*item.string());
+                std::string added = build_always_text.data();
+                while (!added.empty() && added.back() == '/') added.pop_back();
+                names.push_back(std::move(added));
+                save_always(std::move(names));
+                build_always_text.fill('\0');
+            }
+            note_item("build:always:add");
+            ImGui::TextColored(editor_color(palette.text_faint), "%s",
+                               "These ship whatever the scan finds, with everything they refer to.");
+        }
+
         ImGui::SeparatorText("Window");
         choice_row("Window mode", "window_mode", "window_modes", "build:window_mode");
         const bool windowed = string_or(*profile, "window_mode", "windowed") == "windowed";
@@ -11109,12 +11239,42 @@ struct EditorUi::Impl {
                     "Default: the Relay icon", AssetIcon::image);
     }
 
+    // Reads the build's progress, and notices when it ends.
+    void poll_build() {
+        const auto status = call("project.build_status", {}, false);
+        const auto* object = status ? status->object() : nullptr;
+        if (!object) return;
+        const auto state = string_or(*object, "state");
+        if (state == "running") {
+            build_running = true;
+            build_stage = string_or(*object, "stage");
+            build_detail = string_or(*object, "detail");
+            build_fraction = number_or(*object, "fraction", 0.0);
+            build_seconds = number_or(*object, "seconds", 0.0);
+            return;
+        }
+        if (!build_running) return;
+        build_running = false;
+        build_failed = state != "succeeded";
+        build_error = state == "succeeded" ? std::string{} : string_or(*object, "error", "the build failed");
+        if (state == "succeeded") {
+            build_result = "Built " + std::to_string(static_cast<std::uint64_t>(number_or(*object, "files", 0.0))) +
+                           " files into " + string_or(*object, "directory");
+            if (const auto glibc = string_or(*object, "glibc"); !glibc.empty())
+                build_result += ". Runs on glibc " + glibc + " or newer.";
+        } else {
+            build_result.clear();
+        }
+        set_status(state == "succeeded" ? build_result : build_error, state == "failed");
+        refresh_build_status();
+    }
+
     // Run > Build Project: profiles on the left, the selected profile's fields on the right, and a
     // Build button below. Every change is saved at once, like the Game Configuration pages.
     void draw_build_window() {
         if (!build_open) return;
         const auto& palette = editor_palette();
-        const bool visible = begin_tool_window("Build Project", &build_open, ImVec2(980.0F, 680.0F));
+        const bool visible = begin_tool_window("Build Project", &build_open, ImVec2(980.0F, 990.0F));
         note_item("build:window");
         if (!visible) {
             ImGui::End();
@@ -11148,7 +11308,14 @@ struct EditorUi::Impl {
             for (auto& edit : work) edit();
         }
 
-        if (scene_modified())
+        if (build_running) poll_build();
+        if (build_running)
+            ImGui::TextColored(editor_color(palette.text_dim), "%s%s%s", build_stage.c_str(),
+                               build_detail.empty() ? "" : "  \u00B7  ", build_detail.c_str());
+        else if (!build_error.empty())
+            ImGui::TextColored(editor_color(build_failed && build_result.empty() && status_is_error ? palette.warning : palette.text_dim),
+                               "%s", build_error.c_str());
+        else if (scene_modified())
             ImGui::TextColored(editor_color(palette.warning), "This scene has unsaved changes, which the build will not include.");
         else if (game)
             ImGui::TextColored(editor_color(palette.warning), "Stop the game before building.");
@@ -11158,27 +11325,46 @@ struct EditorUi::Impl {
             ImGui::TextColored(editor_color(palette.text_faint),
                                "Builds the game: its program, content, compiled scripts and shaders, in the build folder.");
         const auto active = active_build_profile();
-        const std::string label = "Build " + active;
+        const std::string label = build_running ? std::string{"Cancel build"} : "Build " + active;
         const float button = std::max(180.0F * ui_scale, ImGui::CalcTextSize(label.c_str()).x + 40.0F * ui_scale);
-        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - button - ImGui::GetStyle().WindowPadding.x);
-        ImGui::BeginDisabled(game || project == nullptr);
-        ImGui::PushStyleColor(ImGuiCol_Button, palette.accent);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, palette.accent_hovered);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, palette.accent_active);
+        if (build_running) {
+            // Where the build is, to the second, with the stop button on the same line.
+            char overlay[64];
+            std::snprintf(overlay, sizeof overlay, "%d%%  %.0f s", static_cast<int>(build_fraction * 100.0), build_seconds);
+            ImGui::ProgressBar(static_cast<float>(build_fraction),
+                               ImVec2(ImGui::GetContentRegionAvail().x - button - ImGui::GetStyle().ItemSpacing.x, 0.0F), overlay);
+            note_item("build:progress");
+            ImGui::SameLine();
+        } else {
+            ImGui::SetCursorPosX(ImGui::GetWindowWidth() - button - ImGui::GetStyle().WindowPadding.x);
+        }
+        const bool accent_button = !build_running;
+        ImGui::BeginDisabled(!build_running && (game || project == nullptr));
+        if (accent_button) {
+            ImGui::PushStyleColor(ImGuiCol_Button, palette.accent);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, palette.accent_hovered);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, palette.accent_active);
+        }
         if (ImGui::Button((label + "##build").c_str(), ImVec2(button, 0.0F))) {
-            build_failed = true;
-            build_result.clear();
-            if (const auto result = call("project.build", "\"profile\":\"" + json_escape(active) + "\"")) {
-                const auto* object = result->object();
+            if (build_running) {
+                (void)call("project.build_cancel");
+            } else {
                 build_failed = false;
-                if (object)
-                    build_result = "Built " + std::to_string(static_cast<std::uint64_t>(number_or(*object, "files", 0.0))) +
-                                   " project files into " + string_or(*object, "directory");
-                set_status(build_result, false);
-                refresh_build_status();
+                build_result.clear();
+                build_error.clear();
+                if (call("project.build_start", "\"profile\":\"" + json_escape(active) + "\"")) {
+                    build_running = true;
+                    build_stage = "Starting";
+                    build_detail.clear();
+                    build_fraction = 0.0;
+                    build_seconds = 0.0;
+                } else {
+                    build_failed = true;
+                    build_error = status_message;
+                }
             }
         }
-        ImGui::PopStyleColor(3);
+        if (accent_button) ImGui::PopStyleColor(3);
         note_item("build:build");
         ImGui::EndDisabled();
         ImGui::End();

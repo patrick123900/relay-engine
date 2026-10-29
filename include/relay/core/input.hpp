@@ -26,11 +26,12 @@ struct InputAxisBinding {
     std::string negative, positive; // Button pair; both empty for analog.
     std::string analog;             // Gamepad axis; empty for a button pair.
     double scale{1.0};              // Analog only; -1 inverts.
+    double deadzone{0.2};           // Analog only; magnitudes below it read as zero, the rest is rescaled.
 };
 
 struct InputAxis {
     std::string name;
-    double deadzone{0.2}; // Analog magnitudes below it read as zero.
+    double deadzone{0.2}; // The deadzone given to a stick or trigger bound without its own.
     std::vector<InputAxisBinding> bindings; // The strongest binding wins, clamped to [-1, 1].
 };
 

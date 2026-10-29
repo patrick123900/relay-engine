@@ -127,7 +127,7 @@ int main() {
         expect(relay::set_project_scripts_trusted(project_folder, true, error), "the project can be trusted: " + error);
         expect(protocol.handle(R"({"id":2,"method":"project.set_build_settings","game_name":"Showcase Game","version":"3.2.1","author":"Tester"})").find(R"("ok":true)") != std::string::npos,
                "the game's details are set");
-        expect(protocol.handle(R"({"id":3,"method":"project.set_build_profile","name":"Linux","configuration":"release","output_directory":"builds","window_mode":"windowed","window_width":960,"window_height":540})").find(R"("ok":true)") != std::string::npos,
+        expect(protocol.handle(R"({"id":3,"method":"project.set_build_profile","name":"Linux","configuration":"release","output_directory":"builds","minimum_glibc":"","window_mode":"windowed","window_width":960,"window_height":540})").find(R"("ok":true)") != std::string::npos,
                "the window size is set");
         const auto built = protocol.handle(R"({"id":4,"method":"project.build"})");
         expect(built.find(R"("ok":true)") != std::string::npos && built.find(R"("executable":true)") != std::string::npos,
@@ -269,7 +269,7 @@ int main() {
         expect(ok(protocol.handle(R"({"id":5,"method":"scene.save","filename":"main.relay.json"})")) &&
                    ok(protocol.handle(R"({"id":6,"method":"project.add_scene","scene_file":"main.relay.json"})")) &&
                    ok(protocol.handle(R"({"id":7,"method":"project.set_startup","scene_file":"main.relay.json"})")) &&
-                   ok(protocol.handle(R"({"id":8,"method":"project.set_build_profile","name":"Linux","configuration":"release","output_directory":"builds","window_width":640,"window_height":360})")),
+                   ok(protocol.handle(R"({"id":8,"method":"project.set_build_profile","name":"Linux","configuration":"release","output_directory":"builds","minimum_glibc":"","window_width":640,"window_height":360})")),
                "the scene is saved and made the startup scene");
 
         const auto build = [&](const bool compressed, const fs::path& capture) {

@@ -133,7 +133,7 @@ void on_update(double dt) override {
 
 - `pressed`, `held` and `released` take an action name. Input is latched once per game step, so
   `pressed` is true in exactly one `on_update` per press, even for a tap shorter than a step.
-- `axis` returns a value from -1 to 1 after the axis deadzone; `vector` combines two axes and
+- `axis` returns a value from -1 to 1 after the deadzone of the stick or trigger bound to it; `vector` combines two axes and
   scales diagonals down to length 1.
 - `key_held`/`key_pressed` read raw keys by physical position ("w", "space", "left_shift"),
   `mouse_held`/`mouse_pressed` read "left", "middle" and "right", and `mouse_position`,

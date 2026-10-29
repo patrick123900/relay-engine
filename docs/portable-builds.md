@@ -8,7 +8,7 @@ machine's.**
 
 ## Measuring the floor
 
-Every build records what the player and the libraries it ships ask of the system, in `build.json`
+Every build records what the player, the libraries it ships and the compiled scripts (`scripts/relay-scripts.so`, built on the editor's machine) ask of the system, in `build.json`
 under `requirements` (glibc, the library that set it, libstdc++ and libgcc versions), and the Build
 window and `project.build` report the same. You can check any file yourself:
 
@@ -21,7 +21,7 @@ The second form exits 1 if a file needs a newer glibc than the ceiling, which su
 
 ## Insisting on a minimum
 
-A profile's **Minimum glibc** (`minimum_glibc`, such as `2.31`; empty means no check) makes the build
+A profile's **Minimum glibc** (`minimum_glibc`; empty, the default, means no check; `2.31` is a good value once you have an old-glibc player) makes the build
 fail, after measuring, when the player or a shipped library needs more. The failed build leaves the
 previous one in place. The setting does not make the player older; it only stops a build that would not
 run where you intend to ship it.

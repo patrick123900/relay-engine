@@ -1027,6 +1027,28 @@ void input_mapping() {
     input.apply("gamepad_axis:0:lefty:-32767");
     input.begin_step();
     check(input.axis("move_y") == 1.0, "pushing the stick forward is +1: stick Y is inverted");
+    {
+        // Each bound stick has its own deadzone; a binding without one takes the axis's.
+        std::string map_error;
+        const auto custom = relay::parse_input_map(
+            R"({"format":"relay.input","version":1,"actions":[],"axes":[{"name":"a","deadzone":0.1,"bindings":[{"analog":"gamepad:leftx","deadzone":0.5},{"analog":"gamepad:rightx"}]}]})",
+            map_error);
+        check(custom && custom->axes.front().bindings[0].deadzone == 0.5 && custom->axes.front().bindings[1].deadzone == 0.1,
+              "a binding's deadzone is read, and defaults to its axis's");
+        check(!relay::parse_input_map(
+                  R"({"format":"relay.input","version":1,"actions":[],"axes":[{"name":"a","bindings":[{"analog":"gamepad:leftx","deadzone":0.99}]}]})",
+                  map_error),
+              "a binding deadzone above 0.95 is refused");
+        relay::InputState sticks;
+        sticks.set_map(*custom);
+        sticks.apply("gamepad_axis:0:leftx:9830");  // 0.3 of travel: inside 0.5, outside 0.1
+        sticks.apply("gamepad_axis:0:rightx:9830");
+        sticks.begin_step();
+        check(std::abs(sticks.axis("a") - (0.3 - 0.1) / 0.9) < 1e-3, "the narrower deadzone passes travel the wider one blocks");
+        const auto json = relay::input_map_json(*custom);
+        const auto round_trip = relay::parse_input_map(json, map_error);
+        check(round_trip && round_trip->axes.front().bindings[0].deadzone == 0.5, "binding deadzones survive saving");
+    }
     input.apply("key:down:d");
     input.begin_step();
     check(input.axis("move_x") == 1.0, "the strongest binding wins over a half-pushed stick");

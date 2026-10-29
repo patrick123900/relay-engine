@@ -80,8 +80,8 @@ InputMap default_input_map() {
         // SDL reports stick Y growing downwards; forward is positive here.
         {"move_y", 0.2, {{"key:s", "key:w", "", 1.0}, {"key:down", "key:up", "", 1.0},
                          {"", "", "gamepad:lefty", -1.0}}},
-        {"look_x", 0.15, {{"", "", "gamepad:rightx", 1.0}}},
-        {"look_y", 0.15, {{"", "", "gamepad:righty", -1.0}}},
+        {"look_x", 0.15, {{"", "", "gamepad:rightx", 1.0, 0.15}}},
+        {"look_y", 0.15, {{"", "", "gamepad:righty", -1.0, 0.15}}},
     };
     return map;
 }
@@ -181,6 +181,14 @@ std::optional<InputMap> parse_input_map(const std::string_view json, std::string
                     error = parsed_binding.analog + " is not an analog control";
                     return std::nullopt;
                 }
+                parsed_binding.deadzone = axis.deadzone;
+                if (const auto* own = field(*binding, "deadzone")) {
+                    if (!own->number() || *own->number() < 0.0 || *own->number() > 0.95) {
+                        error = "axis " + axis.name + " binding deadzone must be between 0 and 0.95";
+                        return std::nullopt;
+                    }
+                    parsed_binding.deadzone = *own->number();
+                }
                 if (scale) {
                     if (!scale->number() || std::abs(*scale->number()) > 100.0) {
                         error = "analog scale must be a number between -100 and 100";
@@ -223,7 +231,7 @@ std::string input_map_json(const InputMap& map) {
             output << (item ? ", " : "");
             if (!binding.analog.empty())
                 output << "{\"analog\": \"" << json_escape(binding.analog)
-                       << "\", \"scale\": " << binding.scale << '}';
+                       << "\", \"scale\": " << binding.scale << ", \"deadzone\": " << binding.deadzone << '}';
             else
                 output << "{\"negative\": \"" << json_escape(binding.negative)
                        << "\", \"positive\": \"" << json_escape(binding.positive) << "\"}";
@@ -415,9 +423,9 @@ double InputState::axis(const std::string_view name) const {
         if (!binding.analog.empty()) {
             const auto raw = control_value(binding.analog) * binding.scale;
             const auto magnitude = std::abs(raw);
-            value = magnitude <= axis->deadzone
+            value = magnitude <= binding.deadzone
                         ? 0.0
-                        : std::copysign((magnitude - axis->deadzone) / (1.0 - axis->deadzone), raw);
+                        : std::copysign((magnitude - binding.deadzone) / (1.0 - binding.deadzone), raw);
         } else {
             value = (control(binding.positive, Query::held) ? 1.0 : 0.0) -
                     (control(binding.negative, Query::held) ? 1.0 : 0.0);

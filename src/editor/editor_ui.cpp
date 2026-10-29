@@ -324,7 +324,7 @@ struct EditorUi::Impl {
     void inspector_field_label(const char* raw_label) const {
         const auto shown = field_display_name(raw_label);
         const char* label = shown.c_str();
-        const float label_width = 108.0F * ui_scale;
+        const float label_width = (inspector_label_width > 0.0F ? inspector_label_width : 108.0F) * ui_scale;
         if (ImGui::CalcTextSize(label).x > label_width - 12.0F * ui_scale ||
             ImGui::GetContentRegionAvail().x < 230.0F * ui_scale) {
             ImGui::TextColored(editor_color(editor_palette().text_dim), "%s", label);
@@ -341,6 +341,29 @@ struct EditorUi::Impl {
         const bool changed = editor_checkbox("##value", value);
         ImGui::PopID();
         return changed;
+    }
+
+    // A tooltip for a settings row: shown over anything from where the row started to its last control.
+    void row_hint(const ImVec2 start, const char* text) const {
+        const ImVec2 end = ImGui::GetItemRectMax();
+        if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(start, ImVec2(std::max(end.x, start.x + 1.0F), end.y)))
+            ImGui::SetTooltip("%s", text);
+    }
+
+    // The Inspector's padding, spacing and field fills, for settings windows. Pop with pop_settings_style.
+    void push_settings_style() {
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0F * ui_scale, 6.0F * ui_scale));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(9.0F * ui_scale, 5.0F * ui_scale));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(12, 12, 12, 255));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(16, 16, 16, 255));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(20, 20, 20, 255));
+        ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(8, 8, 8, 255));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(11, 11, 11, 255));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(14, 14, 14, 255));
+    }
+    static void pop_settings_style() {
+        ImGui::PopStyleColor(6);
+        ImGui::PopStyleVar(2);
     }
 
     bool inspector_begin_combo(const char* label, const char* preview) const {
@@ -504,6 +527,11 @@ struct EditorUi::Impl {
     std::function<void()> embedded_save;
     // Width Inspector fields leave free on their right, for a button after them.
     float inspector_field_reserve{0.0F};
+    // Where the Input page's foldable headers lie on screen, so what is inside and below lines up with them.
+    float entry_left{0.0F}, entry_right{0.0F}, entry_column{0.0F};
+    std::string input_open_entry; // An action or axis whose fold opens on the next frame, such as a new one.
+    bool build_window_grown{false}; // The Build window is taller by the progress bar while a build runs.
+    float inspector_label_width{0.0F}; // Wider label column for windows with long labels, in unscaled pixels.
     // The Inspector's material preview: the surface material shown this frame and last frame
     // (what the renderer is asked for), and the last sphere rendered, as one reused texture.
     std::string preview_wanted, preview_request;
@@ -896,8 +924,10 @@ struct EditorUi::Impl {
         bool active{};
         Target target{Target::action};
         std::size_t index{};
+        std::size_t replace{static_cast<std::size_t>(-1)}; // The binding being rebound, or none when adding.
         std::string negative;
         std::array<float, 4> zone{};
+        bool rebinding() const { return replace != static_cast<std::size_t>(-1); }
     } binding_capture;
     // During Run Game the viewport owns keyboard and mouse only after a click; Escape returns them.
     bool game_input_focus{}, game_lock_mouse{}, capture_requested{};
@@ -9839,11 +9869,13 @@ struct EditorUi::Impl {
         return words;
     }
 
-    void begin_binding_capture(const BindingCapture::Target target, const std::size_t index) {
+    void begin_binding_capture(const BindingCapture::Target target, const std::size_t index,
+                               const std::size_t replace = static_cast<std::size_t>(-1)) {
         binding_capture = {};
         binding_capture.active = true;
         binding_capture.target = target;
         binding_capture.index = index;
+        binding_capture.replace = replace;
     }
 
     void cancel_binding_capture() { binding_capture = {}; }
@@ -9862,15 +9894,27 @@ struct EditorUi::Impl {
         if (capture.target == Target::action) {
             if (capture.index < input_edit.actions.size()) {
                 auto& bindings = input_edit.actions[capture.index].bindings;
-                if (std::find(bindings.begin(), bindings.end(), control) == bindings.end() &&
-                    bindings.size() < maximum_input_bindings)
+                if (capture.rebinding()) {
+                    if (capture.replace < bindings.size() &&
+                        std::find(bindings.begin(), bindings.end(), control) == bindings.end())
+                        bindings[capture.replace] = control;
+                } else if (std::find(bindings.begin(), bindings.end(), control) == bindings.end() &&
+                           bindings.size() < maximum_input_bindings) {
                     bindings.push_back(control);
+                }
             }
-        } else if (capture.index < input_edit.axes.size() &&
-                   input_edit.axes[capture.index].bindings.size() < maximum_input_bindings) {
+        } else if (capture.index < input_edit.axes.size()) {
             auto& bindings = input_edit.axes[capture.index].bindings;
-            if (capture.target == Target::analog) bindings.push_back({"", "", control, 1.0});
-            else bindings.push_back({capture.negative, control, "", 1.0});
+            if (capture.rebinding()) {
+                if (capture.replace < bindings.size()) {
+                    auto& binding = bindings[capture.replace];
+                    if (capture.target == Target::analog) binding.analog = control;
+                    else { binding.negative = capture.negative; binding.positive = control; }
+                }
+            } else if (bindings.size() < maximum_input_bindings) {
+                if (capture.target == Target::analog) bindings.push_back({"", "", control, 1.0});
+                else bindings.push_back({capture.negative, control, "", 1.0});
+            }
         }
         binding_capture = {};
         save_input_edit();
@@ -9896,14 +9940,14 @@ struct EditorUi::Impl {
     }
     bool flow_button(Flow& row, const char* label) {
         flow(row, button_width(label));
-        return ImGui::SmallButton(label);
+        return ImGui::Button(label);
     }
 
     // The prompt a binding capture shows in place of the add buttons; mouse clicks inside it bind.
     void draw_capture_prompt(Flow& row, const char* text) {
         flow(row, button_width(text));
         ImGui::PushStyleColor(ImGuiCol_Button, editor_color(editor_palette().accent_soft));
-        ImGui::SmallButton(text);
+        ImGui::Button(text);
         ImGui::PopStyleColor();
         const auto minimum = ImGui::GetItemRectMin(), maximum = ImGui::GetItemRectMax();
         binding_capture.zone = {minimum.x, minimum.y, maximum.x, maximum.y};
@@ -9911,19 +9955,137 @@ struct EditorUi::Impl {
         if (flow_button(row, "Cancel")) cancel_binding_capture();
     }
 
-    // A binding chip: the control's name and a remove button. Returns true when removed.
-    bool binding_chip(Flow& row, const std::string& label, const std::string& id) {
-        flow(row, button_width(label.c_str()) + 2.0F * ui_scale + button_width("x"));
+    // A delete button drawn as a bin, in the size of a field. Red when hovered.
+    bool trash_button(const char* id, const char* tooltip) {
+        const auto& palette = editor_palette();
+        const float size = ImGui::GetFrameHeight();
+        const bool pressed = ImGui::InvisibleButton(id, ImVec2(size, size));
+        const bool hovered = ImGui::IsItemHovered();
+        const auto low = ImGui::GetItemRectMin();
+        auto* draw = ImGui::GetWindowDrawList();
+        if (hovered) draw->AddRectFilled(low, ImGui::GetItemRectMax(), ImGui::GetColorU32(ImGuiCol_FrameBgHovered), 5.0F * ui_scale);
+        const auto color = ImGui::GetColorU32(hovered ? editor_color(palette.danger) : editor_color(palette.text_dim));
+        const float unit = size / 28.0F;
+        const auto point = [&](const float x, const float y) { return ImVec2(low.x + x * unit, low.y + y * unit); };
+        const float thickness = std::max(1.0F, 1.5F * unit);
+        draw->AddLine(point(8.0F, 9.5F), point(20.0F, 9.5F), color, thickness);       // lid
+        draw->AddLine(point(11.5F, 9.5F), point(11.5F, 7.0F), color, thickness);      // handle
+        draw->AddLine(point(11.5F, 7.0F), point(16.5F, 7.0F), color, thickness);
+        draw->AddLine(point(16.5F, 7.0F), point(16.5F, 9.5F), color, thickness);
+        draw->AddQuad(point(9.5F, 9.5F), point(18.5F, 9.5F), point(17.5F, 21.0F), point(10.5F, 21.0F), color, thickness); // bin
+        draw->AddLine(point(12.5F, 12.5F), point(12.5F, 18.0F), color, thickness);
+        draw->AddLine(point(15.5F, 12.5F), point(15.5F, 18.0F), color, thickness);
+        if (hovered) ImGui::SetTooltip("%s", tooltip);
+        return pressed;
+    }
+
+    // A small picture of the device a control belongs to: a keyboard, a mouse or a gamepad.
+    void input_device_icon(const std::string& control, const ImVec2 center, const float size) {
+        auto* draw = ImGui::GetWindowDrawList();
+        const auto color = ImGui::GetColorU32(editor_color(editor_palette().text_dim));
+        const float u = size / 16.0F, line = std::max(1.0F, 1.3F * u);
+        const auto at = [&](const float x, const float y) { return ImVec2(center.x + x * u, center.y + y * u); };
+        if (control.rfind("mouse", 0) == 0) {
+            draw->AddRect(at(-4.5F, -7.0F), at(4.5F, 7.0F), color, 4.5F * u, 0, line);
+            draw->AddLine(at(0.0F, -7.0F), at(0.0F, -1.5F), color, line);
+            draw->AddLine(at(-4.5F, -1.5F), at(4.5F, -1.5F), color, line);
+        } else if (control.rfind("gamepad", 0) == 0) {
+            draw->AddRect(at(-8.0F, -4.5F), at(8.0F, 4.5F), color, 4.0F * u, 0, line);
+            draw->AddLine(at(-5.0F, -2.0F), at(-5.0F, 2.0F), color, line);
+            draw->AddLine(at(-7.0F, 0.0F), at(-3.0F, 0.0F), color, line);
+            draw->AddCircleFilled(at(3.5F, 1.0F), 1.1F * u, color);
+            draw->AddCircleFilled(at(6.0F, -1.0F), 1.1F * u, color);
+        } else {
+            draw->AddRect(at(-8.0F, -5.0F), at(8.0F, 5.0F), color, 2.0F * u, 0, line);
+            for (int column = 0; column < 4; ++column) {
+                draw->AddCircleFilled(at(-4.5F + 3.0F * static_cast<float>(column), -2.0F), 0.9F * u, color);
+            }
+            draw->AddLine(at(-4.5F, 2.0F), at(4.5F, 2.0F), color, line);
+        }
+    }
+
+    enum class RowAction { none, rebind, remove };
+
+    // One bound control in an entry's list, as a rounded row: the device's icon, the control's name
+    // (click it to bind another control), and a delete icon inside at the right. While `prompt` is
+    // set the row is waiting for the new control and says so instead.
+    RowAction binding_row(const std::string& label, const std::string& control, const std::string& id,
+                          const std::string& prompt) {
+        const auto& palette = editor_palette();
         ImGui::PushID(id.c_str());
-        ImGui::PushStyleColor(ImGuiCol_Button, editor_color(editor_palette().surface));
-        ImGui::SmallButton(label.c_str());
-        ImGui::PopStyleColor();
-        note_item("config:input:chip:" + label);
-        ImGui::SameLine(0.0F, 2.0F * ui_scale);
-        const bool removed = ImGui::SmallButton("x");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove this binding");
+        const float height = ImGui::GetFrameHeight();
+        ImGui::SetCursorScreenPos(ImVec2(entry_column, ImGui::GetCursorScreenPos().y));
+        const float width = std::max(1.0F, entry_right - entry_column);
+        const auto low = ImGui::GetCursorScreenPos();
+        const bool clicked = ImGui::InvisibleButton("##row", ImVec2(std::max(1.0F, width - height - ImGui::GetStyle().ItemSpacing.x), height));
+        const bool hovered = ImGui::IsItemHovered();
+        const bool waiting = !prompt.empty();
+        note_item(waiting ? std::string{"config:input:capture"} : "config:input:chip:" + label);
+        if (waiting) {
+            const auto high = ImGui::GetItemRectMax();
+            binding_capture.zone = {low.x, low.y, high.x, high.y};
+        }
+        auto* draw = ImGui::GetWindowDrawList();
+        const ImU32 fill = waiting ? ImGui::GetColorU32(editor_color(palette.accent_soft))
+                                   : ImGui::GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);
+        draw->AddRectFilled(low, ImVec2(low.x + width, low.y + height), fill, 5.0F * ui_scale);
+        const float pad = ImGui::GetStyle().FramePadding.x;
+        input_device_icon(control, ImVec2(low.x + pad + 8.0F * ui_scale, low.y + height * 0.5F), 16.0F * ui_scale);
+        const float text_y = low.y + (height - ImGui::GetTextLineHeight()) * 0.5F;
+        draw->AddText(ImVec2(low.x + pad + 24.0F * ui_scale, text_y),
+                      waiting ? ImGui::GetColorU32(ImGuiCol_Text) : ImGui::GetColorU32(ImGuiCol_Text),
+                      (waiting ? prompt : label).c_str());
+        if (hovered && !waiting) ImGui::SetTooltip("Click to bind another control");
+        ImGui::SetCursorScreenPos(ImVec2(entry_right - 4.0F * ui_scale - height, low.y));
+        const bool removed = trash_button("##remove", "Remove this binding");
         ImGui::PopID();
-        return removed;
+        return removed ? RowAction::remove : clicked ? RowAction::rebind : RowAction::none;
+    }
+
+    // The foldable header of an action or axis, with `status` and a delete icon at its right. Draws
+    // nothing inside; the caller adds the entry's contents when this returns true, then TreePop().
+    bool entry_header(const std::string& title, const std::string& id, const std::string& summary,
+                      const std::string& status, const ImVec4& status_color, bool& remove,
+                      const std::string& remove_id) {
+        if (input_open_entry == title) {
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+            input_open_entry.clear();
+        }
+        const bool open = ImGui::TreeNodeEx((title + "###entry").c_str(),
+                                            ImGuiTreeNodeFlags_Framed | ImGuiTreeNodeFlags_AllowOverlap |
+                                                ImGuiTreeNodeFlags_SpanAvailWidth);
+        note_item(id);
+        const float size = ImGui::GetFrameHeight();
+        const auto header_low = ImGui::GetItemRectMin(), header_high = ImGui::GetItemRectMax();
+        entry_left = header_low.x;
+        entry_right = header_high.x;
+        const float inset = 4.0F * ui_scale;
+        const float right = header_high.x - inset;
+        // What the entry is bound to, dimmed after the name, cut to the room before the status.
+        if (!open && !summary.empty()) {
+            const float start = header_low.x + 190.0F * ui_scale;
+            const float room = right - size - 90.0F * ui_scale - start;
+            std::string shown = summary;
+            while (shown.size() > 1U && ImGui::CalcTextSize(shown.c_str()).x > room) {
+                shown.resize(shown.size() - 1U);
+                if (ImGui::CalcTextSize((shown + "...").c_str()).x <= room) { shown += "..."; break; }
+            }
+            if (room > 40.0F * ui_scale) {
+                ImGui::SetCursorScreenPos(ImVec2(start, header_low.y));
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(editor_color(editor_palette().text_faint), "%s", shown.c_str());
+            }
+        }
+        if (!status.empty()) {
+            ImGui::SetCursorScreenPos(ImVec2(right - size - ImGui::GetStyle().ItemSpacing.x - ImGui::CalcTextSize(status.c_str()).x,
+                                             header_low.y));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(status_color, "%s", status.c_str());
+        }
+        ImGui::SetCursorScreenPos(ImVec2(right - size, header_low.y));
+        if (trash_button("##delete", "Delete")) remove = true;
+        note_item(remove_id);
+        return open;
     }
 
     bool input_name_taken(const std::string& name) const {
@@ -9940,17 +10102,20 @@ struct EditorUi::Impl {
             buffer.fill('\0');
             std::copy_n(name.begin(), std::min<std::size_t>(name.size(), 64U), buffer.begin());
         }
-        ImGui::SetNextItemWidth(-1.0F);
         ImGui::InputText("##name", buffer.data(), buffer.size(), ImGuiInputTextFlags_CharsNoBlank);
-        if (!ImGui::IsItemDeactivatedAfterEdit()) return false;
+        note_item("config:input:name:" + key);
+        // The name follows the typing, there being no Apply: every valid, unused name is taken at once, and
+        // a name that cannot be used is left alone (and the field goes back to the real one on leaving).
+        const bool edited = ImGui::IsItemEdited();
+        const bool left = ImGui::IsItemDeactivatedAfterEdit();
         const std::string renamed = buffer.data();
-        if (renamed == name) return false;
+        if (renamed == name || (!edited && !left)) return false;
         if (!valid_input_name(renamed)) {
-            set_status("Input names are letters, digits and underscores", true);
+            if (left) set_status("Input names are letters, digits and underscores", true);
             return false;
         }
         if (input_name_taken(renamed)) {
-            set_status("An action or axis is already called " + renamed, true);
+            if (left) set_status("An action or axis is already called " + renamed, true);
             return false;
         }
         name = renamed;
@@ -9971,7 +10136,13 @@ struct EditorUi::Impl {
     // A name field and button that add an entry; returns the valid new name when pressed.
     std::optional<std::string> add_input_entry(std::array<char, 65>& buffer, const char* id,
                                                const char* hint, const char* button) {
-        ImGui::SetNextItemWidth(180.0F * ui_scale);
+        // Line up with the entries' headers, which reach past the content edge by half the window padding.
+        const float extend = std::floor(ImGui::GetStyle().WindowPadding.x * 0.5F);
+        const float left = entry_right > entry_left ? entry_left : ImGui::GetCursorScreenPos().x - extend;
+        const float right = entry_right > entry_left ? entry_right : ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x + extend;
+        ImGui::SetCursorScreenPos(ImVec2(left, ImGui::GetCursorScreenPos().y));
+        ImGui::SetNextItemWidth(right - left - (ImGui::CalcTextSize(button).x + ImGui::GetStyle().FramePadding.x * 2.0F +
+                                                ImGui::GetStyle().ItemSpacing.x));
         const bool entered = ImGui::InputTextWithHint(
             id, hint, buffer.data(), buffer.size(),
             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsNoBlank);
@@ -10021,83 +10192,93 @@ struct EditorUi::Impl {
         }
         note_item("config:input:reset");
         const bool live = input_live.object() != nullptr;
-        const auto table_flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
-                                 ImGuiTableFlags_SizingStretchProp;
         std::optional<std::size_t> remove_action, remove_axis;
+        // The entry's bindings sit indented under its name; the name field starts right after its label.
+        const auto name_row = [&](const std::string& key, std::string& name, bool& modified) {
+            // The label lines up with the fold arrow; the field, and everything below it, start in one column.
+            ImGui::SetCursorScreenPos(ImVec2(entry_left + ImGui::GetStyle().FramePadding.x + 2.0F * ui_scale,
+                                             ImGui::GetCursorScreenPos().y));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(editor_color(palette.text_dim), "Name");
+            ImGui::SameLine(0.0F, 14.0F * ui_scale);
+            entry_column = ImGui::GetCursorScreenPos().x;
+            ImGui::SetNextItemWidth(std::max(1.0F, entry_right - entry_column));
+            modified |= input_name_field(key, name);
+        };
 
         ImGui::SeparatorText("Actions");
-        if (ImGui::BeginTable("##actions", 4, table_flags)) {
-            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 150.0F * ui_scale);
-            ImGui::TableSetupColumn("Bindings", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Live", ImGuiTableColumnFlags_WidthFixed, 44.0F * ui_scale);
-            ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed, 56.0F * ui_scale);
-            ImGui::TableHeadersRow();
-            for (std::size_t index = 0; index < input_edit.actions.size(); ++index) {
-                auto& action = input_edit.actions[index];
-                ImGui::PushID(static_cast<int>(index));
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                changed |= input_name_field("action:" + std::to_string(index), action.name);
-                ImGui::TableNextColumn();
-                auto row = begin_flow();
+        for (std::size_t index = 0; index < input_edit.actions.size(); ++index) {
+            auto& action = input_edit.actions[index];
+            ImGui::PushID(static_cast<int>(index));
+            std::string status;
+            if (live)
+                if (const auto* entry = live_entry("actions", action.name); entry && boolean_or(*entry, "held", false))
+                    status = "held";
+            bool remove = false;
+            std::string summary;
+            for (const auto& binding : action.bindings) summary += (summary.empty() ? "" : ", ") + control_label(binding);
+            const bool open = entry_header(action.name, "config:input:action:" + action.name, summary, status,
+                                           editor_color(palette.success), remove, "config:input:action:" + action.name + ":delete");
+            if (remove) remove_action = index;
+            if (open) {
+                name_row("action:" + std::to_string(index), action.name, changed);
                 std::optional<std::size_t> remove_binding;
-                for (std::size_t item = 0; item < action.bindings.size(); ++item)
-                    if (binding_chip(row, control_label(action.bindings[item]), std::to_string(item)))
-                        remove_binding = item;
+                for (std::size_t item = 0; item < action.bindings.size(); ++item) {
+                    const bool rebinding = binding_capture.active && binding_capture.target == Target::action &&
+                                           binding_capture.index == index && binding_capture.replace == item;
+                    const auto result = binding_row(control_label(action.bindings[item]), action.bindings[item], std::to_string(item),
+                                                    rebinding ? "Press a key or gamepad button, or click here" : "");
+                    if (result == RowAction::remove) remove_binding = item;
+                    else if (result == RowAction::rebind && !rebinding) begin_binding_capture(Target::action, index, item);
+                }
                 if (remove_binding) {
-                    action.bindings.erase(action.bindings.begin() +
-                                          static_cast<std::ptrdiff_t>(*remove_binding));
+                    action.bindings.erase(action.bindings.begin() + static_cast<std::ptrdiff_t>(*remove_binding));
                     changed = true;
                 }
-                if (binding_capture.active && binding_capture.target == Target::action &&
-                    binding_capture.index == index) {
+                ImGui::SetCursorScreenPos(ImVec2(entry_column, ImGui::GetCursorScreenPos().y));
+                auto row = begin_flow();
+                row.right = entry_right;
+                if (binding_capture.active && binding_capture.target == Target::action && binding_capture.index == index &&
+                    !binding_capture.rebinding()) {
                     draw_capture_prompt(row, "Press a key or gamepad button, or click here");
                 } else {
-                    if (flow_button(row, "+ Add")) begin_binding_capture(Target::action, index);
+                    if (flow_button(row, "+ Add binding")) begin_binding_capture(Target::action, index);
                     note_item("config:input:action:" + action.name + ":add");
                 }
-                ImGui::TableNextColumn();
-                if (live) {
-                    const auto* entry = live_entry("actions", action.name);
-                    const bool held = entry && boolean_or(*entry, "held", false);
-                    ImGui::TextColored(editor_color(held ? palette.success : palette.text_faint),
-                                       held ? "held" : "-");
-                }
-                ImGui::TableNextColumn();
-                if (ImGui::SmallButton("Delete")) remove_action = index;
-                ImGui::PopID();
+                ImGui::Spacing();
+                ImGui::TreePop();
             }
-            ImGui::EndTable();
+            ImGui::PopID();
         }
-        if (const auto name = add_input_entry(new_action_name, "##new_action", "new_action",
-                                              "Add action")) {
+        if (const auto name = add_input_entry(new_action_name, "##new_action", "new_action", "Add action")) {
             input_edit.actions.push_back({*name, {}});
+            input_open_entry = *name;
             begin_binding_capture(Target::action, input_edit.actions.size() - 1U);
             changed = true;
         }
 
         ImGui::SeparatorText("Axes");
-        if (ImGui::BeginTable("##axes", 5, table_flags)) {
-            ImGui::TableSetupColumn("Axis", ImGuiTableColumnFlags_WidthFixed, 150.0F * ui_scale);
-            ImGui::TableSetupColumn("Deadzone", ImGuiTableColumnFlags_WidthFixed, 80.0F * ui_scale);
-            ImGui::TableSetupColumn("Bindings", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Live", ImGuiTableColumnFlags_WidthFixed, 64.0F * ui_scale);
-            ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed, 56.0F * ui_scale);
-            ImGui::TableHeadersRow();
-            for (std::size_t index = 0; index < input_edit.axes.size(); ++index) {
-                auto& axis = input_edit.axes[index];
-                ImGui::PushID(static_cast<int>(index) + 100000);
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                changed |= input_name_field("axis:" + std::to_string(index), axis.name);
-                ImGui::TableNextColumn();
-                ImGui::SetNextItemWidth(-1.0F);
-                auto deadzone = static_cast<float>(axis.deadzone);
-                if (editor_slider("##deadzone", &deadzone, 0.0F, 0.95F, "%.2f"))
-                    axis.deadzone = deadzone;
-                changed |= ImGui::IsItemDeactivatedAfterEdit();
-                ImGui::TableNextColumn();
-                auto row = begin_flow();
+        for (std::size_t index = 0; index < input_edit.axes.size(); ++index) {
+            auto& axis = input_edit.axes[index];
+            ImGui::PushID(static_cast<int>(index) + 100000);
+            std::string status;
+            if (live) {
+                const auto* entry = live_entry("axes", axis.name);
+                char text[16];
+                std::snprintf(text, sizeof text, "%+.2f", entry ? number_or(*entry, "value", 0.0) : 0.0);
+                status = text;
+            }
+            bool remove = false;
+            std::string summary;
+            for (const auto& binding : axis.bindings)
+                summary += (summary.empty() ? "" : ", ") +
+                           (binding.analog.empty() ? control_label(binding.negative) + "/" + control_label(binding.positive)
+                                                   : control_label(binding.analog));
+            const bool open = entry_header(axis.name, "config:input:axis:" + axis.name, summary, status,
+                                           editor_color(palette.text_dim), remove, "config:input:axis:" + axis.name + ":delete");
+            if (remove) remove_axis = index;
+            if (open) {
+                name_row("axis:" + std::to_string(index), axis.name, changed);
                 std::optional<std::size_t> remove_binding;
                 for (std::size_t item = 0; item < axis.bindings.size(); ++item) {
                     auto& binding = axis.bindings[item];
@@ -10105,15 +10286,51 @@ struct EditorUi::Impl {
                         binding.analog.empty()
                             ? control_label(binding.negative) + " / " + control_label(binding.positive)
                             : control_label(binding.analog) + (binding.scale < 0.0 ? " (inverted)" : "");
-                    if (binding_chip(row, label, std::to_string(item))) remove_binding = item;
+                    const bool rebinding = binding_capture.active && binding_capture.index == index &&
+                                           binding_capture.target != Target::action && binding_capture.replace == item;
+                    const std::string prompt =
+                        !rebinding ? ""
+                        : binding_capture.target == Target::analog ? "Move a gamepad stick or trigger"
+                        : binding_capture.target == Target::pair_negative ? "Press the control for -1 (left, down or back)"
+                                                                           : "Now press the control for +1";
+                    const auto result = binding_row(label, binding.analog.empty() ? binding.negative : binding.analog,
+                                                    std::to_string(item), prompt);
+                    if (result == RowAction::remove) remove_binding = item;
+                    else if (result == RowAction::rebind && !rebinding)
+                        begin_binding_capture(binding.analog.empty() ? Target::pair_negative : Target::analog, index, item);
+                    if (binding.analog.empty()) continue;
+                    // A stick or trigger has its own deadzone: a slider with a typed value beside it.
+                    ImGui::PushID(static_cast<int>(item) + 500);
+                    ImGui::SetCursorScreenPos(ImVec2(entry_column + 16.0F * ui_scale, ImGui::GetCursorScreenPos().y));
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextColored(editor_color(palette.text_dim), "Deadzone");
+                    ImGui::SameLine(0.0F, 14.0F * ui_scale);
+                    const float field_width = 72.0F * ui_scale;
+                    ImGui::SetNextItemWidth(std::max(1.0F, entry_right - ImGui::GetCursorScreenPos().x - field_width -
+                                                               ImGui::GetStyle().ItemSpacing.x));
+                    auto deadzone = static_cast<float>(binding.deadzone);
+                    if (ImGui::SliderFloat("##deadzone", &deadzone, 0.0F, 0.95F, "", ImGuiSliderFlags_AlwaysClamp))
+                        binding.deadzone = deadzone;
+                    changed |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(field_width);
+                    auto typed = static_cast<float>(binding.deadzone);
+                    ImGui::InputFloat("##deadzone_value", &typed, 0.0F, 0.0F, "%.2f");
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        binding.deadzone = std::clamp(static_cast<double>(typed), 0.0, 0.95);
+                        changed = true;
+                    }
+                    ImGui::PopID();
                 }
                 if (remove_binding) {
-                    axis.bindings.erase(axis.bindings.begin() +
-                                        static_cast<std::ptrdiff_t>(*remove_binding));
+                    axis.bindings.erase(axis.bindings.begin() + static_cast<std::ptrdiff_t>(*remove_binding));
                     changed = true;
                 }
+                ImGui::SetCursorScreenPos(ImVec2(entry_column, ImGui::GetCursorScreenPos().y));
+                auto row = begin_flow();
+                row.right = entry_right;
                 const bool capturing = binding_capture.active && binding_capture.index == index &&
-                                       binding_capture.target != Target::action;
+                                       binding_capture.target != Target::action && !binding_capture.rebinding();
                 if (capturing) {
                     draw_capture_prompt(row, binding_capture.target == Target::analog
                                             ? "Move a gamepad stick or trigger"
@@ -10135,8 +10352,7 @@ struct EditorUi::Impl {
                         if (ImGui::BeginPopup("##invert_menu")) {
                             for (auto& binding : axis.bindings) {
                                 if (binding.analog.empty()) continue;
-                                if (ImGui::MenuItem(control_label(binding.analog).c_str(), nullptr,
-                                                    binding.scale < 0.0)) {
+                                if (ImGui::MenuItem(control_label(binding.analog).c_str(), nullptr, binding.scale < 0.0)) {
                                     binding.scale = -binding.scale;
                                     changed = true;
                                 }
@@ -10145,24 +10361,14 @@ struct EditorUi::Impl {
                         }
                     }
                 }
-                ImGui::TableNextColumn();
-                if (live) {
-                    const auto* entry = live_entry("axes", axis.name);
-                    const auto value = entry ? number_or(*entry, "value", 0.0) : 0.0;
-                    char text[16];
-                    std::snprintf(text, sizeof text, "%+.2f", value);
-                    ImGui::ProgressBar(static_cast<float>((value + 1.0) * 0.5), ImVec2(-1.0F, 0.0F),
-                                       text);
-                }
-                ImGui::TableNextColumn();
-                if (ImGui::SmallButton("Delete")) remove_axis = index;
-                note_item("config:input:axis:" + axis.name + ":delete");
-                ImGui::PopID();
+                ImGui::Spacing();
+                ImGui::TreePop();
             }
-            ImGui::EndTable();
+            ImGui::PopID();
         }
         if (const auto name = add_input_entry(new_axis_name, "##new_axis", "new_axis", "Add axis")) {
             input_edit.axes.push_back({*name, 0.2, {}});
+            input_open_entry = *name;
             changed = true;
         }
         if (remove_action) {
@@ -10199,11 +10405,15 @@ struct EditorUi::Impl {
                            status && boolean_or(*status, "saved", false)
                                ? "Saved in the project file"
                                : "Defaults until you change something");
+        inspector_label_width = 190.0F;
+        // One row per effect: its name, the check box, and the renderer's state beside it. What the
+        // effect does is in the tooltip.
         const auto effect = [&](const char* label, const char* key, const char* id,
                                 const char* description, const JsonValue::Object* live) {
             bool enabled = settings && boolean_or(*settings, key, true);
+            const ImVec2 start = ImGui::GetCursorScreenPos();
             // Without a project the save fails and the status bar says why.
-            if (editor_checkbox(label, &enabled)) {
+            if (inspector_checkbox(label, &enabled)) {
                 if (auto saved = call("graphics.set_settings",
                                       std::string{"\""} + key + "\":" + (enabled ? "true" : "false"))) {
                     set_status(std::string(label) + (enabled ? " on" : " off"), false);
@@ -10211,24 +10421,22 @@ struct EditorUi::Impl {
                 }
             }
             note_item(id);
-            ImGui::Indent();
-            ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
-            ImGui::TextWrapped("%s", description);
-            ImGui::PopStyleColor();
+            const auto checkbox_rect_max = ImGui::GetItemRectMax();
             if (live) {
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
                 const auto error = string_or(*live, "error");
                 if (boolean_or(*live, "active", false))
                     ImGui::TextColored(editor_color(palette.success), "Running");
                 else if (!error.empty())
-                    ImGui::TextColored(editor_color(palette.warning), "Unavailable: %s",
-                                       error.c_str());
+                    ImGui::TextColored(editor_color(palette.warning), "Unavailable: %s", error.c_str());
                 else if (!enabled)
                     ImGui::TextColored(editor_color(palette.text_faint), "Off");
                 else
-                    ImGui::TextColored(editor_color(palette.text_faint),
-                                       "Starts with the next frame of a scene");
+                    ImGui::TextColored(editor_color(palette.text_faint), "Starts with the next frame of a scene");
             }
-            ImGui::Unindent();
+            (void)checkbox_rect_max;
+            row_hint(start, description);
         };
         ImGui::SeparatorText("Lighting");
         const auto* gi_value = renderer ? field(*renderer, "global_illumination") : nullptr;
@@ -10248,37 +10456,34 @@ struct EditorUi::Impl {
 
         ImGui::SeparatorText("Frame rate");
         bool vsync = settings && boolean_or(*settings, "vsync", false);
-        if (editor_checkbox("Vsync", &vsync)) {
+        const ImVec2 vsync_start = ImGui::GetCursorScreenPos();
+        if (inspector_checkbox("Vsync", &vsync)) {
             if (call("graphics.set_settings", std::string("\"vsync\":") + (vsync ? "true" : "false"))) {
                 set_status(vsync ? "Vsync on" : "Vsync off", false);
                 if (auto refreshed = call("graphics.settings")) graphics_status = std::move(*refreshed);
             }
         }
         note_item("config:graphics:vsync");
-        ImGui::Indent();
-        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
-        ImGui::TextWrapped("Shows each frame in step with the display's refresh, so the frame rate "
-                           "never exceeds it. Off shows frames as soon as they are ready: faster and "
-                           "more responsive, but the image can tear.");
-        ImGui::PopStyleColor();
         const auto* presentation_value = renderer ? field(*renderer, "presentation") : nullptr;
         if (const auto* presentation = presentation_value ? presentation_value->object() : nullptr) {
+            ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
             const auto mode = string_or(*presentation, "mode");
             if (boolean_or(*presentation, "vsync_requested", false) != vsync)
                 ImGui::TextColored(editor_color(palette.text_faint), "Applies with the next frame");
             else if (mode == "immediate")
                 ImGui::TextColored(editor_color(palette.success), "Running without vsync");
             else if (mode == "mailbox")
-                ImGui::TextColored(editor_color(palette.success),
-                                   "Running without vsync (mailbox: no tearing, but frames the "
-                                   "display misses are dropped)");
+                ImGui::TextColored(editor_color(palette.success), "Running without vsync (mailbox)");
             else if (!vsync)
-                ImGui::TextColored(editor_color(palette.warning),
-                                   "Unavailable: this display only presents with vsync");
+                ImGui::TextColored(editor_color(palette.warning), "Unavailable: this display only presents with vsync");
             else
                 ImGui::TextColored(editor_color(palette.success), "Running with vsync");
         }
-        ImGui::Unindent();
+        row_hint(vsync_start,
+                 "Shows each frame in step with the display's refresh, so the frame rate never exceeds it. "
+                 "Off shows frames as soon as they are ready: faster and more responsive, but the image can tear. "
+                 "Mailbox presents without tearing, but frames the display misses are dropped.");
         const int limit = settings ? static_cast<int>(number_or(*settings, "frame_rate_limit", 0.0)) : 0;
         const auto save_limit = [&](const int value) {
             const auto clamped = std::clamp(value, 0, static_cast<int>(maximum_frame_rate_limit));
@@ -10290,16 +10495,19 @@ struct EditorUi::Impl {
             }
         };
         if (!frame_rate_limit_editing) frame_rate_limit_edit = limit;
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Frame rate limit");
-        ImGui::SameLine();
+        const ImVec2 limit_start = ImGui::GetCursorScreenPos();
+        inspector_field_label("Frame rate limit");
         ImGui::SetNextItemWidth(90.0F * ui_scale);
         ImGui::InputInt("##frame_rate_limit", &frame_rate_limit_edit, 0, 0);
         note_item("config:graphics:frame_rate_limit");
         frame_rate_limit_editing = ImGui::IsItemActive();
         if (ImGui::IsItemDeactivatedAfterEdit() && frame_rate_limit_edit != limit)
             save_limit(frame_rate_limit_edit);
+        row_hint(limit_start,
+                 "The most frames per second while the game runs; 0 is unlimited. With vsync on, the display's "
+                 "refresh rate is the ceiling either way. The editor itself draws at most 250 frames per second.");
         ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
         ImGui::TextColored(editor_color(palette.text_dim), "FPS");
         for (const int preset : {0, 30, 60, 120, 144, 240}) {
             ImGui::SameLine();
@@ -10310,13 +10518,7 @@ struct EditorUi::Impl {
             if (current) ImGui::PopStyleColor();
             note_item("config:graphics:frame_rate_limit:" + std::to_string(preset));
         }
-        ImGui::Indent();
-        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
-        ImGui::TextWrapped("The most frames per second while the game runs; 0 is unlimited. With vsync "
-                           "on, the display's refresh rate is the ceiling either way. The editor "
-                           "itself draws at most 250 frames per second.");
-        ImGui::PopStyleColor();
-        ImGui::Unindent();
+        inspector_label_width = 0.0F;
     }
 
     // Mixer buses: a tree under Master with volume, mute, solo and live meters.
@@ -10344,6 +10546,7 @@ struct EditorUi::Impl {
         const auto* saved_settings = shown_settings ? field(*shown_settings, "settings") : nullptr;
         const bool binaural = saved_settings && saved_settings->object() &&
                               string_or(*saved_settings->object(), "spatialization", "stereo") == "binaural";
+        const ImVec2 listening_start = ImGui::GetCursorScreenPos();
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Listening on");
         ImGui::SameLine();
@@ -10360,13 +10563,9 @@ struct EditorUi::Impl {
             refresh_audio_files();
         }
         note_item("config:audio:headphones");
-        ImGui::Indent();
-        ImGui::PushStyleColor(ImGuiCol_Text, editor_color(palette.text_dim));
-        ImGui::TextWrapped("Headphones gives each ear its own delay and head shadow, so sounds sit "
-                           "left, right and behind you more clearly. It is a head model, not a "
-                           "measured HRTF, so height is only faintly placed.");
-        ImGui::PopStyleColor();
-        ImGui::Unindent();
+        row_hint(listening_start,
+                 "Headphones gives each ear its own delay and head shadow, so sounds sit left, right and "
+                 "behind you more clearly. It is a head model, not a measured HRTF, so height is only faintly placed.");
 
         ImGui::SeparatorText("Mixer buses");
         if (ImGui::Button("Open the Mixer")) {
@@ -10987,8 +11186,19 @@ struct EditorUi::Impl {
         ImGui::EndDisabled();
     }
 
-    // The right column: the active profile's fields, then the game's own details.
+    // The right column: the active profile's fields, then the game's own details. Fields are styled
+    // like the Inspector's, and the labels get room
+    // so check boxes sit beside their names instead of below them.
     void draw_build_profile_fields() {
+        push_settings_style();
+        // Just wide enough for the longest label, so the controls start as far left as they can.
+        inspector_label_width = ImGui::CalcTextSize("Include unused files").x / ui_scale + 20.0F;
+        draw_build_profile_fields_body();
+        inspector_label_width = 0.0F;
+        pop_settings_style();
+    }
+
+    void draw_build_profile_fields_body() {
         const auto& palette = editor_palette();
         const auto* settings = build_settings_object();
         const auto* status = build_status.object();
@@ -11007,7 +11217,9 @@ struct EditorUi::Impl {
         };
         const auto choice_row = [&](const char* label, const char* key, const char* list_key, const char* id) {
             const auto current = string_or(*profile, key);
-            if (inspector_begin_combo(label, capitalised(current).c_str())) {
+            inspector_field_label(label);
+            ImGui::SetNextItemWidth(200.0F * ui_scale); // Wide enough for the longest choice, not the whole row.
+            if (ImGui::BeginCombo((std::string{"##"} + label).c_str(), capitalised(current).c_str())) {
                 const auto* list_value = status ? field(*status, list_key) : nullptr;
                 if (const auto* list = list_value ? list_value->array() : nullptr)
                     for (const auto& item : *list)
@@ -11019,6 +11231,16 @@ struct EditorUi::Impl {
                 ImGui::EndCombo();
             }
             note_item(id);
+        };
+
+        // Explanations live in a tooltip over the row's label or its control, not in the page.
+        const auto explain = [&](const ImVec2 start, const char* text) { row_hint(start, text); };
+        // A check box in the same column as every other control.
+        const auto checkbox_row = [&](const char* label, bool* value, const char* hint) {
+            const ImVec2 start = ImGui::GetCursorScreenPos();
+            const bool changed = inspector_checkbox(label, value);
+            explain(start, hint);
+            return changed;
         };
 
         ImGui::SeparatorText("Profile");
@@ -11042,46 +11264,33 @@ struct EditorUi::Impl {
                        });
                    },
                    [&] { save_build_profile_text("output_directory", build_output.data()); });
-        const auto* builds_value = status ? field(*status, "builds") : nullptr;
-        if (const auto* builds = builds_value ? builds_value->array() : nullptr)
-            for (const auto& entry : *builds)
-                if (const auto* item = entry.object(); item && string_or(*item, "profile") == active) {
-                    const bool built = boolean_or(*item, "built", false);
-                    ImGui::TextColored(editor_color(palette.text_faint), "Writes to %s",
-                                       string_or(*item, "directory").c_str());
-                    ImGui::TextColored(editor_color(built ? palette.success : palette.text_faint), "%s",
-                                       built ? "Built" : "Not built yet");
-                }
 
         bool include_unused = boolean_or(*profile, "include_unused_assets", false);
-        if (inspector_checkbox("Include unused files", &include_unused)) {
+        if (checkbox_row("Include unused files", &include_unused,
+                         "A build ships only the files the game refers to. Turn this on if its code loads "
+                         "files by names it builds up.")) {
             save_build_profile("include_unused_assets", include_unused ? "true" : "false");
         }
         note_item("build:include_unused");
-        ImGui::TextColored(editor_color(palette.text_faint), "%s",
-                           "A build ships only the files the game refers to. Turn this on if its code loads "
-                           "files by names it builds up.");
 
         if (string_or(*profile, "target_platform") == "linux") {
+            const ImVec2 glibc_start = ImGui::GetCursorScreenPos();
             text_row("Minimum glibc", build_minimum_glibc.data(), build_minimum_glibc.size(), "not checked", "build:minimum_glibc",
                      [&] { save_build_profile_text("minimum_glibc", build_minimum_glibc.data()); });
-            ImGui::TextColored(editor_color(palette.text_faint), "%s",
-                               "Fail the build if the game needs a newer glibc than this (such as 2.31), so it is not "
-                               "shipped to machines that cannot start it.");
+            explain(glibc_start, "Fail the build if the game needs a newer glibc than this (such as 2.31), so it is not "
+                                 "shipped to machines that cannot start it.");
         }
         bool compress_textures = boolean_or(*profile, "compress_textures", true);
-        if (inspector_checkbox("Compress textures", &compress_textures))
+        if (checkbox_row("Compress textures", &compress_textures,
+                         "Models' textures ship as GPU-compressed BC1/BC3 with mip levels: a fourth to an eighth of "
+                         "the memory. Normal maps keep full quality."))
             save_build_profile("compress_textures", compress_textures ? "true" : "false");
         note_item("build:compress_textures");
-        ImGui::TextColored(editor_color(palette.text_faint), "%s",
-                           "Models' textures ship as GPU-compressed BC1/BC3 with mip levels: a fourth to an eighth of "
-                           "the memory. Normal maps keep full quality.");
         bool compress_audio = boolean_or(*profile, "compress_audio", true);
-        if (inspector_checkbox("Compress sounds", &compress_audio))
+        if (checkbox_row("Compress sounds", &compress_audio,
+                         "wav sounds ship as lossless FLAC, about half the size and exactly the same samples."))
             save_build_profile("compress_audio", compress_audio ? "true" : "false");
         note_item("build:compress_audio");
-        ImGui::TextColored(editor_color(palette.text_faint), "%s",
-                           "wav sounds ship as lossless FLAC, about half the size and exactly the same samples.");
 
         // What the build would leave out, and folders that always go in.
         ImGui::Spacing();
@@ -11136,7 +11345,9 @@ struct EditorUi::Impl {
             }
         }
         {
+            const ImVec2 always_start = ImGui::GetCursorScreenPos();
             ImGui::TextUnformatted("Always include");
+            explain(always_start, "These ship whatever the scan finds, with everything they refer to.");
             const auto* always_value = field(*profile, "always_include");
             const auto* always = always_value ? always_value->array() : nullptr;
             const auto save_always = [this](std::vector<std::string> names) {
@@ -11176,12 +11387,12 @@ struct EditorUi::Impl {
                 build_always_text.fill('\0');
             }
             note_item("build:always:add");
-            ImGui::TextColored(editor_color(palette.text_faint), "%s",
-                               "These ship whatever the scan finds, with everything they refer to.");
         }
 
         ImGui::SeparatorText("Window");
+        const ImVec2 mode_start = ImGui::GetCursorScreenPos();
         choice_row("Window mode", "window_mode", "window_modes", "build:window_mode");
+        explain(mode_start, "Borderless and fullscreen use the desktop's size; the width and height apply when windowed.");
         const bool windowed = string_or(*profile, "window_mode", "windowed") == "windowed";
         ImGui::BeginDisabled(!windowed);
         const auto size_row = [&](const char* label, const char* key, int& value, const char* id) {
@@ -11196,9 +11407,6 @@ struct EditorUi::Impl {
         size_row("Width", "window_width", build_width, "build:window_width");
         size_row("Height", "window_height", build_height, "build:window_height");
         ImGui::EndDisabled();
-        if (!windowed)
-            ImGui::TextColored(editor_color(palette.text_faint),
-                               "Borderless and fullscreen use the desktop's size.");
 
         ImGui::SeparatorText("Game (shared by every profile)");
         const auto* project = active_project();
@@ -11292,7 +11500,44 @@ struct EditorUi::Impl {
             ImGui::TextColored(editor_color(palette.warning), "Not saved: %s",
                                colon == std::string::npos ? status_message.c_str() : status_message.c_str() + colon + 2);
         }
-        const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0F + ImGui::GetStyle().ItemSpacing.y * 3.0F;
+        if (build_running) poll_build();
+        const auto active = active_build_profile();
+        const std::string label = build_running ? std::string{"Cancel build"} : "Build " + active;
+        const float button = std::max(180.0F * ui_scale, ImGui::CalcTextSize(label.c_str()).x + 40.0F * ui_scale);
+        // What the line beside the button says, and in which colour.
+        std::string message;
+        ImVec4 message_color = editor_color(palette.text_faint);
+        if (build_running) {
+            message = build_stage + (build_detail.empty() ? "" : "  \u00B7  ") + build_detail;
+            message_color = editor_color(palette.text_dim);
+        } else if (!build_error.empty()) {
+            message = build_error;
+            message_color = editor_color(build_failed && build_result.empty() && status_is_error ? palette.warning : palette.text_dim);
+        } else if (scene_modified()) {
+            message = "This scene has unsaved changes, which the build will not include.";
+            message_color = editor_color(palette.warning);
+        } else if (game) {
+            message = "Stop the game before building.";
+            message_color = editor_color(palette.warning);
+        } else if (!build_result.empty() && !build_failed) {
+            message = build_result;
+            message_color = editor_color(palette.success);
+        } else {
+            message = "Builds the game: its program, content, compiled scripts and shaders, in the build folder.";
+        }
+        // The bottom of the window holds the progress bar while building (full width, above) and
+        // one row with the message and the button, which wraps taller only when the message needs it.
+        const float spacing = ImGui::GetStyle().ItemSpacing.y;
+        const float message_wrap = ImGui::GetContentRegionAvail().x - button - ImGui::GetStyle().ItemSpacing.x * 2.0F;
+        const float row_height = std::max(ImGui::GetFrameHeight(),
+                                          ImGui::CalcTextSize(message.c_str(), nullptr, false, message_wrap).y +
+                                              ImGui::GetStyle().FramePadding.y * 2.0F);
+        const float footer = row_height + spacing * 2.0F + (build_running ? ImGui::GetFrameHeight() + spacing : 0.0F);
+        if (build_running != build_window_grown) {
+            const float bar = ImGui::GetFrameHeight() + spacing;
+            ImGui::SetWindowSize(ImVec2(ImGui::GetWindowWidth(), ImGui::GetWindowHeight() + (build_running ? bar : -bar)));
+            build_window_grown = build_running;
+        }
         ImGui::BeginDisabled(project == nullptr);
         if (ImGui::BeginChild("##build_left", ImVec2(230.0F * ui_scale, -footer), ImGuiChildFlags_Borders))
             draw_build_profile_list();
@@ -11308,36 +11553,13 @@ struct EditorUi::Impl {
             for (auto& edit : work) edit();
         }
 
-        if (build_running) poll_build();
-        if (build_running)
-            ImGui::TextColored(editor_color(palette.text_dim), "%s%s%s", build_stage.c_str(),
-                               build_detail.empty() ? "" : "  \u00B7  ", build_detail.c_str());
-        else if (!build_error.empty())
-            ImGui::TextColored(editor_color(build_failed && build_result.empty() && status_is_error ? palette.warning : palette.text_dim),
-                               "%s", build_error.c_str());
-        else if (scene_modified())
-            ImGui::TextColored(editor_color(palette.warning), "This scene has unsaved changes, which the build will not include.");
-        else if (game)
-            ImGui::TextColored(editor_color(palette.warning), "Stop the game before building.");
-        else if (!build_result.empty() && !build_failed)
-            ImGui::TextColored(editor_color(palette.success), "%s", build_result.c_str());
-        else
-            ImGui::TextColored(editor_color(palette.text_faint),
-                               "Builds the game: its program, content, compiled scripts and shaders, in the build folder.");
-        const auto active = active_build_profile();
-        const std::string label = build_running ? std::string{"Cancel build"} : "Build " + active;
-        const float button = std::max(180.0F * ui_scale, ImGui::CalcTextSize(label.c_str()).x + 40.0F * ui_scale);
-        if (build_running) {
-            // Where the build is, to the second, with the stop button on the same line.
-            char overlay[64];
-            std::snprintf(overlay, sizeof overlay, "%d%%  %.0f s", static_cast<int>(build_fraction * 100.0), build_seconds);
-            ImGui::ProgressBar(static_cast<float>(build_fraction),
-                               ImVec2(ImGui::GetContentRegionAvail().x - button - ImGui::GetStyle().ItemSpacing.x, 0.0F), overlay);
-            note_item("build:progress");
-            ImGui::SameLine();
-        } else {
-            ImGui::SetCursorPosX(ImGui::GetWindowWidth() - button - ImGui::GetStyle().WindowPadding.x);
-        }
+        const float footer_y = ImGui::GetCursorPosY();
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushTextWrapPos(ImGui::GetWindowWidth() - button - ImGui::GetStyle().WindowPadding.x -
+                               ImGui::GetStyle().ItemSpacing.x * 2.0F);
+        ImGui::TextColored(message_color, "%s", message.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - button - ImGui::GetStyle().WindowPadding.x, footer_y));
         const bool accent_button = !build_running;
         ImGui::BeginDisabled(!build_running && (game || project == nullptr));
         if (accent_button) {
@@ -11367,6 +11589,14 @@ struct EditorUi::Impl {
         if (accent_button) ImGui::PopStyleColor(3);
         note_item("build:build");
         ImGui::EndDisabled();
+        if (build_running) {
+            // The bar goes below the button row, and the window grows by its height to make room.
+            char overlay[64];
+            std::snprintf(overlay, sizeof overlay, "%d%%  %.0f s", static_cast<int>(build_fraction * 100.0), build_seconds);
+            ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), footer_y + row_height + spacing));
+            ImGui::ProgressBar(static_cast<float>(build_fraction), ImVec2(-FLT_MIN, 0.0F), overlay);
+            note_item("build:progress");
+        }
         ImGui::End();
     }
 
@@ -11376,38 +11606,48 @@ struct EditorUi::Impl {
             if (binding_capture.active) cancel_binding_capture();
             return;
         }
-        ImGui::SetNextWindowSize(ImVec2(900.0F * ui_scale, 680.0F * ui_scale), ImGuiCond_FirstUseEver);
-        const bool visible = ImGui::Begin("Game Configuration", &game_config_open);
+        const bool visible = begin_tool_window("Game Configuration", &game_config_open, ImVec2(900.0F, 680.0F));
         note_item("config:window");
         if (!visible) {
             ImGui::End();
             return;
         }
+        const auto& palette = editor_palette();
+        struct Page { const char* name; const char* detail; const char* id; };
+        constexpr std::array<Page, 3> pages{Page{"Input", "Actions, axes and their controls", "config:page:input"},
+                                            Page{"Graphics", "Lighting and frame rate", "config:page:graphics"},
+                                            Page{"Audio", "Output and mixer buses", "config:page:audio"}};
         if (ImGui::BeginChild("##config_pages", ImVec2(150.0F * ui_scale, 0.0F), ImGuiChildFlags_Borders)) {
-            if (ImGui::Selectable("Input", game_config_page == 0)) game_config_page = 0;
-            note_item("config:page:input");
-            if (ImGui::Selectable("Graphics", game_config_page == 1)) {
-                game_config_page = 1;
-                if (auto settings = call("graphics.settings")) graphics_status = std::move(*settings);
+            ImGui::TextColored(editor_color(palette.text_dim), "CATEGORIES");
+            ImGui::Spacing();
+            for (int index = 0; index < static_cast<int>(pages.size()); ++index) {
+                const auto& page = pages[static_cast<std::size_t>(index)];
+                if (ImGui::Selectable(page.name, game_config_page == index)) {
+                    game_config_page = index;
+                    if (index == 1) {
+                        if (auto settings = call("graphics.settings")) graphics_status = std::move(*settings);
+                    } else if (index == 2) {
+                        refresh_audio_files();
+                        refresh_audio_status();
+                    }
+                }
+                note_item(page.id);
             }
-            note_item("config:page:graphics");
-            if (ImGui::Selectable("Audio", game_config_page == 2)) {
-                game_config_page = 2;
-                refresh_audio_files();
-                refresh_audio_status();
-            }
-            note_item("config:page:audio");
-            for (const char* page : {"Physics"}) {
-                ImGui::BeginDisabled();
-                ImGui::Selectable(page);
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Coming soon");
-            }
+            ImGui::BeginDisabled();
+            ImGui::Selectable("Physics");
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Coming soon");
         }
         ImGui::EndChild();
         ImGui::SameLine();
-        if (ImGui::BeginChild("##config_page", ImVec2(0.0F, 0.0F))) {
+        push_settings_style();
+        if (ImGui::BeginChild("##config_page", ImVec2(0.0F, 0.0F), ImGuiChildFlags_Borders)) {
+            const int shown = std::clamp(game_config_page, 0, static_cast<int>(pages.size()) - 1);
+            ImGui::PushFont(fonts.heading, fonts.heading_size);
+            ImGui::TextUnformatted(pages[static_cast<std::size_t>(shown)].name);
+            ImGui::PopFont();
+            ImGui::TextColored(editor_color(palette.text_dim), "%s", pages[static_cast<std::size_t>(shown)].detail);
+            ImGui::Spacing();
             if (game_config_page == 1)
                 draw_graphics_page();
             else if (game_config_page == 2)
@@ -11416,6 +11656,7 @@ struct EditorUi::Impl {
                 draw_input_page();
         }
         ImGui::EndChild();
+        pop_settings_style();
         ImGui::End();
     }
 

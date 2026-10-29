@@ -642,7 +642,7 @@ without blocking simultaneous human editing.
   case). Traces from before this change recorded layout-dependent keycodes (`key:down:32`),
   which no binding matches.
 - `InputMap` holds actions (any bound control) and axes (button pairs or scaled analog bindings,
-  strongest wins, deadzone rescaled), plus `lock_mouse`. Project files v2 store it as
+  strongest wins; an analog binding has its own `deadzone`, defaulting to its axis's, rescaled), plus `lock_mouse`. Project files v2 store it as
   `settings.input` (the `relay.input` v1 document, embedded as-is); `Project::input` is empty until
   someone saves a map, and the engine defaults apply meanwhile
   (move_x/move_y/look_x/look_y, jump, interact, fire, sprint). `load_project` still reads v1
@@ -669,8 +669,8 @@ without blocking simultaneous human editing.
   free). `EditorUi::game_has_input` and `pointer_locked_for_game` expose the state for tests. **Edit → Game
   Configuration...** is a page-based window (Input now; Graphics, Physics and Audio listed as
   upcoming). The Input page edits a local copy with the engine's own parser and serializer and
-  saves every change through `input.set_map`: action and axis tables with renamable names,
-  wrapping binding chips, press-to-bind capture (`sdl_binding_control`; mouse clicks bind only
+  saves every change through `input.set_map`: foldable action and axis entries (summary when closed, names renamed as typed, device icons,
+  click a binding to rebind it, per-binding deadzone sliders), press-to-bind capture (`sdl_binding_control`; mouse clicks bind only
   inside the prompt, clicking elsewhere cancels), key-pair and stick bindings, invert, deadzone,
   live values during Run Game, mouse lock and Reset to defaults.
 
@@ -1609,6 +1609,14 @@ implemented; "Game builds" above is the reference. What is left of each:
    `players/<platform>-<arch>/`. Not done: no player for anything but Linux x86_64 is produced, scripts
    cannot be built for foreign targets, a container recipe for an old-glibc player is untested (no Docker
    here), and the editor UI does not yet warn under Target when a player is missing.
+
+**Planned: a Manage Players window** (not started). Players (`players/<platform>-<arch>/`) become something
+the person adds and removes from the editor as needed, rather than files placed by hand. It should warn
+about compatibility: when an installed Linux player needs a glibc newer than 2.31 (the floor chosen for wide
+compatibility; the build's Minimum glibc defaults to empty, no check), games built with it will not start
+on older systems, and so should the scripts' own floor, which is the editor machine's. Ahead of it: make a
+native Linux build prefer an installed `players/linux-x86_64/` player to the one beside the editor, and
+produce the old-glibc Linux player (Docker, Debian 11), then Windows and macOS players on their own machines.
 
 Also open for game builds, after those:
 - **Look at it on a desktop.** The player and the Build, Export and file-dialog windows were only run

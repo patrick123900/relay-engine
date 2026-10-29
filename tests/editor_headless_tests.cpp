@@ -1603,6 +1603,7 @@ void export_and_build_ui() {
     ImGui::GetIO().AddMouseWheelEvent(0.0F, 20.0F);
     frame(ui, 3);
     check(engine.build_settings().active().always_include.empty(), "Remove takes it off the list again");
+    (void)protocol.handle(R"({"id":89,"method":"project.set_build_profile","name":"Linux","minimum_glibc":""})"); // This machine's glibc is newer than the default minimum.
     click_center(ui, *need_item(ui, "build:build"));
     wait_for_build(ui);
     check(std::filesystem::is_regular_file("projects/shipping/builds/release/build.json"),
@@ -1895,9 +1896,13 @@ void game_configuration_ui() {
     frame(ui, 3);
     check(ui.headless_item_rect("config:window") && ui.headless_item_rect("config:page:input"),
           "Game Configuration opens on its Input page");
+    check(ui.headless_item_rect("config:input:action:jump") && !ui.headless_item_rect("config:input:action:jump:add"),
+          "actions are folded: their bindings are hidden until the entry is opened");
+    click_center(ui, *ui.headless_item_rect("config:input:action:jump"));
+    frame(ui, 2);
     const auto add = ui.headless_item_rect("config:input:action:jump:add");
     check(add.has_value() && ui.headless_item_rect("config:input:chip:Space"),
-          "the Input page lists default actions with readable bindings");
+          "an opened action lists its bindings readably");
     click_center(ui, *add);
     check(ui.headless_item_rect("config:input:capture").has_value(),
           "adding a binding waits for a control");
@@ -1915,15 +1920,30 @@ void game_configuration_ui() {
         check(saved && saved->input && saved->input->actions.size() == engine.input().map().actions.size(),
               "a binding change saves the input map in the project file");
     }
+    // Clicking an existing binding waits for a control to replace it.
+    click_center(ui, *ui.headless_item_rect("config:input:chip:Space"));
+    check(ui.headless_item_rect("config:input:capture").has_value(), "clicking a binding waits for a new control");
+    key_event(ui, SDL_SCANCODE_X);
+    check(jump().bindings.size() == 3U && jump().bindings.front() == "key:x" && !ui.headless_item_rect("config:input:capture"),
+          "the pressed control replaces the clicked binding in place");
+    click_center(ui, *ui.headless_item_rect("config:input:chip:X"));
+    key_event(ui, SDL_SCANCODE_SPACE);
+    check(jump().bindings.front() == "key:space", "and it can be rebound back");
     click_center(ui, *ui.headless_item_rect("config:input:action:jump:add"));
     key_event(ui, SDL_SCANCODE_ESCAPE);
     check(!ui.headless_item_rect("config:input:capture") && jump().bindings.size() == 3U,
           "Escape cancels a binding capture");
 
-    const auto keys = *ui.headless_item_rect("config:input:axis:move_x:keys");
-    const auto remove = *ui.headless_item_rect("config:input:axis:move_x:delete");
-    check(keys[2] <= remove[0] || keys[1] >= remove[3],
-          "binding buttons wrap inside their column instead of covering Delete");
+    click_center(ui, *ui.headless_item_rect("config:input:action:jump")); // Fold it so the axes stay in view.
+    frame(ui, 2);
+    check(ui.headless_item_rect("config:input:axis:move_x:delete") && !ui.headless_item_rect("config:input:axis:move_x:keys"),
+          "axes are folded too, each with a delete icon");
+    click_center(ui, *ui.headless_item_rect("config:input:axis:move_x"));
+    frame(ui, 2);
+    ImGui::GetIO().AddMousePosEvent(800.0F, 500.0F); // The open axis lies below the page; scroll to it.
+    frame(ui);
+    ImGui::GetIO().AddMouseWheelEvent(0.0F, -10.0F);
+    frame(ui, 3);
     click_center(ui, *ui.headless_item_rect("config:input:axis:move_x:keys"));
     key_event(ui, SDL_SCANCODE_J);
     key_event(ui, SDL_SCANCODE_L);
@@ -1940,6 +1960,19 @@ void game_configuration_ui() {
     const auto& actions = engine.input().map().actions;
     check(actions.back().name == "dash" && actions.back().bindings == std::vector<std::string>{"key:k"},
           "a new action is added and bound");
+    ImGui::GetIO().AddMouseWheelEvent(0.0F, 30.0F); // Back to the top of the page.
+    frame(ui, 3);
+    {
+        // Names follow the typing: there is no Apply.
+        const auto name_field = ui.headless_item_rect("config:input:name:action:" + std::to_string(engine.input().map().actions.size() - 1U));
+        check(name_field.has_value(), "an opened action shows its name field");
+        if (name_field) {
+            click_center(ui, *name_field);
+            type_text(ui, "x");
+            check(engine.input().map().actions.back().name == "dashx", "a typed name is taken as it is typed");
+            key(ui, ImGuiKey_Enter, false);
+        }
+    }
     click_center(ui, *ui.headless_item_rect("config:input:reset"));
     check(engine.input().map().actions.size() == relay::default_input_map().actions.size(),
           "Reset to defaults restores the engine's map");

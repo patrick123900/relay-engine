@@ -3453,7 +3453,7 @@ int main() {
                "two profiles cannot share a name");
         expect(protocol.handle(R"({"id":12022,"method":"project.set_build_settings","active_profile":"Debug Linux"})")
                        .find(R"("ok":true)") != std::string::npos &&
-                   protocol.handle(R"({"id":12023,"method":"project.set_build_profile","name":"Debug Linux","new_name":"Dev"})")
+                   protocol.handle(R"({"id":12023,"method":"project.set_build_profile","name":"Debug Linux","new_name":"Dev","minimum_glibc":""})")
                        .find(R"("ok":true)") != std::string::npos &&
                    engine.build_settings().active_profile == "Dev",
                "renaming the active profile keeps it active");
@@ -3470,6 +3470,10 @@ int main() {
                 for (const auto& entry : archive->entries()) names.insert(entry.name);
             return names;
         };
+        expect(protocol.handle(R"({"id":120249,"method":"project.build_settings"})").find(R"("minimum_glibc":"")") != std::string::npos,
+               "a profile checks no glibc minimum unless told otherwise");
+        // This machine's glibc is newer than that; the build checks below are not about portability.
+        expect(protocol.handle(R"({"id":120248,"method":"project.set_build_profile","name":"Linux","minimum_glibc":""})").find(R"("ok":true)") != std::string::npos, "the minimum is lifted for these builds");
         const auto built = protocol.handle(R"({"id":12025,"method":"project.build"})");
         const auto packed = pak_names(package_root / "builds/release/game.pak");
         expect(built.find(R"("ok":true)") != std::string::npos &&

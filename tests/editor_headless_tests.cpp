@@ -673,6 +673,42 @@ void layout_persistence_ui() {
             click_center(ui, *ui.headless_item_rect("menu:edit"));
             click_center(ui, *ui.headless_item_rect("menu:edit:editor_preferences"));
             frame(ui, 2);
+            // The viewport's own frame rate limit and lighting, for when no game runs.
+            click_center(ui, *ui.headless_item_rect("prefs:page:viewport"));
+            frame(ui, 2);
+            check(ui.viewport_graphics().frame_rate_limit == 250U && ui.viewport_graphics().global_illumination &&
+                      ui.viewport_graphics().reflections && !ui.viewport_graphics().vsync,
+                  "the viewport starts at 250 FPS with lighting on and no vsync");
+            click_center(ui, *ui.headless_item_rect("prefs:frame_rate_limit:60"));
+            click_center(ui, *ui.headless_item_rect("prefs:viewport_vsync"));
+            click_center(ui, *ui.headless_item_rect("prefs:viewport_global_illumination"));
+            frame(ui, 2);
+            check(ui.viewport_graphics().frame_rate_limit == 60U && ui.viewport_graphics().vsync &&
+                      !ui.viewport_graphics().global_illumination && ui.viewport_graphics().reflections,
+                  "the viewport's frame rate limit, vsync and lighting follow the preferences");
+            click_center(ui, *ui.headless_item_rect("prefs:page:camera"));
+            frame(ui, 2);
+            check(ui.headless_item_rect("prefs:field_of_view") && ui.headless_item_rect("prefs:invert_look_y"),
+                  "the Camera page lists the navigation preferences");
+            {
+                // A click on a slider's track, away from its handle, types the value instead of jumping.
+                const auto fov = *ui.headless_item_rect("prefs:field_of_view");
+                const float x = fov[0] + (fov[2] - fov[0]) * 0.9F, y = (fov[1] + fov[3]) * 0.5F;
+                auto& io = ImGui::GetIO();
+                io.AddMousePosEvent(x, y);
+                frame(ui);
+                io.AddMouseButtonEvent(0, true);
+                frame(ui);
+                io.AddMouseButtonEvent(0, false);
+                frame(ui, 2);
+                check(io.WantTextInput, "clicking a slider's track away from its handle starts typing the value");
+                key(ui, ImGuiKey_Escape, false);
+                frame(ui, 2);
+            }
+            click_center(ui, *ui.headless_item_rect("prefs:invert_look_y"));
+            frame(ui, 2);
+            click_center(ui, *ui.headless_item_rect("prefs:page:scripts"));
+            frame(ui, 2);
             click_center(ui, *ui.headless_item_rect("prefs:ide"));
             frame(ui, 2);
             click_center(ui, *ui.headless_item_rect("prefs:ide:zed"));
@@ -681,6 +717,19 @@ void layout_persistence_ui() {
         std::ifstream layout_file(".relay/headless-layout.ini");
         const std::string layout_text((std::istreambuf_iterator<char>(layout_file)), std::istreambuf_iterator<char>());
         check(layout_text.find("ide.preset=zed") != std::string::npos, "the chosen external editor is saved with the layout");
+        check(layout_text.find("viewport.frame_limit=60") != std::string::npos &&
+                  layout_text.find("viewport.vsync=1") != std::string::npos &&
+                  layout_text.find("viewport.global_illumination=0") != std::string::npos &&
+                  layout_text.find("camera.invert_look_y=1") != std::string::npos,
+              "viewport and camera preferences are saved with the layout");
+        {
+            relay::EditorUi reopened([&](std::string_view request) { return protocol.handle(request); });
+            check(reopened.initialize_headless(error), "a later session initializes");
+            frame(reopened, 3);
+            check(reopened.viewport_graphics().frame_rate_limit == 60U && reopened.viewport_graphics().vsync &&
+                      !reopened.viewport_graphics().global_illumination,
+                  "a later session starts with the saved viewport preferences");
+        }
     }
     std::cout << "Headless layout persistence tests passed\n";
 }
@@ -2183,8 +2232,11 @@ void scripts_ui() {
     click_center(ui, *ui.headless_item_rect("menu:edit"));
     click_center(ui, *ui.headless_item_rect("menu:edit:editor_preferences"));
     frame(ui, 2);
-    check(ui.headless_item_rect("prefs:window") && ui.headless_item_rect("prefs:ide"),
+    check(ui.headless_item_rect("prefs:window") && ui.headless_item_rect("prefs:page:viewport"),
           "Edit > Editor preferences opens the preferences window");
+    click_center(ui, *ui.headless_item_rect("prefs:page:scripts"));
+    frame(ui, 2);
+    check(ui.headless_item_rect("prefs:ide").has_value(), "the Scripts page picks the external editor");
     click_center(ui, *ui.headless_item_rect("prefs:ide"));
     frame(ui, 2);
     click_center(ui, *ui.headless_item_rect("prefs:ide:vscode"));

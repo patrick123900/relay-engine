@@ -17,6 +17,8 @@ class EditorLayout {
     void bind(std::string key, bool* value);
     // The same for a line of text (no newlines), such as the user's chosen external editor.
     void bind_text(std::string key, std::string* value);
+    // The same for a number, such as a scale or a speed.
+    void bind_number(std::string key, double* value);
     void build(float scale);
     void save() const;
     void reset() { reset_pending_ = true; }
@@ -40,6 +42,12 @@ class EditorLayout {
         std::string saved;
     };
     std::vector<TextPreference> text_preferences_;
+    struct NumberPreference {
+        std::string key;
+        double* value{};
+        double saved{};
+    };
+    std::vector<NumberPreference> number_preferences_;
     bool reset_pending_{false};
     bool controls_migrated_{false};
     bool optional_migrated_{false};

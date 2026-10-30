@@ -343,6 +343,33 @@ struct EditorUi::Impl {
         return changed;
     }
 
+    // A slider whose track, away from its handle, takes a click as a request to type the value; only
+    // the handle drags. (ImGui types into a slider on Ctrl+click, so such a click is given Ctrl.)
+    bool slider_typed_on_click(const char* id, float* value, const float low, const float high, const char* format,
+                               const bool logarithmic = false) {
+        const auto& style = ImGui::GetStyle();
+        auto& io = ImGui::GetIO();
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        const float width = ImGui::CalcItemWidth(), height = ImGui::GetFrameHeight();
+        float ratio = high > low ? (*value - low) / (high - low) : 0.0F;
+        if (logarithmic && low > 0.0F && high > low && *value > 0.0F)
+            ratio = std::log(*value / low) / std::log(high / low);
+        ratio = std::clamp(ratio, 0.0F, 1.0F);
+        const float grab = std::max(style.GrabMinSize, 12.0F * ui_scale);
+        const float usable = std::max(1.0F, width - 2.0F * style.FramePadding.x);
+        const float centre = origin.x + style.FramePadding.x + grab * 0.5F + (usable - grab) * ratio;
+        const bool inside = io.MousePos.x >= origin.x && io.MousePos.x <= origin.x + width && io.MousePos.y >= origin.y &&
+                            io.MousePos.y <= origin.y + height;
+        const bool track_click = inside && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                                 std::abs(io.MousePos.x - centre) > grab * 0.5F + 3.0F * ui_scale;
+        const bool saved = io.KeyCtrl;
+        if (track_click) io.KeyCtrl = true;
+        const bool changed = ImGui::SliderFloat(id, value, low, high, format,
+                                                ImGuiSliderFlags_AlwaysClamp | (logarithmic ? ImGuiSliderFlags_Logarithmic : 0));
+        if (track_click) io.KeyCtrl = saved;
+        return changed;
+    }
+
     // A tooltip for a settings row: shown over anything from where the row started to its last control.
     void row_hint(const ImVec2 start, const char* text) const {
         const ImVec2 end = ImGui::GetItemRectMax();
@@ -776,6 +803,26 @@ struct EditorUi::Impl {
     std::string ide_preset{"system"}, ide_command;
     std::array<char, 513> ide_command_buffer{};
     bool preferences_open{};
+    int preferences_page{0};
+
+    // What the person has set in Edit → Editor preferences; saved with the layout.
+    struct Preferences {
+        double interface_scale{1.0};       // Multiplies the display's own scale.
+        bool show_frame_rate{true};        // The frame rate in the viewport's corner.
+        bool viewport_global_illumination{true}, viewport_reflections{true}, viewport_vsync{false};
+        double viewport_frame_limit{250.0}; // Frames per second while no game runs; 0 is unlimited.
+        double field_of_view{60.0};        // The viewport camera's vertical field, in degrees.
+        double far_clip{5000.0};
+        double look_sensitivity{1.0};
+        bool invert_look_y{false};
+        double fly_speed{4.0};
+        double zoom_speed{1.0};
+        double gizmo_size{1.0};
+    } prefs;
+    double interface_scale_draft{1.0};
+    bool prefs_applied{false};
+    int frame_limit_edit{250};
+    bool frame_limit_editing{false};
 
     void open_in_file_browser(const std::string& path, const bool directory) {
         if (file_browser) file_browser(std::filesystem::path(assets_root) / path, directory);
@@ -3400,8 +3447,9 @@ struct EditorUi::Impl {
         view.position = navigation_camera.position();
         view.target = navigation_camera.target;
         view.camera = Camera{};
+        view.camera.field_of_view_y_degrees = std::clamp(prefs.field_of_view, 20.0, 120.0);
         view.camera.near_plane = 0.05;
-        view.camera.far_plane = 5000.0;
+        view.camera.far_plane = std::clamp(prefs.far_clip, 100.0, 100000.0);
     }
 
     // One collider's or joint's outline as world-space segments. They are rebuilt only when the
@@ -4057,6 +4105,10 @@ struct EditorUi::Impl {
             capture_pointer(game_lock_mouse, false);
             return;
         }
+        if (!prefs_applied) {
+            navigation_camera.fly_speed = std::clamp(prefs.fly_speed, 0.05, 1000.0);
+            prefs_applied = true;
+        }
         if (!camera_enabled || io.WantTextInput) {
             freelook_latched = false;
             navigating = false;
@@ -4080,7 +4132,8 @@ struct EditorUi::Impl {
 
         const auto delta = mouse_captured ? (already_captured ? motion : ImVec2{}) : io.MouseDelta;
         if (freelook) {
-            navigation_camera.turn(delta.x, delta.y, true);
+            const double sensitivity = std::clamp(prefs.look_sensitivity, 0.1, 5.0);
+            navigation_camera.turn(delta.x * sensitivity, delta.y * sensitivity * (prefs.invert_look_y ? -1.0 : 1.0), true);
             const auto pressed = [](ImGuiKey key) { return ImGui::IsKeyDown(key) ? 1.0 : 0.0; };
             navigation_camera.fly(pressed(ImGuiKey_W) - pressed(ImGuiKey_S),
                                   pressed(ImGuiKey_D) - pressed(ImGuiKey_A),
@@ -4093,9 +4146,11 @@ struct EditorUi::Impl {
                 navigation_camera.pan(delta.x, delta.y, viewport_max.y - viewport_min.y,
                                       view.camera.field_of_view_y_degrees);
             else
-                navigation_camera.turn(delta.x, delta.y, false);
+                navigation_camera.turn(delta.x * std::clamp(prefs.look_sensitivity, 0.1, 5.0),
+                                       delta.y * std::clamp(prefs.look_sensitivity, 0.1, 5.0) * (prefs.invert_look_y ? -1.0 : 1.0), false);
         }
-        if (io.MouseWheel != 0.0F) navigation_camera.wheel(io.MouseWheel, freelook);
+        if (io.MouseWheel != 0.0F)
+            navigation_camera.wheel(io.MouseWheel * std::clamp(prefs.zoom_speed, 0.1, 5.0), freelook);
     }
 
     void update_selection_input() {
@@ -4300,7 +4355,7 @@ struct EditorUi::Impl {
         auto* draw_list = viewport_draw_list;
         draw_list->PushClipRect(viewport_min, viewport_max, true);
         ImGuizmo::Enable(!navigating);
-        ImGuizmo::SetGizmoSizeClipSpace(0.1F);
+        ImGuizmo::SetGizmoSizeClipSpace(0.1F * static_cast<float>(std::clamp(prefs.gizmo_size, 0.5, 2.0)));
         const bool snapping = snap_enabled != ImGui::GetIO().KeyCtrl;
         const auto step = static_cast<float>(snap_step(snap_move));
         const std::array<float, 3> snap_values{step, step, step};
@@ -4397,7 +4452,7 @@ struct EditorUi::Impl {
         auto* draw_list = viewport_draw_list;
         draw_list->PushClipRect(viewport_min, viewport_max, true);
         ImGuizmo::Enable(!navigating);
-        ImGuizmo::SetGizmoSizeClipSpace(0.12F);
+        ImGuizmo::SetGizmoSizeClipSpace(0.12F * static_cast<float>(std::clamp(prefs.gizmo_size, 0.5, 2.0)));
         // Each viewport's gizmo keeps its own drag state.
         ImGui::PushID(gizmo_id);
         const bool snapping = snap_enabled != ImGui::GetIO().KeyCtrl;
@@ -4457,6 +4512,19 @@ struct EditorUi::Impl {
         layout.bind("view.collider_wireframes", &collider_wireframes_enabled);
         layout.bind("view.node_icons", &node_icons_enabled);
         layout.bind("view.camera_wireframes", &camera_wireframes_enabled);
+        layout.bind("ui.show_frame_rate", &prefs.show_frame_rate);
+        layout.bind_number("ui.scale", &prefs.interface_scale);
+        layout.bind("viewport.global_illumination", &prefs.viewport_global_illumination);
+        layout.bind("viewport.reflections", &prefs.viewport_reflections);
+        layout.bind("viewport.vsync", &prefs.viewport_vsync);
+        layout.bind_number("viewport.frame_limit", &prefs.viewport_frame_limit);
+        layout.bind_number("camera.field_of_view", &prefs.field_of_view);
+        layout.bind_number("camera.far_clip", &prefs.far_clip);
+        layout.bind_number("camera.look_sensitivity", &prefs.look_sensitivity);
+        layout.bind("camera.invert_look_y", &prefs.invert_look_y);
+        layout.bind_number("camera.fly_speed", &prefs.fly_speed);
+        layout.bind_number("camera.zoom_speed", &prefs.zoom_speed);
+        layout.bind_number("gizmo.size", &prefs.gizmo_size);
         layout.bind_text("ide.preset", &ide_preset);
         layout.bind_text("ide.command", &ide_command);
     }
@@ -9758,20 +9826,8 @@ struct EditorUi::Impl {
                    !problem.empty());
     }
 
-    void draw_editor_preferences() {
-        if (!preferences_open) return;
-        ImGui::SetNextWindowSize(ImVec2(540.0F * ui_scale, 0.0F), ImGuiCond_FirstUseEver);
-        const bool visible = ImGui::Begin("Editor Preferences", &preferences_open, ImGuiWindowFlags_AlwaysAutoResize);
-        note_item("prefs:window");
-        if (!visible) {
-            ImGui::End();
-            return;
-        }
-        ImGui::PushFont(fonts.heading, fonts.heading_size);
-        ImGui::TextUnformatted("External editor");
-        ImGui::PopFont();
-        ImGui::TextWrapped("The Edit button on a script component opens its source here.");
-        ImGui::Spacing();
+    // The external editor scripts open in.
+    void draw_scripts_preferences() {
         inspector_field_label("Editor");
         if (ImGui::BeginCombo("##ide_preset", ide_display_name().c_str())) {
             for (const auto& preset : ide_presets()) {
@@ -9804,6 +9860,167 @@ struct EditorUi::Impl {
         const auto command = ide_preset == "custom" ? ide_command : preset ? std::string(preset->command) : std::string{};
         if (const auto words = ide_command_line(command, "x", 1, "x"); !words.empty() && !ide_program_found(words.front()))
             ImGui::TextColored(editor_color(editor_palette().warning), "'%s' was not found on your PATH.", words.front().c_str());
+    }
+
+    void draw_editor_preferences() {
+        if (!preferences_open) return;
+        const bool visible = begin_tool_window("Editor Preferences", &preferences_open, ImVec2(860.0F, 640.0F));
+        note_item("prefs:window");
+        if (!visible) {
+            ImGui::End();
+            return;
+        }
+        const auto& palette = editor_palette();
+        struct Page { const char* name; const char* detail; const char* id; };
+        constexpr std::array<Page, 5> pages{Page{"Interface", "The editor's size and readouts", "prefs:page:interface"},
+                                            Page{"Viewport", "Frame rate and lighting while no game runs", "prefs:page:viewport"},
+                                            Page{"Camera", "Moving around the scene", "prefs:page:camera"},
+                                            Page{"Editing", "Snapping, gizmos and overlays", "prefs:page:editing"},
+                                            Page{"Scripts", "The program that edits scripts", "prefs:page:scripts"}};
+        if (ImGui::BeginChild("##prefs_pages", ImVec2(150.0F * ui_scale, 0.0F), ImGuiChildFlags_Borders)) {
+            ImGui::TextColored(editor_color(palette.text_dim), "CATEGORIES");
+            ImGui::Spacing();
+            for (int index = 0; index < static_cast<int>(pages.size()); ++index) {
+                if (ImGui::Selectable(pages[static_cast<std::size_t>(index)].name, preferences_page == index))
+                    preferences_page = index;
+                note_item(pages[static_cast<std::size_t>(index)].id);
+            }
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            if (ImGui::Selectable("Reset all")) {
+                prefs = {};
+                navigation_camera.fly_speed = prefs.fly_speed;
+                interface_scale_draft = prefs.interface_scale;
+            }
+            note_item("prefs:reset");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Return every editor preference except the external editor to its default");
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+        push_settings_style();
+        if (ImGui::BeginChild("##prefs_page", ImVec2(0.0F, 0.0F), ImGuiChildFlags_Borders)) {
+            const int shown = std::clamp(preferences_page, 0, static_cast<int>(pages.size()) - 1);
+            ImGui::PushFont(fonts.heading, fonts.heading_size);
+            ImGui::TextUnformatted(pages[static_cast<std::size_t>(shown)].name);
+            ImGui::PopFont();
+            ImGui::TextColored(editor_color(palette.text_dim), "%s", pages[static_cast<std::size_t>(shown)].detail);
+            ImGui::Spacing();
+            inspector_label_width = 190.0F;
+            const auto check_row = [&](const char* label, bool& value, const char* hint, const char* id) {
+                const ImVec2 start = ImGui::GetCursorScreenPos();
+                inspector_checkbox(label, &value);
+                note_item(id);
+                row_hint(start, hint);
+            };
+            const auto slider_row = [&](const char* label, double& value, const double low, const double high, const char* format,
+                                        const char* hint, const char* id, const bool logarithmic = false) {
+                const ImVec2 start = ImGui::GetCursorScreenPos();
+                inspector_field_label(label);
+                ImGui::SetNextItemWidth(360.0F * ui_scale);
+                auto shown_value = static_cast<float>(value);
+                const bool changed = slider_typed_on_click((std::string{"##"} + id).c_str(), &shown_value, static_cast<float>(low),
+                                                           static_cast<float>(high), format, logarithmic);
+                if (changed) value = shown_value;
+                note_item(id);
+                row_hint(start, hint);
+                return changed;
+            };
+            if (shown == 0) {
+                ImGui::SeparatorText("Size");
+                const ImVec2 start = ImGui::GetCursorScreenPos();
+                inspector_field_label("Interface scale");
+                if (!ImGui::IsAnyItemActive()) interface_scale_draft = prefs.interface_scale;
+                ImGui::SetNextItemWidth(360.0F * ui_scale);
+                auto draft = static_cast<float>(interface_scale_draft);
+                if (slider_typed_on_click("##interface_scale", &draft, 0.75F, 2.0F, "%.2fx"))
+                    interface_scale_draft = draft;
+                note_item("prefs:interface_scale");
+                if (ImGui::IsItemDeactivatedAfterEdit()) prefs.interface_scale = interface_scale_draft;
+                row_hint(start, "Multiplies the size the display asks for. It applies when you let go of the slider.");
+                ImGui::SeparatorText("Readouts");
+                check_row("Show frame rate", prefs.show_frame_rate, "The frame rate in the corner of the viewport.", "prefs:show_frame_rate");
+            } else if (shown == 1) {
+                ImGui::SeparatorText("Frame rate");
+                check_row("Vsync", prefs.viewport_vsync,
+                          "Shows each frame in step with the display's refresh, so the viewport never draws faster than it. Off draws as fast as the limit allows, "
+                          "and the image can tear.",
+                          "prefs:viewport_vsync");
+                const ImVec2 start = ImGui::GetCursorScreenPos();
+                inspector_field_label("Frame rate limit");
+                const int limit = static_cast<int>(std::clamp(prefs.viewport_frame_limit, 0.0, 1000.0));
+                if (!frame_limit_editing) frame_limit_edit = limit;
+                ImGui::SetNextItemWidth(90.0F * ui_scale);
+                ImGui::InputInt("##viewport_frame_limit", &frame_limit_edit, 0, 0);
+                note_item("prefs:frame_rate_limit");
+                frame_limit_editing = ImGui::IsItemActive();
+                if (ImGui::IsItemDeactivatedAfterEdit()) prefs.viewport_frame_limit = std::clamp(frame_limit_edit, 0, 1000);
+                row_hint(start, "The most frames per second the viewport draws; 0 is unlimited. With vsync on, the display's refresh rate is the ceiling either way. "
+                                "A game that runs from the editor uses the project's own limit.");
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(editor_color(palette.text_dim), "FPS");
+                for (const int preset : {0, 30, 60, 120, 144, 250}) {
+                    ImGui::SameLine();
+                    const auto label = preset == 0 ? std::string("Unlimited") : std::to_string(preset);
+                    const bool current = preset == limit;
+                    if (current) ImGui::PushStyleColor(ImGuiCol_Button, palette.accent);
+                    if (ImGui::SmallButton(label.c_str()) && !current) prefs.viewport_frame_limit = preset;
+                    if (current) ImGui::PopStyleColor();
+                    note_item("prefs:frame_rate_limit:" + std::to_string(preset));
+                }
+                ImGui::SeparatorText("Lighting");
+                check_row("Global illumination", prefs.viewport_global_illumination,
+                          "Light bounces between surfaces in the editor view (AMD FidelityFX Brixelizer). Turn it off for a faster, flatter view on slower GPUs.",
+                          "prefs:viewport_global_illumination");
+                check_row("Ray traced reflections", prefs.viewport_reflections,
+                          "Sharp reflections on smooth surfaces in the editor view, traced with hardware ray tracing. Needs a GPU that supports it.",
+                          "prefs:viewport_reflections");
+            } else if (shown == 2) {
+                ImGui::SeparatorText("View");
+                slider_row("Field of view", prefs.field_of_view, 30.0, 110.0, "%.0f\u00B0", "The viewport camera's vertical field of view.", "prefs:field_of_view");
+                slider_row("Far clip", prefs.far_clip, 100.0, 100000.0, "%.0f", "How far the viewport camera sees, in units.", "prefs:far_clip", true);
+                ImGui::SeparatorText("Movement");
+                if (slider_row("Fly speed", prefs.fly_speed, 0.1, 200.0, "%.2f", "Speed while flying with the right mouse button held, in units per second. The scroll wheel changes it too, until you restart.",
+                               "prefs:fly_speed", true))
+                    navigation_camera.fly_speed = prefs.fly_speed;
+                slider_row("Zoom speed", prefs.zoom_speed, 0.25, 4.0, "%.2fx", "How far one step of the scroll wheel moves the camera.", "prefs:zoom_speed");
+                ImGui::SeparatorText("Looking");
+                slider_row("Look sensitivity", prefs.look_sensitivity, 0.2, 3.0, "%.2fx", "How far the camera turns for a given mouse movement.", "prefs:look_sensitivity");
+                check_row("Invert vertical look", prefs.invert_look_y, "Moving the mouse up looks down, as in flight controls.", "prefs:invert_look_y");
+            } else if (shown == 3) {
+                ImGui::SeparatorText("Snapping");
+                check_row("Snap to grid", snap_enabled, "Moves, turns and scales in whole steps. Hold Ctrl to flip it while dragging.", "prefs:snap");
+                static constexpr std::array<const char*, 4> labels{"Move step", "Rotate step", "Scale step", "Interface step"};
+                static constexpr std::array<const char*, 4> hints{"Units a move snaps to.", "Degrees a rotation snaps to.", "Amount a scale snaps to.",
+                                                                  "Units the interface editor's grid snaps to."};
+                for (std::size_t index = 0; index < snap_steps.size(); ++index) {
+                    const ImVec2 start = ImGui::GetCursorScreenPos();
+                    inspector_field_label(labels[index]);
+                    ImGui::SetNextItemWidth(120.0F * ui_scale);
+                    std::array<char, 24> text{};
+                    std::snprintf(text.data(), text.size(), "%s", snap_steps[index].c_str());
+                    if (ImGui::InputText((std::string{"##snap_step"} + std::to_string(index)).c_str(), text.data(), text.size(),
+                                         ImGuiInputTextFlags_CharsDecimal))
+                        snap_steps[index] = text.data();
+                    note_item("prefs:snap_step" + std::to_string(index));
+                    row_hint(start, hints[index]);
+                }
+                ImGui::SeparatorText("Gizmos");
+                slider_row("Gizmo size", prefs.gizmo_size, 0.5, 2.0, "%.2fx", "The size of the move, rotate and scale handles.", "prefs:gizmo_size");
+                ImGui::SeparatorText("Overlays");
+                check_row("Ground grid", grid_enabled, "The grid on the ground plane.", "prefs:grid");
+                check_row("Node icons", node_icons_enabled, "Icons for cameras, lights and other nodes that have no shape.", "prefs:node_icons");
+                check_row("Collider outlines", collider_wireframes_enabled, "Outlines of collision shapes and joints.", "prefs:collider_outlines");
+                check_row("Camera outlines", camera_wireframes_enabled, "The viewing volume of cameras in the scene.", "prefs:camera_outlines");
+            } else {
+                ImGui::SeparatorText("External editor");
+                draw_scripts_preferences();
+            }
+            inspector_label_width = 0.0F;
+        }
+        ImGui::EndChild();
+        pop_settings_style();
         ImGui::End();
     }
 
@@ -11976,7 +12193,7 @@ struct EditorUi::Impl {
     }
 
     void draw_viewport_fps() {
-        if (!viewport_visible || !viewport_draw_list) return;
+        if (!prefs.show_frame_rate || !viewport_visible || !viewport_draw_list) return;
         char label[32];
         std::snprintf(label, sizeof(label), "%.0f FPS", ImGui::GetIO().Framerate);
         const auto size = ImGui::CalcTextSize(label);
@@ -12094,6 +12311,7 @@ struct EditorUi::Impl {
         child->device = device;
         child->fonts = fonts;
         child->ui_scale = ui_scale;
+        child->prefs = prefs;
         child->grid_enabled = grid_enabled;
         child->snap_enabled = snap_enabled;
         child->snap_steps = snap_steps;
@@ -15340,6 +15558,12 @@ void EditorUi::set_attachment_picker(AttachmentPicker picker) { impl_->attachmen
 
 bool EditorUi::game_has_input() const { return impl_->game_input_focus; }
 
+EditorUi::ViewportGraphics EditorUi::viewport_graphics() const {
+    const auto& prefs = impl_->prefs;
+    return {prefs.viewport_global_illumination, prefs.viewport_reflections, prefs.viewport_vsync,
+            static_cast<std::uint32_t>(std::clamp(prefs.viewport_frame_limit, 0.0, 1000.0))};
+}
+
 bool EditorUi::open_template(const std::string_view name) { return impl_->open_template(std::string{name}); }
 
 void EditorUi::set_shared_assets(AssetRegistry* assets) { impl_->shared_assets = assets; }
@@ -15723,8 +15947,8 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     // Use only the remaining content scale here to avoid applying desktop scaling twice.
     const float density = impl_->headless ? 1.0F : SDL_GetWindowPixelDensity(impl_->sdl_window);
     const float display_scale = impl_->headless ? 1.0F : SDL_GetWindowDisplayScale(impl_->sdl_window);
-    const float scale = density > 0.0F && display_scale > 0.0F
-                            ? display_scale / density : 1.0F;
+    const float scale = (density > 0.0F && display_scale > 0.0F ? display_scale / density : 1.0F) *
+                        static_cast<float>(std::clamp(impl_->prefs.interface_scale, 0.75, 2.5));
     if (std::abs(scale - impl_->ui_scale) > 0.001F) {
         impl_->ui_scale = scale;
         apply_editor_theme(scale);

@@ -33,7 +33,7 @@ camera is never the active one, a disabled collider, body, joint, script, light,
 emitter, keyframe animation or interface widget is ignored). The Transform and Model animation have
 no checkbox. A script component's header also has an **Edit** (pencil) button (and an **Edit script** context
 item) that opens the script's source, at its class, in your IDE; choose the IDE under **Edit →
-Editor preferences...** (Visual Studio Code, VSCodium, Cursor, Zed, Sublime Text, Kate, CLion, Qt
+Editor preferences... → Scripts** (Visual Studio Code, VSCodium, Cursor, Zed, Sublime Text, Kate, CLion, Qt
 Creator, your system default, or a custom command with `{file}`, `{line}` and `{project}`). Remove one with the **×** on its header (or right-click → **Remove component**). **+ Add Component** at the bottom opens the Add Component window: categories on the
 left, engine components and your script behaviours on the right, a description of the selection,
 and search. The Transform cannot be removed.
@@ -142,6 +142,23 @@ is uncompressed and holds the project file and its settings, every scene, templa
 import record. Captures, traces, earlier exports, builds and hidden files such as caches are left
 out. Extracting it anywhere gives a folder that opens as an identical copy of the project. Export
 refuses to overwrite an existing file. Exporting is not building: it saves the project, not the game.
+
+## Editor preferences
+
+**Edit → Editor preferences...** opens a window laid out like Game Configuration, with a page per area.
+Everything is saved with the editor's layout in your user configuration folder, so it applies to every
+project; **Reset all** (below the page list) returns everything except the external editor to its
+defaults. Sliders drag by their handle; click anywhere else on a slider to type its value instead.
+
+- **Interface:** the interface scale (a multiplier on the display's own scale, applied when you let go of
+  the slider) and whether the viewport shows its frame rate.
+- **Viewport:** how the editor view is drawn **while no game runs**: vsync, a frame rate limit (0 is
+  unlimited; 250 by default), global illumination and ray traced reflections. While a game runs from
+  the editor, the project's own graphics settings (Game Configuration → Graphics) apply instead.
+- **Camera:** field of view, far clip, fly speed, zoom speed, look sensitivity and inverted vertical look.
+- **Editing:** snapping and its four step sizes, the gizmo size, and the ground grid, node icons, collider
+  outlines and camera outlines.
+- **Scripts:** the external editor scripts open in.
 
 ## Building a game
 

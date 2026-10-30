@@ -11,6 +11,7 @@
 #include "relay/editor/editor_overlay.hpp"
 #include "relay/editor/ide.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <array>
@@ -72,6 +73,15 @@ public:
     // Host seam: whether the running game wants the cursor locked (the input map's lock_mouse
     // until a script changes it). A cursor a script frees for a menu appears mid-viewport.
     void set_game_cursor_locked(bool locked);
+    // How the editor viewport is drawn while no game runs (Edit → Editor preferences → Viewport).
+    // While the game runs the project's own graphics settings apply instead.
+    struct ViewportGraphics {
+        bool global_illumination{true};
+        bool reflections{true};
+        bool vsync{false};
+        std::uint32_t frame_rate_limit{250}; // Frames per second; 0 is unlimited.
+    };
+    [[nodiscard]] ViewportGraphics viewport_graphics() const;
     // Opens a project template in its own editing window (a floating Hierarchy, viewport and
     // Inspector over a private copy of the template), or focuses it when it is already open. False,
     // with a status message, when no project is open or the template cannot be read.

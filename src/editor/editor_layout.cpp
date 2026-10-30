@@ -4,6 +4,8 @@
 #include <imgui_internal.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -48,6 +50,10 @@ void EditorLayout::bind_text(std::string key, std::string* value) {
     text_preferences_.push_back({std::move(key), value, *value});
 }
 
+void EditorLayout::bind_number(std::string key, double* value) {
+    number_preferences_.push_back({std::move(key), value, *value});
+}
+
 void EditorLayout::read_preference(const std::string_view line) {
     const auto equals = line.find('=');
     if (equals == std::string_view::npos) return;
@@ -63,6 +69,16 @@ void EditorLayout::read_preference(const std::string_view line) {
             *preference.value = std::string(value);
             preference.saved = *preference.value;
         }
+    for (auto& preference : number_preferences_)
+        if (preference.key == key) {
+            const std::string text{value};
+            char* end = nullptr;
+            const double parsed = std::strtod(text.c_str(), &end);
+            if (end != text.c_str() && std::isfinite(parsed)) {
+                *preference.value = parsed;
+                preference.saved = parsed;
+            }
+        }
     preferences_loaded = true;
 }
 
@@ -73,6 +89,11 @@ void EditorLayout::write_preferences(std::string& output) const {
     for (const auto& preference : text_preferences_) {
         auto text = *preference.value;
         std::erase_if(text, [](const char character) { return character == '\n' || character == '\r'; });
+        output += preference.key + '=' + text + '\n';
+    }
+    for (const auto& preference : number_preferences_) {
+        char text[40];
+        std::snprintf(text, sizeof text, "%.6g", *preference.value);
         output += preference.key + '=' + text + '\n';
     }
     output += '\n';
@@ -119,6 +140,11 @@ void EditorLayout::build(const float scale) {
             ImGui::MarkIniSettingsDirty();
         }
     for (auto& preference : text_preferences_)
+        if (*preference.value != preference.saved) {
+            preference.saved = *preference.value;
+            ImGui::MarkIniSettingsDirty();
+        }
+    for (auto& preference : number_preferences_)
         if (*preference.value != preference.saved) {
             preference.saved = *preference.value;
             ImGui::MarkIniSettingsDirty();

@@ -465,6 +465,7 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
     // The game's frame rate limiter: the current period and the next frame's deadline.
     std::chrono::steady_clock::duration limiter_period{};
     std::chrono::steady_clock::time_point limiter_deadline{};
+    std::uint32_t viewport_frame_limit = 250U; // The editor's limit on frames per second; 0 is unlimited.
     while (engine.status().running && !window_closed) {
         // Each loop iteration is one profiled frame, so its duration is the displayed frame time.
         relay::profiler().begin_frame();
@@ -520,6 +521,19 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
             }
         }
         apply_graphics_settings(window, engine);
+#ifdef RELAY_HAS_EDITOR_UI
+        // While no game runs the viewport follows the editor's own preferences; RELAY_* overrides still win.
+        if (editor && engine.status().mode != relay::RuntimeMode::game) {
+            const auto viewport = editor->viewport_graphics();
+            const auto forced = [](const char* name) { return std::getenv(name) != nullptr; };
+            if (!forced("RELAY_GLOBAL_ILLUMINATION")) window.set_global_illumination(viewport.global_illumination);
+            if (!forced("RELAY_REFLECTIONS")) window.set_reflections(viewport.reflections);
+            if (!forced("RELAY_VSYNC")) window.set_vsync(viewport.vsync);
+            viewport_frame_limit = viewport.frame_rate_limit;
+        } else {
+            viewport_frame_limit = 250U;
+        }
+#endif
         // Shaders animate in the editor too, so they follow the wall clock rather than game time.
         window.set_shader_time(std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                                              shader_clock_start).count());
@@ -544,8 +558,9 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
                                          window.render_resource_count());
         const auto status = engine.status();
         const bool game = status.mode == relay::RuntimeMode::game;
-        const auto limit = engine.graphics_settings().frame_rate_limit;
-        if (game && limit != 0U && window.presented()) {
+        // The project's limit while the game runs, the editor's own while it does not.
+        const auto limit = game ? engine.graphics_settings().frame_rate_limit : viewport_frame_limit;
+        if (limit != 0U && window.presented()) {
             // The project's frame rate limit. Deadlines advance by whole periods so the average
             // rate is exact despite sleep overshoot; a frame that falls behind restarts them.
             RELAY_PROFILE_WAIT("Frame rate limit");
@@ -557,9 +572,8 @@ int run_live_editor_session(const bool with_ui, const bool read_stdin, bool& rea
                                    : frame_start + period;
             limiter_period = period;
             std::this_thread::sleep_until(limiter_deadline);
-        } else if (!game || !window.presented()) {
-            // The editor needs no more than 250 frames a second. Without a presented image,
-            // as in a minimized window, nothing else would pace the loop.
+        } else if (!window.presented()) {
+            // Without a presented image, as in a minimized window, nothing else would pace the loop.
             limiter_period = {};
             RELAY_PROFILE_WAIT("Frame pacing");
             std::this_thread::sleep_until(frame_start + 4ms);

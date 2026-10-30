@@ -157,7 +157,16 @@ without blocking simultaneous human editing.
   "##id" suffixes dropped, underscores become spaces, first letter capitalised, so script and shader
   names read "Wave height". Every Inspector checkbox (`inspector_checkbox`) and script text property
   puts its name in the left label column like other fields.
-- External editor: Edit → Editor preferences... (`draw_editor_preferences`) picks an `IdePreset`
+- Editor preferences: Edit → Editor preferences... (`draw_editor_preferences`) is a free-floating window laid
+  out like Game Configuration (pages Interface, Viewport, Camera, Editing, Scripts). `EditorUi::Impl::Preferences`
+  holds the interface scale (multiplies the display scale in `EditorUi::build`), the frame rate readout, the
+  viewport's vsync / frame rate limit / GI / reflections, camera field of view, far clip, fly and zoom speed,
+  look sensitivity, inverted look and gizmo size; all persist through `EditorLayout::bind`/`bind_number`
+  (`ui.*`, `viewport.*`, `camera.*`, `gizmo.size`). The live editor (`apps/relay_demo`) applies
+  `EditorUi::viewport_graphics()` instead of the project's graphics settings, and its limit instead of
+  the project's, whenever the runtime mode is not game. Not done: autosave, theme and colour choices, font
+  choice, keyboard shortcut editing, a recent-projects list; the interface scale was only checked headlessly.
+- External editor (Scripts page): picks an `IdePreset`
   (`src/editor/ide.cpp`: system default, VS Code, VSCodium, Cursor, Zed, Sublime, Kate, CLion, Qt
   Creator, or a custom template with `{file}`/`{line}`/`{project}`; split on spaces, no shell). The
   choice is two text preferences (`ide.preset`, `ide.command`) in the layout ini via the new

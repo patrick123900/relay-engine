@@ -1527,7 +1527,8 @@ Phase 3:
    materials trace as opaque, transparent objects are not in the ray tracing scene, rough
    metals near the threshold keep some denoiser blotching, and each acceleration structure is a
    separate allocation (no sub-allocation yet). The FidelityFX build is only tested on Linux
-   with GCC; the Windows build of the vendored SDK has not been tried. The Graphics page has
+   with GCC; the Windows build of the vendored SDK compiles its shader tool with MinGW but its shader
+   permutations have never been generated on Windows (the tool is GLSL-only there; `RELAY_FFX_SC_HLSL` is never defined). The Graphics page has
    headless coverage only.
 13. GPU timestamps bracket whole passes on the graphics queue; the panel's GPU numbers do not
    separate work that overlaps inside a pass.
@@ -1671,6 +1672,15 @@ Other:
 
 Deferred:
 
+- Windows build: prepared but never run on a real Windows machine. `docs/building-windows.md`, the
+  `windows` and `windows-vcpkg` presets, `vcpkg.json` and `.github/workflows/windows.yml` exist; SDL3 is
+  fetched and built statically when absent (`RELAY_FETCH_SDL`, default ON only on Windows). Checked by
+  cross-compiling with MinGW on Linux (engine, editor, player, tests and the FidelityFX tool compile and
+  link apart from the Vulkan loader); MSVC, the generated FidelityFX shaders, rendering and the tests
+  have not run. Expect first-build fixes for MSVC (`/W4` noise, `/bigobj`, `wmain`), and a CI run is the
+  quickest way to find them. On Windows the built-in player is `relay_player.exe` beside the editor
+  (all programs land in the build folder), the build skips the Linux `ldd` library copy, and Run
+  standalone / Build use it as the `windows x86_64` player.
 - Load scripts on Windows (`LoadLibraryW`, `.dll`, MSVC/clang-cl and MinGW compiler flags). The
   stubs are in `src/script/script_system.cpp` (`load`, `build`, `status`). It can be developed on
   Linux: MinGW and Wine can run the script tests end to end, but the MSVC/clang-cl flags need the

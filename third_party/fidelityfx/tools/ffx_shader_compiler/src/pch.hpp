@@ -26,10 +26,14 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#endif
+#ifdef RELAY_FFX_SC_HLSL
+// Relay: the HLSL compilers need ATL and the DirectX Shader Compiler headers. Relay's build never
+// defines RELAY_FFX_SC_HLSL, so the tool is GLSL-only on every platform, Windows included.
 #include <atlcomcli.h>
 #include <dxcapi.h>
 #include <d3dcompiler.h>
-#endif // Relay: the HLSL compilers are Windows-only; the GLSL path builds everywhere.
+#endif
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -50,7 +54,7 @@
 #include <iostream>
 #include <algorithm>
 #include <fstream>
-#ifdef _WIN32
+#ifdef RELAY_FFX_SC_HLSL
 #include <d3d12shader.h>
 #endif
 

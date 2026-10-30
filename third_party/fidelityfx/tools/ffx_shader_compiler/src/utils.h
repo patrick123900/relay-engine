@@ -23,7 +23,7 @@
 #pragma once
 
 #include "pch.hpp"
-#ifdef _WIN32
+#ifdef RELAY_FFX_SC_HLSL
 #include "DXBCChecksum.h"
 #endif
 

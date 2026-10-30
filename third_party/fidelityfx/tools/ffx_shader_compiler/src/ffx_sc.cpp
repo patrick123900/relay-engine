@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifdef _WIN32
+#ifdef RELAY_FFX_SC_HLSL
 #include "hlsl_compiler.h"
 #endif
 #include "glsl_compiler.h"
@@ -588,7 +588,7 @@ void Application::OpenSourceFile()
         std::wstring extension    = m_Params.inputFile.substr(extensionPos + 1, m_Params.inputFile.size() - extensionPos - 1);
 
         if (extension == L"hlsl")
-#ifndef _WIN32
+#ifndef RELAY_FFX_SC_HLSL
             throw std::runtime_error("HLSL shaders can only be compiled on Windows");
 #else
             m_Compiler = std::unique_ptr<HLSLCompiler>(
@@ -601,7 +601,7 @@ void Application::OpenSourceFile()
     }
     else
     {
-#ifndef _WIN32
+#ifndef RELAY_FFX_SC_HLSL
         if (m_Params.compiler != L"glslang")
             throw std::runtime_error("only the glslang compiler is available outside Windows");
 #else
@@ -1124,43 +1124,68 @@ void Application::DumpDepfileMSVC()
     printf("MSVC depfile not implemented yet.\n");
 }
 
+// Relay: both entry points convert their arguments to the wide strings the tool works with. An
+// argument of the form @<file> is replaced by the lines of that file, one argument per line, so build
+// systems can pass permutation lists such as -DOPTION={0,1} without a POSIX shell brace-expanding
+// them.
+static void AppendArgument(std::vector<std::wstring>& arguments, const std::wstring& argument, bool first)
+{
+    if (first || argument.empty() || argument[0] != L'@')
+    {
+        arguments.push_back(argument);
+        return;
+    }
+    const std::string path = WCharToUTF8(argument.substr(1));
+#ifdef _WIN32
+    std::ifstream responseFile(fs::path(argument.substr(1)));
+#else
+    std::ifstream responseFile(path);
+#endif
+    if (!responseFile)
+        throw std::runtime_error("could not open response file " + path);
+    for (std::string line; std::getline(responseFile, line);)
+    {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (!line.empty())
+            arguments.push_back(UTF8ToWChar(line));
+    }
+}
+
 #ifdef _WIN32
 int wmain(int argc, wchar_t** argv)
 {
+    std::vector<std::wstring> wideArguments;
+    try
+    {
+        for (int i = 0; i < argc; ++i)
+            AppendArgument(wideArguments, argv[i], i == 0);
+    }
+    catch (const std::exception& e)
+    {
+        fprintf(stderr, "ffx_sc failed: %s\n", e.what());
+        return -1;
+    }
 #else
-// Relay: convert UTF-8 arguments to the wide strings the tool works with. An argument of the form
-// @<file> is replaced by the lines of that file, one argument per line, so build systems can pass
-// permutation lists such as -DOPTION={0,1} without a POSIX shell brace-expanding them.
 int main(int argc, char** argv)
 {
     std::vector<std::wstring> wideArguments;
-    for (int i = 0; i < argc; ++i)
+    try
     {
-        if (i > 0 && argv[i][0] == '@')
-        {
-            std::ifstream responseFile(argv[i] + 1);
-            if (!responseFile)
-            {
-                fprintf(stderr, "ffx_sc failed: could not open response file %s\n", argv[i] + 1);
-                return -1;
-            }
-            for (std::string line; std::getline(responseFile, line);)
-            {
-                if (!line.empty() && line.back() == '\r')
-                    line.pop_back();
-                if (!line.empty())
-                    wideArguments.push_back(UTF8ToWChar(line));
-            }
-        }
-        else
-            wideArguments.push_back(UTF8ToWChar(argv[i]));
+        for (int i = 0; i < argc; ++i)
+            AppendArgument(wideArguments, UTF8ToWChar(argv[i]), i == 0);
     }
+    catch (const std::exception& e)
+    {
+        fprintf(stderr, "ffx_sc failed: %s\n", e.what());
+        return -1;
+    }
+#endif
     argc = static_cast<int>(wideArguments.size());
     std::vector<const wchar_t*> wideArgumentPointers;
     for (const auto& argument : wideArguments)
         wideArgumentPointers.push_back(argument.c_str());
     const wchar_t* const* wargv = wideArgumentPointers.data();
-#endif
     try
     {
         if (argc <= 1)
@@ -1170,11 +1195,7 @@ int main(int argc, char** argv)
         }
 
         LaunchParameters params;
-#ifdef _WIN32
-        params.ParseCommandLine(argc - 1, argv + 1);
-#else
         params.ParseCommandLine(argc - 1, wargv + 1);
-#endif
 
         Application app(params);
         app.Process();

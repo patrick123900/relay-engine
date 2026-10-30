@@ -46,6 +46,13 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+// Windows has no setenv or unsetenv; the C runtime's _putenv_s sets a variable, and an empty value
+// removes it.
+int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+int unsetenv(const char* name) { return _putenv_s(name, ""); }
+#endif
+
 namespace {
 
 int failures = 0;
@@ -3414,7 +3421,7 @@ int main() {
         std::filesystem::create_directories(fake_player / "shaders");
         std::filesystem::copy_file("/bin/true", fake_player / "relay_player");
         write_file(fake_player / "shaders" / "test.spv", "spirv");
-        setenv("RELAY_PLAYER_BINARY", (fake_player / "relay_player").c_str(), 1);
+        setenv("RELAY_PLAYER_BINARY", (fake_player / "relay_player").string().c_str(), 1);
         // Build settings save in the project file and drive project.build.
         engine.project() = package;
         expect(protocol.handle(R"({"id":12010,"method":"project.build_settings"})").find(R"("saved":false)") != std::string::npos,
@@ -3703,12 +3710,12 @@ int main() {
                    "cancelling with no build running is harmless");
 
             // A failure is reported, not thrown away.
-            setenv("RELAY_PLAYER_BINARY", (fake_player / "missing").c_str(), 1);
+            setenv("RELAY_PLAYER_BINARY", (fake_player / "missing").string().c_str(), 1);
             expect(protocol.handle(R"({"id":12049,"method":"project.build_start"})").find(R"("ok":true)") != std::string::npos, "a doomed build starts");
             const auto failed = wait_for_state("failed");
             expect(failed.find("\"state\":\"failed\"") != std::string::npos && failed.find("player was not found") != std::string::npos,
                    "a failed build says why: " + failed);
-            setenv("RELAY_PLAYER_BINARY", (fake_player / "relay_player").c_str(), 1);
+            setenv("RELAY_PLAYER_BINARY", (fake_player / "relay_player").string().c_str(), 1);
         }
         // Other targets: a player built elsewhere and installed in a folder per target.
         {
@@ -3719,7 +3726,7 @@ int main() {
                    "the settings list only the targets a player exists for: " + targets);
             const auto players = std::filesystem::temp_directory_path() /
                 ("relay-players-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-            setenv("RELAY_PLAYERS_DIR", players.c_str(), 1);
+            setenv("RELAY_PLAYERS_DIR", players.string().c_str(), 1);
             expect(protocol.handle(R"({"id":120381,"method":"project.set_build_profile","name":"Windows","copy_from":"Linux","target_platform":"windows","configuration":"release"})")
                        .find(R"("ok":true)") != std::string::npos, "a Windows profile is added");
             const auto missing = protocol.handle(R"({"id":120382,"method":"project.build","profile":"Windows"})");
@@ -3841,7 +3848,7 @@ int main() {
             expect(protocol.handle(R"({"id":120386,"method":"project.build","profile":"Linux"})").find(R"("ok":true)") != std::string::npos,
                    "the native build still works");
         }
-        setenv("RELAY_PLAYER_BINARY", (fake_player / "missing").c_str(), 1);
+        setenv("RELAY_PLAYER_BINARY", (fake_player / "missing").string().c_str(), 1);
         expect(protocol.handle(R"({"id":12036,"method":"project.build","profile":"Linux"})").find("player was not found") != std::string::npos,
                "a build without the player program says so");
         unsetenv("RELAY_PLAYER_BINARY");

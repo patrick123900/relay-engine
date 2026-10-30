@@ -7,7 +7,36 @@ option(RELAY_ENABLE_SDL "Build the SDL-powered human window" ON)
 option(RELAY_ENABLE_EDITOR_UI "Build the Dear ImGui human editor interface" ON)
 option(RELAY_FETCH_VULKAN_HEADERS "Fetch pinned Khronos headers when the system only has a loader" ON)
 option(RELAY_OPEN_DEMO_PROJECT "Open examples/demo when the editor starts (dev builds)" OFF)
+# Windows has no system package manager to supply SDL3, so it is built from source there.
+if(WIN32)
+    set(_relay_fetch_sdl_default ON)
+else()
+    set(_relay_fetch_sdl_default OFF)
+endif()
+option(RELAY_FETCH_SDL "Fetch and build SDL3 when the system has none" ${_relay_fetch_sdl_default})
 option(RELAY_ENABLE_FIDELITYFX "Build AMD FidelityFX effects for ray traced lighting" ON)
+
+if(MSVC)
+    # Source files hold UTF-8, and the large editor and protocol files need more object sections.
+    add_compile_options(/utf-8 /bigobj /Zc:__cplusplus /MP)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    # Jolt would otherwise link the static runtime while everything else uses the DLL runtime.
+    set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
+endif()
+if(WIN32)
+    # Every program lands directly in the build folder, as with a single-configuration generator, so
+    # the editor finds the player and its shaders beside it whatever the configuration.
+    foreach(_config "" _DEBUG _RELEASE _RELWITHDEBINFO _MINSIZEREL)
+        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY${_config} "${CMAKE_BINARY_DIR}")
+    endforeach()
+    set(RELAY_EXE_SUFFIX ".exe")
+else()
+    set(RELAY_EXE_SUFFIX "")
+endif()
+if(MINGW)
+    # Programs run without the MinGW runtime DLLs beside them.
+    add_link_options(-static -static-libgcc -static-libstdc++)
+endif()
 
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 include(FetchContent)
@@ -212,7 +241,7 @@ foreach(_target IN LISTS RELAY_ENGINE_TARGETS)
     target_compile_definitions(${_target} PRIVATE
         RELAY_SCRIPT_DEFAULT_COMPILER="${CMAKE_CXX_COMPILER}"
         RELAY_SCRIPT_DEFAULT_SDK_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sdk"
-        RELAY_PLAYER_DEFAULT_PATH="${CMAKE_CURRENT_BINARY_DIR}/relay_player"
+        RELAY_PLAYER_DEFAULT_PATH="${CMAKE_CURRENT_BINARY_DIR}/relay_player${RELAY_EXE_SUFFIX}"
         RELAY_PLAYERS_DEFAULT_DIR="${CMAKE_CURRENT_BINARY_DIR}/players")
     add_dependencies(${_target} relay_protocol_codegen_check)
     target_compile_features(${_target} PUBLIC cxx_std_20)
@@ -336,6 +365,26 @@ if(RELAY_ENABLE_SDL)
             if(TARGET PkgConfig::SDL3)
                 add_library(SDL3::SDL3 ALIAS PkgConfig::SDL3)
             endif()
+        endif()
+    endif()
+    if(NOT TARGET SDL3::SDL3 AND RELAY_FETCH_SDL)
+        # No system SDL3 (the usual case on Windows): build the pinned release into the program.
+        message(STATUS "SDL3 was not found; fetching and building a static copy")
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+        set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            SDL3
+            URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
+            URL_HASH SHA256=9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+            EXCLUDE_FROM_ALL
+        )
+        FetchContent_MakeAvailable(SDL3)
+        if(TARGET SDL3-static AND NOT TARGET SDL3::SDL3)
+            add_library(SDL3::SDL3 ALIAS SDL3-static)
         endif()
     endif()
 

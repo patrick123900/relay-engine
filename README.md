@@ -71,6 +71,8 @@ Development builds open the demo project in [`examples/demo`](examples/demo). Pr
 (F5) to walk around its showcase as a first person player; the first run asks you to trust the
 project so its scripts can build. `./build/dev/relay_demo --headless` runs without a display.
 
+On Windows, see [Building on Windows](docs/building-windows.md).
+
 To use agents, install the bridge (Node.js 24+ and a current Codex CLI) and start the editor with
 it, then sign in under **Agent → Account**:
 
@@ -126,7 +128,7 @@ generates the C++, TypeScript and reference documentation.
 ## Status
 
 Relay is a Linux-first research project under active development; APIs and file formats may still
-change. The renderer is verified on Linux with RADV; Windows and macOS parity, script loading on
+change. The renderer is verified on Linux with RADV; Windows builds compile in CI but have seen little use (see [Building on Windows](docs/building-windows.md)); macOS parity, script loading on
 Windows and wider import sandboxing are still in progress. Relay targets local, single-user
 authoring and treats project files and imported assets as untrusted input. Native gameplay scripts
 run with your permissions, so Relay builds them only for projects you have trusted.

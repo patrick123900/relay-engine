@@ -1,0 +1,35 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  VULKAN_SDK_VERSION: 1.4.309.0
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Vulkan SDK
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\VulkanSDK.exe"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/VulkanSDK-$env:VULKAN_SDK_VERSION-Installer.exe" -OutFile $installer
+          Start-Process $installer -ArgumentList "--accept-licenses --default-answer --confirm-command install" -Wait
+          $root = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"
+          "VULKAN_SDK=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$root\Bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Configure
+        run: cmake --preset windows -DRELAY_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build --preset windows --parallel
+
+      - name: Test
+        run: ctest --test-dir build/windows -C Release --output-on-failure -R "relay_tests|relay_workflow_tests"

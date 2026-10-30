@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "relay-engine",
+  "version": "0.1.0",
+  "description": "Optional libraries for Relay on Windows: image formats, model import and runtime shader compilation.",
+  "dependencies": [
+    "libpng",
+    "libjpeg-turbo",
+    "assimp",
+    "glslang"
+  ]
+}

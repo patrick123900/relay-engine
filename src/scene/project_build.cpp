@@ -19,6 +19,11 @@
 #include <set>
 #include <sstream>
 
+#if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #ifndef RELAY_PLAYER_DEFAULT_PATH
 #define RELAY_PLAYER_DEFAULT_PATH ""
 #endif
@@ -87,6 +92,12 @@ const char* host_platform() {
 #else
     return "linux";
 #endif
+}
+
+// Linux and Windows builds of Relay produce a player of their own; other hosts rely on installed ones.
+bool builtin_player_platform() {
+    const std::string platform{host_platform()};
+    return platform == "linux" || platform == "windows";
 }
 
 const char* host_architecture() {
@@ -204,7 +215,14 @@ bool player_installed(const BuildProfile& profile) {
 std::filesystem::path find_player_binary() {
     std::error_code ec;
     if (const char* chosen = std::getenv("RELAY_PLAYER_BINARY"); chosen && *chosen) return chosen;
-#ifndef _WIN32
+#if defined(_WIN32)
+    std::wstring buffer(32768U, L'\0');
+    const auto length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length > 0U && length < buffer.size()) {
+        const auto beside = std::filesystem::path(buffer.substr(0U, length)).parent_path() / "relay_player.exe";
+        if (std::filesystem::is_regular_file(beside, ec)) return beside;
+    }
+#else
     const auto self = std::filesystem::read_symlink("/proc/self/exe", ec);
     if (!ec) {
         const auto beside = self.parent_path() / "relay_player";
@@ -216,7 +234,7 @@ std::filesystem::path find_player_binary() {
 
 // Libraries every Linux system provides, or that must come from the machine's own drivers and
 // desktop; everything else the player needs ships beside it.
-bool system_library(const std::string& name) {
+[[maybe_unused]] bool system_library(const std::string& name) {
     static const char* const prefixes[] = {
         "ld-linux", "libc.so", "libm.so", "libdl.so", "libpthread.so", "librt.so", "libutil.so",
         "libresolv.so", "libnsl.so", "libanl.so", "libvulkan.so", "libGL", "libEGL", "libX", "libxcb",
@@ -231,6 +249,13 @@ bool system_library(const std::string& name) {
 bool program_libraries(const std::filesystem::path& program,
                        std::vector<std::pair<std::string, std::filesystem::path>>& libraries,
                        std::string& error) {
+#if defined(_WIN32)
+    // The Windows player links its libraries statically; the system supplies the rest.
+    (void)program;
+    (void)libraries;
+    (void)error;
+    return true;
+#else
     const auto result = run_process({"ldd", program.string()}, std::chrono::seconds{30}, 256U * 1024U);
     if (!result.started || result.exit_code != 0) {
         error = "cannot list the libraries of " + program.string() + " with ldd";
@@ -254,6 +279,7 @@ bool program_libraries(const std::filesystem::path& program,
         libraries.emplace_back(std::move(name), std::filesystem::path{rest});
     }
     return true;
+#endif
 }
 
 // Finds the player for the profile's target and the files it needs. This machine's own target uses
@@ -263,7 +289,7 @@ bool find_player_kit(const BuildProfile& profile, PlayerKit& kit, std::string& e
     std::error_code ec;
     const bool own = profile.target_platform == host_platform() && profile.architecture == host_architecture();
     // The player this Relay was built with serves its own Linux target, unless one was installed for it.
-    if (own && profile.target_platform == "linux" && !player_installed(profile)) {
+    if (own && builtin_player_platform() && !player_installed(profile)) {
         const auto player = find_player_binary();
         if (player.empty() || !std::filesystem::is_regular_file(player, ec)) {
             error = "the game player was not found" + (player.empty() ? std::string{} : " at " + player.generic_string()) +
@@ -271,6 +297,7 @@ bool find_player_kit(const BuildProfile& profile, PlayerKit& kit, std::string& e
             return false;
         }
         kit.program = player;
+        kit.program_extension = player.extension().string();
         const auto shader_source = player.parent_path() / "shaders";
         std::size_t shaders = 0;
         for (std::filesystem::directory_iterator it(shader_source, ec), end; !ec && it != end; it.increment(ec))
@@ -401,11 +428,11 @@ std::vector<PlayerInfo> list_players() {
         players.push_back(std::move(info));
     }
     // This machine's own Linux player, which the editor was built with, serves its target unless one is installed.
-    if (std::string{host_platform()} == "linux" && !find_installed_player(installed, "linux", host_architecture())) {
+    if (builtin_player_platform() && !find_installed_player(installed, host_platform(), host_architecture())) {
         const auto player = find_player_binary();
         if (!player.empty() && std::filesystem::is_regular_file(player, ec)) {
             PlayerInfo info;
-            info.platform = "linux";
+            info.platform = host_platform();
             info.architecture = host_architecture();
             info.native = true;
             info.built_in = true;

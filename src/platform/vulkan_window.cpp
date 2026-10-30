@@ -6076,6 +6076,7 @@ void fragment() {
         return {right, up};
     }
 
+#ifdef RELAY_HAS_FIDELITYFX
     // Builds this frame's particle quads for the acceleration structure, with the buffers the trace
     // shader shades them from. Returns false (and adds nothing) when there are no particles.
     bool prepare_particle_trace(const RenderScene& render_scene, std::vector<RayTracingInstance>& ray_instances,
@@ -6200,6 +6201,7 @@ void fragment() {
         table.push_back({0U, 0U, 0, 2U});
         return true;
     }
+#endif
 
     // Builds the acceleration structures, classifies, traces and denoises this frame's
     // reflections between the geometry and forward passes.

@@ -29,6 +29,11 @@ target_include_directories(relay_ffx_sc PRIVATE
     "${RELAY_FFX_TOOL}/libs/tiny-process-library")
 find_package(Threads REQUIRED)
 target_link_libraries(relay_ffx_sc PRIVATE Threads::Threads)
+if(WIN32 AND NOT MSVC)
+    # MSVC links pathcch through a #pragma comment and starts wmain on its own.
+    target_link_libraries(relay_ffx_sc PRIVATE pathcch)
+    target_link_options(relay_ffx_sc PRIVATE -municode)
+endif()
 if(NOT MSVC)
     # Upstream code; keep Relay's build output readable.
     target_compile_options(relay_ffx_sc PRIVATE -w)

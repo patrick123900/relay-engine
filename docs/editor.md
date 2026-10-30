@@ -103,7 +103,7 @@ menu stays open so several categories can be ticked at once. Right-click an entr
 in file browser** to show it in your system file manager. Results list each match with its folder;
 double-click a folder result or choose **Show in folder** to jump back to the tree there. **Escape**
 clears the search. The chevron button left of the funnel collapses every folder, or opens them all
-when all are closed. The project's `.relayproject` file is not listed; the Project panel manages it.
+when all are closed. The project's `.relayproject` file is not listed; **Edit → Game Configuration → Scenes** manages the project's scenes.
 The project's member scenes cannot be moved or deleted from here. To bring a model into the scene,
 double-click it, drag it into the viewport (it lands on the ground under the pointer) or onto a
 hierarchy row (it becomes a child), or right-click it and choose **Import to scene**.
@@ -215,6 +215,34 @@ keeps whatever the scan finds. **Compress textures** stores images as BC1/BC3 wi
 needs a newer C library. Linux x86_64 builds need a Vulkan GPU driver and a C library at least as new as
 the build machine's; [portable builds](portable-builds.md) covers older systems and other targets.
 
+**Run → Run standalone game** builds the game with the build profile for the machine the editor runs on
+(the active profile if it targets this machine, otherwise the first profile that does) and starts the built
+program on its own, outside the editor. It builds first, with progress in the status bar (and the Build
+window, if open), and unsaved scene changes are not included. If no profile targets this machine, or no player
+is installed for it, it reports an error and builds nothing. The game's output is written to `last-run.log`
+beside it.
+
+## Managing players
+
+A *player* is the program a game is made from, and Relay builds for every target it has a player for. The
+Platform and Architecture choices in **Run → Build project...** list only the targets whose player is
+installed, so a Windows build is offered once a Windows player is. The player for your own platform is built
+into Relay.
+
+**Run → Manage players...** lists the players that exist, with what each one is for, its version, files, size
+and (for Linux) the glibc it needs. **Add player...** installs one, either **from a folder** (the folder that
+holds the player: its program, a `shaders/` folder of compiled `.spv` files and what else it needs) or, once
+players are published for download, **from a URL**. A folder with a `player.json` says which platform and
+architecture it is for; for one without, type them. **Remove** deletes an installed player after you confirm,
+and **Open folder** shows it. An installed player for your own platform is used instead of the built-in one.
+
+Players are modular, so a player built by anyone for any platform, Android for example, can be added and then
+built for, as long as it follows the layout in [portable builds](portable-builds.md).
+
+A game needs a glibc at least as new as its Linux player, so the window shows the newest glibc each Linux
+player asks for and warns when it is newer than 2.31, since games made with it, and their scripts, may not
+start on older systems.
+
 ## Graphics settings
 
 **Edit → Game Configuration... → Graphics** turns lighting effects on or off for the project.
@@ -308,6 +336,14 @@ starts the game when they compile; errors appear under **Diagnostics → Scripts
 line. Saving a script while the game runs rebuilds it and swaps in the new code.
 Because scripts run with your full user permissions, Relay only builds a project's scripts after
 you trust that project. See the [scripting guide](scripting.md).
+
+## Scenes and the startup scene
+
+**Edit → Game Configuration... → Scenes** lists the project's scenes. Click one to open it. **Game opens**
+chooses the startup scene, the scene a game opens when it starts, in a build and when run standalone; the
+first scene saved into a project becomes it. **Add existing scene...** copies a scene file into the project,
+**New scene** starts an empty one, and the bin icon on a row removes a scene from the project (the file is
+kept). There is no separate project panel.
 
 ## Input
 

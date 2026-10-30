@@ -113,14 +113,10 @@ const std::vector<std::string_view>& build_window_modes() {
     return values;
 }
 
-const std::vector<std::string_view>& build_platforms() {
-    static const std::vector<std::string_view> values{"linux", "windows", "macos"};
-    return values;
-}
-
-const std::vector<std::string_view>& build_architectures() {
-    static const std::vector<std::string_view> values{"x86_64", "aarch64"};
-    return values;
+bool valid_build_target_word(const std::string& word) {
+    if (word.empty() || word.size() > 24U || word.front() < 'a' || word.front() > 'z') return false;
+    return std::all_of(word.begin(), word.end(),
+                       [](const char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; });
 }
 
 const std::vector<std::string_view>& build_configurations() {
@@ -134,12 +130,13 @@ bool validate_build_profile(const BuildProfile& profile, std::string& error) {
                 " characters without leading or trailing spaces";
         return false;
     }
-    if (!listed(build_platforms(), profile.target_platform)) {
-        error = "unsupported target platform " + profile.target_platform;
+    // Which targets can be built is up to the players installed; a profile may name any target.
+    if (!valid_build_target_word(profile.target_platform)) {
+        error = "a target platform is a short lower-case word, such as linux or windows";
         return false;
     }
-    if (!listed(build_architectures(), profile.architecture)) {
-        error = "unsupported architecture " + profile.architecture;
+    if (!valid_build_target_word(profile.architecture)) {
+        error = "an architecture is a short lower-case word, such as x86_64 or aarch64";
         return false;
     }
     if (!listed(build_configurations(), profile.configuration)) {

@@ -175,4 +175,38 @@ std::string open_in_ide(const IdeLaunch& launch) {
 #endif
 }
 
+std::string launch_game(const std::filesystem::path& program, const std::filesystem::path& log) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(program, error)) return "the game's program was not found: " + program.generic_string();
+#if defined(_WIN32)
+    const auto text = program.string();
+    if (_spawnl(_P_NOWAIT, text.c_str(), text.c_str(), nullptr) == -1) return "could not start " + program.generic_string();
+    (void)log;
+    return {};
+#else
+    std::string path = program.string(), log_path = log.string();
+    char* arguments[] = {path.data(), nullptr};
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawnattr_init(&attributes);
+    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, 1, log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_adddup2(&actions, 1, 2);
+#ifdef POSIX_SPAWN_SETSID
+    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSID);
+#endif
+    pid_t child{};
+    const int started = posix_spawn(&child, path.c_str(), &actions, &attributes, arguments, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attributes);
+    if (started != 0) return "could not start " + program.generic_string();
+    std::thread([child] {
+        int status{};
+        (void)waitpid(child, &status, 0);
+    }).detach();
+    return {};
+#endif
+}
+
 } // namespace relay

@@ -1948,8 +1948,8 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
             "name": z.string().min(1).max(32).describe("Profile to change; it is created when it does not exist"),
             "new_name": z.string().min(1).max(32).optional().describe("Rename the profile"),
             "copy_from": z.string().max(32).optional().describe("When creating the profile, start from this existing profile"),
-            "target_platform": z.enum(["linux", "windows", "macos"]).optional().describe("Platform to build for"),
-            "architecture": z.enum(["x86_64", "aarch64"]).optional().describe("CPU architecture to build for"),
+            "target_platform": z.string().max(24).regex(new RegExp("^[a-z][a-z0-9_]{0,23}$")).optional().describe("Platform to build for"),
+            "architecture": z.string().max(24).regex(new RegExp("^[a-z][a-z0-9_]{0,23}$")).optional().describe("CPU architecture to build for"),
             "configuration": z.enum(["release", "debug"]).optional().describe("Build configuration; each has its own folder below the build folder"),
             "output_directory": z.string().max(512).optional().describe("Folder that holds the release and debug folders: relative to the project, or absolute (default builds)"),
             "window_mode": z.enum(["windowed", "borderless", "fullscreen"]).optional().describe("How the game's window first opens"),
@@ -1983,7 +1983,7 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
     });
     server.registerTool("project_build", {
         title: "Build project",
-        description: "Build the game for a build profile into <build folder>/<configuration>/ (the release and debug folders are both created), replacing the previous build of that configuration. The result runs on its own: the game's program (named for the game, from relay_player), game.pak (every file the game refers to in one archive, with its models and project shaders already imported and compiled; unreferenced files are left out unless the profile ships every file), scripts/ (the behaviours compiled for the configuration; the project's scripts must be trusted), shaders/, lib/ (libraries the program needs; the model importer and shader compiler are not among them), build.json and icon.png. Linux x86_64 only. The call waits until the build is done (compiling scripts can take a while); an editor uses project.build_start and project.build_status instead, to keep drawing. Save scene changes first.",
+        description: "Build the game for a build profile into <build folder>/<configuration>/ (the release and debug folders are both created), replacing the previous build of that configuration. The result runs on its own: the game's program (named for the game, from relay_player), game.pak (every file the game refers to in one archive, with its models and project shaders already imported and compiled; unreferenced files are left out unless the profile ships every file), scripts/ (the behaviours compiled for the configuration; the project's scripts must be trusted), shaders/, lib/ (libraries the program needs; the model importer and shader compiler are not among them), build.json and icon.png. The target's player must be installed (see players.list). The call waits until the build is done (compiling scripts can take a while); an editor uses project.build_start and project.build_status instead, to keep drawing. Save scene changes first.",
         inputSchema: z.object({
             "profile": z.string().max(32).optional().describe("Profile to build; default is the active profile")
         }),
@@ -2041,6 +2041,46 @@ export function registerGeneratedTools(server, invoke, overrides = {}) {
         if (override)
             return override({});
         return invoke("project.build_cancel", {});
+    });
+    server.registerTool("players_list", {
+        title: "List game players",
+        description: "List the players Relay can make games from, which are the build targets it offers (platform and architecture): each one installed or this Relay's own built in, where installed players live, how many files and bytes they hold, and for Linux players the newest glibc they need. A game needs a glibc at least as new as its player, so portable_glibc names the oldest version games are meant to run on and a player above it is flagged.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    }, async () => {
+        const override = overrides["players_list"];
+        if (override)
+            return override({});
+        return invoke("players.list", {});
+    });
+    server.registerTool("players_install", {
+        title: "Install a game player",
+        description: "Install a player, which makes the build target it is for available: copy the folder that holds the player program, its shaders/ folder of compiled .spv files and what else it needs into Relay's players folder, replacing any player installed for that target. The folder's player.json (format relay.player, with platform, architecture and program) says what it is for; without one, give target_platform and architecture. Any platform and architecture a player exists for can be built for. Only the person using the editor can do this; agents cannot.",
+        inputSchema: z.object({
+            "target_platform": z.string().max(24).regex(new RegExp("^[a-z][a-z0-9_]{0,23}$")).optional().describe("Platform the player is for; read from the folder's player.json when it has one"),
+            "architecture": z.string().max(24).regex(new RegExp("^[a-z][a-z0-9_]{0,23}$")).optional().describe("CPU architecture the player is for; read from the folder's player.json when it has one"),
+            "source": z.string().min(1).max(1024).describe("Absolute path of the folder that holds the player")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["players_install"];
+        if (override)
+            return override(input);
+        return invoke("players.install", { "target_platform": input["target_platform"], "architecture": input["architecture"], "source": input["source"] });
+    });
+    server.registerTool("players_remove", {
+        title: "Remove a game player",
+        description: "Delete the player installed for a build target. The player built into this Relay cannot be removed. Only the person using the editor can do this; agents cannot.",
+        inputSchema: z.object({
+            "target_platform": z.string().max(24).regex(new RegExp("^[a-z][a-z0-9_]{0,23}$")).describe("Platform of the player"),
+            "architecture": z.string().max(24).regex(new RegExp("^[a-z][a-z0-9_]{0,23}$")).describe("CPU architecture of the player")
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+        const override = overrides["players_remove"];
+        if (override)
+            return override(input);
+        return invoke("players.remove", { "target_platform": input["target_platform"], "architecture": input["architecture"] });
     });
     server.registerTool("scene_keyframe_set", {
         title: "Set transform keyframe",

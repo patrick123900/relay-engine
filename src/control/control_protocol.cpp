@@ -414,7 +414,8 @@ std::string build_status_json(const BuildStatus& status) {
         text += ",\"directory\":\"" + escape_json(status.report.directory.generic_string()) +
                 "\",\"profile_built\":\"" + escape_json(status.profile) + "\",\"files\":" +
                 std::to_string(status.report.files) + ",\"bytes\":" + std::to_string(status.report.bytes) +
-                ",\"executable\":" + (status.report.executable ? "true" : "false") +
+                ",\"executable\":" + (status.report.executable ? "true" : "false") + ",\"program\":\"" +
+                escape_json(status.report.executable_path.generic_string()) + '"' +
                 ",\"left_out_count\":" + std::to_string(status.report.left_out_count) +
                 ",\"left_out\":" + string_list_json(status.report.left_out) +
                 ",\"warnings\":" + string_list_json(status.report.warnings) +
@@ -1789,8 +1790,16 @@ std::string ControlProtocol::handle(const std::string_view request) {
                       escape_json(directory.generic_string()) + "\",\"built\":" +
                       (built ? "true" : "false") + '}';
         }
+        std::vector<std::string_view> platform_names, architecture_names;
+        const auto available = available_build_targets();
+        for (const auto& target : available) {
+            if (std::find(platform_names.begin(), platform_names.end(), target.platform) == platform_names.end())
+                platform_names.push_back(target.platform);
+            if (std::find(architecture_names.begin(), architecture_names.end(), target.architecture) == architecture_names.end())
+                architecture_names.push_back(target.architecture);
+        }
         std::string targets = "[";
-        for (const auto& target : available_build_targets()) {
+        for (const auto& target : available) {
             if (targets.size() > 1) targets += ',';
             targets += "{\"platform\":\"" + target.platform + "\",\"architecture\":\"" + target.architecture +
                        "\",\"available\":" + (target.available ? "true" : "false") + ",\"native\":" +
@@ -1802,8 +1811,8 @@ std::string ControlProtocol::handle(const std::string_view request) {
                ",\"defaults\":" + build_settings_json(BuildSettings{}) +
                ",\"game_name\":\"" +
                escape_json(effective_game_name(settings, project ? project->name : std::string{})) +
-               "\",\"targets\":" + targets + ",\"platforms\":" + list(build_platforms()) +
-               ",\"architectures\":" + list(build_architectures()) +
+               "\",\"targets\":" + targets + ",\"platforms\":" + list(platform_names) +
+               ",\"architectures\":" + list(architecture_names) +
                ",\"configurations\":" + list(build_configurations()) +
                ",\"window_modes\":" + list(build_window_modes()) +
                ",\"builds\":" + builds + "]}}";
@@ -1925,6 +1934,40 @@ std::string ControlProtocol::handle(const std::string_view request) {
         const bool running = engine_.builds().running();
         engine_.builds().cancel();
         return response_prefix(id) + "{\"cancelling\":" + (running ? "true" : "false") + "}}";
+    }
+    if (method == "players.list") {
+        std::string players = "[";
+        for (const auto& info : list_players()) {
+            if (players.size() > 1) players += ',';
+            players += "{\"platform\":\"" + info.platform + "\",\"architecture\":\"" + info.architecture +
+                       "\",\"name\":\"" + escape_json(info.name) + "\",\"description\":\"" + escape_json(info.description) +
+                       "\",\"version\":\"" + escape_json(info.version) + "\",\"native\":" + (info.native ? "true" : "false") + ",\"installed\":" + (info.installed ? "true" : "false") +
+                       ",\"built_in\":" + (info.built_in ? "true" : "false") + ",\"folder\":\"" + escape_json(info.folder.generic_string()) +
+                       "\",\"program\":\"" + escape_json(info.program.generic_string()) + "\",\"files\":" + std::to_string(info.files) +
+                       ",\"bytes\":" + std::to_string(info.bytes) + ",\"glibc\":\"" + escape_json(info.glibc) + "\",\"glibc_from\":\"" +
+                       escape_json(info.glibc_from) + "\"}";
+        }
+        return response_prefix(id) + "{\"directory\":\"" + escape_json(players_folder().generic_string()) + "\",\"portable_glibc\":\"" +
+               portable_glibc + "\",\"players\":" + players + "]}}";
+    }
+    if (method == "players.install" || method == "players.remove") {
+        // Players are programs that ship inside games, so only a person puts one in or takes one out.
+        if (agent_dispatch_) return error_response(id, "only the person using the editor can install or remove players");
+        std::string error;
+        const auto platform = optional_string_field(request, "target_platform").value_or("");
+        const auto architecture = optional_string_field(request, "architecture").value_or("");
+        std::string installed_platform, installed_architecture;
+        const bool done = method == "players.install"
+                              ? install_player(std::filesystem::path{string_field(request, "source")}, platform, architecture,
+                                               installed_platform, installed_architecture, error)
+                              : remove_player(platform, architecture, error);
+        if (!done) return error_response(id, error);
+        if (method == "players.install") {
+            engine_.logs().write(LogLevel::info, "Installed the " + installed_platform + " " + installed_architecture + " player");
+            return response_prefix(id) + "{\"platform\":\"" + installed_platform + "\",\"architecture\":\"" + installed_architecture + "\"}}";
+        }
+        engine_.logs().write(LogLevel::info, "Removed the " + platform + " " + architecture + " player");
+        return response_prefix(id) + "{\"platform\":\"" + platform + "\",\"architecture\":\"" + architecture + "\"}}";
     }
     if (method == "project.close") {
         engine_.project().reset();

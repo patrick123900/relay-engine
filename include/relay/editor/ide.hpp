@@ -40,4 +40,9 @@ struct IdeLaunch {
 // control protocol.
 [[nodiscard]] std::string open_in_ide(const IdeLaunch& launch);
 
+// Starts a built game's program on its own, without blocking, in a session of its own so closing the
+// editor does not close it. Its output goes to `log` (replaced), so a game that fails to start leaves a
+// trace. Returns an error message, or empty on success. A human-only editor action.
+[[nodiscard]] std::string launch_game(const std::filesystem::path& program, const std::filesystem::path& log);
+
 } // namespace relay

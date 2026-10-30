@@ -3,6 +3,7 @@
 #include "relay/audio/audio_clip.hpp"
 #include "relay/audio/flac_encoder.hpp"
 #include "relay/core/elf_requirements.hpp"
+#include "relay/core/json.hpp"
 #include "relay/core/pak.hpp"
 #include "relay/core/process.hpp"
 #include "relay/render/cooked_assets.hpp"
@@ -104,9 +105,17 @@ struct PlayerKit {
     std::vector<std::pair<std::string, std::filesystem::path>> files;
 };
 
-// Players for other targets than the machine's own are built elsewhere (a Windows player needs
-// Windows' toolchain) and installed in a folder per target below `players/` beside Relay:
-// players/windows-x86_64/relay_player.exe with its shaders/ and the libraries it needs.
+// Players are modular. Each lives in a folder of its own below `players/` beside Relay (or in
+// RELAY_PLAYERS_DIR), described by a player.json: which platform and architecture its games are for, and
+// which file is the program. A Windows player is relay_player.exe with its shaders/ and libraries; a
+// community player for any other target (an Android one, say) is installed the same way. A folder without
+// a player.json is named <platform>-<architecture> and holds relay_player or relay_player.exe.
+struct PlayerEntry {
+    std::string platform, architecture, name, description, version;
+    std::filesystem::path folder;
+    std::string program; // The program's file name inside the folder.
+};
+
 std::filesystem::path players_directory() {
     if (const char* chosen = std::getenv("RELAY_PLAYERS_DIR"); chosen && *chosen) return chosen;
     std::error_code ec;
@@ -119,10 +128,75 @@ std::filesystem::path players_directory() {
 
 std::string player_target_name(const BuildProfile& profile) { return profile.target_platform + "-" + profile.architecture; }
 
-bool player_installed(const BuildProfile& profile) {
+// A platform or architecture is a short lower-case word.
+bool valid_target_word(const std::string& word) {
+    if (word.empty() || word.size() > 24U || word.front() < 'a' || word.front() > 'z') return false;
+    return std::all_of(word.begin(), word.end(),
+                       [](const char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; });
+}
+
+bool read_player_manifest(const std::filesystem::path& folder, PlayerEntry& entry) {
+    std::ifstream stream(folder / "player.json", std::ios::binary);
+    if (!stream) return false;
+    const std::string text{std::istreambuf_iterator<char>(stream), {}};
+    JsonParser parser(text);
+    const auto value = parser.parse();
+    const auto* object = value ? value->object() : nullptr;
+    if (!object) return false;
+    const auto text_of = [&](const char* name) {
+        const auto* entry_value = field(*object, name);
+        return entry_value && entry_value->string() ? *entry_value->string() : std::string{};
+    };
+    if (text_of("format") != "relay.player") return false;
+    entry.platform = text_of("platform");
+    entry.architecture = text_of("architecture");
+    entry.name = text_of("name");
+    entry.description = text_of("description");
+    entry.version = text_of("version");
+    entry.program = text_of("program");
+    return true;
+}
+
+std::vector<PlayerEntry> installed_players() {
+    std::vector<PlayerEntry> players;
     std::error_code ec;
-    const auto folder = players_directory() / player_target_name(profile);
-    return std::filesystem::is_regular_file(folder / "relay_player", ec) || std::filesystem::is_regular_file(folder / "relay_player.exe", ec);
+    for (std::filesystem::directory_iterator it(players_directory(), ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_directory(ec) || it->is_symlink(ec)) continue;
+        const auto folder_name = it->path().filename().string();
+        if (folder_name.ends_with(".installing")) continue;
+        PlayerEntry entry;
+        entry.folder = it->path();
+        if (!read_player_manifest(it->path(), entry)) {
+            const auto dash = folder_name.find('-');
+            if (dash == std::string::npos) continue;
+            entry.platform = folder_name.substr(0, dash);
+            entry.architecture = folder_name.substr(dash + 1U);
+            entry.program.clear();
+        }
+        if (entry.program.empty())
+            for (const char* name : {"relay_player", "relay_player.exe"})
+                if (std::filesystem::is_regular_file(it->path() / name, ec)) entry.program = name;
+        if (!valid_target_word(entry.platform) || !valid_target_word(entry.architecture) || entry.program.empty() ||
+            entry.program.find('/') != std::string::npos || entry.program.find('\\') != std::string::npos ||
+            !std::filesystem::is_regular_file(it->path() / entry.program, ec))
+            continue;
+        players.push_back(std::move(entry));
+    }
+    std::sort(players.begin(), players.end(), [](const PlayerEntry& a, const PlayerEntry& b) {
+        return std::tie(a.platform, a.architecture) < std::tie(b.platform, b.architecture);
+    });
+    return players;
+}
+
+const PlayerEntry* find_installed_player(const std::vector<PlayerEntry>& players, const std::string& platform,
+                                         const std::string& architecture) {
+    for (const auto& entry : players)
+        if (entry.platform == platform && entry.architecture == architecture) return &entry;
+    return nullptr;
+}
+
+bool player_installed(const BuildProfile& profile) {
+    return find_installed_player(installed_players(), profile.target_platform, profile.architecture) != nullptr;
 }
 
 // The program a built game runs: RELAY_PLAYER_BINARY, else relay_player beside the running
@@ -188,7 +262,8 @@ bool program_libraries(const std::filesystem::path& program,
 bool find_player_kit(const BuildProfile& profile, PlayerKit& kit, std::string& error) {
     std::error_code ec;
     const bool own = profile.target_platform == host_platform() && profile.architecture == host_architecture();
-    if (own && profile.target_platform == "linux") {
+    // The player this Relay was built with serves its own Linux target, unless one was installed for it.
+    if (own && profile.target_platform == "linux" && !player_installed(profile)) {
         const auto player = find_player_binary();
         if (player.empty() || !std::filesystem::is_regular_file(player, ec)) {
             error = "the game player was not found" + (player.empty() ? std::string{} : " at " + player.generic_string()) +
@@ -215,18 +290,16 @@ bool find_player_kit(const BuildProfile& profile, PlayerKit& kit, std::string& e
         }
         return true;
     }
-    const auto folder = players_directory() / player_target_name(profile);
-    for (const char* name : {"relay_player", "relay_player.exe"})
-        if (std::filesystem::is_regular_file(folder / name, ec)) {
-            kit.program = folder / name;
-            kit.program_extension = std::string{name} == "relay_player.exe" ? ".exe" : "";
-        }
-    if (kit.program.empty()) {
+    const auto players = installed_players();
+    const auto* entry = find_installed_player(players, profile.target_platform, profile.architecture);
+    if (entry == nullptr) {
         error = "there is no " + std::string{profile.target_platform} + " " + profile.architecture + " player installed. " +
-                "Players for other targets are built on their own platform and installed in " +
-                (folder).generic_string() + " (with relay_player, its shaders/ folder and the libraries it needs); set RELAY_PLAYERS_DIR to use another folder";
+                "Add one under Run > Manage players, or put its folder in " + players_directory().generic_string();
         return false;
     }
+    const auto folder = entry->folder;
+    kit.program = folder / entry->program;
+    kit.program_extension = std::filesystem::path{entry->program}.extension().string();
     std::size_t shaders = 0;
     for (std::filesystem::recursive_directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
         if (!it->is_regular_file(ec) || it->path() == kit.program) continue;
@@ -286,25 +359,183 @@ static bool plan_game_files(const Project& project, const BuildSettings& setting
     return true;
 }
 
+std::filesystem::path players_folder() { return players_directory(); }
+
+std::vector<PlayerInfo> list_players() {
+    std::vector<PlayerInfo> players;
+    std::error_code ec;
+    const auto measure = [&](PlayerInfo& info, const std::vector<std::filesystem::path>& files) {
+        ElfRequirements newest;
+        for (const auto& file : files) {
+            ElfRequirements found;
+            std::string read_error;
+            if (!read_elf_requirements(file, found, read_error)) continue;
+            if (!found.glibc.empty() && compare_dotted_versions(found.glibc, newest.glibc) > 0) info.glibc_from = file.filename().string();
+            merge_requirements(newest, found);
+        }
+        info.glibc = newest.glibc;
+    };
+    const auto installed = installed_players();
+    for (const auto& entry : installed) {
+        PlayerInfo info;
+        info.platform = entry.platform;
+        info.architecture = entry.architecture;
+        info.name = entry.name;
+        info.description = entry.description;
+        info.version = entry.version;
+        info.native = entry.platform == host_platform() && entry.architecture == host_architecture();
+        info.installed = true;
+        info.folder = entry.folder;
+        info.program = entry.folder / entry.program;
+        std::vector<std::filesystem::path> measured;
+        for (std::filesystem::recursive_directory_iterator it(entry.folder, ec), end; !ec && it != end && info.files < 100000U;
+             it.increment(ec))
+            if (it->is_regular_file(ec)) {
+                ++info.files;
+                info.bytes += it->file_size(ec);
+                if (entry.platform == "linux" &&
+                    (it->path() == info.program || it->path().filename().string().find(".so") != std::string::npos))
+                    measured.push_back(it->path());
+            }
+        measure(info, measured);
+        players.push_back(std::move(info));
+    }
+    // This machine's own Linux player, which the editor was built with, serves its target unless one is installed.
+    if (std::string{host_platform()} == "linux" && !find_installed_player(installed, "linux", host_architecture())) {
+        const auto player = find_player_binary();
+        if (!player.empty() && std::filesystem::is_regular_file(player, ec)) {
+            PlayerInfo info;
+            info.platform = "linux";
+            info.architecture = host_architecture();
+            info.native = true;
+            info.built_in = true;
+            info.folder = players_directory() / player_target_name([&] {
+                BuildProfile profile;
+                profile.target_platform = info.platform;
+                profile.architecture = info.architecture;
+                return profile;
+            }());
+            info.program = player;
+            info.files = 1U;
+            info.bytes = std::filesystem::file_size(player, ec);
+            std::vector<std::filesystem::path> measured{player};
+            std::vector<std::pair<std::string, std::filesystem::path>> libraries;
+            std::string ignored;
+            if (program_libraries(player, libraries, ignored))
+                for (const auto& library : libraries) measured.push_back(library.second);
+            measure(info, measured);
+            players.insert(players.begin(), std::move(info));
+        }
+    }
+    return players;
+}
+
 std::vector<BuildTarget> available_build_targets() {
     std::vector<BuildTarget> targets;
-    for (const auto platform : build_platforms())
-        for (const auto architecture : build_architectures()) {
-            BuildProfile profile;
-            profile.target_platform = std::string{platform};
-            profile.architecture = std::string{architecture};
-            BuildTarget target{std::string{platform}, std::string{architecture}, false,
-                               platform == host_platform() && architecture == host_architecture()};
-            if (target.native && platform == "linux") {
-                std::error_code ec;
-                const auto player = find_player_binary();
-                target.available = !player.empty() && std::filesystem::is_regular_file(player, ec);
-            } else {
-                target.available = player_installed(profile);
-            }
-            targets.push_back(std::move(target));
-        }
+    for (const auto& player : list_players()) targets.push_back({player.platform, player.architecture, true, player.native});
     return targets;
+}
+
+bool install_player(const std::filesystem::path& source, const std::string& platform_hint, const std::string& architecture_hint,
+                    std::string& platform, std::string& architecture, std::string& error) {
+    std::error_code ec;
+    if (!source.is_absolute() || !std::filesystem::is_directory(source, ec)) {
+        error = "choose the folder that holds the player, with its program and shaders";
+        return false;
+    }
+    // player.json says what the player is for; a folder without one is told by the person.
+    PlayerEntry described;
+    const bool has_manifest = read_player_manifest(source, described);
+    platform = has_manifest && !described.platform.empty() ? described.platform : platform_hint;
+    architecture = has_manifest && !described.architecture.empty() ? described.architecture : architecture_hint;
+    if (platform.empty() || architecture.empty()) {
+        error = "this folder has no player.json saying which platform and architecture the player is for; say which";
+        return false;
+    }
+    if (!valid_target_word(platform) || !valid_target_word(architecture)) {
+        error = "a platform and an architecture are short lower-case words, such as windows and x86_64";
+        return false;
+    }
+    std::string program = described.program;
+    if (program.empty())
+        for (const char* name : {"relay_player", "relay_player.exe"})
+            if (std::filesystem::is_regular_file(source / name, ec)) program = name;
+    if (program.empty() || program.find('/') != std::string::npos || program.find('\\') != std::string::npos ||
+        !std::filesystem::is_regular_file(source / program, ec)) {
+        error = source.generic_string() + " has no player program (relay_player, or the program named in player.json)";
+        return false;
+    }
+    std::size_t shaders = 0;
+    std::vector<std::filesystem::path> files;
+    for (std::filesystem::recursive_directory_iterator it(source, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->is_symlink(ec) || !it->is_regular_file(ec)) continue;
+        if (files.size() >= 4096U) {
+            error = "the player folder holds more than 4096 files";
+            return false;
+        }
+        const auto relative = it->path().lexically_relative(source).generic_string();
+        if (relative.rfind("shaders/", 0) == 0 && it->path().extension() == ".spv") ++shaders;
+        files.push_back(it->path());
+    }
+    if (shaders == 0U) {
+        error = "the player has no compiled shaders: " + (source / "shaders").generic_string() + " holds no .spv files";
+        return false;
+    }
+    const auto root = players_directory();
+    const auto name = platform + "-" + architecture;
+    const auto target = root / name;
+    const auto staging = root / (name + ".installing");
+    std::filesystem::remove_all(staging, ec);
+    std::filesystem::create_directories(staging, ec);
+    if (ec) {
+        error = "cannot create " + staging.generic_string() + ": " + ec.message();
+        return false;
+    }
+    for (const auto& file : files)
+        if (!copy_regular_file(file, staging / file.lexically_relative(source))) {
+            std::filesystem::remove_all(staging, ec);
+            error = "cannot copy " + file.generic_string();
+            return false;
+        }
+    if (!has_manifest) {
+        const std::string manifest = "{\"format\": \"relay.player\", \"version\": 1, \"platform\": \"" + platform +
+                                     "\", \"architecture\": \"" + architecture + "\", \"program\": \"" + json_escape(program) + "\"}\n";
+        if (!write_text_file(staging / "player.json", manifest)) {
+            std::filesystem::remove_all(staging, ec);
+            error = "cannot write the player's description";
+            return false;
+        }
+    }
+    std::filesystem::permissions(staging / program,
+                                 std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec |
+                                     std::filesystem::perms::others_exec,
+                                 std::filesystem::perm_options::add, ec);
+    // A player already installed for the target, whatever its folder is called, is replaced.
+    for (const auto& entry : installed_players())
+        if (entry.platform == platform && entry.architecture == architecture) std::filesystem::remove_all(entry.folder, ec);
+    std::filesystem::remove_all(target, ec);
+    std::filesystem::rename(staging, target, ec);
+    if (ec) {
+        error = "cannot install the player in " + target.generic_string() + ": " + ec.message();
+        return false;
+    }
+    return true;
+}
+
+bool remove_player(const std::string& platform, const std::string& architecture, std::string& error) {
+    std::error_code ec;
+    const auto installed = installed_players();
+    const auto* entry = find_installed_player(installed, platform, architecture);
+    if (entry == nullptr) {
+        error = "no player is installed for " + platform + " " + architecture;
+        return false;
+    }
+    std::filesystem::remove_all(entry->folder, ec);
+    if (ec) {
+        error = "cannot remove " + entry->folder.generic_string() + ": " + ec.message();
+        return false;
+    }
+    return true;
 }
 
 bool preview_build(const Project& project, const BuildSettings& settings, const BuildProfile& profile,

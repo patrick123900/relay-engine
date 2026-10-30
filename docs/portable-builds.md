@@ -34,20 +34,35 @@ is the oldest you want to support), with Vulkan headers, SDL3 and the other depe
 README. Build the `relay_player` target there, then check it with `relay_elf_requirements --max-glibc`.
 The result is installed like any player, below. No such environment is provided or tested yet.
 
-## Other targets
+## Players and other targets
 
-Builds for a platform or architecture other than the one running the editor use a *player built on that
-target*. The editor looks for it in `players/<platform>-<architecture>/` (for example
-`players/windows-x86_64/` or `players/linux-aarch64/`) beside the editor, or in the folder named by
-`RELAY_PLAYERS_DIR`. A target's folder holds the program (`relay_player` or `relay_player.exe`), a
-`shaders/` folder and any libraries it needs (`lib/` on Linux, or `.dll`/`.dylib` files beside the
-program), and is copied into the build as is. `project.build_settings` lists each target and whether
-its player is installed (`targets`), and a build for a target with none says where to put one.
+Builds are made from a *player*, a program built for one platform and architecture. Relay offers a build for
+each target it has a player for: the player built into Relay for the machine's own Linux target, and any player
+installed below the `players/` folder beside the editor (or in the folder named by `RELAY_PLAYERS_DIR`). **Run
+→ Manage players...** adds and removes them (`players.list`, `players.install` and `players.remove` in the
+protocol; installing and removing are for the person at the editor, not agents). An installed player for the
+machine's own target is used instead of the built-in one, which is how an old-glibc Linux player is put to use.
+
+A player is a folder, `players/<platform>-<architecture>/`, holding:
+
+- `player.json`, which says what it is: `{"format": "relay.player", "version": 1, "platform": "windows",
+  "architecture": "x86_64", "program": "relay_player.exe", "name": "Windows (x86_64)", "description": "...",
+  "version": "1.0"}`. Only `format`, `platform`, `architecture` and `program` are needed. A folder without one is
+  named `<platform>-<architecture>` and holds `relay_player` or `relay_player.exe`; installing it from the
+  editor asks which target it is for and writes a `player.json`.
+- the program, which a build copies and names after the game, keeping its extension;
+- a `shaders/` folder of compiled `.spv` files, and every other file the player needs (`lib/` on Linux,
+  `.dll` or `.dylib` files beside the program), which are copied into the build as they are.
+
+Platform and architecture are short lower-case words (`windows`, `macos`, `linux`, `android`; `x86_64`,
+`aarch64`, `arm64`), not a fixed list, so a player made by someone else for another target is built for like
+any other. Relay itself has only been built on Linux x86_64 so far.
 
 Not done yet:
 
-- Relay itself has only been built on Linux x86_64. No Windows, macOS or Arm player is produced.
-- A project with scripts cannot be built for another target, because scripts are compiled to native
-  code on the editor's machine (`.so`). Such a build is refused. Cross-compiling scripts, or building
-  them on the target, is open.
-- Windows and macOS packaging beyond copying the player (icons, bundles, signing) is not started.
+- No Windows, macOS or Arm player is produced here, and players cannot yet be downloaded from a URL (the Add
+  player window has the field, disabled).
+- A project with scripts cannot be built for another target, because scripts are compiled to native code on
+  the editor's machine (`.so`). Such a build is refused. Cross-compiling scripts, or building them on the
+  target, is open.
+- Packaging beyond copying the player (Windows icons, macOS bundles, signing, Android packages) is not started.

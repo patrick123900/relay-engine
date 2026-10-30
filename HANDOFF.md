@@ -365,7 +365,7 @@ without blocking simultaneous human editing.
   `collect_project_files`: every scene (listed or not), template, script, asset and
   `.relay-imports.json`, plus a normalized `project.relayproject`, minus hidden entries, captures,
   traces, exports and every in-project build folder. It refuses overwrites and links. File → Export
-  project... and the Project panel's button open the floating Export Project window
+  project... opens the floating Export Project window
   (`draw_export_window`, keys `export:*`: format, name, destination with **Browse...**). Both
   formats were extracted with `unzip`, Python's zipfile and GNU `tar`.
 - File dialogs: every Browse button opens the operating system's dialog through SDL3
@@ -1619,13 +1619,30 @@ implemented; "Game builds" above is the reference. What is left of each:
    cannot be built for foreign targets, a container recipe for an old-glibc player is untested (no Docker
    here), and the editor UI does not yet warn under Target when a player is missing.
 
-**Planned: a Manage Players window** (not started). Players (`players/<platform>-<arch>/`) become something
-the person adds and removes from the editor as needed, rather than files placed by hand. It should warn
-about compatibility: when an installed Linux player needs a glibc newer than 2.31 (the floor chosen for wide
-compatibility; the build's Minimum glibc defaults to empty, no check), games built with it will not start
-on older systems, and so should the scripts' own floor, which is the editor machine's. Ahead of it: make a
-native Linux build prefer an installed `players/linux-x86_64/` player to the one beside the editor, and
-produce the old-glibc Linux player (Docker, Debian 11), then Windows and macOS players on their own machines.
+**The Project panel is gone** (done): its scene list moved to Edit → Game Configuration → Scenes (`draw_scenes_page`: startup scene
+combo via `project.set_startup`, open a scene, add existing, new, remove from project). `panel_names` lost its `Project`
+entry, so the panel indices after Timeline shifted down by one.
+
+**Run standalone game** (done): Run → Run standalone game (`run_standalone_game`) picks the build profile for the
+native target (`project.build_settings` `targets` with `native`; the active profile if it matches, else the first),
+starts it with `project.build_start`, and when `poll_build` sees it succeed launches `program` (from
+`project.build_status`) through `EditorUi::set_game_launcher` (`launch_game` in `src/editor/ide.cpp`: detached
+session, output to `last-run.log`). Errors, with no build, if there is no native player or profile. Headless
+editors have no launcher; tests install their own. Not done: stopping the game from the editor, showing its log
+in the editor, running it for other targets.
+
+**Players are modular** (done): a build target exists only where a player does. `list_players()`
+(`src/scene/project_build.cpp`) scans `players/<platform>-<arch>/` for a `player.json` (`relay.player`:
+platform, architecture, program, optional name, description, version) and adds this machine's own built-in
+Linux player when none is installed; `available_build_targets()` is that list, so the Build window's Platform
+and Architecture combos (`project.build_settings` `targets`) offer only installed targets. Platform and
+architecture are free words (`valid_build_target_word`), so a community player for any target works.
+Run → Manage players... (`draw_players_window`, `draw_add_player_popup`) lists them (glibc above
+`portable_glibc` 2.31 is flagged), adds from a folder (`players.install`; a folder without `player.json` needs the
+platform and architecture typed) or, later, a URL (the field is disabled), and removes after confirming. An
+installed linux-x86_64 player wins over the built-in one. Still to do: downloading from a URL; producing the
+old-glibc Linux player (Docker, Debian 11) and the Windows, macOS and Arm players; building scripts for other
+targets; the windows have only been run headlessly.
 
 Also open for game builds, after those:
 - **Look at it on a desktop.** The player and the Build, Export and file-dialog windows were only run

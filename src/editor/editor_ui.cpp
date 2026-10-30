@@ -20,6 +20,7 @@
 #include "relay/editor/editor_state.hpp"
 #include "relay/editor/editor_selection.hpp"
 #include "relay/editor/editor_timeline.hpp"
+#include "relay/core/elf_requirements.hpp"
 #include "relay/editor/editor_theme.hpp"
 #include "relay/editor/editor_widgets.hpp"
 #include "relay/editor/asset_thumbnails.hpp"
@@ -112,13 +113,13 @@ const JsonValue::Object* component(const JsonValue::Object& entity, const std::s
 }
 
 // Dockable panels, in the order of EditorUi::Impl::panel_open.
-constexpr std::array<const char*, 13> panel_names{"Hierarchy", "Inspector", "Assets", "History",
-                                                  "Diagnostics", "Viewport", "Timeline", "Project",
+constexpr std::array<const char*, 12> panel_names{"Hierarchy", "Inspector", "Assets", "History",
+                                                  "Diagnostics", "Viewport", "Timeline",
                                                   "Agent", "Profiler", "Mixer", "Shader Editor",
                                                   "Interface"};
 constexpr std::array<bool, panel_names.size()> default_panels{true, true, true, false, true,
                                                               true, false, false, false, false,
-                                                              false, false, false};
+                                                              false, false};
 
 // A dim caption in a fixed column, so every inspector row lines up down the panel.
 void row_label(const char* const label, const float width) {
@@ -824,6 +825,10 @@ struct EditorUi::Impl {
     int frame_limit_edit{250};
     bool frame_limit_editing{false};
 
+    void open_in_file_browser_absolute(const std::string& path) {
+        if (file_browser) file_browser(std::filesystem::path(path), true);
+    }
+
     void open_in_file_browser(const std::string& path, const bool directory) {
         if (file_browser) file_browser(std::filesystem::path(assets_root) / path, directory);
     }
@@ -857,6 +862,16 @@ struct EditorUi::Impl {
     // Run > Build Project: build.settings from project.build_settings. The text fields are held in
     // buffers that are saved when an edit ends, and reloaded when the profile or project changes.
     bool build_open{};
+    bool standalone_running{}; // A build started by Run standalone game, to be launched when it succeeds.
+    std::string standalone_stage;
+    EditorUi::GameLauncher game_launcher = [](const std::filesystem::path& program, const std::filesystem::path& log) {
+        return launch_game(program, log);
+    };
+    bool players_open{}, players_confirm_remove{}, players_add_open{};
+    std::array<char, 1025> players_add_folder{}, players_add_url{};
+    std::array<char, 25> players_add_platform{}, players_add_architecture{};
+    JsonValue players_status;
+    int players_selected{0};
     JsonValue build_status;
     std::string build_loaded_for;
     std::array<char, 33> build_profile_name{}, build_version{};
@@ -1764,7 +1779,7 @@ struct EditorUi::Impl {
 
     // Opens a shader in the Shader Editor, or brings its tab forward.
     void open_shader(const std::string& path) {
-        panel_open[11] = true;
+        panel_open[10] = true;
         shader_editor_focus_pending = true;
         shader_tab_select_request = path;
         if (std::any_of(shader_tabs.begin(), shader_tabs.end(), [&](const ShaderTab& tab) { return tab.path == path; }))
@@ -2370,7 +2385,7 @@ struct EditorUi::Impl {
     // Voices and meters are only fetched while something shows them.
     void refresh_audio_status() {
         const auto* entity = selection.empty() ? nullptr : find_entity(selection);
-        const bool shown = (game_config_open && game_config_page == 2) || panel_open[10] ||
+        const bool shown = (game_config_open && game_config_page == 2) || panel_open[9] ||
                            (entity && (component(*entity, "audio_source") ||
                                        component(*entity, "reverb_zone") ||
                                        component(*entity, "music_player")));
@@ -3287,7 +3302,7 @@ struct EditorUi::Impl {
     }
 
     void refresh_agent() {
-        if (!panel_open[8]) return;
+        if (!panel_open[7]) return;
         RELAY_PROFILE_SCOPE("Refresh: agent");
         if (auto result = call_if_changed("session.review", agent_review_reply))
             agent_review = std::move(*result);
@@ -8156,7 +8171,7 @@ struct EditorUi::Impl {
                 else draw_ui_fields(component, *values->object());
                 if (id == "ui_canvas" || id == "ui_control") {
                     if (ImGui::Button("Open the Interface editor", ImVec2(-FLT_MIN, 0.0F))) {
-                        panel_open[12] = true;
+                        panel_open[11] = true;
                         interface_focus_pending = true;
                     }
                     note_item("inspector:" + id + ":open_interface_editor");
@@ -8718,55 +8733,6 @@ struct EditorUi::Impl {
         return true;
     }
 
-    void draw_project() {
-        const auto* project = active_project();
-        if (ImGui::Button("New project")) discarding_action(PendingAction::new_project);
-        ImGui::SameLine();
-        if (ImGui::Button("Open project")) discarding_action(PendingAction::open_project);
-        if (project) {
-            ImGui::Separator();
-            ImGui::TextUnformatted(string_or(*project, "name").c_str());
-            ImGui::TextDisabled("Folder: %s", string_or(*project, "root").c_str());
-            if (ImGui::Button("Add existing scene"))
-                file_dialog(FileAction::add_project_scene, scene_filename.data());
-            note_item("project:add_scene");
-            ImGui::SameLine();
-            if (ImGui::Button("New scene")) discarding_action(PendingAction::new_scene);
-            ImGui::TextDisabled("Saving a scene adds it to this project.");
-            const auto startup = string_or(*project, "startup_scene");
-            if (const auto* files = field(*project, "scenes"); files && files->array())
-                for (const auto& entry : *files->array()) {
-                    if (!entry.string()) continue;
-                    const auto& file = *entry.string();
-                    const auto label = file + (file == startup ? " (startup)" : "");
-                    const bool selected_scene = ImGui::Selectable(label.c_str(), scene_has_file && file == scene_filename.data());
-                    note_item("project:scene:" + file);
-                    if (selected_scene) {
-                        pending_scene_filename = file;
-                        discarding_action(PendingAction::project_scene);
-                    }
-                    if (ImGui::BeginPopupContextItem()) {
-                        const auto fields = "\"scene_file\":\"" + json_escape(file) + '\"';
-                        if (ImGui::MenuItem("Set as startup scene"))
-                            mutate("project.set_startup", fields, "Startup scene updated");
-                        if (ImGui::MenuItem("Remove from project"))
-                            mutate("project.remove_scene", fields, "Scene removed from project; file kept");
-                        ImGui::EndPopup();
-                    }
-                }
-            ImGui::Separator();
-            if (ImGui::Button("Export project..."))
-                begin_export_project();
-            ImGui::TextDisabled("Save scene changes before exporting. Existing packages are kept.");
-        } else ImGui::TextDisabled("No project open. Scene files can still be edited.");
-        ImGui::Separator();
-        ImGui::TextDisabled("Available projects");
-        for (const auto& file : project_files)
-            if (ImGui::Selectable(file.c_str())) {
-                pending_project_filename = file;
-                discarding_action(PendingAction::open_project);
-            }
-    }
 
     bool save_scene() {
         // Without a file behind it yet, Save has to ask where the scene should go rather than
@@ -9071,7 +9037,6 @@ struct EditorUi::Impl {
             note_item("menu:file:new_project");
             if (ImGui::MenuItem("Open project...")) discarding_action(PendingAction::open_project);
             note_item("menu:file:open_project");
-            if (ImGui::MenuItem("Project browser")) panel_open[7] = true;
             if (ImGui::MenuItem("Close project", nullptr, false, active_project() != nullptr))
                 if (mutate("project.close", {}, "Project closed")) project_status = JsonValue{};
             ImGui::Separator();
@@ -9173,10 +9138,22 @@ struct EditorUi::Impl {
                 mutate("runtime.step", "\"frames\":1", "Stepped one frame");
             ImGui::EndDisabled();
             ImGui::Separator();
-            future_action("Run standalone game");
+            {
+                const auto* runtime = runtime_status.object();
+                const bool game_running = runtime && string_or(*runtime, "mode") == "game";
+                ImGui::BeginDisabled(!active_project() || build_running || game_running);
+                if (ImGui::MenuItem(standalone_running ? "Building standalone game..." : "Run standalone game"))
+                    run_standalone_game();
+                ImGui::EndDisabled();
+                note_item("menu:run:standalone");
+            }
             if (ImGui::MenuItem("Build project..."))
                 open_build_window();
             note_item("menu:run:build_project");
+            ImGui::Separator();
+            if (ImGui::MenuItem("Manage players..."))
+                open_players_window();
+            note_item("menu:run:manage_players");
             ImGui::EndMenu();
         }
         const bool tools_menu = ImGui::BeginMenu("Tools");
@@ -9202,21 +9179,21 @@ struct EditorUi::Impl {
             }
             if (ImGui::MenuItem("Asset browser")) open_asset_browser(std::nullopt);
             note_item("menu:asset_browser");
-            if (ImGui::MenuItem("Shader editor")) panel_open[11] = true;
+            if (ImGui::MenuItem("Shader editor")) panel_open[10] = true;
             note_item("menu:shader_editor");
             if (ImGui::MenuItem("Interface editor")) {
-                panel_open[12] = true;
+                panel_open[11] = true;
                 interface_focus_pending = true;
             }
             note_item("menu:interface_editor");
             if (ImGui::MenuItem("Animation timeline")) panel_open[6] = true;
-            if (ImGui::MenuItem("Profiler")) panel_open[9] = true;
+            if (ImGui::MenuItem("Profiler")) panel_open[8] = true;
             if (ImGui::MenuItem("Audio mixer")) {
-                panel_open[10] = true;
+                panel_open[9] = true;
                 refresh_audio_files();
             }
             note_item("menu:audio_mixer");
-            if (ImGui::MenuItem("Agent workspace...", "Ctrl+Shift+A")) { panel_open[8] = true; agent_expand_pending = true; }
+            if (ImGui::MenuItem("Agent workspace...", "Ctrl+Shift+A")) { panel_open[7] = true; agent_expand_pending = true; }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Layout")) {
@@ -10604,6 +10581,74 @@ struct EditorUi::Impl {
         if (changed) save_input_edit();
     }
 
+    // The project's scenes: which one the game opens first, and adding, opening and removing scenes.
+    void draw_scenes_page() {
+        const auto& palette = editor_palette();
+        const auto* project = active_project();
+        if (!project) {
+            ImGui::TextColored(editor_color(palette.warning), "Open a project to see its scenes.");
+            return;
+        }
+        const auto startup = string_or(*project, "startup_scene");
+        std::vector<std::string> scenes;
+        if (const auto* files = field(*project, "scenes"); files && files->array())
+            for (const auto& entry : *files->array())
+                if (entry.string()) scenes.push_back(*entry.string());
+        ImGui::SeparatorText("Startup scene");
+        inspector_label_width = 150.0F;
+        {
+            const ImVec2 start = ImGui::GetCursorScreenPos();
+            inspector_field_label("Game opens");
+            ImGui::SetNextItemWidth(360.0F * ui_scale);
+            if (ImGui::BeginCombo("##startup_scene", startup.empty() ? "No scene" : startup.c_str())) {
+                for (const auto& file : scenes) {
+                    if (ImGui::Selectable(file.c_str(), file == startup) && file != startup)
+                        mutate("project.set_startup", "\"scene_file\":\"" + json_escape(file) + "\"", "Startup scene updated");
+                    note_item("config:scenes:startup:" + file);
+                }
+                ImGui::EndCombo();
+            }
+            note_item("config:scenes:startup");
+            row_hint(start, "The scene a game opens when it starts, in a build and when run standalone. The first scene saved into a project becomes it.");
+        }
+        inspector_label_width = 0.0F;
+        ImGui::SeparatorText("Scenes");
+        if (scenes.empty()) ImGui::TextColored(editor_color(palette.text_faint), "No scenes yet. Saving a scene adds it to the project.");
+        std::optional<std::string> remove;
+        for (const auto& file : scenes) {
+            ImGui::PushID(file.c_str());
+            const float height = ImGui::GetFrameHeight();
+            const float width = ImGui::GetContentRegionAvail().x;
+            const auto low = ImGui::GetCursorScreenPos();
+            const bool current = scene_has_file && file == scene_filename.data();
+            if (ImGui::Selectable("##scene", current, ImGuiSelectableFlags_AllowOverlap, ImVec2(std::max(1.0F, width - height - ImGui::GetStyle().ItemSpacing.x), height))) {
+                pending_scene_filename = file;
+                discarding_action(PendingAction::project_scene);
+            }
+            note_item("config:scenes:scene:" + file);
+            auto* draw = ImGui::GetWindowDrawList();
+            const float text_y = low.y + (height - ImGui::GetTextLineHeight()) * 0.5F;
+            draw->AddText(ImVec2(low.x + ImGui::GetStyle().FramePadding.x, text_y), ImGui::GetColorU32(ImGuiCol_Text), file.c_str());
+            if (file == startup) {
+                const float used = ImGui::CalcTextSize(file.c_str()).x + 12.0F * ui_scale;
+                draw->AddText(ImVec2(low.x + ImGui::GetStyle().FramePadding.x + used, text_y),
+                              ImGui::GetColorU32(editor_color(palette.text_faint)), "startup");
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open this scene");
+            ImGui::SetCursorScreenPos(ImVec2(low.x + width - height, low.y));
+            if (trash_button("##remove_scene", "Remove from the project (the file is kept)")) remove = file;
+            note_item("config:scenes:remove:" + file);
+            ImGui::PopID();
+        }
+        ImGui::Spacing();
+        if (ImGui::Button("Add existing scene...")) file_dialog(FileAction::add_project_scene, scene_filename.data());
+        note_item("config:scenes:add");
+        ImGui::SameLine();
+        if (ImGui::Button("New scene")) discarding_action(PendingAction::new_scene);
+        note_item("config:scenes:new");
+        if (remove) mutate("project.remove_scene", "\"scene_file\":\"" + json_escape(*remove) + "\"", "Scene removed from project; file kept");
+    }
+
     // Lighting effects. Each checkbox saves through graphics.set_settings; the status under it
     // comes from the renderer, which may not support an effect on this GPU.
     void draw_graphics_page() {
@@ -10786,7 +10831,7 @@ struct EditorUi::Impl {
 
         ImGui::SeparatorText("Mixer buses");
         if (ImGui::Button("Open the Mixer")) {
-            panel_open[10] = true;
+            panel_open[9] = true;
             ImGui::SetWindowFocus("Mixer");
         }
         note_item("config:audio:open_mixer");
@@ -11276,6 +11321,321 @@ struct EditorUi::Impl {
         build_loaded_for = (project ? string_or(*project, "filename") : std::string{}) + "|" + active;
     }
 
+    // ---- Manage players ------------------------------------------------------------------
+
+    void open_players_window() {
+        players_open = true;
+        players_confirm_remove = false;
+        refresh_players();
+        ImGui::SetWindowFocus("Manage Players");
+    }
+
+    void refresh_players() {
+        if (auto status = call("players.list")) players_status = std::move(*status);
+    }
+
+    static std::string format_bytes(const double bytes) {
+        char text[32];
+        if (bytes >= 1024.0 * 1024.0 * 1024.0) std::snprintf(text, sizeof text, "%.1f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+        else if (bytes >= 1024.0 * 1024.0) std::snprintf(text, sizeof text, "%.1f MB", bytes / (1024.0 * 1024.0));
+        else std::snprintf(text, sizeof text, "%.0f KB", bytes / 1024.0);
+        return text;
+    }
+
+    // The players Relay can make games from, which are the targets a build can be made for. Players are
+    // modular: one is added from a folder (later also from a URL) and removed again. A Linux player that
+    // needs a newer glibc than the portable floor is flagged.
+    void draw_players_window() {
+        if (!players_open) return;
+        const bool visible = begin_tool_window("Manage Players", &players_open, ImVec2(900.0F, 560.0F));
+        note_item("players:window");
+        if (!visible) {
+            ImGui::End();
+            return;
+        }
+        const auto& palette = editor_palette();
+        const auto* status = players_status.object();
+        const auto* list_value = status ? field(*status, "players") : nullptr;
+        const auto* list = list_value ? list_value->array() : nullptr;
+        const std::string floor = status ? string_or(*status, "portable_glibc", "2.31") : "2.31";
+        const auto too_new = [&](const JsonValue::Object& player) {
+            const auto glibc = string_or(player, "glibc");
+            return !glibc.empty() && compare_dotted_versions(glibc, floor) > 0;
+        };
+        std::vector<const JsonValue::Object*> players;
+        if (list)
+            for (const auto& entry : *list)
+                if (const auto* object = entry.object()) players.push_back(object);
+        const auto target_title = [&](const JsonValue::Object& player) {
+            const auto name = string_or(player, "name");
+            return !name.empty() ? name : capitalised(string_or(player, "platform")) + "  \u00B7  " + string_or(player, "architecture");
+        };
+        // A warning that stays in view while any Linux player asks for more than the floor.
+        const JsonValue::Object* newest_problem = nullptr;
+        for (const auto* player : players)
+            if (too_new(*player)) newest_problem = player;
+        if (newest_problem)
+            ImGui::TextColored(editor_color(palette.warning),
+                               "The %s player needs glibc %s, newer than %s. Games built with it will not start on older Linux systems, "
+                               "and their scripts, compiled on this machine, may not either. Add a player built against glibc %s or older.",
+                               target_title(*newest_problem).c_str(), string_or(*newest_problem, "glibc").c_str(), floor.c_str(), floor.c_str());
+        const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+        ImGui::BeginGroup();
+        if (ImGui::BeginChild("##players_list", ImVec2(210.0F * ui_scale, -footer), ImGuiChildFlags_Borders)) {
+            ImGui::TextColored(editor_color(palette.text_dim), "PLAYERS");
+            ImGui::Spacing();
+            for (std::size_t index = 0; index < players.size(); ++index) {
+                const auto& player = *players[index];
+                ImGui::PushID(static_cast<int>(index));
+                if (ImGui::Selectable("##player", players_selected == static_cast<int>(index), 0,
+                                      ImVec2(0.0F, ImGui::GetFrameHeight()))) {
+                    players_selected = static_cast<int>(index);
+                    players_confirm_remove = false;
+                }
+                note_item("players:target:" + string_or(player, "platform") + "-" + string_or(player, "architecture"));
+                const auto low = ImGui::GetItemRectMin(), high = ImGui::GetItemRectMax();
+                auto* draw = ImGui::GetWindowDrawList();
+                draw->AddText(ImVec2(low.x + 10.0F * ui_scale, low.y + (high.y - low.y - ImGui::GetTextLineHeight()) * 0.5F),
+                              ImGui::GetColorU32(ImGuiCol_Text), target_title(player).c_str());
+                // A dot at the right: amber when the player's glibc is above the portable floor.
+                if (too_new(player))
+                    draw->AddCircleFilled(ImVec2(high.x - 12.0F * ui_scale, (low.y + high.y) * 0.5F), 4.0F * ui_scale,
+                                          ImGui::GetColorU32(editor_color(palette.warning)));
+                ImGui::PopID();
+            }
+            if (players.empty()) ImGui::TextColored(editor_color(palette.text_faint), "None installed");
+        }
+        ImGui::EndChild();
+        ImGui::EndGroup();
+        const float list_width = ImGui::GetItemRectSize().x;
+        ImGui::SameLine();
+        push_settings_style();
+        if (ImGui::BeginChild("##players_page", ImVec2(0.0F, -footer), ImGuiChildFlags_Borders)) {
+            if (players.empty()) {
+                ImGui::TextColored(editor_color(palette.text_dim),
+                                   "No players are installed, so no game can be built. Add one with Add player.");
+            } else {
+                players_selected = std::clamp(players_selected, 0, static_cast<int>(players.size()) - 1);
+                const auto& player = *players[static_cast<std::size_t>(players_selected)];
+                const bool installed = boolean_or(player, "installed", false);
+                const auto platform = string_or(player, "platform"), architecture = string_or(player, "architecture");
+                ImGui::PushFont(fonts.heading, fonts.heading_size);
+                ImGui::TextUnformatted(target_title(player).c_str());
+                ImGui::PopFont();
+                const auto description = string_or(player, "description");
+                ImGui::TextColored(editor_color(palette.text_dim), "%s",
+                                   !description.empty() ? description.c_str() : installed ? "Installed" : "Built into this Relay");
+                ImGui::Spacing();
+                inspector_label_width = 150.0F;
+                const auto row = [&](const char* label, const std::string& value) {
+                    inspector_field_label(label);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextWrapped("%s", value.c_str());
+                };
+                ImGui::SeparatorText("Player");
+                row("Builds games for", capitalised(platform) + ", " + architecture);
+                if (const auto version = string_or(player, "version"); !version.empty()) row("Version", version);
+                row("Source", installed ? "Installed" : "Built into this Relay");
+                row("Program", string_or(player, "program"));
+                if (installed) row("Folder", string_or(player, "folder"));
+                row("Files", std::to_string(static_cast<std::size_t>(number_or(player, "files", 0.0))));
+                row("Size", format_bytes(number_or(player, "bytes", 0.0)));
+                if (platform == "linux") {
+                    const auto glibc = string_or(player, "glibc");
+                    inspector_field_label("Needs glibc");
+                    ImGui::AlignTextToFramePadding();
+                    if (glibc.empty()) {
+                        ImGui::TextColored(editor_color(palette.text_faint), "Not measured");
+                    } else {
+                        ImGui::TextColored(editor_color(too_new(player) ? palette.warning : palette.success), "%s  (%s)", glibc.c_str(),
+                                           string_or(player, "glibc_from").c_str());
+                        if (too_new(player))
+                            ImGui::TextColored(editor_color(palette.warning),
+                                               "Newer than %s: games made with this player need a Linux at least this new.", floor.c_str());
+                    }
+                }
+                ImGui::SeparatorText("Actions");
+                ImGui::BeginDisabled(!installed);
+                if (ImGui::Button("Remove")) players_confirm_remove = true;
+                ImGui::EndDisabled();
+                note_item("players:remove");
+                if (!installed && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("The player this Relay was built with cannot be removed. Adding a player for the same target replaces it.");
+                if (installed) {
+                    ImGui::SameLine();
+                    if (ImGui::Button("Open folder")) open_in_file_browser_absolute(string_or(player, "folder"));
+                    note_item("players:open_folder");
+                }
+                if (players_confirm_remove && installed) {
+                    ImGui::Spacing();
+                    ImGui::TextColored(editor_color(palette.warning), "Remove the %s player? Games can no longer be built for it.", target_title(player).c_str());
+                    if (ImGui::Button("Remove it")) {
+                        if (call("players.remove", "\"target_platform\":\"" + json_escape(platform) + "\",\"architecture\":\"" +
+                                                       json_escape(architecture) + "\""))
+                            set_status("Removed the " + platform + " " + architecture + " player", false);
+                        players_confirm_remove = false;
+                        refresh_players();
+                    }
+                    note_item("players:remove:confirm");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Keep it")) players_confirm_remove = false;
+                    note_item("players:remove:cancel");
+                }
+                inspector_label_width = 0.0F;
+            }
+        }
+        ImGui::EndChild();
+        pop_settings_style();
+        if (ImGui::Button("Add player...", ImVec2(list_width, 0.0F))) {
+            players_add_open = true;
+            players_add_folder.fill('\0');
+            players_add_platform.fill('\0');
+            players_add_architecture.fill('\0');
+            players_add_url.fill('\0');
+            ImGui::OpenPopup("Add player");
+        }
+        note_item("players:add");
+        draw_add_player_popup();
+        ImGui::End();
+    }
+
+    // Adds a player from a folder, or, once players are published, from a URL.
+    void draw_add_player_popup() {
+        ImGui::SetNextWindowSize(ImVec2(620.0F * ui_scale, 0.0F), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5F, 0.5F));
+        if (!ImGui::BeginPopupModal("Add player", &players_add_open, ImGuiWindowFlags_NoResize)) return;
+        const auto& palette = editor_palette();
+        push_settings_style();
+        inspector_label_width = 130.0F;
+        ImGui::SeparatorText("From a folder");
+        inspector_field_label("Folder");
+        const float button = 86.0F * ui_scale;
+        ImGui::SetNextItemWidth(-(button + ImGui::GetStyle().ItemSpacing.x));
+        ImGui::InputTextWithHint("##players_add_folder", "The folder that holds the player", players_add_folder.data(), players_add_folder.size());
+        note_item("players:add:folder");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!file_dialog_available() || file_dialog_busy);
+        if (ImGui::Button("Browse...", ImVec2(button, 0.0F)))
+            choose_folder("Choose the folder that holds the player", players_add_folder[0] != '\0' ? std::string{players_add_folder.data()} : std::string{},
+                          [this](const std::string& chosen) { fill_buffer(players_add_folder, chosen); });
+        ImGui::EndDisabled();
+        note_item("players:add:browse");
+        inspector_field_label("Platform");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##players_add_platform", "From its player.json", players_add_platform.data(), players_add_platform.size(),
+                                 ImGuiInputTextFlags_CharsNoBlank);
+        note_item("players:add:platform");
+        inspector_field_label("Architecture");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##players_add_architecture", "From its player.json", players_add_architecture.data(),
+                                 players_add_architecture.size(), ImGuiInputTextFlags_CharsNoBlank);
+        note_item("players:add:architecture");
+        ImGui::TextColored(editor_color(palette.text_faint),
+                           "A folder with a player.json says what the player is for. For one without, fill in the platform and architecture, such as windows and x86_64.");
+        ImGui::SeparatorText("From a URL");
+        ImGui::BeginDisabled();
+        inspector_field_label("URL");
+        ImGui::SetNextItemWidth(-(button + ImGui::GetStyle().ItemSpacing.x));
+        ImGui::InputTextWithHint("##players_add_url", "https://... (available later)", players_add_url.data(), players_add_url.size());
+        ImGui::SameLine();
+        ImGui::Button("Download", ImVec2(button, 0.0F));
+        ImGui::EndDisabled();
+        note_item("players:add:url");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Downloading a player becomes available once players are published for download.");
+        ImGui::Spacing();
+        const bool can_add = players_add_folder[0] != '\0';
+        ImGui::BeginDisabled(!can_add);
+        if (ImGui::Button("Add player", ImVec2(130.0F * ui_scale, 0.0F))) {
+            std::string parameters = "\"source\":\"" + json_escape(players_add_folder.data()) + "\"";
+            if (players_add_platform[0] != '\0') parameters += ",\"target_platform\":\"" + json_escape(players_add_platform.data()) + "\"";
+            if (players_add_architecture[0] != '\0') parameters += ",\"architecture\":\"" + json_escape(players_add_architecture.data()) + "\"";
+            if (const auto added = call("players.install", parameters)) {
+                const auto* object = added->object();
+                set_status("Added the " + (object ? string_or(*object, "platform") + " " + string_or(*object, "architecture") : std::string{"new"}) + " player", false);
+                refresh_players();
+                if (const auto* status = players_status.object())
+                    if (const auto* list = field(*status, "players"); list && list->array())
+                        for (std::size_t index = 0; index < list->array()->size(); ++index)
+                            if (const auto* player = (*list->array())[index].object();
+                                player && object && string_or(*player, "platform") == string_or(*object, "platform") &&
+                                string_or(*player, "architecture") == string_or(*object, "architecture"))
+                                players_selected = static_cast<int>(index);
+                players_add_open = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndDisabled();
+        note_item("players:add:confirm");
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(100.0F * ui_scale, 0.0F)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            players_add_open = false;
+            ImGui::CloseCurrentPopup();
+        }
+        note_item("players:add:cancel");
+        inspector_label_width = 0.0F;
+        pop_settings_style();
+        ImGui::EndPopup();
+    }
+
+    // Run > Run standalone game: builds with the build profile for the machine the editor runs on, then
+    // starts the built game on its own. An error, and no build, if no profile suits this machine.
+    void run_standalone_game() {
+        const auto fail = [&](const std::string& message) { set_status(message, true); };
+        if (!active_project()) return fail("Open a project to run it");
+        const auto settings = call("project.build_settings");
+        const auto* object = settings ? settings->object() : nullptr;
+        if (!object) return fail("The build settings could not be read");
+        // This machine's own target, if a player exists for it.
+        std::string platform, architecture;
+        if (const auto* targets_value = field(*object, "targets"); targets_value && targets_value->array())
+            for (const auto& entry : *targets_value->array())
+                if (const auto* target = entry.object(); target && boolean_or(*target, "native", false)) {
+                    platform = string_or(*target, "platform");
+                    architecture = string_or(*target, "architecture");
+                }
+        if (platform.empty())
+            return fail("No player is installed for this machine, so the game cannot be run standalone. Add one under Run > Manage players.");
+        // The active profile if it targets this machine, else the first profile that does.
+        const auto* inner = field(*object, "settings") ? field(*object, "settings")->object() : nullptr;
+        const auto* profiles_value = inner ? field(*inner, "profiles") : nullptr;
+        const auto active = inner ? string_or(*inner, "active_profile") : std::string{};
+        std::string chosen;
+        if (const auto* profiles = profiles_value ? profiles_value->array() : nullptr)
+            for (const auto& entry : *profiles)
+                if (const auto* profile = entry.object();
+                    profile && string_or(*profile, "target_platform") == platform && string_or(*profile, "architecture") == architecture) {
+                    if (chosen.empty() || string_or(*profile, "name") == active) chosen = string_or(*profile, "name");
+                }
+        if (chosen.empty())
+            return fail("There is no build profile for this machine (" + platform + ", " + architecture +
+                        "). Add one under Run > Build project.");
+        build_error.clear();
+        build_result.clear();
+        build_failed = false;
+        if (!call("project.build_start", "\"profile\":\"" + json_escape(chosen) + "\"")) return;
+        build_running = true;
+        standalone_running = true;
+        build_stage = "Starting";
+        build_detail.clear();
+        build_fraction = 0.0;
+        build_seconds = 0.0;
+        set_status("Building " + chosen + " to run it...", false);
+    }
+
+    // Starts the game a standalone run just built.
+    void launch_standalone(const JsonValue::Object& built) {
+        const std::filesystem::path program = string_or(built, "program");
+        if (!game_launcher) {
+            set_status("This editor cannot start programs", true);
+            return;
+        }
+        const auto problem = game_launcher(program, program.parent_path() / "last-run.log");
+        set_status(problem.empty() ? "Started " + program.filename().string() + ". Its output is in last-run.log beside it"
+                                   : problem,
+                   !problem.empty());
+    }
+
     void open_build_window() {
         build_open = true;
         build_result.clear();
@@ -11463,8 +11823,54 @@ struct EditorUi::Impl {
         ImGui::SeparatorText("Profile");
         text_row("Name", build_profile_name.data(), build_profile_name.size(), "Profile name", "build:profile_name",
                  [&] { save_build_profile_text("new_name", build_profile_name.data()); });
-        choice_row("Platform", "target_platform", "platforms", "build:platform");
-        choice_row("Architecture", "architecture", "architectures", "build:architecture");
+        // Only targets a player is installed for are offered (Run > Manage players adds more); a
+        // profile that names another still shows it, marked.
+        const auto target_names = [&](const bool platforms) {
+            std::vector<std::string> names;
+            const auto* targets_value = status ? field(*status, "targets") : nullptr;
+            const auto current_platform = string_or(*profile, "target_platform");
+            if (const auto* targets = targets_value ? targets_value->array() : nullptr)
+                for (const auto& entry : *targets)
+                    if (const auto* target = entry.object()) {
+                        if (!platforms && string_or(*target, "platform") != current_platform) continue;
+                        const auto name = string_or(*target, platforms ? "platform" : "architecture");
+                        if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
+                    }
+            return names;
+        };
+        const auto target_row = [&](const char* label, const char* key, const bool platforms, const char* id) {
+            const auto current = string_or(*profile, key);
+            const auto names = target_names(platforms);
+            const bool known = std::find(names.begin(), names.end(), current) != names.end();
+            inspector_field_label(label);
+            ImGui::SetNextItemWidth(200.0F * ui_scale);
+            if (ImGui::BeginCombo((std::string{"##"} + label).c_str(), (capitalised(current) + (known ? "" : "  (no player)")).c_str())) {
+                for (const auto& name : names) {
+                    if (ImGui::Selectable(capitalised(name).c_str(), name == current) && name != current) {
+                        save_build_profile_text(key, name);
+                        if (platforms) {
+                            // Keep the architecture one this platform has a player for.
+                            const auto* targets_value = status ? field(*status, "targets") : nullptr;
+                            std::string first, kept;
+                            if (const auto* targets = targets_value ? targets_value->array() : nullptr)
+                                for (const auto& entry : *targets)
+                                    if (const auto* target = entry.object(); target && string_or(*target, "platform") == name) {
+                                        if (first.empty()) first = string_or(*target, "architecture");
+                                        if (string_or(*target, "architecture") == string_or(*profile, "architecture"))
+                                            kept = string_or(*target, "architecture");
+                                    }
+                            if (kept.empty() && !first.empty()) save_build_profile_text("architecture", first);
+                        }
+                    }
+                    note_item(std::string(id) + ":" + name);
+                }
+                ImGui::EndCombo();
+            }
+            note_item(id);
+            if (!known && ImGui::IsItemHovered()) ImGui::SetTooltip("No player is installed for this. Add one under Run > Manage players.");
+        };
+        target_row("Platform", "target_platform", true, "build:platform");
+        target_row("Architecture", "architecture", false, "build:architecture");
         choice_row("Configuration", "configuration", "configurations", "build:configuration");
 
         ImGui::SeparatorText("Output");
@@ -11676,6 +12082,8 @@ struct EditorUi::Impl {
             build_detail = string_or(*object, "detail");
             build_fraction = number_or(*object, "fraction", 0.0);
             build_seconds = number_or(*object, "seconds", 0.0);
+            if (standalone_running)
+                set_status("Building to run: " + build_stage + " (" + std::to_string(static_cast<int>(build_fraction * 100.0)) + "%)", false);
             return;
         }
         if (!build_running) return;
@@ -11692,6 +12100,9 @@ struct EditorUi::Impl {
         }
         set_status(state == "succeeded" ? build_result : build_error, state == "failed");
         refresh_build_status();
+        const bool standalone = std::exchange(standalone_running, false);
+        if (standalone && state == "succeeded") launch_standalone(*object);
+        else if (standalone && state == "cancelled") set_status("The standalone run was cancelled", false);
     }
 
     // Run > Build Project: profiles on the left, the selected profile's fields on the right, and a
@@ -11831,9 +12242,10 @@ struct EditorUi::Impl {
         }
         const auto& palette = editor_palette();
         struct Page { const char* name; const char* detail; const char* id; };
-        constexpr std::array<Page, 3> pages{Page{"Input", "Actions, axes and their controls", "config:page:input"},
+        constexpr std::array<Page, 4> pages{Page{"Input", "Actions, axes and their controls", "config:page:input"},
                                             Page{"Graphics", "Lighting and frame rate", "config:page:graphics"},
-                                            Page{"Audio", "Output and mixer buses", "config:page:audio"}};
+                                            Page{"Audio", "Output and mixer buses", "config:page:audio"},
+                                            Page{"Scenes", "The startup scene and the project's scenes", "config:page:scenes"}};
         if (ImGui::BeginChild("##config_pages", ImVec2(150.0F * ui_scale, 0.0F), ImGuiChildFlags_Borders)) {
             ImGui::TextColored(editor_color(palette.text_dim), "CATEGORIES");
             ImGui::Spacing();
@@ -11869,6 +12281,8 @@ struct EditorUi::Impl {
                 draw_graphics_page();
             else if (game_config_page == 2)
                 draw_audio_page();
+            else if (game_config_page == 3)
+                draw_scenes_page();
             else
                 draw_input_page();
         }
@@ -12695,7 +13109,7 @@ struct EditorUi::Impl {
                 begin_rename(RenameKind::entity, selection, string_or(*entity, "name"));
         }
         if (!embedded && shortcuts.KeyCtrl && shortcuts.KeyShift && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
-            panel_open[8] = true; agent_expand_pending = true; return;
+            panel_open[7] = true; agent_expand_pending = true; return;
         }
         if (shortcuts.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
             if (embedded) {
@@ -14816,7 +15230,7 @@ struct EditorUi::Impl {
     // Stopping the game keeps its frames: the profiler pauses so editor frames do not push them
     // out, and resumes by itself when the next game starts.
     void update_profiler_session() {
-        if (!panel_open[9]) {
+        if (!panel_open[8]) {
             profile_saw_game = false;
             return;
         }
@@ -15662,6 +16076,7 @@ bool EditorUi::initialize_headless(std::string& error) {
     // Headless editors never reach the desktop; tests install their own handler to observe calls.
     impl_->file_browser = {};
     impl_->ide_launcher = {};
+    impl_->game_launcher = {};
     impl_->bind_preferences();
     impl_->fonts = load_editor_fonts(1.0F);
     apply_editor_theme(1.0F);
@@ -15742,6 +16157,8 @@ void EditorUi::set_panel_visible(const std::string_view name, const bool visible
     for (std::size_t i = 0; i < panel_names.size(); ++i)
         if (panel_names[i] == name) impl_->panel_open[i] = visible;
 }
+
+void EditorUi::set_game_launcher(GameLauncher launcher) { impl_->game_launcher = std::move(launcher); }
 
 void EditorUi::set_ide_handler(IdeHandler handler) {
     impl_->ide_launcher = std::move(handler);
@@ -16119,10 +16536,6 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
     }
     if (!impl_->panel_open[6]) impl_->timeline_scrub_targets.clear();
     if (impl_->panel_open[7]) {
-        if (panel("Project", 7)) { RELAY_PROFILE_SCOPE("Panel: Project"); impl_->draw_project(); }
-        ImGui::End();
-    }
-    if (impl_->panel_open[8]) {
         if (impl_->agent_expand_pending) {
             impl_->agent_expand_pending = false;
             const auto* viewport = ImGui::GetMainViewport();
@@ -16131,20 +16544,20 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
             ImGui::SetNextWindowSize(size);
             ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - size.x - 16 * impl_->ui_scale, viewport->WorkPos.y + 16 * impl_->ui_scale));
         }
-        if (panel("Agent", 8)) { RELAY_PROFILE_SCOPE("Panel: Agent"); impl_->draw_agent(); }
+        if (panel("Agent", 7)) { RELAY_PROFILE_SCOPE("Panel: Agent"); impl_->draw_agent(); }
         ImGui::End();
     }
     impl_->update_profiler_session();
-    if (impl_->panel_open[9]) {
+    if (impl_->panel_open[8]) {
         // Layouts saved before the profiler existed have no place for it; it joins Diagnostics.
         if (!ImGui::FindWindowSettingsByID(ImHashStr("Profiler")))
             if (const auto* diagnostics = ImGui::FindWindowByName("Diagnostics");
                 diagnostics && diagnostics->DockId)
                 ImGui::SetNextWindowDockID(diagnostics->DockId, ImGuiCond_FirstUseEver);
-        if (panel("Profiler", 9)) { RELAY_PROFILE_SCOPE("Panel: Profiler"); impl_->draw_profiler(); }
+        if (panel("Profiler", 8)) { RELAY_PROFILE_SCOPE("Panel: Profiler"); impl_->draw_profiler(); }
         ImGui::End();
     }
-    if (impl_->panel_open[11]) {
+    if (impl_->panel_open[10]) {
         // Node graphs need room: the shader editor opens as a tab beside the viewport the first time.
         if (!ImGui::FindWindowSettingsByID(ImHashStr("Shader Editor")))
             if (const auto* viewport_window = ImGui::FindWindowByName("Viewport");
@@ -16154,13 +16567,13 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
             ImGui::SetNextWindowFocus();
             impl_->shader_editor_focus_pending = false;
         }
-        if (panel("Shader Editor", 11)) impl_->draw_shader_editor();
+        if (panel("Shader Editor", 10)) impl_->draw_shader_editor();
         else impl_->shader_editor_focused = false;
         ImGui::End();
     } else {
         impl_->shader_editor_focused = false;
     }
-    if (impl_->panel_open[12]) {
+    if (impl_->panel_open[11]) {
         // Like the Shader Editor, the Interface editor opens beside the viewport the first time.
         if (!ImGui::FindWindowSettingsByID(ImHashStr("Interface")))
             if (const auto* viewport_window = ImGui::FindWindowByName("Viewport");
@@ -16170,24 +16583,26 @@ void EditorUi::build(const std::uint32_t width, const std::uint32_t height) {
             ImGui::SetNextWindowFocus();
             impl_->interface_focus_pending = false;
         }
-        if (panel("Interface", 12)) impl_->draw_interface_editor();
+        if (panel("Interface", 11)) impl_->draw_interface_editor();
         ImGui::End();
     } else {
         // The viewport's scene camera view edits the interface too, so a drag there carries on.
         if (impl_->camera_enabled) impl_->interface_drag.reset();
     }
-    if (impl_->panel_open[10]) {
+    if (impl_->panel_open[9]) {
         // Like the profiler, the mixer joins Diagnostics the first time it opens.
         if (!ImGui::FindWindowSettingsByID(ImHashStr("Mixer")))
             if (const auto* diagnostics = ImGui::FindWindowByName("Diagnostics");
                 diagnostics && diagnostics->DockId)
                 ImGui::SetNextWindowDockID(diagnostics->DockId, ImGuiCond_FirstUseEver);
-        if (panel("Mixer", 10)) impl_->draw_mixer();
+        if (panel("Mixer", 9)) impl_->draw_mixer();
         ImGui::End();
     }
     impl_->draw_dialogs();
     impl_->draw_game_config();
+    if (impl_->build_running && !impl_->build_open) impl_->poll_build();
     impl_->draw_build_window();
+    impl_->draw_players_window();
     impl_->draw_export_window();
     impl_->draw_editor_preferences();
     impl_->draw_asset_browser();

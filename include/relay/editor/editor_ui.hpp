@@ -100,6 +100,10 @@ public:
     [[nodiscard]] bool panel_visible(std::string_view name) const;
     void set_file_browser_handler(FileBrowserHandler handler);
     void set_ide_handler(IdeHandler handler);
+    // Starts a built game's program on its own (Run > Run standalone game); returns an error message, or
+    // empty. The editor's own launcher spawns a detached process; headless editors start with none.
+    using GameLauncher = std::function<std::string(const std::filesystem::path& program, const std::filesystem::path& log)>;
+    void set_game_launcher(GameLauncher launcher);
     // Replaces the system file dialog, for tests and hosts with their own. Headless editors have
     // none, and their Browse buttons stay disabled.
     void set_file_dialog_handler(FileDialogHandler handler);

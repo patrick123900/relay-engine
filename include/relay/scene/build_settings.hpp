@@ -81,8 +81,8 @@ inline constexpr std::size_t maximum_always_include = 64;
 inline constexpr std::uint32_t minimum_window_size = 320;
 inline constexpr std::uint32_t maximum_window_size = 16384;
 
-[[nodiscard]] const std::vector<std::string_view>& build_platforms();
-[[nodiscard]] const std::vector<std::string_view>& build_architectures();
+// A platform or architecture name: a lower-case word of letters, digits and underscores.
+[[nodiscard]] bool valid_build_target_word(const std::string& word);
 [[nodiscard]] const std::vector<std::string_view>& build_configurations();
 [[nodiscard]] const std::vector<std::string_view>& build_window_modes();
 

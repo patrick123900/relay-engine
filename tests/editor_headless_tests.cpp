@@ -48,6 +48,7 @@ void key(relay::EditorUi& ui, ImGuiKey keycode, bool ctrl = true, bool shift = f
     io.AddKeyEvent(ImGuiMod_Shift, false);
     frame(ui, 2);
 }
+void click_center(relay::EditorUi& ui, const std::array<float, 4>& rect);
 void click(relay::EditorUi& ui, const std::array<float, 4>& rect, bool ctrl = false, bool shift = false) {
     auto& io = ImGui::GetIO();
     io.AddKeyEvent(ImGuiMod_Ctrl, ctrl);
@@ -307,17 +308,19 @@ void project_ui() {
           "editor Save As writes scene and registers project startup membership");
     key(ui, ImGuiKey_N);
     check(engine.scene().entities().empty(), "new scene after save does not show a discard prompt");
-    check(!ui.headless_item_rect("project:scene:main.relay.json"), "project panel is hidden by default");
-    ui.set_panel_visible("Project", true);
+    check(!ui.headless_item_rect("project:scene:main.relay.json"), "there is no project browser panel any more");
+    click_center(ui, *ui.headless_item_rect("menu:edit"));
+    click_center(ui, *ui.headless_item_rect("menu:edit:game_configuration"));
     frame(ui, 3);
-    ImGui::SetWindowFocus("Project");
+    click_center(ui, *ui.headless_item_rect("config:page:scenes"));
     frame(ui, 3);
-    const auto member = ui.headless_item_rect("project:scene:main.relay.json");
-    check(member.has_value(), "project browser shows saved scene membership");
+    const auto member = ui.headless_item_rect("config:scenes:scene:main.relay.json");
+    check(member.has_value() && ui.headless_item_rect("config:scenes:startup").has_value(),
+          "Game Configuration's Scenes page shows the startup scene and the project's scenes");
     click(ui, *member);
     check(engine.scene().entities().size() == 1 &&
               engine.scene().get(engine.scene().entities().front())->name == "Project scene",
-          "project browser opens saved scene through guarded protocol workflow");
+          "the Scenes page opens a saved scene through the guarded protocol workflow");
     std::cout << "Headless project save/browser tests passed\n";
 }
 void click_center(relay::EditorUi& ui, const std::array<float, 4>& rect) {
@@ -1719,6 +1722,78 @@ void export_and_build_ui() {
     frame(ui, 4);
     check(engine.build_settings().profiles.size() == 1U && engine.build_settings().active_profile == "Linux",
           "Delete removes the selected profile");
+    // Run standalone game: builds with the profile for this machine and starts the result.
+    {
+        std::vector<std::filesystem::path> started;
+        ui.set_game_launcher([&](const std::filesystem::path& program, const std::filesystem::path&) {
+            started.push_back(program);
+            return std::string{};
+        });
+        (void)protocol.handle(R"({"id":90,"method":"project.set_build_profile","name":"Linux","minimum_glibc":"","output_directory":"standalone"})");
+        click_center(ui, *need_item(ui, "menu:run"));
+        click_center(ui, *need_item(ui, "menu:run:standalone"));
+        wait_for_build(ui);
+        frame(ui, 3);
+        check(started.size() == 1U && started.back().filename() == "Shipping" &&
+                  std::filesystem::is_regular_file(started.back()) && started.back().parent_path().filename() == "release",
+              "Run standalone game builds for this machine and starts the built program");
+        // A profile only for another target leaves nothing to run: an error, and no build.
+        (void)protocol.handle(R"({"id":91,"method":"project.set_build_profile","name":"Linux","target_platform":"windows"})");
+        click_center(ui, *need_item(ui, "menu:run"));
+        click_center(ui, *need_item(ui, "menu:run:standalone"));
+        frame(ui, 4);
+        check(started.size() == 1U && !engine.builds().running(), "with no profile for this machine nothing is built or started");
+        (void)protocol.handle(R"({"id":92,"method":"project.set_build_profile","name":"Linux","target_platform":"linux"})");
+    }
+    // Manage players: every target is listed; a player for another platform is installed from a folder and removed again.
+    {
+        const auto players = std::filesystem::absolute("projects/shipping/players");
+        const auto source = std::filesystem::absolute("projects/shipping/windows-player-source");
+        std::filesystem::remove_all(players);
+        std::filesystem::remove_all(source);
+        std::filesystem::create_directories(source / "shaders");
+        {
+            std::ofstream(source / "relay_player.exe") << "program";
+            std::ofstream(source / "shaders" / "scene.spv") << "spirv";
+        }
+        setenv("RELAY_PLAYERS_DIR", players.c_str(), 1);
+        click_center(ui, *need_item(ui, "menu:run"));
+        click_center(ui, *need_item(ui, "menu:run:manage_players"));
+        frame(ui, 3);
+        check(ui.headless_item_rect("players:window").has_value() && ui.headless_item_rect("players:target:linux-x86_64") &&
+                  !ui.headless_item_rect("players:target:windows-x86_64") && ui.headless_item_rect("players:add"),
+              "Run > Manage players lists only the players that exist, and offers to add one");
+        click_center(ui, *need_item(ui, "players:add"));
+        frame(ui, 3);
+        check(ui.headless_item_rect("players:add:folder") && ui.headless_item_rect("players:add:browse") &&
+                  ui.headless_item_rect("players:add:url") && ui.headless_item_rect("players:add:platform"),
+              "Add player offers a folder and, for later, a URL");
+        answer = source.string();
+        click_center(ui, *need_item(ui, "players:add:browse"));
+        frame(ui, 3);
+        click_center(ui, *need_item(ui, "players:add:platform"));
+        type_text(ui, "windows");
+        click_center(ui, *need_item(ui, "players:add:architecture"));
+        type_text(ui, "x86_64");
+        frame(ui, 2);
+        click_center(ui, *need_item(ui, "players:add:confirm"));
+        frame(ui, 4);
+        check(std::filesystem::is_regular_file(players / "windows-x86_64" / "relay_player.exe") &&
+                  std::filesystem::is_regular_file(players / "windows-x86_64" / "shaders" / "scene.spv") &&
+                  std::filesystem::is_regular_file(players / "windows-x86_64" / "player.json"),
+              "the chosen folder is installed as a player for the platform and architecture given");
+        check(ui.headless_item_rect("players:target:windows-x86_64").has_value() && ui.headless_item_rect("players:open_folder").has_value(),
+              "the new player is listed and selected");
+        click_center(ui, *need_item(ui, "players:remove"));
+        frame(ui, 2);
+        click_center(ui, *need_item(ui, "players:remove:confirm"));
+        frame(ui, 4);
+        check(!std::filesystem::exists(players / "windows-x86_64") && !ui.headless_item_rect("players:target:windows-x86_64"),
+              "Remove, once confirmed, deletes the installed player and its entry");
+        unsetenv("RELAY_PLAYERS_DIR");
+        std::filesystem::remove_all(players);
+        std::filesystem::remove_all(source);
+    }
     unsetenv("RELAY_PLAYER_BINARY");
     std::cout << "Headless export and build tests passed\n";
 }
@@ -1814,10 +1889,13 @@ void system_dialogs_ui() {
 
     // Add an existing scene from elsewhere: it is copied into the project's scenes folder.
     check(relay::save_scene_file_atomic(engine.scene(), outside / "incoming/extra.relay.json", error), "write a scene to add");
-    ui.set_panel_visible("Project", true);
+    click_center(ui, *need_item(ui, "menu:edit"));
+    click_center(ui, *need_item(ui, "menu:edit:game_configuration"));
+    frame(ui, 3);
+    click_center(ui, *need_item(ui, "config:page:scenes"));
     frame(ui, 3);
     answer = (outside / "incoming/extra.relay.json").string();
-    click_center(ui, *need_item(ui, "project:add_scene"));
+    click_center(ui, *need_item(ui, "config:scenes:add"));
     frame(ui, 3);
     click_center(ui, *need_item(ui, "dialog:file:browse"));
     frame(ui, 3);
@@ -1827,6 +1905,18 @@ void system_dialogs_ui() {
               std::find(engine.project()->scenes.begin(), engine.project()->scenes.end(), "extra.relay.json") !=
                   engine.project()->scenes.end(),
           "a scene from elsewhere is copied into the project and added");
+    // The startup scene is chosen on the same page, and a scene can be taken out of the project again.
+    click_center(ui, *need_item(ui, "config:scenes:startup"));
+    frame(ui, 2);
+    click_center(ui, *need_item(ui, "config:scenes:startup:extra.relay.json"));
+    frame(ui, 3);
+    check(engine.project()->startup_scene == "extra.relay.json", "the Scenes page sets the startup scene");
+    click_center(ui, *need_item(ui, "config:scenes:remove:extra.relay.json"));
+    frame(ui, 3);
+    check(std::find(engine.project()->scenes.begin(), engine.project()->scenes.end(), "extra.relay.json") ==
+                  engine.project()->scenes.end() &&
+              fs::is_regular_file(outside / "my-project/scenes/extra.relay.json"),
+          "removing a scene takes it out of the project and keeps its file");
 
     fs::remove_all(outside);
     std::cout << "Headless system dialog tests passed\n";

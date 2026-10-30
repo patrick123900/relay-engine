@@ -117,8 +117,7 @@ struct BuildReport {
     std::string glibc, glibc_from, libstdcxx, cxxabi;
 };
 
-// The targets a build can be made for, and whether this Relay has a player for each: its own
-// platform's, or one installed in the players folder (see project_build.cpp).
+// The targets a build can be made for: those a player exists for, installed or built in.
 struct BuildTarget {
     std::string platform;
     std::string architecture;
@@ -126,6 +125,43 @@ struct BuildTarget {
     bool native{}; // This machine's own platform and CPU.
 };
 [[nodiscard]] std::vector<BuildTarget> available_build_targets();
+
+// The glibc that Relay's own games are meant to run on: a Linux player that needs a newer one
+// leaves older systems out, and games built with it, and their scripts, may not start there.
+inline constexpr const char* portable_glibc = "2.31";
+
+// What Relay has for one build target. Players are modular: each is a folder below the players folder
+// (beside Relay, or RELAY_PLAYERS_DIR) with a player.json saying which platform and architecture it makes
+// games for, so any target a player exists for can be built for, including community ones. This machine's
+// own Linux target is also served by the player Relay was built with (`built_in`) unless one is installed.
+struct PlayerInfo {
+    std::string platform;
+    std::string architecture;
+    std::string name;        // From player.json; empty when it has none.
+    std::string description;
+    std::string version;
+    bool native{};
+    bool installed{};
+    bool built_in{};
+    std::filesystem::path folder;  // Where an installed player lives.
+    std::filesystem::path program; // The program its games are made from.
+    std::size_t files{};
+    std::uintmax_t bytes{};
+    std::string glibc;      // Linux: the newest glibc its program and libraries ask for.
+    std::string glibc_from; // The file that sets it.
+};
+// The players that exist: installed ones, and this machine's built-in one.
+[[nodiscard]] std::vector<PlayerInfo> list_players();
+[[nodiscard]] std::filesystem::path players_folder();
+// Copies the player in `source` (its program, a shaders/ folder of .spv files and whatever else it needs,
+// described by a player.json) in as the player for its target, replacing one already there. A folder
+// without a player.json needs the platform and architecture given. `platform` and `architecture` say
+// which target it was installed for.
+bool install_player(const std::filesystem::path& source, const std::string& platform_hint,
+                    const std::string& architecture_hint, std::string& platform, std::string& architecture,
+                    std::string& error);
+// Deletes an installed player; the built-in one cannot be removed.
+bool remove_player(const std::string& platform, const std::string& architecture, std::string& error);
 
 // What a build of `profile` would pack and leave out, without building.
 struct BuildPreview {

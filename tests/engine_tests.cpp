@@ -3241,7 +3241,27 @@ int main() {
     expect(engine.status().frame_index == 5, "step advances an exact number of frames while paused");
 
     relay::ControlProtocol protocol(engine);
-    expect(relay::protocol_schema_version == 60U && relay::protocol_methods().size() == 181U,
+#ifndef _WIN32
+    {
+        // A built game starts on its own, with its output kept in a log.
+        const auto folder = std::filesystem::temp_directory_path() / ("relay-launch-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(folder);
+        write_file(folder / "game", "#!/bin/sh\necho started-by-test\necho oops 1>&2\n");
+        std::filesystem::permissions(folder / "game", std::filesystem::perms::owner_all);
+        expect(relay::launch_game(folder / "missing", folder / "log.txt").find("not found") != std::string::npos, "launching a missing program says so");
+        expect(relay::launch_game(folder / "game", folder / "log.txt").empty(), "a game's program is started");
+        std::string logged;
+        for (int attempt = 0; attempt < 100 && logged.find("oops") == std::string::npos; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            std::ifstream log(folder / "log.txt");
+            logged.assign(std::istreambuf_iterator<char>(log), {});
+        }
+        expect(logged.find("started-by-test") != std::string::npos && logged.find("oops") != std::string::npos,
+               "its output and errors are kept in the log: " + logged);
+        std::filesystem::remove_all(folder);
+    }
+#endif
+    expect(relay::protocol_schema_version == 61U && relay::protocol_methods().size() == 184U,
            "generated native protocol catalog contains every schema method");
     const auto status = protocol.handle(R"({"id":7,"method":"runtime.status"})");
     expect(status.find(R"("id":7)") != std::string::npos, "protocol preserves request id");
@@ -3418,7 +3438,7 @@ int main() {
                  R"({"id":120191,"method":"project.set_build_settings","active_profile":"Nowhere"})",
                  R"({"id":120192,"method":"project.set_build_profile","name":"Linux","output_directory":"a/../../b"})",
                  R"({"id":120193,"method":"project.set_build_profile","name":"Linux","output_directory":"relative/../x"})",
-                 R"({"id":120194,"method":"project.set_build_profile","name":"Linux","target_platform":"freebsd"})",
+                 R"({"id":120194,"method":"project.set_build_profile","name":"Linux","target_platform":"Free BSD"})",
                  R"({"id":120195,"method":"project.set_build_profile","name":"Linux","configuration":"profile"})",
                  R"({"id":120196,"method":"project.set_build_profile","name":"Linux","window_mode":"maximized"})",
                  R"({"id":120197,"method":"project.set_build_profile","name":"Linux","window_width":100})",
@@ -3695,8 +3715,8 @@ int main() {
             const auto targets = protocol.handle(R"({"id":120380,"method":"project.build_settings"})");
             expect(targets.find("\"targets\":[") != std::string::npos &&
                        targets.find("{\"platform\":\"linux\",\"architecture\":\"x86_64\",\"available\":true,\"native\":true}") != std::string::npos &&
-                       targets.find("{\"platform\":\"windows\",\"architecture\":\"x86_64\",\"available\":false,\"native\":false}") != std::string::npos,
-                   "the settings list which targets have a player: " + targets);
+                       targets.find("\"platform\":\"windows\"") == std::string::npos,
+                   "the settings list only the targets a player exists for: " + targets);
             const auto players = std::filesystem::temp_directory_path() /
                 ("relay-players-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
             setenv("RELAY_PLAYERS_DIR", players.c_str(), 1);
@@ -3730,6 +3750,91 @@ int main() {
             std::filesystem::remove_all(package_root / "scripts");
             expect(protocol.handle(R"({"id":120385,"method":"project.remove_build_profile","name":"Windows"})").find(R"("ok":true)") != std::string::npos,
                    "the Windows profile is removed");
+            // The players Relay can make games from, and putting one in or taking it out.
+            {
+                const auto listed = protocol.handle(R"({"id":120390,"method":"players.list"})");
+                expect(listed.find("\"portable_glibc\":\"2.31\"") != std::string::npos &&
+                           listed.find("\"platform\":\"windows\",\"architecture\":\"x86_64\",\"name\":\"\",\"description\":\"\",\"version\":\"\",\"native\":false,\"installed\":true") != std::string::npos &&
+                           listed.find("\"platform\":\"macos\"") == std::string::npos,
+                       "players.list holds the installed players and no placeholders: " + listed);
+                const auto source = std::filesystem::temp_directory_path() /
+                    ("relay-player-source-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+                std::filesystem::create_directories(source / "shaders");
+                expect(protocol.handle(("{\"id\":120391,\"method\":\"players.install\",\"target_platform\":\"macos\",\"architecture\":\"aarch64\",\"source\":\"" +
+                                        source.generic_string() + "\"}").c_str()).find("has no player program") != std::string::npos,
+                       "a folder without a player is refused");
+                std::filesystem::copy_file("/bin/true", source / "relay_player");
+                expect(protocol.handle(("{\"id\":120392,\"method\":\"players.install\",\"target_platform\":\"macos\",\"architecture\":\"aarch64\",\"source\":\"" +
+                                        source.generic_string() + "\"}").c_str()).find("no compiled shaders") != std::string::npos,
+                       "a player without shaders is refused");
+                write_file(source / "shaders" / "scene.spv", "spirv");
+                write_file(source / "libfake.dylib", "lib");
+                const std::string install_request = "{\"id\":120393,\"method\":\"players.install\",\"target_platform\":\"macos\",\"architecture\":\"aarch64\",\"source\":\"" +
+                                                    source.generic_string() + "\"}";
+                expect(protocol.handle_agent(install_request).find("\"ok\":false") != std::string::npos,
+                       "an agent cannot install a player");
+                expect(protocol.handle(install_request).find(R"("ok":true)") != std::string::npos &&
+                           std::filesystem::is_regular_file(players / "macos-aarch64" / "relay_player") &&
+                           std::filesystem::is_regular_file(players / "macos-aarch64" / "libfake.dylib") &&
+                           std::filesystem::is_regular_file(players / "macos-aarch64" / "shaders" / "scene.spv"),
+                       "a player folder is copied in whole");
+                expect(protocol.handle(R"({"id":120394,"method":"players.list"})")
+                               .find("\"platform\":\"macos\",\"architecture\":\"aarch64\",\"name\":\"\",\"description\":\"\",\"version\":\"\",\"native\":false,\"installed\":true") != std::string::npos,
+                       "the installed player is listed");
+                const std::string remove_request = R"({"id":120395,"method":"players.remove","target_platform":"macos","architecture":"aarch64"})";
+                expect(protocol.handle_agent(remove_request).find("\"ok\":false") != std::string::npos &&
+                           std::filesystem::exists(players / "macos-aarch64"),
+                       "an agent cannot remove a player");
+                expect(protocol.handle(remove_request).find(R"("ok":true)") != std::string::npos && !std::filesystem::exists(players / "macos-aarch64"),
+                       "a player is removed");
+                expect(protocol.handle(remove_request).find("no player is installed") != std::string::npos, "removing nothing says so");
+                // Players are modular: a folder's player.json names any target, and it becomes one to build for.
+                {
+                    const auto custom = std::filesystem::temp_directory_path() /
+                        ("relay-custom-player-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+                    std::filesystem::create_directories(custom / "shaders");
+                    std::filesystem::copy_file("/bin/true", custom / "game_runner.bin");
+                    write_file(custom / "shaders" / "scene.spv", "spirv");
+                    write_file(custom / "player.json",
+                               R"j({"format":"relay.player","version":1,"platform":"androidx","architecture":"arm64","name":"Android (Arm64)","program":"game_runner.bin","description":"A community player"})j");
+                    const auto added = protocol.handle(("{\"id\":120399,\"method\":\"players.install\",\"source\":\"" + custom.generic_string() + "\"}").c_str());
+                    expect(added.find("\"platform\":\"androidx\"") != std::string::npos && added.find(R"("ok":true)") != std::string::npos,
+                           "a player's own player.json says which target it is for: " + added);
+                    const auto listed_custom = protocol.handle(R"({"id":120400,"method":"players.list"})");
+                    expect(listed_custom.find("\"name\":\"Android (Arm64)\"") != std::string::npos &&
+                               listed_custom.find("\"description\":\"A community player\"") != std::string::npos,
+                           "its name and description are listed: " + listed_custom);
+                    expect(protocol.handle(R"({"id":120401,"method":"project.build_settings"})").find("\"platform\":\"androidx\"") != std::string::npos,
+                           "its target is offered for builds");
+                    expect(protocol.handle(R"({"id":120402,"method":"project.set_build_profile","name":"Phone","copy_from":"Linux","target_platform":"androidx","architecture":"arm64","minimum_glibc":""})")
+                                   .find(R"("ok":true)") != std::string::npos,
+                           "a build profile can name it");
+                    const auto phone = protocol.handle(R"({"id":120403,"method":"project.build","profile":"Phone"})");
+                    expect(phone.find("scripts") != std::string::npos || phone.find(R"("ok":true)") != std::string::npos,
+                           "a build for it uses its player: " + phone);
+                    if (phone.find(R"("ok":true)") != std::string::npos)
+                        expect(std::filesystem::is_regular_file(package_root / "builds/release/Portable_Game.bin"),
+                               "the program keeps the extension of the player's program");
+                    expect(protocol.handle(R"({"id":120404,"method":"project.remove_build_profile","name":"Phone"})").find(R"("ok":true)") != std::string::npos,
+                           "the profile is removed");
+                    expect(protocol.handle(R"({"id":120405,"method":"players.remove","target_platform":"androidx","architecture":"arm64"})").find(R"("ok":true)") != std::string::npos,
+                           "and the player");
+                    std::filesystem::remove_all(custom);
+                }
+                // An installed player for this machine's own target is used in place of the one built in.
+                std::filesystem::create_directories(source / "shaders");
+                std::filesystem::copy_file("/bin/true", source / "relay_player", std::filesystem::copy_options::overwrite_existing);
+                write_file(source / "shaders" / "scene.spv", "spirv");
+                expect(protocol.handle(("{\"id\":120396,\"method\":\"players.install\",\"target_platform\":\"linux\",\"architecture\":\"x86_64\",\"source\":\"" +
+                                        source.generic_string() + "\"}").c_str()).find(R"("ok":true)") != std::string::npos,
+                       "a Linux player can be installed");
+                expect(protocol.handle(R"({"id":120397,"method":"project.build","profile":"Linux"})").find(R"("ok":true)") != std::string::npos &&
+                           std::filesystem::file_size(package_root / "builds/release/Portable_Game") == std::filesystem::file_size("/bin/true"),
+                       "the installed player, not the built-in one, makes the game");
+                expect(protocol.handle(R"({"id":120398,"method":"players.remove","target_platform":"linux","architecture":"x86_64"})").find(R"("ok":true)") != std::string::npos,
+                       "and removing it returns to the built-in player");
+                std::filesystem::remove_all(source);
+            }
             unsetenv("RELAY_PLAYERS_DIR");
             std::filesystem::remove_all(players);
             // The Linux build in the same folder was replaced by the Windows one; make it again.
